@@ -79,9 +79,9 @@ def main():
     all_passed = True
     
     # Run tests
-    all_passed &= test_imports()
-    all_passed &= test_module_docstring()
-    all_passed &= test_error_handling()
+    all_passed = all_passed and test_imports()
+    all_passed = all_passed and test_module_docstring()
+    all_passed = all_passed and test_error_handling()
     
     print("\n" + "=" * 60)
     if all_passed:
@@ -94,4 +94,5 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    sys.exit(exit_code)
