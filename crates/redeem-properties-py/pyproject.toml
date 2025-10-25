@@ -39,6 +39,5 @@ Repository = "https://github.com/singjc/redeem"
 Documentation = "https://github.com/singjc/redeem"
 
 [tool.maturin]
-python-source = "python"
 module-name = "redeem_properties_py"
 features = ["pyo3/extension-module"]

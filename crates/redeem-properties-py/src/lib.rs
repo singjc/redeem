@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use numpy::{PyArray1, PyArray2, PyArrayMethods};
+use numpy::{PyArray1, PyArray2};
 use redeem_properties::models::{
     rt_model::RTModelWrapper,
     ccs_model::CCSModelWrapper,
