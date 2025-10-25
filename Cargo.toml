@@ -1,6 +1,6 @@
 [workspace]
 members = [ "crates/redeem-classifiers", "crates/redeem-cli",
-    "crates/redeem-properties"
+    "crates/redeem-properties", "crates/redeem-properties-py"
 ]
 
 resolver = "2"

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "redeem-properties-py"
+version = "0.1.0"
+description = "Python bindings for ReDeeM peptide property prediction models"
+authors = [
+    {name = "Justin Sing", email = "justincsing@gmail.com"}
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "maturin>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/singjc/redeem"
+Repository = "https://github.com/singjc/redeem"
+Documentation = "https://github.com/singjc/redeem"
+
+[tool.maturin]
+python-source = "python"
+module-name = "redeem_properties_py"
+features = ["pyo3/extension-module"]

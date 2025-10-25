@@ -1,0 +1,28 @@
+[package]
+name = "redeem-properties-py"
+version = "0.1.0"
+authors = ["Justin Sing <justincsing@gmail.com>"]
+edition = "2021"
+rust-version = "1.76"
+description = "Python bindings for redeem-properties - peptide property prediction models"
+readme = "README.md"
+
+[lib]
+name = "redeem_properties_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+redeem-properties = { path = "../redeem-properties" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+anyhow = "1.0"
+ndarray = "0.15"
+
+[dependencies.candle-core]
+version = "0.8.4"
+default-features = false
+features = []
+
+[features]
+default = []
+cuda = ["redeem-properties/cuda"]
