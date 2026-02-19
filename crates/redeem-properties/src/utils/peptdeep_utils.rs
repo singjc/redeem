@@ -1,26 +1,27 @@
-use anyhow::{Context, Result, Error};
+use anyhow::{Context, Error, Result};
+use csv::ReaderBuilder;
+use log::info;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use reqwest;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
+use std::io;
 use std::ops::Index;
 use std::path::PathBuf;
-use std::io;
-use std::fs;
 use std::sync::Arc;
-use log::info;
-use csv::ReaderBuilder;
-use reqwest;
-use regex::Regex;
-use std::collections::HashMap;
-use serde::Deserialize;
 use zip::ZipArchive;
-use once_cell::sync::Lazy;
 
-const MODIFICATIONS_TSV_BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),"/assets/modification.tsv"));
+const MODIFICATIONS_TSV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/modification.tsv"
+));
 
-
-const PRETRAINED_MODELS_URL: &str = "https://github.com/singjc/redeem/releases/download/v0.1.0-alpha/peptdeep_generic_pretrained_models.zip";
-const PRETRAINED_MODELS_ZIP: &str = "data/peptdeep_generic_pretrained_models.zip";
-const PRETRAINED_MODELS_PATH: &str = "data/peptdeep_generic_pretrained_models";
-
+const PRETRAINED_MODELS_URL: &str = "https://github.com/singjc/redeem/releases/download/v0.1.0-alpha/pretrained_models.zip";
+const PRETRAINED_MODELS_ZIP: &str = "data/pretrained_models.zip";
+const PRETRAINED_MODELS_PATH: &str = "data/pretrained_models";
 
 // Constants and Utility Structs
 
@@ -36,12 +37,11 @@ const MAX_INSTRUMENT_NUM: usize = 8;
 
 const UNKNOWN_INSTRUMENT_NUM: usize = MAX_INSTRUMENT_NUM - 1;
 
-
 #[derive(Debug, Clone)]
 pub struct ModificationMap {
     pub name: String,
     pub amino_acid: Option<char>, // Optional if not applicable
-    pub unimod_id: Option<u32>
+    pub unimod_id: Option<u32>,
 }
 
 /// Loads a unified modification map where the key is either:
@@ -85,12 +85,8 @@ pub fn load_modifications() -> Result<HashMap<(String, Option<char>), Modificati
 }
 
 // Lazy static variable to hold the loaded modification map
-pub static MODIFICATION_MAP: Lazy<HashMap<(String, Option<char>), ModificationMap>> = Lazy::new(|| {
-    load_modifications().expect("Failed to load modifications")
-});
-
-
-
+pub static MODIFICATION_MAP: Lazy<HashMap<(String, Option<char>), ModificationMap>> =
+    Lazy::new(|| load_modifications().expect("Failed to load modifications"));
 
 #[derive(Clone, Debug, Deserialize)]
 /// Represents the constants used in a model.
@@ -137,7 +133,7 @@ impl Default for ModelConstants {
                 "Lu", "Md", "Mg", "Mn", "Mo", "Na", "Nb", "Nd", "Ne", "Ni", "No", "Np", "Os", "Pa",
                 "Pb", "Pd", "Pm", "Po", "Pr", "Pt", "Pu", "Ra", "Rb", "Re", "Rh", "Rn", "Ru", "Sb",
                 "Sc", "Se", "Si", "Sm", "Sn", "Sr", "Ta", "Tb", "Tc", "Te", "Th", "Ti", "Tl", "Tm",
-                "Xe", "Yb", "Zn", "Zr", "2H", "13C", "15N", "18O", "?"
+                "Xe", "Yb", "Zn", "Zr", "2H", "13C", "15N", "18O", "?",
             ]
             .into_iter()
             .map(String::from)
@@ -151,12 +147,16 @@ impl Default for ModelConstants {
 pub fn parse_model_constants(path: &str) -> Result<ModelConstants> {
     let f = std::fs::File::open(path).map_err(|e| Error::msg(e.to_string()))?;
     // Holds the model constants.
-    let constants: ModelConstants = serde_yaml::from_reader(f).map_err(|e| Error::msg(e.to_string()))?;
+    let constants: ModelConstants =
+        serde_yaml::from_reader(f).map_err(|e| Error::msg(e.to_string()))?;
     Ok(constants)
 }
 
-
-fn parse_mod_formula(formula: &str, mod_elem_to_idx: &HashMap<String, usize>, mod_feature_size: usize) -> Vec<f32> {
+fn parse_mod_formula(
+    formula: &str,
+    mod_elem_to_idx: &HashMap<String, usize>,
+    mod_feature_size: usize,
+) -> Vec<f32> {
     let mut feature = vec![0.0; mod_feature_size];
     let elems: Vec<&str> = formula.trim_end_matches(')').split(')').collect();
     for elem in elems {
@@ -175,13 +175,14 @@ fn parse_mod_formula(formula: &str, mod_elem_to_idx: &HashMap<String, usize>, mo
 }
 
 pub fn load_mod_to_feature(constants: &ModelConstants) -> Result<HashMap<String, Vec<f32>>, Error> {
-
     let mut rdr = ReaderBuilder::new()
         .delimiter(b'\t')
-        .from_reader(MODIFICATIONS_TSV_BYTES);  // Read from the byte slice
+        .from_reader(MODIFICATIONS_TSV_BYTES); // Read from the byte slice
 
     // Create mod_elem_to_idx mapping
-    let mod_elem_to_idx: HashMap<String, usize> = constants.mod_elements.iter()
+    let mod_elem_to_idx: HashMap<String, usize> = constants
+        .mod_elements
+        .iter()
         .enumerate()
         .map(|(i, elem)| (elem.clone(), i))
         .collect();
@@ -192,7 +193,8 @@ pub fn load_mod_to_feature(constants: &ModelConstants) -> Result<HashMap<String,
 
     for result in rdr.deserialize() {
         let record: ModFeature = result?;
-        let feature_vector = parse_mod_formula(&record.composition, &mod_elem_to_idx, mod_feature_size);
+        let feature_vector =
+            parse_mod_formula(&record.composition, &mod_elem_to_idx, mod_feature_size);
         mod_to_feature.insert(record.mod_name, feature_vector);
     }
 
@@ -202,7 +204,6 @@ pub fn load_mod_to_feature(constants: &ModelConstants) -> Result<HashMap<String,
 pub fn load_mod_to_feature_arc(
     constants: &ModelConstants,
 ) -> Result<HashMap<Arc<[u8]>, Vec<f32>>, Error> {
-
     let mut rdr = ReaderBuilder::new()
         .delimiter(b'\t')
         .from_reader(MODIFICATIONS_TSV_BYTES);
@@ -219,13 +220,13 @@ pub fn load_mod_to_feature_arc(
 
     for result in rdr.deserialize() {
         let record: ModFeature = result?;
-        let feature_vector = parse_mod_formula(&record.composition, &mod_elem_to_idx, mod_feature_size);
+        let feature_vector =
+            parse_mod_formula(&record.composition, &mod_elem_to_idx, mod_feature_size);
         mod_to_feature.insert(Arc::from(record.mod_name.as_bytes()), feature_vector);
     }
 
     Ok(mod_to_feature)
 }
-
 
 /// Removes mass shifts and UniMod annotations from a modified peptide sequence.
 ///
@@ -235,7 +236,7 @@ pub fn load_mod_to_feature_arc(
 /// # Example
 /// ```
 /// use redeem_properties::utils::peptdeep_utils::remove_mass_shift;
-/// 
+///
 /// let peptide = "MGC[+57.0215]AAR";
 /// assert_eq!(remove_mass_shift(peptide), "MGCAAR");
 /// let peptide = "MGC(UniMod:4)AAR";
@@ -246,7 +247,6 @@ pub fn remove_mass_shift(peptide: &str) -> String {
     let re = Regex::new(r"(\[.*?\]|\(UniMod:\d+\))").unwrap();
     re.replace_all(peptide, "").to_string()
 }
-
 
 pub fn extract_masses(peptide: &str) -> Vec<f64> {
     let mut masses = Vec::new();
@@ -286,16 +286,15 @@ pub fn extract_masses_and_indices(peptide: &str) -> Vec<(f64, usize)> {
     results
 }
 
-
 /// Extracts modification indices from a peptide string.
 /// The indices are 0-based and represent the positions of the modifications.
-/// 
+///
 /// # Example
 /// ```
 /// use redeem_properties::utils::peptdeep_utils::get_modification_indices;
 /// let result = get_modification_indices("AC[+57.0215]DE");
 /// assert_eq!(result, "1");
-/// 
+///
 /// let result = get_modification_indices("AC(UniMod:4)DE");
 /// assert_eq!(result, "1");
 /// ```
@@ -326,8 +325,6 @@ pub fn get_modification_indices(peptide: &str) -> String {
 
     indices.join(";")
 }
-
-
 
 /// Extracts mass shift annotations (e.g., [+57.0215]) from a peptide string and returns them
 /// as a vector of (mass_string, position) where position is the index of the annotated amino acid.
@@ -361,7 +358,6 @@ pub fn extract_mass_annotations(peptide: &str) -> Vec<(String, usize)> {
 
     results
 }
-
 
 /// Extracts UniMod annotations (e.g., (UniMod:4)) from a peptide string and returns them
 /// as a vector of (unimod_id_string, position) where position is the index of the annotated amino acid.
@@ -403,7 +399,6 @@ pub fn extract_unimod_annotations(peptide: &str) -> Vec<(String, usize)> {
     results
 }
 
-
 /// Extracts either mass shift or UniMod annotations from a peptide string,
 /// returning a vector of (mod_str, position).
 ///
@@ -428,8 +423,6 @@ pub fn extract_mod_annotations(peptide: &str) -> Vec<(String, usize)> {
     }
 }
 
-
-
 /// Attempts to look up a modification name from a map using the provided key and amino acid.
 /// Falls back to a key with `None` if the exact amino acid is not matched.
 ///
@@ -451,9 +444,6 @@ pub fn lookup_modification(
         .or_else(|| map.get(&(key, None)))
         .map(|m| m.name.clone())
 }
-
-
-
 
 /// Generates a standardized modification string (e.g., "Carbamidomethyl@C")
 /// for a peptide sequence based on mass shifts (e.g., `[+57.0215]`) or
@@ -507,15 +497,15 @@ pub fn get_modification_string(
             // If not found and it's a terminal mod, look for Protein_N-term
             if mod_str.is_none() && pos == 0 {
                 // Try all entries with same key and look for *_N-term
-                let fallback = modification_map
-                    .iter()
-                    .find_map(|((k, _), v)| {
-                        if k == &key && (v.name.contains("Protein_N-term") || v.name.contains("Any_N-term")) {
-                            Some(v.name.clone())
-                        } else {
-                            None
-                        }
-                    });
+                let fallback = modification_map.iter().find_map(|((k, _), v)| {
+                    if k == &key
+                        && (v.name.contains("Protein_N-term") || v.name.contains("Any_N-term"))
+                    {
+                        Some(v.name.clone())
+                    } else {
+                        None
+                    }
+                });
                 fallback
             } else {
                 mod_str
@@ -524,7 +514,6 @@ pub fn get_modification_string(
         .collect::<Vec<_>>()
         .join(";")
 }
-
 
 pub fn download_pretrained_models_exist() -> Result<PathBuf, io::Error> {
     let zip_path = PathBuf::from(PRETRAINED_MODELS_ZIP);
@@ -573,17 +562,16 @@ pub fn download_pretrained_models_exist() -> Result<PathBuf, io::Error> {
 
 pub fn parse_instrument_index(instrument: &str) -> usize {
     let upper_instrument = instrument.to_uppercase();
-    
-    INSTRUMENT_DICT.iter()
+
+    INSTRUMENT_DICT
+        .iter()
         .find(|&&(name, _)| name == upper_instrument)
         .map_or(UNKNOWN_INSTRUMENT_NUM, |&(_, index)| index)
 }
 
-
-
 // TODO: Derive from PeptDep constants yaml
-const IM_GAS_MASS: f64 = 28.0; 
-const CCS_IM_COEF: f64 = 1059.62245; 
+const IM_GAS_MASS: f64 = 28.0;
+const CCS_IM_COEF: f64 = 1059.62245;
 
 /// Calculates the reduced mass for CCS and mobility calculation.
 ///
@@ -622,26 +610,24 @@ pub fn ccs_to_mobility_bruker(ccs_value: f64, charge: f64, precursor_mz: f64) ->
     ccs_value * f64::sqrt(reduced_mass) / (charge * CCS_IM_COEF)
 }
 
-
 /// Converts mobility to CCS (Collision Cross Section) for Bruker (timsTOF) instruments.
-/// 
+///
 /// This function calculates the CCS using the formula:
 /// ccs_value = (mobility * charge * CCS_IM_COEF) / sqrt(reduced_mass)
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `mobility` - The mobility value
 /// * `charge` - The charge of the ion
 /// * `precursor_mz` - The precursor mass-to-charge ratio (m/z)
-/// 
+///
 /// # Returns
-/// 
+///
 /// The calculated CCS value as a f64
 pub fn ion_mobility_to_ccs_bruker(mobility: f64, charge: i32, precursor_mz: f64) -> f32 {
     let reduced_mass = get_reduced_mass(precursor_mz, charge as f64);
     ((mobility * (charge as f64) * CCS_IM_COEF) / f64::sqrt(reduced_mass)) as f32
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -655,11 +641,35 @@ mod tests {
     }
 
     #[test]
+    fn test_download_pretrained_models_exist_returns_valid_path() {
+        let result = download_pretrained_models_exist();
+        
+        // Should return Ok with a valid path
+        assert!(result.is_ok(), "Failed to download/extract pretrained models");
+        
+        let path = result.unwrap();
+        
+        // Path should exist
+        assert!(path.exists(), "Pretrained models path does not exist: {:?}", path);
+        
+        // Path should be a directory
+        assert!(path.is_dir(), "Pretrained models path is not a directory: {:?}", path);
+        
+        // Check that the path matches expected location
+        assert_eq!(path, PathBuf::from(PRETRAINED_MODELS_PATH));
+        
+        println!("Pretrained models successfully available at: {:?}", path);
+    }
+
+    #[test]
     fn test_extract_unimod_annotations() {
         let peptide = "AC(UniMod:4)DE(UniMod:7)FG";
         let result = extract_unimod_annotations(peptide);
         println!("Peptide: {}, Result: {:?}", peptide, result);
-        assert_eq!(result, vec![("UniMod:4".to_string(), 2), ("UniMod:7".to_string(), 4)]);
+        assert_eq!(
+            result,
+            vec![("UniMod:4".to_string(), 2), ("UniMod:7".to_string(), 4)]
+        );
 
         let peptide = "AC(UniMod:4)DE(UniMod:7)FG(UniMod:10)";
         let result = extract_unimod_annotations(peptide);
@@ -676,7 +686,10 @@ mod tests {
         let peptide = "(UniMod:1)M(UniMod:35)AAAATMAAAAR";
         let result = extract_unimod_annotations(peptide);
         println!("Peptide: {}, Result: {:?}", peptide, result);
-        assert_eq!(result, vec![("UniMod:1".to_string(), 0), ("UniMod:35".to_string(), 1)]);
+        assert_eq!(
+            result,
+            vec![("UniMod:1".to_string(), 0), ("UniMod:35".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -684,12 +697,18 @@ mod tests {
         let peptide = "[+42.0105]M[+15.9949]AAAATMAAAAR";
         let result = extract_mod_annotations(peptide);
         println!("Peptide: {}, Result: {:?}", peptide, result);
-        assert_eq!(result, vec![("42.0105".to_string(), 0), ("15.9949".to_string(), 1)]);
+        assert_eq!(
+            result,
+            vec![("42.0105".to_string(), 0), ("15.9949".to_string(), 1)]
+        );
 
         let peptide = "(UniMod:1)M(UniMod:35)AAAATMAAAAR";
         let result = extract_mod_annotations(peptide);
         println!("Peptide: {}, Result: {:?}", peptide, result);
-        assert_eq!(result, vec![("UniMod:1".to_string(), 0), ("UniMod:35".to_string(), 1)]);
+        assert_eq!(
+            result,
+            vec![("UniMod:1".to_string(), 0), ("UniMod:35".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -712,7 +731,10 @@ mod tests {
 
         for (peptide, expected) in test_cases {
             let result = get_modification_indices(peptide);
-            println!("Peptide: {}, Expected: {}, Result: {}", peptide, expected, result);
+            println!(
+                "Peptide: {}, Expected: {}, Result: {}",
+                peptide, expected, result
+            );
             assert_eq!(result, expected, "Failed for peptide: {}", peptide);
         }
     }
@@ -724,18 +746,27 @@ mod tests {
             ("PEPT[+15.9949]IDE", vec![(15.9949, 4)]),
             ("P[+15.9949]EPT[+79.99]IDE", vec![(15.9949, 1), (79.99, 4)]),
             ("TVQSLEIDLDSM[+15.9949]R", vec![(15.9949, 12)]),
-            ("TVQS[+79.99]LEIDLDSM[+15.9949]R", vec![(79.99, 4), (15.9949, 12)]),
+            (
+                "TVQS[+79.99]LEIDLDSM[+15.9949]R",
+                vec![(79.99, 4), (15.9949, 12)],
+            ),
             ("[+42.0106]PEPTIDE", vec![(42.0106, 0)]),
             ("PEPTIDE[+42.0106]", vec![(42.0106, 7)]),
-            ("P[+15.9949]EP[+79.99]T[+15.9949]IDE", vec![(15.9949, 1), (79.99, 3), (15.9949, 4)]),
-            ("PEPTIDE[]", vec![]),  // Empty modification
-            ("P[+15.9949]EP[-79.99]TIDE", vec![(15.9949, 1), (-79.99, 3)]),  // Negative mass
-            ("P[+15.9949]EP[79.99]TIDE", vec![(15.9949, 1), (79.99, 3)]),  // No plus sign
+            (
+                "P[+15.9949]EP[+79.99]T[+15.9949]IDE",
+                vec![(15.9949, 1), (79.99, 3), (15.9949, 4)],
+            ),
+            ("PEPTIDE[]", vec![]), // Empty modification
+            ("P[+15.9949]EP[-79.99]TIDE", vec![(15.9949, 1), (-79.99, 3)]), // Negative mass
+            ("P[+15.9949]EP[79.99]TIDE", vec![(15.9949, 1), (79.99, 3)]), // No plus sign
         ];
 
         for (peptide, expected) in test_cases {
             let result = extract_masses_and_indices(peptide);
-            println!("Peptide: {}, Expected: {:?}, Result: {:?}", peptide, expected, result);
+            println!(
+                "Peptide: {}, Expected: {:?}, Result: {:?}",
+                peptide, expected, result
+            );
             assert_eq!(result, expected, "Failed for peptide: {}", peptide);
         }
     }
@@ -750,20 +781,30 @@ mod tests {
             ("P[+15.9949]EPT[+79.9663]IDE", "Oxidation@P;Phospho@T"),
             ("TVQSLEIDLDSM[+15.9949]R", "Oxidation@M"),
             ("TVQS[+79.9663]LEIDLDSM[+15.9949]R", "Phospho@S;Oxidation@M"),
-            ("(UniMod:1)M(UniMod:35)AAAATMAAAAR", "Acetyl@Protein_N-term;Oxidation@M"),
+            (
+                "(UniMod:1)M(UniMod:35)AAAATMAAAAR",
+                "Acetyl@Protein_N-term;Oxidation@M",
+            ),
             ("[+42.0106]PEPTIDE", "Acetyl@Protein_N-term"),
             ("PEPTIDE[+42.0106]", ""),
-            ("P[+15.9949]EP[+79.9663]T[+15.9949]IDE", "Oxidation@P;Oxidation@T"),
-            ("(UniMod:1)M(UniMod:35)AAAATMAAAAR", "Acetyl@Protein_N-term;Oxidation@M"),
+            (
+                "P[+15.9949]EP[+79.9663]T[+15.9949]IDE",
+                "Oxidation@P;Oxidation@T",
+            ),
+            (
+                "(UniMod:1)M(UniMod:35)AAAATMAAAAR",
+                "Acetyl@Protein_N-term;Oxidation@M",
+            ),
         ];
-
 
         for (peptide, expected) in test_cases {
             let result = get_modification_string(peptide, &modification_map);
-            println!("Peptide: {}, Expected: {}, Result: {}", peptide, expected, result);
+            println!(
+                "Peptide: {}, Expected: {}, Result: {}",
+                peptide, expected, result
+            );
             assert_eq!(result, expected, "Failed for peptide: {}", peptide);
         }
-
     }
 
     #[test]
@@ -773,14 +814,13 @@ mod tests {
         let precursor_mz = 762.329553;
 
         let result = ccs_to_mobility_bruker(ccs_value, charge, precursor_mz);
-        
+
         let expected = 8.078969627454307e-05;
         println!("Rust result: {}", result);
         println!("Python result: {}", expected);
         println!("Difference: {}", (result - expected).abs());
 
         assert_eq!(result, expected, "Failed for ccs_to_mobility_bruker");
-
     }
 
     #[test]
@@ -790,14 +830,12 @@ mod tests {
         let precursor_mz = 762.329553;
 
         let result = ion_mobility_to_ccs_bruker(mobility, charge, precursor_mz);
-        
+
         let expected = 0.032652;
         println!("Rust result: {}", result);
         println!("Python result: {}", expected);
         println!("Difference: {}", (result - expected).abs());
 
         assert_eq!(result, expected, "Failed for ion_mobility_to_ccs_bruker");
-
     }
-
 }

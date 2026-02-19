@@ -1,7 +1,7 @@
 use crate::models::ccs_cnn_lstm_model::CCSCNNLSTMModel;
 use crate::models::ccs_cnn_tf_model::CCSCNNTFModel;
 use crate::models::model_interface::{ModelInterface, PredictionResult};
-use crate::utils::data_handling::PeptideData;
+use crate::utils::data_handling::{PeptideData, TargetNormalization};
 use crate::utils::peptdeep_utils::ModificationMap;
 use crate::utils::stats::TrainingStepMetrics;
 use anyhow::{anyhow, Result};
@@ -85,6 +85,9 @@ impl CCSModelWrapper {
         learning_rate: f64,
         epochs: usize,
         early_stopping_patience: usize,
+        target_norm: TargetNormalization,
+        train_var_prefixes: Option<Vec<String>>,
+        warmup_fraction: Option<f64>,
     ) -> Result<TrainingStepMetrics> {
         self.model.train(
             training_data,
@@ -98,6 +101,9 @@ impl CCSModelWrapper {
             "training",
             true,
             true,
+            target_norm,
+            train_var_prefixes,
+            warmup_fraction,
         )
     }
 
@@ -108,6 +114,7 @@ impl CCSModelWrapper {
         batch_size: usize,
         learning_rate: f64,
         epochs: usize,
+        target_norm: TargetNormalization,
     ) -> Result<()> {
         self.model.fine_tune(
             training_data,
@@ -115,6 +122,8 @@ impl CCSModelWrapper {
             batch_size,
             learning_rate,
             epochs,
+            target_norm,
+            None,
         )
     }
 

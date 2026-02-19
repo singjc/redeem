@@ -3,7 +3,10 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Dropout, Module, VarBuilder, VarMap};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, sync::Arc};
+
+use crate::utils::utils::get_tensor_stats;
 
 use crate::{
     building_blocks::building_blocks::{
@@ -209,6 +212,7 @@ impl ModelInterface for MS2BertModel {
             mod_x_out.shape(),
             mod_x_out.device()
         );
+
         log::trace!(
             "[MS2BertModel::forward] charge_out shape: {:?}, device: {:?}",
             charge_out.shape(),
@@ -226,9 +230,10 @@ impl ModelInterface for MS2BertModel {
         );
 
         // Forward pass through input_nn with dropout
-        let in_x = self
-            .dropout
-            .forward(&self.input_nn.forward(&aa_indices_out, &mod_x_out)?, self.is_training)?;
+        let in_x = self.dropout.forward(
+            &self.input_nn.forward(&aa_indices_out, &mod_x_out)?,
+            self.is_training,
+        )?;
 
         log::trace!(
             "[MS2BertModel::forward] in_x shape (post dropout-input_nn): {:?}, device: {:?}",

@@ -15,7 +15,10 @@ pub struct TrainingStepMetrics {
     pub phases: Vec<TrainingPhase>,
     pub precisions: Vec<Option<f32>>,
     pub recalls: Vec<Option<f32>>,
-    pub accuracies: Vec<Option<f32>>,
+    pub accuracies: Vec<Option<f32>>, // retained for MS2/CCS style metrics
+    pub maes: Vec<Option<f32>>,
+    pub rmses: Vec<Option<f32>>,
+    pub r2s: Vec<Option<f32>>,
 }
 
 impl TrainingStepMetrics {
@@ -59,8 +62,14 @@ impl TrainingStepMetrics {
 
         for i in 0..self.epochs.len() {
             match self.phases[i] {
-                TrainingPhase::Train => train_map.entry(self.epochs[i]).or_default().push(self.losses[i]),
-                TrainingPhase::Validation => val_map.entry(self.epochs[i]).or_default().push(self.losses[i]),
+                TrainingPhase::Train => train_map
+                    .entry(self.epochs[i])
+                    .or_default()
+                    .push(self.losses[i]),
+                TrainingPhase::Validation => val_map
+                    .entry(self.epochs[i])
+                    .or_default()
+                    .push(self.losses[i]),
             }
         }
 
@@ -71,10 +80,12 @@ impl TrainingStepMetrics {
         epochs
             .into_iter()
             .map(|epoch| {
-                let (avg_train, std_train) = train_map.get(&epoch)
+                let (avg_train, std_train) = train_map
+                    .get(&epoch)
                     .map(|v| compute_loss_stats(v))
                     .unwrap_or((f32::NAN, f32::NAN));
-                let (avg_val, std_val) = val_map.get(&epoch)
+                let (avg_val, std_val) = val_map
+                    .get(&epoch)
                     .map(|v| compute_loss_stats(v))
                     .map_or((None, None), |(avg, std)| (Some(avg), Some(std)));
 
@@ -83,16 +94,22 @@ impl TrainingStepMetrics {
             .collect()
     }
 
-    /// Computes the average and standard deviation of precision, recall, and accuracy values grouped by epoch and training phase.
+    /// Computes the average and standard deviation of precision, recall, accuracy, and regression metrics grouped by epoch and training phase.
     ///
     /// # Returns
     /// A `HashMap` where each key is a tuple `(epoch, TrainingPhase)` and each value is a tuple of:
-    /// `(avg_precision, std_precision, avg_recall, std_recall, avg_accuracy, std_accuracy)`.
+    /// `(avg_precision, std_precision, avg_recall, std_recall, avg_accuracy, std_accuracy, avg_mae, std_mae, avg_rmse, std_rmse, avg_r2, std_r2)`.
     pub fn summarize_metrics_by_epoch_phase(
         &self,
     ) -> std::collections::HashMap<
         (usize, TrainingPhase),
         (
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
             Option<f32>,
             Option<f32>,
             Option<f32>,
@@ -106,6 +123,9 @@ impl TrainingStepMetrics {
         let mut prec_map: HashMap<(usize, TrainingPhase), Vec<f32>> = HashMap::new();
         let mut rec_map: HashMap<(usize, TrainingPhase), Vec<f32>> = HashMap::new();
         let mut acc_map: HashMap<(usize, TrainingPhase), Vec<f32>> = HashMap::new();
+        let mut mae_map: HashMap<(usize, TrainingPhase), Vec<f32>> = HashMap::new();
+        let mut rmse_map: HashMap<(usize, TrainingPhase), Vec<f32>> = HashMap::new();
+        let mut r2_map: HashMap<(usize, TrainingPhase), Vec<f32>> = HashMap::new();
 
         for i in 0..self.epochs.len() {
             let key = (self.epochs[i], self.phases[i].clone());
@@ -117,6 +137,15 @@ impl TrainingStepMetrics {
             }
             if let Some(a) = self.accuracies[i] {
                 acc_map.entry(key.clone()).or_default().push(a);
+            }
+            if let Some(m) = self.maes[i] {
+                mae_map.entry(key.clone()).or_default().push(m);
+            }
+            if let Some(r) = self.rmses[i] {
+                rmse_map.entry(key.clone()).or_default().push(r);
+            }
+            if let Some(r2) = self.r2s[i] {
+                r2_map.entry(key.clone()).or_default().push(r2);
             }
         }
 
@@ -148,10 +177,25 @@ impl TrainingStepMetrics {
                 .get(&key)
                 .map(summarize)
                 .map_or((None, None), |(a, s)| (Some(a), Some(s)));
+            let (mae_avg, mae_std) = mae_map
+                .get(&key)
+                .map(summarize)
+                .map_or((None, None), |(a, s)| (Some(a), Some(s)));
+            let (rmse_avg, rmse_std) = rmse_map
+                .get(&key)
+                .map(summarize)
+                .map_or((None, None), |(a, s)| (Some(a), Some(s)));
+            let (r2_avg, r2_std) = r2_map
+                .get(&key)
+                .map(summarize)
+                .map_or((None, None), |(a, s)| (Some(a), Some(s)));
 
             result.insert(
                 key,
-                (prec_avg, prec_std, rec_avg, rec_std, acc_avg, acc_std),
+                (
+                    prec_avg, prec_std, rec_avg, rec_std, acc_avg, acc_std, mae_avg, mae_std,
+                    rmse_avg, rmse_std, r2_avg, r2_std,
+                ),
             );
         }
 
@@ -159,14 +203,17 @@ impl TrainingStepMetrics {
     }
 }
 
-
 /// Utility functions for evaluating prediction metrics.
 pub struct Metrics;
 
 impl Metrics {
     /// Computes accuracy as the proportion of predictions within a tolerance of the target.
     pub fn accuracy(pred: &[f32], target: &[f32], tolerance: f32) -> f32 {
-        let correct = pred.iter().zip(target).filter(|(p, t)| (*p - *t).abs() <= tolerance).count();
+        let correct = pred
+            .iter()
+            .zip(target)
+            .filter(|(p, t)| (*p - *t).abs() <= tolerance)
+            .count();
         correct as f32 / pred.len() as f32
     }
 
@@ -176,9 +223,10 @@ impl Metrics {
             .zip(target)
             .zip(tolerance)
             .filter(|((p, t), tol)| (*p - *t).abs() <= **tol)
-            .count() as f32 / pred.len() as f32
+            .count() as f32
+            / pred.len() as f32
     }
-   
+
     /// Computes precision as TP / (TP + FP), based on a binary threshold.
     pub fn precision(pred: &[f32], target: &[f32], threshold: f32) -> Option<f32> {
         let mut tp = 0;
@@ -218,13 +266,43 @@ impl Metrics {
             None
         }
     }
+
+    pub fn mae(pred: &[f32], target: &[f32]) -> f32 {
+        pred.iter()
+            .zip(target)
+            .map(|(p, t)| (p - t).abs())
+            .sum::<f32>()
+            / pred.len() as f32
+    }
+
+    pub fn rmse(pred: &[f32], target: &[f32]) -> f32 {
+        let mse = pred
+            .iter()
+            .zip(target)
+            .map(|(p, t)| (p - t).powi(2))
+            .sum::<f32>()
+            / pred.len() as f32;
+        mse.sqrt()
+    }
+
+    pub fn r2(pred: &[f32], target: &[f32]) -> f32 {
+        let mean_t = target.iter().copied().sum::<f32>() / target.len() as f32;
+        let ss_res = pred
+            .iter()
+            .zip(target)
+            .map(|(p, t)| (t - p).powi(2))
+            .sum::<f32>();
+        let ss_tot = target.iter().map(|t| (t - mean_t).powi(2)).sum::<f32>();
+        if ss_tot.abs() < 1e-9 {
+            0.0
+        } else {
+            1.0 - ss_res / ss_tot
+        }
+    }
 }
 
-
 /// Compute average and std deviation from a slice of loss values.
-pub fn compute_loss_stats(losses: &[f32]) -> (f32, f32) 
-{
-    
+pub fn compute_loss_stats(losses: &[f32]) -> (f32, f32) {
     let avg = losses.iter().copied().sum::<f32>() / losses.len() as f32;
     let std = (losses.iter().map(|l| (l - avg).powi(2)).sum::<f32>() / losses.len() as f32).sqrt();
     (avg, std)

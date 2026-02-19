@@ -1,8 +1,8 @@
 //! A sequential layer used to chain multiple layers and closures.
 //! Adapted from candle-nn squential.rs
-use std::sync::Arc;
 use candle_core::{Module, Result, Tensor};
 use candle_nn::func;
+use std::sync::Arc;
 
 /// A sequential layer combining multiple other layers.
 #[derive(Clone)]

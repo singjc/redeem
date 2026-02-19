@@ -1,6 +1,6 @@
 use crate::models::model_interface::{ModelInterface, PredictionResult};
 use crate::models::ms2_bert_model::MS2BertModel;
-use crate::utils::data_handling::PeptideData;
+use crate::utils::data_handling::{PeptideData, TargetNormalization};
 use crate::utils::peptdeep_utils::ModificationMap;
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
@@ -80,6 +80,7 @@ impl MS2ModelWrapper {
         batch_size: usize,
         learning_rate: f64,
         epochs: usize,
+        target_norm: TargetNormalization,
     ) -> Result<()> {
         self.model.fine_tune(
             training_data,
@@ -87,6 +88,8 @@ impl MS2ModelWrapper {
             batch_size,
             learning_rate,
             epochs,
+            target_norm,
+            None,
         )
     }
 

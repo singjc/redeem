@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/singjc/redeem/raw/master/img/redeem_logo.png" alt="ReDeem_Logo" width="500">
-    <source media="(prefers-color-scheme: light)" srcset="https://github.com/singjc/redeem/raw/master/img/redeem_logo.png" alt="ReDeem_Logo" width="500">
-    <img alt="ReDeem Logo" comment="Placeholder to transition between light color mode and dark color mode - this image is not directly used." src="https://github.com/singjc/redeem/raw/master/img/redeem_logo.png">
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/singjc/redeem/raw/develop/img/redeem_logo_new.png" alt="ReDeem_Logo" width="500">
+    <source media="(prefers-color-scheme: light)" srcset="https://github.com/singjc/redeem/raw/develop/img/redeem_logo_new.png" alt="ReDeem_Logo" width="500">
+    <img alt="ReDeem Logo" comment="Placeholder to transition between light color mode and dark color mode - this image is not directly used." src="https://github.com/singjc/redeem/raw/develop/img/redeem_logo_new.png">
   </picture>
 </p>
 

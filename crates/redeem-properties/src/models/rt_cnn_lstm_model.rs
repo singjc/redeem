@@ -121,7 +121,8 @@ impl ModelInterface for RTCNNLSTMModel {
             dropout,
             rt_encoder,
             rt_decoder,
-            is_training: true,
+            // Default to evaluation mode for inference use cases.
+            is_training: false,
         })
     }
 
@@ -435,6 +436,9 @@ mod tests {
     #[test]
     fn test_prediction() {
         let model_path = PathBuf::from("data/models/alphapeptdeep/generic/rt.pth");
+        let model_path = PathBuf::from(
+            "/home/singjc/Documents/github/easypqp-rs/pretrained_models_v3/generic/rt.pth",
+        );
         let constants_path =
             PathBuf::from("data/models/alphapeptdeep/generic/rt.pth.model_const.yaml");
         let device = Device::new_cuda(0).unwrap_or(Device::Cpu);

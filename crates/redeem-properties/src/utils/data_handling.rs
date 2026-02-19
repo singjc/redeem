@@ -1,10 +1,9 @@
-
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TargetNormalization {
-    ZScore(f32, f32),     // mean, std
-    MinMax(f32, f32),     // min, max
+    ZScore(f32, f32), // mean, std
+    MinMax(f32, f32), // min, max
     None,
 }
 
@@ -18,13 +17,12 @@ impl TargetNormalization {
     }
 }
 
-
 #[derive(Clone)]
 pub struct PeptideData {
     pub modified_sequence: Arc<[u8]>, // e.g., "(UniMod:1)M(UniMod:35)AAAATMAAAAR"
-    pub naked_sequence: Arc<[u8]>, // e.g., "MAAAATMAAAAR"
-    pub mods: Arc<[u8]>,         // e.g., "Any_N-term;Oxidation@M"
-    pub mod_sites: Arc<[u8]>,    // e.g., "0;1"
+    pub naked_sequence: Arc<[u8]>,    // e.g., "MAAAATMAAAAR"
+    pub mods: Arc<[u8]>,              // e.g., "Any_N-term;Oxidation@M"
+    pub mod_sites: Arc<[u8]>,         // e.g., "0;1"
     pub charge: Option<i32>,
     pub precursor_mass: Option<f32>,
     pub nce: Option<i32>,
@@ -106,7 +104,10 @@ pub struct PeptideBatchData {
 impl From<&[PeptideData]> for PeptideBatchData {
     fn from(slice: &[PeptideData]) -> Self {
         Self {
-            naked_sequence: slice.iter().map(|p| Arc::clone(&p.naked_sequence)).collect(),
+            naked_sequence: slice
+                .iter()
+                .map(|p| Arc::clone(&p.naked_sequence))
+                .collect(),
             mods: slice.iter().map(|p| Arc::clone(&p.mods)).collect(),
             mod_sites: slice.iter().map(|p| Arc::clone(&p.mod_sites)).collect(),
             charges: slice.iter().map(|p| p.charge).collect(),
@@ -120,7 +121,6 @@ impl From<&[PeptideData]> for PeptideBatchData {
         }
     }
 }
-
 
 impl PeptideBatchData {
     pub fn naked_sequence_strs(&self) -> Vec<&str> {

@@ -1,11 +1,10 @@
-use anyhow::{Result, anyhow};
-use std::{collections::HashMap, sync::Arc};
+use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::building_blocks::building_blocks::AA_EMBEDDING_SIZE;
-
 
 const VALID_AA: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -18,9 +17,8 @@ fn aa_index_map() -> HashMap<char, i64> {
         .collect()
 }
 
-
 /// Convert peptide sequences into AA ID array.
-/// 
+///
 /// Based on https://github.com/MannLabs/alphapeptdeep/blob/450518a39a4cd7d03db391108ec8700b365dd436/peptdeep/model/featurize.py#L88
 pub fn aa_indices_tensor(seq: &str, device: &Device) -> Result<Tensor> {
     let map = aa_index_map();
@@ -36,7 +34,9 @@ pub fn aa_indices_tensor(seq: &str, device: &Device) -> Result<Tensor> {
     indices.extend(filtered);
     indices.push(0); // padding end
 
-    Ok(Tensor::from_slice(&indices, (1, indices.len()), device)?.to_dtype(DType::F32)?.unsqueeze(2)?)
+    Ok(Tensor::from_slice(&indices, (1, indices.len()), device)?
+        .to_dtype(DType::F32)?
+        .unsqueeze(2)?)
 }
 
 /// Convert peptide sequences into AA ID array using Arc<[u8]>.
@@ -57,13 +57,19 @@ pub fn aa_indices_tensor_from_arc(seq: &Arc<[u8]>, device: &Device) -> Result<Te
     indices.extend(filtered);
     indices.push(0); // padding end
 
-    Ok(Tensor::from_slice(&indices, (1, indices.len()), device)?.to_dtype(DType::F32)?.unsqueeze(2)?)
+    Ok(Tensor::from_slice(&indices, (1, indices.len()), device)?
+        .to_dtype(DType::F32)?
+        .unsqueeze(2)?)
 }
 
 /// One-hot encode amino acid indices and concatenate additional tensors.
 pub fn aa_one_hot(aa_indices: &Tensor, cat_others: &[&Tensor]) -> Result<Tensor> {
     let (batch_size, seq_len) = aa_indices.shape().dims2()?;
-    log::trace!("[aa_one_hot] batch_size: {}, seq_len: {}", batch_size, seq_len);
+    log::trace!(
+        "[aa_one_hot] batch_size: {}, seq_len: {}",
+        batch_size,
+        seq_len
+    );
     let num_classes = AA_EMBEDDING_SIZE;
 
     let indices = aa_indices.to_vec2::<f32>()?;
@@ -73,7 +79,9 @@ pub fn aa_one_hot(aa_indices: &Tensor, cat_others: &[&Tensor]) -> Result<Tensor>
             if !val.is_finite() || *val < 0.0 || *val > (AA_EMBEDDING_SIZE as f32) {
                 log::error!(
                     "[aa_one_hot] Invalid index at batch {}, position {}: {}",
-                    i, j, val
+                    i,
+                    j,
+                    val
                 );
             }
         }
@@ -127,16 +135,17 @@ pub fn aa_one_hot(aa_indices: &Tensor, cat_others: &[&Tensor]) -> Result<Tensor>
     } else {
         let mut features = vec![one_hot_tensor];
         features.extend(cat_others.iter().cloned().cloned());
-        Ok(Tensor::cat(&features, 2)?)
+        // Build concatenated tensor so we can both return it and optionally
+        // write a post-concatenation diagnostic CSV (per-sample rows) to help
+        // align with other encoder dumps.
+        let concatenated = Tensor::cat(&features, 2)?;
+
+        Ok(concatenated)
     }
 }
 
-
-
-
-
 /// Get the modification features for a given set of modifications and modification sites.
-/// 
+///
 /// Based on https://github.com/MannLabs/alphapeptdeep/blob/450518a39a4cd7d03db391108ec8700b365dd436/peptdeep/model/featurize.py#L47
 pub fn get_mod_features_from_parsed(
     mod_names: &[&str],
@@ -146,43 +155,38 @@ pub fn get_mod_features_from_parsed(
     mod_to_feature: &HashMap<String, Vec<f32>>,
     device: &Device,
 ) -> Result<Tensor> {
-    // Initialize buffer with atomic wrappers
-    let atomic_buffer: Vec<AtomicU32> = (0..seq_len * mod_feature_size)
-        .map(|_| AtomicU32::new(0))
-        .collect();
+    // Build mod features deterministically.
+    // Previously this used a Vec<AtomicU32> with bitwise fetch_add which
+    // effectively added u32 bit patterns (incorrect for floats) and is
+    // unsafe for concurrent accumulation. Switch to a simple, correct
+    // sequential accumulation here to ensure deterministic, correct
+    // behavior for diagnostic runs.
+    let mut mod_x = vec![0.0f32; seq_len * mod_feature_size];
 
-    mod_names
-        .par_iter()
-        .zip(mod_sites.par_iter())
-        .for_each(|(&mod_name, &site)| {
-            if site >= seq_len {
-                log::warn!(
-                    "Skipping mod {} at invalid site {} (seq_len {})",
-                    mod_name, site, seq_len
-                );
-                return;
+    for (&mod_name, &site) in mod_names.iter().zip(mod_sites.iter()) {
+        if site >= seq_len {
+            log::warn!(
+                "Skipping mod {} at invalid site {} (seq_len {})",
+                mod_name,
+                site,
+                seq_len
+            );
+            continue;
+        }
+        if let Some(feat) = mod_to_feature.get(mod_name) {
+            for (i, &val) in feat.iter().enumerate() {
+                let idx = site * mod_feature_size + i;
+                mod_x[idx] += val;
             }
-            if let Some(feat) = mod_to_feature.get(mod_name) {
-                for (i, &val) in feat.iter().enumerate() {
-                    let idx = site * mod_feature_size + i;
-                    let val_bits = val.to_bits();
-                    atomic_buffer[idx].fetch_add(val_bits, Ordering::Relaxed);
-                }
-            } else {
-                log::warn!("Unknown modification feature: {}", mod_name);
-            }
-        });
+        } else {
+            log::warn!("Unknown modification feature: {}", mod_name);
+        }
+    }
 
-    // Convert atomic buffer back to f32
-    let mod_x: Vec<f32> = atomic_buffer
-        .into_iter()
-        .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
-        .collect();
-
-    Tensor::from_slice(&mod_x, (1, seq_len, mod_feature_size), device)
-        .map_err(|e| anyhow!("Failed to create tensor: {}", e))
+    let t = Tensor::from_slice(&mod_x, (1, seq_len, mod_feature_size), device)
+        .map_err(|e| anyhow!("Failed to create tensor: {}", e))?;
+    Ok(t)
 }
-
 
 pub fn get_mod_features_from_parsed_arc(
     mod_names: &[Arc<[u8]>],
@@ -192,53 +196,42 @@ pub fn get_mod_features_from_parsed_arc(
     mod_to_feature: &HashMap<Arc<[u8]>, Vec<f32>>,
     device: &Device,
 ) -> Result<Tensor> {
-    let atomic_buffer: Vec<AtomicU32> = (0..seq_len * mod_feature_size)
-        .map(|_| AtomicU32::new(0))
-        .collect();
+    // Deterministic sequential accumulation for Arc<[u8]> mod names.
+    let mut mod_x = vec![0.0f32; seq_len * mod_feature_size];
 
-    mod_names
-        .par_iter()
-        .zip(mod_sites.par_iter())
-        .for_each(|(mod_name, &site)| {
-            if site >= seq_len {
-                log::warn!(
-                    "Skipping mod {:?} at invalid site {} (seq_len {})",
-                    std::str::from_utf8(mod_name).unwrap_or("<invalid>"),
-                    site,
-                    seq_len
-                );
-                return;
+    for (mod_name, &site) in mod_names.iter().zip(mod_sites.iter()) {
+        if site >= seq_len {
+            log::warn!(
+                "Skipping mod {:?} at invalid site {} (seq_len {})",
+                std::str::from_utf8(mod_name).unwrap_or("<invalid>"),
+                site,
+                seq_len
+            );
+            continue;
+        }
+        if let Some(feat) = mod_to_feature.get(mod_name) {
+            for (i, &val) in feat.iter().enumerate() {
+                let idx = site * mod_feature_size + i;
+                mod_x[idx] += val;
             }
-            if let Some(feat) = mod_to_feature.get(mod_name) {
-                for (i, &val) in feat.iter().enumerate() {
-                    let idx = site * mod_feature_size + i;
-                    let val_bits = val.to_bits();
-                    atomic_buffer[idx].fetch_add(val_bits, Ordering::Relaxed);
-                }
-            } else {
-                log::warn!(
-                    "Unknown modification feature: {:?}",
-                    std::str::from_utf8(mod_name).unwrap_or("<invalid>")
-                );
-            }
-        });
-
-    let mod_x: Vec<f32> = atomic_buffer
-        .into_iter()
-        .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
-        .collect();
+        } else {
+            log::warn!(
+                "Unknown modification feature: {:?}",
+                std::str::from_utf8(mod_name).unwrap_or("<invalid>")
+            );
+        }
+    }
 
     Tensor::from_slice(&mod_x, (1, seq_len, mod_feature_size), device)
         .map_err(|e| anyhow!("Failed to create tensor: {}", e))
 }
 
-
 #[cfg(test)]
 mod tests {
- 
-    use crate::utils::peptdeep_utils::{load_mod_to_feature, load_mod_to_feature_arc};
+
     use crate::utils::peptdeep_utils::parse_model_constants;
     use crate::utils::peptdeep_utils::ModelConstants;
+    use crate::utils::peptdeep_utils::{load_mod_to_feature, load_mod_to_feature_arc};
 
     use super::*;
     use candle_core::Device;
@@ -247,15 +240,27 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn test_aa_indices_tensor(){
+    fn test_aa_indices_tensor() {
         let device = Device::Cpu;
         let seq = "AGHCEWQMKYR";
         let start_time = std::time::Instant::now();
         let result = aa_indices_tensor(seq, &device).unwrap();
         println!("aa_indices_tensor Time taken: {:?}", start_time.elapsed());
         // expected result is [[0, 1, 7, 8, 3, 5, 23, 17, 13, 11, 25, 18, 0]]
-        let expect_out = Tensor::from_vec(vec!{0.0f32, 1.0f32, 7.0f32, 8.0f32, 3.0f32, 5.0f32, 23.0f32, 17.0f32, 13.0f32, 11.0f32, 25.0f32, 18.0f32, 0.0f32}, (1, 13), &device).unwrap();
-        println!("{:?} - aa_indices_tensor: {:?}", seq, result.to_vec3::<f32>().unwrap());
+        let expect_out = Tensor::from_vec(
+            vec![
+                0.0f32, 1.0f32, 7.0f32, 8.0f32, 3.0f32, 5.0f32, 23.0f32, 17.0f32, 13.0f32, 11.0f32,
+                25.0f32, 18.0f32, 0.0f32,
+            ],
+            (1, 13),
+            &device,
+        )
+        .unwrap();
+        println!(
+            "{:?} - aa_indices_tensor: {:?}",
+            seq,
+            result.to_vec3::<f32>().unwrap()
+        );
         println!("result shape: {:?}", result.shape());
         assert_eq!(result.shape().dims(), &[1, 13, 1]);
         // assert_eq!(result.to_vec3::<f32>().unwrap(), expect_out.to_vec3::<f32>().unwrap());
@@ -263,8 +268,15 @@ mod tests {
         let seq_bytes = Arc::from(seq.as_bytes().to_vec().into_boxed_slice());
         let start_time = std::time::Instant::now();
         let result = aa_indices_tensor_from_arc(&seq_bytes, &device).unwrap();
-        println!("aa_indices_tensor_from_arc Time taken: {:?}", start_time.elapsed());
-        println!("{:?} - aa_indices_tensor_from_arc: {:?}", seq, result.to_vec3::<f32>().unwrap());
+        println!(
+            "aa_indices_tensor_from_arc Time taken: {:?}",
+            start_time.elapsed()
+        );
+        println!(
+            "{:?} - aa_indices_tensor_from_arc: {:?}",
+            seq,
+            result.to_vec3::<f32>().unwrap()
+        );
         assert_eq!(result.shape().dims(), &[1, 13, 1]);
         // assert_eq!(result.to_vec3::<f32>().unwrap(), expect_out.to_vec3::<f32>().unwrap());
     }
@@ -299,8 +311,12 @@ mod tests {
             mod_feature_size,
             &mod_to_feature,
             &device,
-        ).unwrap();
-        println!("get_mod_features_from_parsed Time taken: {:?}", start_time.elapsed());
+        )
+        .unwrap();
+        println!(
+            "get_mod_features_from_parsed Time taken: {:?}",
+            start_time.elapsed()
+        );
 
         println!("tensor shape: {:?}", tensor.shape());
 
@@ -311,10 +327,7 @@ mod tests {
             .iter()
             .map(|&s| Arc::from(s.as_bytes().to_vec().into_boxed_slice()))
             .collect();
-        let mod_sites_arc: Vec<usize> = mod_sites
-            .iter()
-            .map(|&s| s)
-            .collect();
+        let mod_sites_arc: Vec<usize> = mod_sites.iter().map(|&s| s).collect();
         let start_time = std::time::Instant::now();
         let tensor_arc = get_mod_features_from_parsed_arc(
             &mod_names_arc,
@@ -323,12 +336,14 @@ mod tests {
             mod_feature_size,
             &mod_to_feature,
             &device,
-        ).unwrap();
-        println!("get_mod_features_from_parsed_arc Time taken: {:?}", start_time.elapsed());
+        )
+        .unwrap();
+        println!(
+            "get_mod_features_from_parsed_arc Time taken: {:?}",
+            start_time.elapsed()
+        );
         println!("tensor_arc shape: {:?}", tensor_arc.shape());
         assert_eq!(tensor_arc.shape().dims(), &[1, seq_len, mod_feature_size]);
         assert_eq!(tensor.shape(), tensor_arc.shape());
-
-
     }
 }

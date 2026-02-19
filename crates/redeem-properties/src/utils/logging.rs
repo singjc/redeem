@@ -1,11 +1,11 @@
 use candle_core::{Result, Tensor};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ops::Range;
-use tqdm::Tqdm;
-use tqdm::tqdm;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use sysinfo::System;
+use tqdm::tqdm;
+use tqdm::Tqdm;
 
 /// A thread-safe progress bar implementation using `tqdm`.
 ///
@@ -22,11 +22,11 @@ use sysinfo::System;
 /// * `description` - A description displayed alongside the progress bar.
 pub struct Progress {
     total: usize,
-    progress: Arc<Mutex<Tqdm<Range<usize>>>>, 
-    count: AtomicUsize,               // Atomic counter for tracking progress
-    sender: mpsc::Sender<usize>,      // Channel to send updates
+    progress: Arc<Mutex<Tqdm<Range<usize>>>>,
+    count: AtomicUsize,          // Atomic counter for tracking progress
+    sender: mpsc::Sender<usize>, // Channel to send updates
     progress_thread: Option<thread::JoinHandle<()>>, // Background thread to update tqdm
-    description: String,              // Description for the progress bar
+    description: String,         // Description for the progress bar
 }
 
 impl Progress {
@@ -84,7 +84,7 @@ impl Progress {
     /// ```
     pub fn inc(&self) {
         let new_count = self.count.fetch_add(1, Ordering::AcqRel) + 1;
-    
+
         if new_count > self.total {
             log::trace!("⚠️ WARNING: Progress logger received and extra update! This is likely because the logger was initialized with an incorrect total counter, and the process is iterating beyond that counter.");
             return; // Prevent overflow
@@ -201,15 +201,14 @@ pub fn print_tensor(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-    use rayon::prelude::*;
     use super::*;
+    use rayon::prelude::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
-    fn test_progress_it(){
+    fn test_progress_it() {
         let total = 24;
         let pbar = Progress::new(total, "Testing Rayon");
         let v = vec![1; total];
@@ -234,8 +233,12 @@ mod tests {
         println!("Memory usage: {} MB", mem_usage / 1024 / 1024);
         // print mem_usage in GB
         println!("Memory usage: {} GB", mem_usage / 1024 / 1024 / 1024);
-        
+
         // Ensure memory usage is a reasonable positive value
-        assert!(mem_usage > 0, "Memory usage should be greater than zero, but got {}", mem_usage);
+        assert!(
+            mem_usage > 0,
+            "Memory usage should be greater than zero, but got {}",
+            mem_usage
+        );
     }
 }

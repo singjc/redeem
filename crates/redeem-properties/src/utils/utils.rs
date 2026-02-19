@@ -1,6 +1,6 @@
-use candle_core::{Device, Tensor};
+use anyhow::{anyhow, Result};
 use candle_core::utils::{cuda_is_available, metal_is_available};
-use anyhow::{Result, anyhow};
+use candle_core::{Device, Tensor};
 use std::f64::consts::PI;
 
 // Learning rate scheduler trait
@@ -40,7 +40,12 @@ impl CosineWithWarmup {
     /// * `num_warmup_steps` - Number of steps to linearly increase the learning rate.
     /// * `num_training_steps` - Total number of training steps.
     /// * `num_cycles` - Number of cosine cycles during decay.
-    pub fn new(initial_lr: f64, num_warmup_steps: usize, num_training_steps: usize, num_cycles: f64) -> Self {
+    pub fn new(
+        initial_lr: f64,
+        num_warmup_steps: usize,
+        num_training_steps: usize,
+        num_cycles: f64,
+    ) -> Self {
         Self {
             initial_lr,
             current_step: 0,
@@ -59,7 +64,8 @@ impl CosineWithWarmup {
         let progress = (self.current_step - self.num_warmup_steps) as f64
             / (self.num_training_steps - self.num_warmup_steps).max(1) as f64;
 
-        let cosine_decay = 0.5 * (1.0 + (std::f64::consts::PI * self.num_cycles * 2.0 * progress).cos());
+        let cosine_decay =
+            0.5 * (1.0 + (std::f64::consts::PI * self.num_cycles * 2.0 * progress).cos());
         self.initial_lr * cosine_decay.max(1e-10)
     }
 }
@@ -73,7 +79,6 @@ impl LRScheduler for CosineWithWarmup {
         self.get_lr()
     }
 }
-
 
 /// Converts a device string to a Candle Device.
 ///
@@ -114,9 +119,11 @@ pub fn get_device(device_str: &str) -> Result<Device> {
         let cuda_index = if device_str == "cuda" {
             0 // Default to the first CUDA device
         } else {
-            device_str.split(':').nth(1)
+            device_str
+                .split(':')
+                .nth(1)
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(0) 
+                .unwrap_or(0)
         };
 
         let device = Device::cuda_if_available(cuda_index)?;
@@ -132,15 +139,14 @@ pub fn get_device(device_str: &str) -> Result<Device> {
     }
 }
 
-
 /// Returns the best available device based on the specified flags.
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `cpu` - A flag indicating whether to use the CPU device
-/// 
+///
 /// # Returns
-/// 
+///
 /// A `Result` containing the Candle `Device` or an error if the device is not available
 pub fn device(cpu: bool) -> Result<Device> {
     if cpu {
@@ -164,7 +170,6 @@ pub fn device(cpu: bool) -> Result<Device> {
     }
 }
 
-
 pub fn get_tensor_stats(x: &Tensor) -> Result<(f32, f32, f32), candle_core::Error> {
     // let flat: Vec<f32> = match x.rank() {
     //     0 => vec![x.to_scalar::<f32>()?],
@@ -176,7 +181,9 @@ pub fn get_tensor_stats(x: &Tensor) -> Result<(f32, f32, f32), candle_core::Erro
     let flat = x.flatten_all()?.to_vec1::<f32>()?;
 
     if flat.is_empty() {
-        return Err(candle_core::Error::Msg("Tensor has no elements to compute stats.".to_string()));
+        return Err(candle_core::Error::Msg(
+            "Tensor has no elements to compute stats.".to_string(),
+        ));
     }
 
     let mean = flat.iter().copied().sum::<f32>() / flat.len() as f32;
@@ -186,8 +193,6 @@ pub fn get_tensor_stats(x: &Tensor) -> Result<(f32, f32, f32), candle_core::Erro
     Ok((mean, min, max))
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,7 +200,7 @@ mod tests {
     use candle_core::{Device, Result, Tensor};
 
     #[test]
-    fn test_device(){
+    fn test_device() {
         let device = get_device("cpu").unwrap();
         println!("Device: {:?}", device);
 

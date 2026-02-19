@@ -1,14 +1,29 @@
-use ndarray::{Array1, Array2};
-use plotly::box_plot::BoxMean;
-use plotly::common::{DashType, HoverInfo, Label, Line, Marker, Mode, Orientation};
-use plotly::{Plot, Histogram, Scatter, BoxPlot};
-use plotly::layout::{Axis, Layout, Legend};
+//! Plotting helpers: histograms, P–P plots, boxplots and scatter plots.
+//!
+//! These functions produce `plotly::Plot` objects from score and label
+//! arrays. They are minimal helpers used by the example report generation.
 use itertools_num::linspace;
+use plotly::box_plot::BoxMean;
+use plotly::common::{DashType, Line, Marker, Mode, Orientation};
+use plotly::layout::{Axis, Layout, Legend};
+use plotly::{BoxPlot, Histogram, Plot, Scatter};
 
 /// Plot a histogram of the scores for the targets and decoys
-pub fn plot_score_histogram(scores: &Vec<f64>, labels: &Vec<i32>, title: &str, x_title: &str) -> Result<Plot, String> {
-    assert_eq!(scores.len(), labels.len(), "Scores and labels must have the same length");
-    assert!(labels.iter().all(|&l| l == 1 || l == -1), "Labels must be 1 for targets and -1 for decoys");
+pub fn plot_score_histogram(
+    scores: &[f64],
+    labels: &[i32],
+    title: &str,
+    x_title: &str,
+) -> Result<Plot, String> {
+    assert_eq!(
+        scores.len(),
+        labels.len(),
+        "Scores and labels must have the same length"
+    );
+    assert!(
+        labels.iter().all(|&l| l == 1 || l == -1),
+        "Labels must be 1 for targets and -1 for decoys"
+    );
 
     let mut scores_target = Vec::new();
     let mut scores_decoy = Vec::new();
@@ -37,20 +52,21 @@ pub fn plot_score_histogram(scores: &Vec<f64>, labels: &Vec<i32>, title: &str, x
     Ok(plot)
 }
 
-
-
-fn ecdf(data: &mut Vec<f64>) -> (Vec<f64>, Vec<f64>) {
+fn ecdf(data: &mut [f64]) -> (Vec<f64>, Vec<f64>) {
     data.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = data.len() as f64;
     let y: Vec<f64> = (1..=data.len()).map(|i| i as f64 / n).collect();
-    (data.clone(), y)
+    (data.to_vec(), y)
 }
 
-fn interpolate_ecdf(x: &Vec<f64>, y: &Vec<f64>, x_seq: &Vec<f64>) -> Vec<f64> {
-    x_seq.iter().map(|&xi| {
-        let idx = x.iter().position(|&xv| xv >= xi).unwrap_or(x.len() - 1);
-        y[idx]
-    }).collect()
+fn interpolate_ecdf(x: &[f64], y: &[f64], x_seq: &[f64]) -> Vec<f64> {
+    x_seq
+        .iter()
+        .map(|&xi| {
+            let idx = x.iter().position(|&xv| xv >= xi).unwrap_or(x.len() - 1);
+            y[idx]
+        })
+        .collect()
 }
 
 // fn estimate_pi0(decoy_scores: &Vec<f64>, lambda: f64) -> f64 {
@@ -60,26 +76,33 @@ fn interpolate_ecdf(x: &Vec<f64>, y: &Vec<f64>, x_seq: &Vec<f64>) -> Vec<f64> {
 // }
 
 /// Estimate the proportion of null hypotheses (π₀).
-fn estimate_pi0(labels: &Vec<i32>) -> f64 {
+fn estimate_pi0(labels: &[i32]) -> f64 {
     let count_decoys = labels.iter().filter(|&&l| l == -1).count() as f64;
     let count_targets = labels.iter().filter(|&&l| l == 1).count() as f64;
     count_decoys / count_targets
 }
 
 /// Generate a P-P plot as described in Debrie, E. et. al. (2023) Journal of Proteome Research.
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `top_targets` - The top scores for the targets
 /// * `top_decoys` - The top scores for the decoys
 /// * `title` - The title of the plot
-/// 
+///
 /// # Returns
-/// 
+///
 /// A Plot object containing the P-P plot
-pub fn plot_pp(scores: &Vec<f64>, labels: &Vec<i32>, title: &str) -> Result<Plot, String> {
-    assert_eq!(scores.len(), labels.len(), "Scores and labels must have the same length");
-    assert!(labels.iter().all(|&l| l == 1 || l == -1), "Labels must be 1 for targets and -1 for decoys");
+pub fn plot_pp(scores: &[f64], labels: &[i32], title: &str) -> Result<Plot, String> {
+    assert_eq!(
+        scores.len(),
+        labels.len(),
+        "Scores and labels must have the same length"
+    );
+    assert!(
+        labels.iter().all(|&l| l == 1 || l == -1),
+        "Labels must be 1 for targets and -1 for decoys"
+    );
 
     let mut scores_target = Vec::new();
     let mut scores_decoy = Vec::new();
@@ -136,50 +159,70 @@ pub fn plot_pp(scores: &Vec<f64>, labels: &Vec<i32>, title: &str) -> Result<Plot
 }
 
 /// Generate a box plot of the scores/intensities for each file
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `scores` - A vector of vectors where each inner vector contains the scores/intensities for a file
 /// * `filenames` - A vector of filenames corresponding to the scores
 /// * `title` - The title of the plot
 /// * `x_title` - The title of the x-axis
 /// * `y_title` - The title of the y-axis
-/// 
+///
 /// # Returns
-/// 
+///
 /// A Plot object containing the box plot
-pub fn plot_boxplot(scores: &Vec<Vec<f64>>, filenames: Vec<String>, title: &str, x_title: &str, y_title: &str) -> Result<Plot, String> {
-    assert_eq!(scores.len(), filenames.len(), "Scores and filenames must have the same length");
+pub fn plot_boxplot(
+    scores: &[Vec<f64>],
+    filenames: &[String],
+    title: &str,
+    x_title: &str,
+    y_title: &str,
+) -> Result<Plot, String> {
+    assert_eq!(
+        scores.len(),
+        filenames.len(),
+        "Scores and filenames must have the same length"
+    );
 
     let mut plot = Plot::new();
     for (i, s) in scores.iter().enumerate() {
-        let trace = BoxPlot::new_xy(
-            vec![filenames[i].clone(); s.len()],
-            s.to_vec()).name(filenames[i].clone()).box_mean(BoxMean::True);
+        let trace = BoxPlot::new_xy(vec![filenames[i].clone(); s.len()], s.to_vec())
+            .name(filenames[i].clone())
+            .box_mean(BoxMean::True);
         plot.add_trace(trace);
     }
-    
+
     let layout = Layout::new()
         .title(title)
         .x_axis(Axis::new().title(x_title).tick_angle(45.0))
         .y_axis(Axis::new().title(y_title))
         .show_legend(false);
-    
+
     plot.set_layout(layout);
 
     Ok(plot)
 }
 
-
-pub fn plot_scatter(x: &Vec<Vec<f64>>, y: &Vec<Vec<f64>>, labels: Vec<String>, title: &str, x_title: &str, y_title: &str) -> Result<Plot, String> {
+pub fn plot_scatter(
+    x: &[Vec<f64>],
+    y: &[Vec<f64>],
+    labels: &[String],
+    title: &str,
+    x_title: &str,
+    y_title: &str,
+) -> Result<Plot, String> {
     assert_eq!(x.len(), y.len(), "X and Y must have the same length");
 
     // Check to see how large the data is, if there's a large amount of data we should use web_gl_mode. We can look at one of the arrays to see how many points there are
-    let web_gl_mode = x[0].len() > 10_000;
+    let _web_gl_mode = x[0].len() > 10_000;
 
     let mut plot = Plot::new();
     for (i, (x_i, y_i)) in x.iter().zip(y.iter()).enumerate() {
-        let trace = Scatter::new(x_i.to_vec(), y_i.to_vec()).name(labels[i].clone()).mode(Mode::Markers).marker(Marker::new().size(10)).web_gl_mode(true);
+        let trace = Scatter::new(x_i.to_vec(), y_i.to_vec())
+            .name(labels[i].clone())
+            .mode(Mode::Markers)
+            .marker(Marker::new().size(10))
+            .web_gl_mode(true);
         plot.add_trace(trace);
     }
 
@@ -214,7 +257,7 @@ mod tests {
         let x_title = "Filenames";
         let y_title = "Scores";
 
-        let plot = plot_boxplot(&scores, filenames, title, x_title, y_title).unwrap();
+        let plot = plot_boxplot(&scores, &filenames, title, x_title, y_title).unwrap();
 
         plot.write_html("test_plot_boxplot.html");
 
@@ -240,7 +283,7 @@ mod tests {
         let x_title = "Filenames";
         let y_title = "Scores";
 
-        plot_boxplot(&scores, filenames, title, x_title, y_title).unwrap();
+        plot_boxplot(&scores, &filenames, title, x_title, y_title).unwrap();
     }
 
     #[test]
@@ -264,9 +307,8 @@ mod tests {
         let x_title = "X";
         let y_title = "Y";
 
-        let plot = plot_scatter(&x, &y, labels, title, x_title, y_title).unwrap();
+        let plot = plot_scatter(&x, &y, &labels, title, x_title, y_title).unwrap();
 
         plot.write_html("test_plot_scatter.html");
     }
-
 }

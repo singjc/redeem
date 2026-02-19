@@ -26,6 +26,11 @@ tqdm = {git = "https://github.com/singjc/tqdm.git", branch = "add/update_desc"}
 rayon = "1.5"
 sysinfo = "0.33.1"
 
+# Optional embedding of pretrained model files into the crate binary.
+[dependencies.include_dir]
+version = "0.7"
+optional = true
+
 [dependencies.candle-core]
 version = "0.8.4"
 default-features = false
@@ -44,6 +49,7 @@ features = []
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+embed-pretrained = ["include_dir"]
 
 
 [lib]

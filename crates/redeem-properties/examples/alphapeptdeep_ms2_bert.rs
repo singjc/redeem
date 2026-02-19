@@ -7,13 +7,14 @@ use redeem_properties::{
         ms2_bert_model::MS2BertModel,
     },
     utils::{
-        data_handling::{PeptideData, PeptideBatchData},
-        peptdeep_utils::{get_modification_indices, get_modification_string, load_modifications, remove_mass_shift, ModificationMap},
+        data_handling::{PeptideBatchData, PeptideData, TargetNormalization},
+        peptdeep_utils::{
+            get_modification_indices, get_modification_string, load_modifications,
+            remove_mass_shift, ModificationMap,
+        },
     },
 };
-use std::{
-    collections::HashMap, fs::File, path::PathBuf, sync::Arc
-};
+use std::{collections::HashMap, fs::File, path::PathBuf, sync::Arc};
 
 fn run_prediction(model: &mut MS2BertModel, batch_data: &[PeptideData]) -> Result<()> {
     let batch = PeptideBatchData::from(batch_data);
@@ -29,7 +30,6 @@ fn run_prediction(model: &mut MS2BertModel, batch_data: &[PeptideData]) -> Resul
     } else {
         None
     };
-    
 
     let predictions = model.predict(
         &batch.naked_sequence,
@@ -56,7 +56,11 @@ fn run_prediction(model: &mut MS2BertModel, batch_data: &[PeptideData]) -> Resul
                 pred.iter()
                     .zip(obs.as_ref().unwrap())
                     .map(|(p_row, o_row)| {
-                        p_row.iter().zip(o_row.iter()).map(|(p, o)| (p - o).abs()).sum::<f32>()
+                        p_row
+                            .iter()
+                            .zip(o_row.iter())
+                            .map(|(p, o)| (p - o).abs())
+                            .sum::<f32>()
                     })
                     .sum::<f32>()
             })
@@ -70,7 +74,9 @@ fn run_prediction(model: &mut MS2BertModel, batch_data: &[PeptideData]) -> Resul
                 .unwrap_or(0.0);
             println!(
                 "Peptide: {}\n  Predicted Intensity Sum: {:.4}\n  Observed Intensity Sum: {:.4}",
-                std::str::from_utf8(peptide).unwrap_or(""), pred_sum, obs_sum
+                std::str::from_utf8(peptide).unwrap_or(""),
+                pred_sum,
+                obs_sum
             );
         }
 
@@ -82,7 +88,8 @@ fn run_prediction(model: &mut MS2BertModel, batch_data: &[PeptideData]) -> Resul
 
 fn main() -> Result<()> {
     let model_path = PathBuf::from("data/models/alphapeptdeep/generic/ms2.pth");
-    let constants_path = PathBuf::from("data/models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+    let constants_path =
+        PathBuf::from("data/models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
     let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
     println!("Device: {:?}", device);
 
@@ -107,7 +114,9 @@ fn main() -> Result<()> {
         let len = naked.len().saturating_sub(1);
         charge_map.insert(seq.clone().to_string(), charge);
 
-        let entry = data_map.entry(seq.to_string()).or_insert_with(|| vec![vec![0.0; 8]; len]);
+        let entry = data_map
+            .entry(seq.to_string())
+            .or_insert_with(|| vec![vec![0.0; 8]; len]);
         if let Some(row) = entry.get_mut(idx.saturating_sub(1)) {
             let col = match (ftype, fz) {
                 ("B", 1) => 0,
@@ -124,7 +133,9 @@ fn main() -> Result<()> {
     let mut training_data = Vec::new();
 
     for (mod_seq, ms2) in data_map {
-        let naked = remove_mass_shift(&mod_seq).trim_start_matches('-').to_string();
+        let naked = remove_mass_shift(&mod_seq)
+            .trim_start_matches('-')
+            .to_string();
         let mods = get_modification_string(&mod_seq, &modifications);
         let mod_sites = get_modification_indices(&mod_seq);
 
@@ -147,7 +158,15 @@ fn main() -> Result<()> {
     println!("Loaded {} peptides.", training_data.len());
     run_prediction(&mut model, &training_data)?;
 
-    model.fine_tune(&training_data, modifications, 3, 0.001, 5)?;
+    model.fine_tune(
+        &training_data,
+        modifications,
+        3,
+        0.001,
+        5,
+        TargetNormalization::None,
+        None,
+    )?;
     run_prediction(&mut model, &training_data)?;
 
     Ok(())

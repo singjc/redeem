@@ -6,7 +6,7 @@ use redeem_properties::{
         rt_cnn_lstm_model::RTCNNLSTMModel,
     },
     utils::{
-        data_handling::PeptideData,
+        data_handling::{PeptideData, TargetNormalization},
         peptdeep_utils::{
             get_modification_indices, get_modification_string, load_modifications,
             remove_mass_shift,
@@ -74,7 +74,8 @@ fn run_prediction(model: &mut RTCNNLSTMModel, batch_data: &[PeptideData]) -> Res
 fn main() -> Result<()> {
     env_logger::init();
 
-    let model_path = PathBuf::from("/home/singjc/Documents/github/redeem/rt_fine_tuned.safetensors");
+    let model_path =
+        PathBuf::from("/home/singjc/Documents/github/redeem/rt_fine_tuned.safetensors");
     let constants_path = PathBuf::from("/home/singjc/Documents/github/redeem/crates/redeem-properties/data/models/alphapeptdeep/generic/rt.pth.model_const.yaml");
     let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
     println!("Device: {:?}", device);
@@ -155,7 +156,15 @@ fn main() -> Result<()> {
 
     run_prediction(&mut model, &prediction_data)?;
 
-    model.fine_tune(&training_data, modifications, 10, 0.001, 5)?;
+    model.fine_tune(
+        &training_data,
+        modifications,
+        10,
+        0.001,
+        5,
+        TargetNormalization::None,
+        None,
+    )?;
 
     run_prediction(&mut model, &prediction_data)?;
 

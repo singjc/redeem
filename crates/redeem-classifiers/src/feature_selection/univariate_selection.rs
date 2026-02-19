@@ -1,10 +1,10 @@
 //! Univariate feature selection methods following scikit-learn's API.
-//! 
+//!
 //! See: https://scikit-learn.org/stable/modules/feature_selection.html#univariate-feature-selection
 
-use ndarray::{Array1, Array2, ArrayBase, Axis, Data, Ix2};
-use statrs::{distribution::{Continuous, ContinuousCDF, FisherSnedecor}, statistics::Statistics};
+use statrs::distribution::{ContinuousCDF, FisherSnedecor};
 
+use crate::math::{Array1, Array2};
 
 /// Compute row-wise (squared) Euclidean norms of a 2D array.
 ///
@@ -23,6 +23,9 @@ use statrs::{distribution::{Continuous, ContinuousCDF, FisherSnedecor}, statisti
 /// # Examples
 ///
 /// ```rust
+/// use redeem_classifiers::math::{Array1, Array2};
+/// use redeem_classifiers::feature_selection::univariate_selection::row_norms;
+///
 /// let x = Array2::from_shape_vec((3, 3), vec![
 ///     1.0, 2.0, 3.0,
 ///     4.0, 5.0, 6.0,
@@ -31,25 +34,18 @@ use statrs::{distribution::{Continuous, ContinuousCDF, FisherSnedecor}, statisti
 /// let norms = row_norms(&x, false);
 /// println!("Row norms: {:?}", norms);
 /// ```
-pub fn row_norms<S>(x: &ArrayBase<S, Ix2>, squared: bool) -> Array1<f64>
-where
-    S: Data<Elem = f64>,
-{
-    let n_samples = x.nrows();
-    let mut norms = Array1::zeros(n_samples);
-
-    for (i, row) in x.axis_iter(Axis(0)).enumerate() {
-        let sum_of_squares: f64 = row.iter().map(|&val| val.powi(2)).sum();
-        norms[i] = if squared {
+pub fn row_norms(x: &Array2<f64>, squared: bool) -> Array1<f64> {
+    let mut norms = Vec::with_capacity(x.nrows());
+    for row in 0..x.nrows() {
+        let sum_of_squares: f64 = x.row_slice(row).iter().map(|val| val.powi(2)).sum();
+        norms.push(if squared {
             sum_of_squares
         } else {
             sum_of_squares.sqrt()
-        };
+        });
     }
-
-    norms
+    Array1::from_vec(norms)
 }
-
 
 /// Compute Pearson's r for each feature and the target.
 ///
@@ -64,10 +60,10 @@ where
 ///   the data matrix (features).
 /// * `y` - A 1D array of shape (n_samples,) representing the target vector.
 /// * `center` - A boolean indicating whether to center the data.
-///     If true, both `X` and `y` will be centered by subtracting their means.
+///   If true, both `X` and `y` will be centered by subtracting their means.
 /// * `force_finite` - A boolean indicating whether to force the correlation
-///     coefficients to be finite. If true, non-finite values will be replaced
-///     with 0.0.
+///   coefficients to be finite. If true, non-finite values will be replaced
+///   with 0.0.
 ///
 /// # Returns
 ///
@@ -77,61 +73,88 @@ where
 /// # Examples
 ///
 /// ```rust
-/// let x = Array2::from_shape_vec((10, 5), vec![/* your data */]).unwrap();
-/// let y = Array1::from_vec(vec![/* your target */]);
+/// use redeem_classifiers::math::{Array1, Array2};
+/// use redeem_classifiers::feature_selection::univariate_selection::r_regression;
+///
+/// let x = Array2::from_shape_vec((10, 5), (0..50).map(|i| i as f64).collect()).unwrap();
+/// let y = Array1::from_vec((0..10).map(|i| i as f64).collect());
 /// let correlation_coefficients = r_regression(&x, &y, true, true);
 /// println!("Correlation coefficients: {:?}", correlation_coefficients);
 /// ```
-pub fn r_regression(x: &Array2<f64>, y: &Array1<f64>, center: bool, force_finite: bool) -> Array1<f64> {
-    let n_samples = x.nrows() as f64;
+pub fn r_regression(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    center: bool,
+    force_finite: bool,
+) -> Array1<f64> {
     let n_features = x.ncols();
-
-    let mut y_centered = y.to_owned();
-    let mut x_means = Array1::zeros(n_features);
-    let mut x_norms = Array1::zeros(n_features);
+    let mut y_centered = y.to_vec();
+    let mut x_means = vec![0.0; n_features];
+    let mut x_norms = vec![0.0; n_features];
 
     if center {
-        let y_mean = y.mean().unwrap();
-        y_centered -= y_mean;
-
-        for (i, col) in x.columns().into_iter().enumerate() {
-            let col_mean = col.mean();
-            x_means[i] = col_mean;
+        let y_mean = y_centered.iter().copied().sum::<f64>() / y_centered.len() as f64;
+        for value in &mut y_centered {
+            *value -= y_mean;
         }
 
-        // Compute the scaled standard deviations via moments
-        let x_squared_norms = row_norms(&x.t(), true);
-        x_norms = (&x_squared_norms - n_samples * &x_means.mapv(|m| m.powi(2))).mapv(f64::sqrt);
-    } else {
-        x_norms = row_norms(&x.t(), false);
-    }
-
-    let mut correlation_coefficient = Array1::zeros(n_features);
-    for (i, col) in x.columns().into_iter().enumerate() {
-        let centered_col = if center {
-            col.mapv(|v| v - x_means[i])
-        } else {
-            col.to_owned()
-        };
-        correlation_coefficient[i] = centered_col.dot(&y_centered);
-    }
-
-    let y_norm = y_centered.dot(&y_centered).sqrt();
-
-    correlation_coefficient /= &x_norms;
-    correlation_coefficient /= y_norm;
-
-    if force_finite {
-        for val in correlation_coefficient.iter_mut() {
-            if !val.is_finite() {
-                *val = 0.0;
+        for col in 0..n_features {
+            let mut sum = 0.0;
+            for row in 0..x.nrows() {
+                sum += x[(row, col)];
             }
+            let mean = sum / x.nrows() as f64;
+            x_means[col] = mean;
+        }
+
+        for col in 0..n_features {
+            let mut sum_sq = 0.0;
+            for row in 0..x.nrows() {
+                let centered = x[(row, col)] - x_means[col];
+                sum_sq += centered * centered;
+            }
+            x_norms[col] = sum_sq.sqrt();
+        }
+    } else {
+        for col in 0..n_features {
+            let mut sum_sq = 0.0;
+            for row in 0..x.nrows() {
+                let val = x[(row, col)];
+                sum_sq += val * val;
+            }
+            x_norms[col] = sum_sq.sqrt();
         }
     }
 
-    correlation_coefficient
-}
+    let mut correlation = vec![0.0; n_features];
+    for col in 0..n_features {
+        let mut dot = 0.0;
+        for row in 0..x.nrows() {
+            let value = if center {
+                x[(row, col)] - x_means[col]
+            } else {
+                x[(row, col)]
+            };
+            dot += value * y_centered[row];
+        }
+        correlation[col] = dot;
+    }
 
+    let y_norm = y_centered.iter().map(|v| v * v).sum::<f64>().sqrt();
+    for i in 0..n_features {
+        let denom = x_norms[i] * y_norm;
+        correlation[i] = if denom == 0.0 {
+            0.0
+        } else {
+            correlation[i] / denom
+        };
+        if force_finite && !correlation[i].is_finite() {
+            correlation[i] = 0.0;
+        }
+    }
+
+    Array1::from_vec(correlation)
+}
 
 /// Univariate linear regression tests returning F-statistic and p-values.
 ///
@@ -157,46 +180,59 @@ pub fn r_regression(x: &Array2<f64>, y: &Array1<f64>, center: bool, force_finite
 /// # Examples
 ///
 /// ```rust
-/// let x = Array2::from_shape_vec((10, 5), vec![/* your data */]).unwrap();
-/// let y = Array1::from_vec(vec![/* your target */]);
+/// use redeem_classifiers::math::{Array1, Array2};
+/// use redeem_classifiers::feature_selection::univariate_selection::f_regression;
+///
+/// let x = Array2::from_shape_vec((10, 5), (0..50).map(|i| i as f64).collect()).unwrap();
+/// let y = Array1::from_vec((0..10).map(|i| i as f64).collect());
 /// let (f_statistic, p_values) = f_regression(&x, &y, true, true);
 /// println!("F-statistic: {:?}", f_statistic);
 /// println!("p-values: {:?}", p_values);
 /// ```
-pub fn f_regression(x: &Array2<f64>, y: &Array1<f64>, center: bool, force_finite: bool) -> (Array1<f64>, Array1<f64>) {
+pub fn f_regression(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    center: bool,
+    force_finite: bool,
+) -> (Array1<f64>, Array1<f64>) {
     let correlation_coefficient = r_regression(x, y, center, force_finite);
     let deg_of_freedom = y.len() as f64 - if center { 2.0 } else { 1.0 };
 
-    // Calculate squared correlation coefficients
     let corr_coef_squared = correlation_coefficient.mapv(|x| x.powi(2));
 
-    // Calculate F-statistic
-    let mut f_statistic = &corr_coef_squared / (1.0 - &corr_coef_squared) * deg_of_freedom;
-    let mut p_values = Array1::zeros(f_statistic.len());
+    let mut f_statistics = Vec::with_capacity(corr_coef_squared.len());
+    for &coef in corr_coef_squared.iter() {
+        let denom = 1.0 - coef;
+        let value = if denom <= 0.0 {
+            f64::MAX
+        } else {
+            (coef / denom) * deg_of_freedom
+        };
+        f_statistics.push(value);
+    }
 
-    // Create an F-distribution object for calculating p-values
     let f_dist = FisherSnedecor::new(1.0, deg_of_freedom).unwrap();
-    for (i, &f) in f_statistic.iter().enumerate() {
-        p_values[i] = 1.0 - f_dist.cdf(f);
+    let mut p_values = Vec::with_capacity(f_statistics.len());
+    for &f in &f_statistics {
+        p_values.push(1.0 - f_dist.cdf(f));
     }
 
     if force_finite {
-        for i in 0..f_statistic.len() {
-            if !f_statistic[i].is_finite() {
-                if f_statistic[i].is_infinite() {
-                    f_statistic[i] = f64::MAX;
-                    p_values[i] = 0.0;
-                } else if f_statistic[i].is_nan() {
-                    f_statistic[i] = 0.0;
-                    p_values[i] = 1.0;
+        for (f_val, p_val) in f_statistics.iter_mut().zip(p_values.iter_mut()) {
+            if !f_val.is_finite() {
+                if f_val.is_infinite() {
+                    *f_val = f64::MAX;
+                    *p_val = 0.0;
+                } else {
+                    *f_val = 0.0;
+                    *p_val = 1.0;
                 }
             }
         }
     }
 
-    (f_statistic, p_values)
+    (Array1::from_vec(f_statistics), Array1::from_vec(p_values))
 }
-
 
 /// A struct for selecting the k best features based on F-scores.
 ///
@@ -233,47 +269,52 @@ impl SelectKBest {
     /// # Returns
     ///
     /// A vector of indices corresponding to the k best features.
-    pub fn fit(&self, x: &Array2<f64>, y: &Array1<f64>, center: Option<bool>, force_finite: Option<bool>) -> Vec<usize> {
+    pub fn fit(
+        &self,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        center: Option<bool>,
+        force_finite: Option<bool>,
+    ) -> Vec<usize> {
         let center = center.unwrap_or(true);
         let force_finite = force_finite.unwrap_or(true);
-    
+
         let (f_scores, _) = f_regression(x, y, center, force_finite);
 
         // Create a vector of indices
         let mut indices: Vec<usize> = (0..f_scores.len()).collect();
-        
+
         // Sort indices based on scores in ascending order using a stable sort
-        indices.sort_by(|&i, &j| f_scores[i].partial_cmp(&f_scores[j]).unwrap_or(std::cmp::Ordering::Equal));
-    
+        indices.sort_by(|&i, &j| {
+            f_scores[i]
+                .partial_cmp(&f_scores[j])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         // Select top k features by taking the last k elements
         indices.iter().rev().take(self.k).cloned().collect()
     }
-    
 }
-
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array2};
+    use crate::math::{Array1, Array2};
 
     #[test]
     fn test_select_k_best() {
         // Create a feature matrix with 5 features and 10 samples
         // Features: [random, collinear with target, constant, collinear with feature 1, noise]
-        let x = Array2::from_shape_vec((10, 5), vec![
-            0.1,  1.0, 5.0,  0.2, -0.3,
-            0.4, -1.0, 5.0,  0.8,  0.1,
-            0.6,  1.0, 5.0,  1.2,  0.2,
-            0.9, -1.0, 5.0,  1.8, -0.1,
-            1.2,  1.0, 5.0,  2.4,  0.3,
-            1.5, -1.0, 5.0,  3.0,  0.0,
-            1.8,  1.0, 5.0,  3.6, -0.2,
-            2.1, -1.0, 5.0,  4.2,  0.4,
-            2.4,  1.0, 5.0,  4.8, -0.1,
-            2.7, -1.0, 5.0,  5.4,  0.2,
-        ]).unwrap();
+        let x = Array2::from_shape_vec(
+            (10, 5),
+            vec![
+                0.1, 1.0, 5.0, 0.2, -0.3, 0.4, -1.0, 5.0, 0.8, 0.1, 0.6, 1.0, 5.0, 1.2, 0.2, 0.9,
+                -1.0, 5.0, 1.8, -0.1, 1.2, 1.0, 5.0, 2.4, 0.3, 1.5, -1.0, 5.0, 3.0, 0.0, 1.8, 1.0,
+                5.0, 3.6, -0.2, 2.1, -1.0, 5.0, 4.2, 0.4, 2.4, 1.0, 5.0, 4.8, -0.1, 2.7, -1.0, 5.0,
+                5.4, 0.2,
+            ],
+        )
+        .unwrap();
 
         // Create a target vector perfectly correlated with the second feature
         let y = Array1::from_vec(vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]);
@@ -292,9 +333,8 @@ mod tests {
         // Print selected features for debugging
         println!("Selected features:");
         for i in selected_indices.iter() {
-            println!("Feature {:?}: {:?}",i, x.column(*i));
+            println!("Feature {:?}: {:?}", i, x.column(*i));
         }
-        
 
         // Check that we got 3 indices
         assert_eq!(selected_indices.len(), 3);
@@ -303,13 +343,18 @@ mod tests {
         assert!(selected_indices.iter().all(|&idx| idx < 5));
 
         // Check that the indices are unique
-        assert!(selected_indices.iter().collect::<std::collections::HashSet<_>>().len() == 3);
+        assert!(
+            selected_indices
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == 3
+        );
 
         // The second feature (index 1) should definitely be selected as it's perfectly correlated with the target
         assert!(selected_indices.contains(&1));
 
         // The third feature (index 2) should not be selected as it's constant
         assert!(!selected_indices.contains(&2));
-
     }
 }

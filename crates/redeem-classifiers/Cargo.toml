@@ -15,47 +15,31 @@ log = "0.4.0"
 rand = "0.8"
 serde = { version="1.0", features = ["derive"] }
 statrs = "0.17.1"
-ndarray = "0.15"
-#ndarray = "0.16.1"
-# ndarray-stats = "0.6.0"
-# xgboost-rs = "0.3.0"
-# xgboost = { git = "https://github.com/singjc/rust-xgboost.git", branch = "master" }
-# gbdt = "0.1.3"
 gbdt = {git = "https://github.com/singjc/gbdt-rs.git", branch = "add/decision_function"}
-# linfa-logistic = "0.7.1"
 rayon = "1.5"
-sage-core = { git = "https://github.com/lazear/sage", branch = "master" }
 csv = "1.3.1"
-# linfa-datasets = { version = "0.7.1", features = ["winequality"] }
 plotly = "0.12.1"
 maud = "0.27.0"
 chrono = "0.4.39"
 itertools-num = "0.1.3"
+num-traits = "0.2"
+# Mark light-svm as optional so the `svm` feature can enable it
+light-svm = { version = "0.1.0", optional = true }
+report-builder = "0.1.0"
 
 # Optional dependencies
 [features]
 default = []  # No default features
-# xgboost = ["dep:xgboost"]  
-linfa = ["dep:linfa", "dep:linfa-svm"]  
+# feature name kept as `xgboost` for cfg(...) compatibility; it enables the
+# crates.io `xgb` dependency.
+xgboost = ["dep:xgb"]
+svm = ["dep:light-svm"]
+simd = []
 
-[dependencies.xgboost]
-#version = "0.1.4"
-git = "https://github.com/singjc/rust-xgboost.git"
-# path = "/home/singjc/Documents/github/rust-xgboost"
-optional = true  
-
-[dependencies.linfa]
-version = "0.7.1"
-optional = true  
-
-[dependencies.linfa-svm]
-version = "0.7.2"
-optional = true  
+[dependencies.xgb]
+version = "3.0.5"
+optional = true
 
 [lib]
 name = "redeem_classifiers"
 path = "src/lib.rs"
-
-
-[dev-dependencies]
-approx = "0.5"

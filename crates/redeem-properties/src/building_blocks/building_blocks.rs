@@ -1,11 +1,7 @@
-use anyhow::{Context, Result as AnyHowResult};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{self as nn, linear};
+use candle_nn as nn;
 use candle_transformers as transformers;
-use serde::de;
-use core::num;
 use std::fmt;
-use std::time::Instant;
 
 use crate::building_blocks::bilstm::BidirectionalLSTM;
 use crate::building_blocks::featurize::aa_one_hot;
@@ -16,9 +12,11 @@ use crate::utils::utils::get_tensor_stats;
 use super::nn::TransformerEncoder;
 
 /// constants used by PeptDeep Models
-pub const MOD_FEATURE_SIZE: usize = 109; // TODO: derive from constants yaml
 pub const AA_EMBEDDING_SIZE: usize = 27; // TODO: derive from constants yaml
 const MAX_INSTRUMENT_NUM: usize = 8; // TODO: derive from constants yaml
+                                     // Number of features in the modification vector (kept as a single global
+                                     // constant to match the legacy code paths that expect a fixed layout).
+pub const MOD_FEATURE_SIZE: usize = 109;
 
 /// Decode w linear NN
 #[derive(Clone)]
@@ -29,35 +27,63 @@ pub struct DecoderLinear {
 impl DecoderLinear {
     pub fn new(in_features: usize, out_features: usize, vb: &nn::VarBuilder) -> Result<Self> {
         let linear1 = nn::linear(in_features, 64, vb.pp("nn.0"))?;
-        let prelu = nn::PReLU::new(Tensor::zeros(64, DType::F32, vb.device())?, false);
+        // PReLU with a shared, learnable slope (scalar) registered in the var store.
+        let prelu = nn::PReLU::new(vb.get(1, "nn.1.weight")?, true);
         let linear2 = nn::linear(64, out_features, vb.pp("nn.2"))?;
 
         let mut nn = seq();
         nn = nn.add(linear1);
         nn = nn.add(prelu);
         nn = nn.add(linear2);
-    
+
         Ok(Self { nn })
     }
-    
-    
 
     pub fn from_varstore(
         varstore: &nn::VarBuilder,
         in_features: usize,
         out_features: usize,
         names: Vec<&str>,
-        names_bias: Vec<&str>
+        names_bias: Vec<&str>,
     ) -> Result<Self> {
-        let linear1 = nn::Linear::new(
-            varstore.get((64, in_features), names[0]).unwrap(),
-            Some(varstore.get(64, names_bias[0]).unwrap()),
-        );
-        let prelu = nn::PReLU::new(varstore.get(1, names[1]).unwrap(), true);
-        let linear2 = nn::Linear::new(
-            varstore.get((out_features, 64), names[2]).unwrap(),
-            Some(varstore.get(out_features, names_bias[1]).unwrap()),
-        );
+        // Load tensors defensively to avoid panics when a checkpoint uses a different
+        // decoder head layout (e.g., small/MLP vs legacy linear). Return a clear
+        // error instead of unwrapping so higher-level detection can react.
+        let w0 = varstore.get((64, in_features), names[0]);
+        let b0 = varstore.get(64, names_bias[0]);
+        let p = varstore.get(1, names[1]);
+        let w_out = varstore.get((out_features, 64), names[2]);
+        let b_out = varstore.get(out_features, names_bias[1]);
+
+        let linear1 = match (w0, b0) {
+            (Ok(w), Ok(b)) => nn::Linear::new(w, Some(b)),
+            (Ok(w), Err(_)) => nn::Linear::new(w, None),
+            _ => {
+                return Err(candle_core::Error::Msg(format!(
+                "DecoderLinear missing required varstore tensors for {} (expected shape ({}, {}))",
+                names[0], 64, in_features
+            )))
+            }
+        };
+
+        let prelu = if let Ok(pv) = p {
+            let channel_shared = pv.elem_count() == 1;
+            nn::PReLU::new(pv, channel_shared)
+        } else {
+            // Shared, learnable slope fallback (registered so it can be trained if needed).
+            nn::PReLU::new(varstore.get(1, "nn.1.weight")?, true)
+        };
+
+        let linear2 = match (w_out, b_out) {
+            (Ok(w), Ok(b)) => nn::Linear::new(w, Some(b)),
+            (Ok(w), Err(_)) => nn::Linear::new(w, None),
+            _ => {
+                return Err(candle_core::Error::Msg(format!(
+                "DecoderLinear missing required varstore tensors for {} (expected shape ({}, {}))",
+                names[2], out_features, 64
+            )))
+            }
+        };
 
         let mut nn = seq();
         nn = nn.add(linear1);
@@ -68,11 +94,326 @@ impl DecoderLinear {
     }
 }
 
+// A richer MLP decoder head used for transformer-based models during training.
+// This preserves the original `DecoderLinear` so older/lstm models remain compatible with
+// existing varstore layouts. `DecoderMLP` provides additional capacity.
+#[derive(Clone)]
+pub struct DecoderMLP {
+    nn: Sequential,
+}
+
+impl DecoderMLP {
+    pub fn new(in_features: usize, out_features: usize, vb: &nn::VarBuilder) -> Result<Self> {
+        // Architecture: Linear(in -> 64) -> PReLU -> Linear(64 -> 16) -> PReLU -> Linear(16 -> out)
+        let linear1 = nn::linear(in_features, 64, vb.pp("nn.0"))?;
+        let prelu1 = nn::PReLU::new(vb.get(1, "nn.1.weight")?, true);
+        let linear_hidden = nn::linear(64, 16, vb.pp("nn.2"))?;
+        let prelu2 = nn::PReLU::new(vb.get(1, "nn.3.weight")?, true);
+        let linear2 = nn::linear(16, out_features, vb.pp("nn.4"))?;
+
+        let mut nn_mod = seq();
+        nn_mod = nn_mod.add(linear1);
+        nn_mod = nn_mod.add(prelu1);
+        nn_mod = nn_mod.add(linear_hidden);
+        nn_mod = nn_mod.add(prelu2);
+        nn_mod = nn_mod.add(linear2);
+
+        Ok(Self { nn: nn_mod })
+    }
+
+    pub fn from_varstore(
+        varstore: &nn::VarBuilder,
+        in_features: usize,
+        out_features: usize,
+        _names: Vec<&str>,
+        _names_bias: Vec<&str>,
+    ) -> Result<Self> {
+        // For now require an MLP varstore layout when loading from a checkpoint; when
+        // migrating older checkpoints we can add compatibility mapping. The training path
+        // (new_untrained) will construct an MLP directly.
+        // Attempt to read weights for nn.0, nn.2, nn.4 and their biases if present.
+        let w0 = varstore.get((64, in_features), "nn.0.weight");
+        let b0 = varstore.get(64, "nn.0.bias");
+        let w_hidden = varstore.get((16, 64), "nn.2.weight");
+        let b_hidden = varstore.get(16, "nn.2.bias");
+        let w_out = varstore.get((out_features, 16), "nn.4.weight");
+        let b_out = varstore.get(out_features, "nn.4.bias");
+
+        let linear1 = match (w0, b0) {
+            (Ok(w), Ok(b)) => nn::Linear::new(w, Some(b)),
+            (Ok(w), Err(_)) => nn::Linear::new(w, None),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "DecoderMLP missing required varstore tensors for nn.0".to_string(),
+                ))
+            }
+        };
+
+        let prelu1 = if let Ok(p) = varstore.get(1, "nn.1.weight") {
+            let channel_shared = p.elem_count() == 1;
+            nn::PReLU::new(p, channel_shared)
+        } else {
+            nn::PReLU::new(varstore.get(1, "nn.1.weight")?, true)
+        };
+
+        let linear_hidden = match (w_hidden, b_hidden) {
+            (Ok(w), Ok(b)) => nn::Linear::new(w, Some(b)),
+            (Ok(w), Err(_)) => nn::Linear::new(w, None),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "DecoderMLP missing required varstore tensors for nn.2".to_string(),
+                ))
+            }
+        };
+
+        let prelu2 = if let Ok(p) = varstore.get(1, "nn.3.weight") {
+            let channel_shared = p.elem_count() == 1;
+            nn::PReLU::new(p, channel_shared)
+        } else {
+            nn::PReLU::new(varstore.get(1, "nn.3.weight")?, true)
+        };
+
+        let linear2 = match (w_out, b_out) {
+            (Ok(w), Ok(b)) => nn::Linear::new(w, Some(b)),
+            (Ok(w), Err(_)) => nn::Linear::new(w, None),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "DecoderMLP missing required varstore tensors for nn.4".to_string(),
+                ))
+            }
+        };
+
+        let mut nn_mod = seq();
+        nn_mod = nn_mod.add(linear1);
+        nn_mod = nn_mod.add(prelu1);
+        nn_mod = nn_mod.add(linear_hidden);
+        nn_mod = nn_mod.add(prelu2);
+        nn_mod = nn_mod.add(linear2);
+
+        Ok(Self { nn: nn_mod })
+    }
+}
+
+impl Module for DecoderMLP {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // reuse the instrumentation approach used previously for Debugging
+        match self.nn.forward_all(x) {
+            Ok(outputs) => {
+                if let Some(last) = outputs.last() {
+                    Ok(last.clone())
+                } else {
+                    Ok(x.clone())
+                }
+            }
+            Err(e) => {
+                log::error!("[DecoderMLP] forward pass failed: {:?}", e);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl fmt::Debug for DecoderMLP {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecoderMLP")
+            .field("nn", &"<Sequential>")
+            .finish()
+    }
+}
+
+/// A very small projection head that first projects to a low-dimensional
+/// bottleneck (e.g. 4-d) then back to the scalar output. Optionally it can
+/// contain a learnable scalar multiplier (a 1->1 linear) that is applied to
+/// the final output. This is useful to experiment with temperature-like
+/// scaling during head-only fine-tuning.
+#[derive(Clone)]
+pub struct DecoderSmall {
+    nn: Sequential,
+    scale: Option<nn::Linear>,
+}
+
+impl DecoderSmall {
+    pub fn new(
+        in_features: usize,
+        out_features: usize,
+        vb: &nn::VarBuilder,
+        learnable_scaler: bool,
+    ) -> Result<Self> {
+        let linear1 = nn::linear(in_features, 4, vb.pp("nn.0"))?;
+        // Shared, learnable slope (scalar) registered in the var store.
+        let prelu = nn::PReLU::new(vb.get(1, "nn.1.weight")?, true);
+        let linear2 = nn::linear(4, out_features, vb.pp("nn.2"))?;
+
+        let mut nn_mod = seq();
+        nn_mod = nn_mod.add(linear1);
+        nn_mod = nn_mod.add(prelu);
+        nn_mod = nn_mod.add(linear2);
+
+        let scale = if learnable_scaler {
+            Some(nn::linear(1, 1, vb.pp("scale"))?)
+        } else {
+            None
+        };
+
+        Ok(Self { nn: nn_mod, scale })
+    }
+
+    pub fn from_varstore(
+        varstore: &nn::VarBuilder,
+        in_features: usize,
+        out_features: usize,
+        _names: Vec<&str>,
+        _names_bias: Vec<&str>,
+    ) -> Result<Self> {
+        // Load a small head assuming the varstore uses the small layout.
+        let w0 = varstore.get((4, in_features), "nn.0.weight");
+        let b0 = varstore.get(4, "nn.0.bias");
+        let w_out = varstore.get((out_features, 4), "nn.2.weight");
+        let b_out = varstore.get(out_features, "nn.2.bias");
+
+        let linear1 = match (w0, b0) {
+            (Ok(w), Ok(b)) => nn::Linear::new(w, Some(b)),
+            (Ok(w), Err(_)) => nn::Linear::new(w, None),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "DecoderSmall missing required varstore tensors for nn.0".to_string(),
+                ))
+            }
+        };
+
+        let prelu = if let Ok(p) = varstore.get(1, "nn.1.weight") {
+            let channel_shared = p.elem_count() == 1;
+            nn::PReLU::new(p, channel_shared)
+        } else {
+            // Shared, learnable slope fallback.
+            nn::PReLU::new(varstore.get(1, "nn.1.weight")?, true)
+        };
+
+        let linear2 = match (w_out, b_out) {
+            (Ok(w), Ok(b)) => nn::Linear::new(w, Some(b)),
+            (Ok(w), Err(_)) => nn::Linear::new(w, None),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "DecoderSmall missing required varstore tensors for nn.2".to_string(),
+                ))
+            }
+        };
+
+        let mut nn_mod = seq();
+        nn_mod = nn_mod.add(linear1);
+        nn_mod = nn_mod.add(prelu);
+        nn_mod = nn_mod.add(linear2);
+
+        // Try to load optional scalar
+        let scale = if let Ok(_) = varstore.get((1, 1), "scale.weight") {
+            match nn::linear(1, 1, varstore.pp("scale")) {
+                Ok(s) => Some(s),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(Self { nn: nn_mod, scale })
+    }
+}
+
+impl Module for DecoderSmall {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self.nn.forward_all(x) {
+            Ok(outputs) => {
+                if let Some(last) = outputs.last() {
+                    let mut out = last.clone();
+                    if let Some(scale_layer) = &self.scale {
+                        // Determine batch size from output
+                        if let Ok((r, _c)) = out.shape().dims2() {
+                            let ones = vec![1.0f32; r * 1];
+                            if let Ok(ones_t) = Tensor::from_slice(&ones, (r, 1), out.device()) {
+                                if let Ok(scalar) = scale_layer.forward(&ones_t) {
+                                    if let Ok(scaled) = out.mul(&scalar) {
+                                        out = scaled;
+                                    }
+                                }
+                            }
+                        } else if let Ok(n) = out.shape().dims1() {
+                            let ones = vec![1.0f32; n];
+                            if let Ok(ones_t) = Tensor::from_slice(&ones, (n, 1), out.device()) {
+                                if let Ok(scalar) = scale_layer.forward(&ones_t) {
+                                    if let Ok(scaled) = out.mul(&scalar) {
+                                        out = scaled;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(out)
+                } else {
+                    Ok(x.clone())
+                }
+            }
+            Err(e) => {
+                log::error!("[DecoderSmall] forward pass failed: {:?}", e);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl fmt::Debug for DecoderSmall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecoderSmall")
+            .field("nn", &"<Sequential>")
+            .finish()
+    }
+}
+
+/// Wrapper enum so models can hold either the legacy linear decoder or the new MLP
+/// head without changing the rest of the model API. It dispatches forward calls
+/// to the contained implementation.
+#[derive(Clone)]
+pub enum DecoderHead {
+    Linear(DecoderLinear),
+    MLP(DecoderMLP),
+    Small(DecoderSmall),
+}
+
+impl Module for DecoderHead {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            DecoderHead::Linear(l) => l.forward(x),
+            DecoderHead::MLP(m) => m.forward(x),
+            DecoderHead::Small(s) => s.forward(x),
+        }
+    }
+}
+
+impl fmt::Debug for DecoderHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecoderHead::Linear(_) => f.debug_struct("DecoderHead::Linear").finish(),
+            DecoderHead::MLP(_) => f.debug_struct("DecoderHead::MLP").finish(),
+            DecoderHead::Small(_) => f.debug_struct("DecoderHead::Small").finish(),
+        }
+    }
+}
+
 impl Module for DecoderLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self.nn.forward(x) {
-            Ok(output) => {
-                Ok(output)
+        // Use forward_all to capture outputs after each sub-layer
+        match self.nn.forward_all(x) {
+            Ok(outputs) => {
+                // outputs contains intermediate results after each layer
+                // outputs[0] = after linear1 (pre-activation)
+                // outputs[1] = after prelu (post-activation)
+                // outputs[2] = after linear2 (final)
+
+                // Return the final output
+                if let Some(last) = outputs.last() {
+                    Ok(last.clone())
+                } else {
+                    Ok(x.clone())
+                }
             }
             Err(e) => {
                 log::error!("[DecoderLinear] forward pass failed: {:?}", e);
@@ -81,7 +422,6 @@ impl Module for DecoderLinear {
         }
     }
 }
-
 
 impl fmt::Debug for DecoderLinear {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -167,7 +507,7 @@ impl PositionalEncoding {
         varstore: &nn::VarBuilder,
         out_features: usize,
         max_len: usize,
-        name: &str
+        name: &str,
     ) -> Result<Self> {
         let pe = varstore.get((1, max_len, out_features), name);
         Ok(Self { pe: pe.unwrap() })
@@ -194,7 +534,11 @@ struct ModEmbeddingFixFirstK {
 }
 
 impl ModEmbeddingFixFirstK {
-    fn new(mod_feature_size: usize, out_features: usize, varbuilder: &nn::VarBuilder) -> Result<Self> {
+    fn new(
+        mod_feature_size: usize,
+        out_features: usize,
+        varbuilder: &nn::VarBuilder,
+    ) -> Result<Self> {
         let k = 6;
         let nn = nn::linear_no_bias(mod_feature_size - k, out_features - k, varbuilder.pp("nn"))?;
         Ok(Self { k, nn })
@@ -204,7 +548,7 @@ impl ModEmbeddingFixFirstK {
         varstore: &nn::VarBuilder,
         mod_feature_size: usize,
         out_features: usize,
-        name: &str
+        name: &str,
     ) -> Result<Self> {
         let k = 6;
         let weight = varstore.get((out_features - k, MOD_FEATURE_SIZE - k), name);
@@ -225,7 +569,9 @@ impl Module for ModEmbeddingFixFirstK {
         let transformed = self.nn.forward(&rest.contiguous()?)?;
 
         // Concatenate the results
-        Tensor::cat(&[&first_k, &transformed], D::Minus1)
+        let out = Tensor::cat(&[&first_k, &transformed], D::Minus1)?;
+
+        Ok(out)
     }
 }
 
@@ -246,7 +592,7 @@ impl Input26aaModPositionalEncoding {
         varstore: &nn::VarBuilder,
         out_features: usize,
         max_len: usize,
-        names: Vec<&str>
+        names: Vec<&str>,
     ) -> Result<Self> {
         let mod_hidden = 8;
         Ok(Self {
@@ -254,23 +600,26 @@ impl Input26aaModPositionalEncoding {
                 varstore,
                 MOD_FEATURE_SIZE,
                 mod_hidden,
-                names[0]
+                names[0],
             )?,
             aa_emb: AAEmbedding::from_varstore(varstore, out_features - mod_hidden, names[1])?,
             pos_encoder: PositionalEncoding::from_varstore(
                 varstore,
                 out_features,
                 max_len,
-                names[2]
+                names[2],
             )?,
         })
     }
 
     pub fn forward(&self, aa_indices: &Tensor, mod_x: &Tensor) -> Result<Tensor> {
-        let mod_x = self.mod_nn.forward(mod_x)?;
-        let x = self.aa_emb.forward(aa_indices)?;
-        // Concatenate x and mod_x along the last dimension
-        let concatenated = Tensor::cat(&[&x, &mod_x], 2)?;
+        // Compute embeddings
+        let mod_out = self.mod_nn.forward(mod_x)?;
+        let aa_out = self.aa_emb.forward(aa_indices)?;
+
+        // Concatenate aa and mod embeddings and apply positional encoding
+        let concatenated = Tensor::cat(&[&aa_out, &mod_out], 2)?;
+
         self.pos_encoder.forward(&concatenated)
     }
 }
@@ -294,7 +643,7 @@ impl MetaEmbedding {
     pub fn from_varstore(
         varstore: &nn::VarBuilder,
         out_features: usize,
-        name: Vec<&str>
+        name: Vec<&str>,
     ) -> Result<Self> {
         let weight = varstore.get((out_features - 1, MAX_INSTRUMENT_NUM + 1), name[0]);
         let bias = varstore.get(out_features - 1, name[1]);
@@ -336,10 +685,11 @@ impl MetaEmbedding {
         nces: &Tensor,
         instrument_indices: &Tensor,
     ) -> Result<Tensor> {
-
-
         // One-hot encode the instrument indices
-        let inst_x = self.one_hot(&instrument_indices.to_dtype(DType::I64)?, MAX_INSTRUMENT_NUM)?;
+        let inst_x = self.one_hot(
+            &instrument_indices.to_dtype(DType::I64)?,
+            MAX_INSTRUMENT_NUM,
+        )?;
 
         // Ensure all tensors are on the same device
         let charges = &charges.to_device(inst_x.device())?;
@@ -372,7 +722,7 @@ impl HiddenHfaceTransformer {
         _nheads: usize,
         _nlayers: usize,
         _dropout: f64,
-        _output_attentions: bool
+        _output_attentions: bool,
     ) -> Result<Self> {
         unimplemented!()
     }
@@ -384,7 +734,7 @@ impl HiddenHfaceTransformer {
         nheads: usize,
         nlayers: usize,
         dropout: f64,
-        _output_attentions: bool
+        _output_attentions: bool,
     ) -> Result<Self> {
         let config = transformers::models::bert::Config {
             hidden_size: hidden_dim,
@@ -456,7 +806,7 @@ impl ModLossNN {
         decoder_linear_output_dim: usize,
         bert_name: &str,
         decoder_linear_names: Vec<&str>,
-        decoder_linear_bias_names: Vec<&str>
+        decoder_linear_bias_names: Vec<&str>,
     ) -> Result<Self> {
         let config = transformers::models::bert::Config {
             hidden_size: hidden_dim,
@@ -480,7 +830,7 @@ impl ModLossNN {
             hidden_dim,
             decoder_linear_output_dim,
             decoder_linear_names,
-            decoder_linear_bias_names
+            decoder_linear_bias_names,
         )
         .unwrap();
         modules.push(decoder_linear);
@@ -562,7 +912,7 @@ impl SeqCNN {
         varstore: nn::VarBuilder,
         embedding_hidden: usize,
         names_weight: Vec<&str>,
-        names_bias: Vec<&str>
+        names_bias: Vec<&str>,
     ) -> Result<Self> {
         let cnn_short = nn::Conv1d::new(
             varstore
@@ -688,17 +1038,13 @@ impl SeqTransformer {
         device: &Device,
     ) -> Result<Self> {
         let encoder = TransformerEncoder::new(
-            varbuilder,
-            input_dim,
-            model_dim,
-            ff_dim,
-            num_heads,
-            num_layers,
-            max_len,
-            dropout,
+            varbuilder, input_dim, model_dim, ff_dim, num_heads, num_layers, max_len, dropout,
             device,
         )?;
-        Ok(Self { encoder, training: true })
+        Ok(Self {
+            encoder,
+            training: true,
+        })
     }
 
     /// Load a transformer encoder from a varstore (used when loading from pre-trained weights).
@@ -724,11 +1070,18 @@ impl SeqTransformer {
             dropout_prob,
             device,
         )?;
-        Ok(Self { encoder, training: true })
+        Ok(Self {
+            encoder,
+            training: true,
+        })
     }
 
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
+    }
+
+    pub fn forward_with_mask(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        Ok(self.encoder.forward_with_mask(x, mask, self.training)?)
     }
 }
 
@@ -738,7 +1091,6 @@ impl Module for SeqTransformer {
     }
 }
 
-
 /// apply linear transformation and tensor rescaling with softmax
 #[derive(Debug, Clone)]
 struct SeqAttentionSum {
@@ -747,10 +1099,7 @@ struct SeqAttentionSum {
 
 impl SeqAttentionSum {
     pub fn new(hidden_dim: usize, varbuilder: &nn::VarBuilder) -> Result<Self> {
-        let attention = nn::linear_no_bias(
-            hidden_dim,
-            1,
-            varbuilder.pp("attn.0"))?;
+        let attention = nn::linear_no_bias(hidden_dim, 1, varbuilder.pp("attn.0"))?;
         Ok(Self { attention })
     }
 
@@ -769,7 +1118,6 @@ impl Module for SeqAttentionSum {
                 return Err(e);
             }
         };
-        
 
         // Apply softmax to normalize weights
         // TODO: This is done in the model itself in the PyTorch implementation
@@ -842,14 +1190,14 @@ impl Encoder26aaModCnnLstmAttnSum {
     }
 
     pub fn forward(&self, aa_indices: &Tensor, mod_x: &Tensor) -> Result<Tensor> {
-        let mod_x = self.mod_nn.forward(mod_x)?;
+        let mod_out = self.mod_nn.forward(mod_x)?;
 
-        let additional_tensors: Vec<&Tensor> = vec![&mod_x];
+        let additional_tensors: Vec<&Tensor> = vec![&mod_out];
 
         let x = aa_one_hot(&aa_indices, &additional_tensors)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
-        let (mean, min, max) = get_tensor_stats(&x)?;
+        // let (mean, min, max) = get_tensor_stats(&x)?;
         // log::trace!("[Encoder26aaModCnnLstmAttnSum] one-hot output stats - min: {min}, max: {max}, mean: {mean}");
 
         let x = self.input_cnn.forward(&x)?;
@@ -920,17 +1268,18 @@ impl Encoder26aaModChargeCnnLstmAttnSum {
     }
 
     pub fn forward(&self, aa_indices: &Tensor, mod_x: &Tensor, charges: &Tensor) -> Result<Tensor> {
-
         let mod_x = self.mod_nn.forward(mod_x)?;
 
         let charges_repeated = charges.unsqueeze(1)?.repeat(&[1, mod_x.dim(1)?, 1])?;
         let additional_tensors: Vec<&Tensor> = vec![&mod_x, &charges_repeated];
-        
+
         let x = aa_one_hot(&aa_indices, &additional_tensors)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         let (mean, min, max) = get_tensor_stats(&x)?;
-        log::trace!("[Encoder26aaModChargeCnnLstmAttnSum] one-hot output stats - min: {min}, max: {max}, mean: {mean}");
+        log::trace!(
+            "[Encoder26aaModChargeCnnLstmAttnSum] one-hot output stats - min: {min}, max: {max}, mean: {mean}"
+        );
 
         let x = self.input_cnn.forward(&x)?;
 
@@ -941,7 +1290,6 @@ impl Encoder26aaModChargeCnnLstmAttnSum {
         Ok(x)
     }
 }
-
 
 /// Encode AAs (26 AA letters) and modifications using CNN + Transformer + AttentionSum.
 #[derive(Debug, Clone)]
@@ -984,10 +1332,34 @@ impl Encoder26aaModCnnTransformerAttnSum {
                 names_input_cnn_weight,
                 names_input_cnn_bias,
             )?,
-            proj_cnn_to_transformer: candle_nn::Linear::new(
-                varstore.get((hidden_dim, input_dim * 4), "proj_cnn_to_transformer.weight")?,
-                None,
-            ),
+            // Retrieve the raw weight tensor from the varstore so we can both
+            // construct the Linear module and optionally retain a clone for
+            // in-process diagnostic dot-product checks.
+            // Diagnostic probe: attempt multiple get() variants at this exact
+            // call-site (local name, qualified name, and scoped pp(transformer_pp))
+            // and write their results to separate files so we can see what the
+            // encoder actually resolves at runtime.
+            proj_cnn_to_transformer: {
+                // Try local name first; if not present in this varstore scope,
+                // fall back to a qualified name derived from the transformer
+                // prefix (e.g. "rt_encoder.proj_cnn_to_transformer.weight").
+
+                let w = match varstore.get(
+                    (hidden_dim, input_dim * 4),
+                    "proj_cnn_to_transformer.weight",
+                ) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        let prefix = transformer_pp.split('.').next().unwrap_or(transformer_pp);
+                        let qualified = format!("{}.proj_cnn_to_transformer.weight", prefix);
+                        varstore.get((hidden_dim, input_dim * 4), &qualified)?
+                    }
+                };
+
+                let lin = candle_nn::Linear::new(w.clone(), None);
+
+                lin
+            },
             input_transformer: SeqTransformer::from_varstore(
                 varstore.pp(transformer_pp).clone(),
                 input_dim * 4,
@@ -1021,9 +1393,17 @@ impl Encoder26aaModCnnTransformerAttnSum {
     ) -> Result<Self> {
         let input_dim = AA_EMBEDDING_SIZE + mod_hidden_dim;
         Ok(Self {
-            mod_nn: ModEmbeddingFixFirstK::new(MOD_FEATURE_SIZE, mod_hidden_dim, &varbuilder.pp("mod_nn"))?,
+            mod_nn: ModEmbeddingFixFirstK::new(
+                MOD_FEATURE_SIZE,
+                mod_hidden_dim,
+                &varbuilder.pp("mod_nn"),
+            )?,
             input_cnn: SeqCNN::new(input_dim, &varbuilder.pp("input_cnn"))?,
-            proj_cnn_to_transformer: candle_nn::linear_no_bias(input_dim * 4, hidden_dim, varbuilder.pp("proj_cnn_to_transformer"))?,
+            proj_cnn_to_transformer: candle_nn::linear_no_bias(
+                input_dim * 4,
+                hidden_dim,
+                varbuilder.pp("proj_cnn_to_transformer"),
+            )?,
             input_transformer: SeqTransformer::new(
                 &varbuilder.pp("input_transformer"),
                 input_dim * 4,
@@ -1051,9 +1431,14 @@ impl Encoder26aaModCnnTransformerAttnSum {
         // log::trace!("[Encoder26aaModCnnTransformerAttnSum] one-hot output stats - min: {min}, max: {max}, mean: {mean}");
 
         if !mean.is_finite() || !min.is_finite() || !max.is_finite() {
-            log::error!("ERROR [Encoder26aaModCnnTransformerAttnSum] aa_one_hot produced non-finite tensor stats: mean={mean}, min={min}, max={max}");
+            log::error!(
+                "ERROR [Encoder26aaModCnnTransformerAttnSum] aa_one_hot produced non-finite tensor stats: mean={mean}, min={min}, max={max}"
+            );
             candle_core::bail!("ERROR: Non-finite values found in peptide encoding output.");
         }
+
+        let zero = Tensor::zeros(aa_indices.shape(), aa_indices.dtype(), aa_indices.device())?;
+        let padding_mask = aa_indices.eq(&zero)?.to_dtype(candle_core::DType::F32)?;
 
         let x = self.input_cnn.forward(&x)?;
         let x = x.contiguous()?;
@@ -1061,14 +1446,19 @@ impl Encoder26aaModCnnTransformerAttnSum {
         let x = self.proj_cnn_to_transformer.forward(&x)?;
         let x = x.contiguous()?;
 
-        let x = self.input_transformer.forward(&x)?;
+        let x = self
+            .input_transformer
+            .forward_with_mask(&x, Some(&padding_mask))?;
         let x = x.contiguous()?;
         let x = self.attn_sum.forward(&x)?;
 
         Ok(x)
     }
-}
 
+    pub fn set_training(&mut self, training: bool) {
+        self.input_transformer.set_training(training);
+    }
+}
 
 /// Encode AAs (26 AA letters), modifications and Charge state using CNN + Transformer + AttentionSum.
 #[derive(Debug, Clone)]
@@ -1111,9 +1501,23 @@ impl Encoder26aaModChargeCnnTransformerAttnSum {
                 names_input_cnn_weight,
                 names_input_cnn_bias,
             )?,
-            proj_cnn_to_transformer: candle_nn::Linear::new(
-                varstore.get((hidden_dim, input_dim * 4), "proj_cnn_to_transformer.weight")?,
-                None),            
+            proj_cnn_to_transformer: {
+                // Try local name first; if not present in this varstore scope,
+                // fall back to a qualified name derived from the transformer
+                // prefix (e.g. "rt_encoder.proj_cnn_to_transformer.weight").
+                let w = match varstore.get(
+                    (hidden_dim, input_dim * 4),
+                    "proj_cnn_to_transformer.weight",
+                ) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        let prefix = transformer_pp.split('.').next().unwrap_or(transformer_pp);
+                        let qualified = format!("{}.proj_cnn_to_transformer.weight", prefix);
+                        varstore.get((hidden_dim, input_dim * 4), &qualified)?
+                    }
+                };
+                candle_nn::Linear::new(w.clone(), None)
+            },
             input_transformer: SeqTransformer::from_varstore(
                 varstore.pp(transformer_pp).clone(),
                 input_dim * 4,
@@ -1147,9 +1551,17 @@ impl Encoder26aaModChargeCnnTransformerAttnSum {
     ) -> Result<Self> {
         let input_dim = AA_EMBEDDING_SIZE + mod_hidden_dim + 1;
         Ok(Self {
-            mod_nn: ModEmbeddingFixFirstK::new(MOD_FEATURE_SIZE, mod_hidden_dim, &varbuilder.pp("mod_nn"))?,
+            mod_nn: ModEmbeddingFixFirstK::new(
+                MOD_FEATURE_SIZE,
+                mod_hidden_dim,
+                &varbuilder.pp("mod_nn"),
+            )?,
             input_cnn: SeqCNN::new(input_dim, &varbuilder.pp("input_cnn"))?,
-            proj_cnn_to_transformer: candle_nn::linear_no_bias(input_dim*4, hidden_dim, varbuilder.pp("proj_cnn_to_transformer"))?,
+            proj_cnn_to_transformer: candle_nn::linear_no_bias(
+                input_dim * 4,
+                hidden_dim,
+                varbuilder.pp("proj_cnn_to_transformer"),
+            )?,
             input_transformer: SeqTransformer::new(
                 &varbuilder.pp("input_transformer"),
                 input_dim * 4,
@@ -1175,17 +1587,27 @@ impl Encoder26aaModChargeCnnTransformerAttnSum {
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         let (mean, min, max) = get_tensor_stats(&x)?;
-        log::trace!("[Encoder26aaModChargeCnnTransformerAttnSum] one-hot output stats - min: {min}, max: {max}, mean: {mean}");
+        log::trace!(
+            "[Encoder26aaModChargeCnnTransformerAttnSum] one-hot output stats - min: {min}, max: {max}, mean: {mean}"
+        );
 
         let x = self.input_cnn.forward(&x)?;
         let x = x.contiguous()?;
+
         let x = self.proj_cnn_to_transformer.forward(&x)?;
         let x = x.contiguous()?;
+
         let x = self.input_transformer.forward(&x)?;
         let x = x.contiguous()?;
         let x = self.attn_sum.forward(&x)?;
 
         Ok(x)
+    }
+
+    /// Set training/eval mode for nested components (e.g., SeqTransformer)
+    /// so that dropout and other training-only behavior can be toggled.
+    pub fn set_training(&mut self, training: bool) {
+        self.input_transformer.set_training(training);
     }
 }
 

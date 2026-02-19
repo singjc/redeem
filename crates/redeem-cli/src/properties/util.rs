@@ -1,11 +1,17 @@
 use anyhow::Result;
-use std::{fs::File, io::Write, path::{Path, PathBuf}};
-
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 pub fn validate_tsv_or_csv_file(path: &str) -> Result<()> {
     let pb = PathBuf::from(path);
 
-    let ext = pb.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase());
+    let ext = pb
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
     match ext.as_deref() {
         Some("tsv") | Some("csv") => {}
         _ => anyhow::bail!("File must have a .tsv or .csv extension: {}", path),

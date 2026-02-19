@@ -1,11 +1,10 @@
+use anyhow::{Context, Result};
+use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use clap::ArgMatches;
-use anyhow::{Context, Result};
 
 use crate::properties::util::validate_tsv_or_csv_file;
-
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PropertyTrainConfig {
@@ -24,6 +23,14 @@ pub struct PropertyTrainConfig {
     pub checkpoint_file: Option<String>,
     pub instrument: String,
     pub nce: i32,
+    /// Which head to use for new untrained models: "linear", "mlp", or "small".
+    pub head_type: String,
+    /// If true and head_type == "small", enable the learnable scalar multiplier.
+    pub head_learnable_scaler: bool,
+    // Optional list of variable name prefixes to train (head-only training). Example: ["rt_decoder.nn."]
+    pub train_var_prefixes: Option<Vec<String>>,
+    /// Fraction of total steps used for LR warmup (0.0–1.0). Defaults to 0.12 if omitted.
+    pub warmup_fraction: Option<f32>,
 }
 
 impl Default for PropertyTrainConfig {
@@ -44,6 +51,10 @@ impl Default for PropertyTrainConfig {
             checkpoint_file: None,
             instrument: String::from("QE"),
             nce: 20,
+            train_var_prefixes: None,
+            head_type: String::from("mlp"),
+            head_learnable_scaler: false,
+            warmup_fraction: Some(0.12),
         }
     }
 }
@@ -64,13 +75,15 @@ impl PropertyTrainConfig {
                     } else {
                         log::warn!(
                             "Config Invalid value for '{}', using default: {:?}",
-                            stringify!($field), config.$field
+                            stringify!($field),
+                            config.$field
                         );
                     }
                 } else {
                     log::warn!(
                         "Config Missing field '{}', using default: {:?}",
-                        stringify!($field), config.$field
+                        stringify!($field),
+                        config.$field
                     );
                 }
             };
@@ -90,6 +103,10 @@ impl PropertyTrainConfig {
         load_or_default!(checkpoint_file);
         load_or_default!(instrument);
         load_or_default!(nce);
+        load_or_default!(head_type);
+        load_or_default!(head_learnable_scaler);
+        load_or_default!(train_var_prefixes);
+        load_or_default!(warmup_fraction);
 
         // Apply CLI overrides
         if let Some(train_data) = matches.get_one::<String>("train_data") {

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 redeem-properties = { path = "../redeem-properties" }
+redeem-classifiers = { path = "../redeem-classifiers" }
 env_logger = "0.11.8"
 log = "0.4"
 clap = { version="4.0", features = ["cargo", "unicode"] }
@@ -28,6 +29,13 @@ version = "0.8.4"
 default-features = false
 features = []
 
+[dependencies.candle-nn]
+version = "0.8.4"
+default-features = false
+features = []
+
 [features]
 default = []
 cuda = ["candle-core/cuda"]
+svm = ["redeem-classifiers/svm"]
+xgboost = ["redeem-classifiers/xgboost"]

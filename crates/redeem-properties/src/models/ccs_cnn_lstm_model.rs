@@ -154,7 +154,8 @@ impl ModelInterface for CCSCNNLSTMModel {
         let x = self
             .ccs_encoder
             .forward(&aa_indices_out, &mod_x_out, &charge_out)?;
-        let x = self.dropout.forward(&x, true)?;
+        // Respect training/eval mode when applying dropout.
+        let x = self.dropout.forward(&x, self.is_training)?;
         let x = Tensor::cat(&[x, charge_out], 1)?;
         let x = self.ccs_decoder.forward(&x)?;
 

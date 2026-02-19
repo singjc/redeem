@@ -1,30 +1,118 @@
-use linfa::dataset::Pr;
-use linfa::traits::Predict;
-use linfa::Dataset;
-use linfa_svm::SvmParams;
-use linfa_svm::Svm;
-use ndarray::{Array1, Array2};
+//! SVM classifier adapter (feature-gated).
+//!
+//! Wraps the `light-svm` crate to provide a `ClassifierModel` implementation
+//! with optional Platt calibration for probability estimates.
+use light_svm::{
+    calibration::PlattCalibrator,
+    data::{CsrMatrix, DenseMatrix as LightDenseMatrix},
+    svc::{ClassStrategy, DecisionScores, LinearSVC},
+};
 
-use crate::models::utils::{ModelParams, ModelType};
-use crate::psm_scorer::SemiSupervisedModel;
+use crate::config::{ModelConfig, ModelType};
+use crate::math::Array2;
+use crate::models::classifier_trait::ClassifierModel;
 
 pub struct SVMClassifier {
-    model: Option<Svm<f64, Pr>>,
-    params: ModelParams,
-    predictions: Option<linfa::DatasetBase<ndarray::ArrayBase<ndarray::OwnedRepr<f64>, ndarray::Dim<[usize; 2]>>, ndarray::ArrayBase<ndarray::OwnedRepr<Pr>, ndarray::Dim<[usize; 1]>>>>,
+    params: ModelConfig,
+    model: Option<LinearSVC>,
+    calibrator: Option<PlattCalibrator>,
+    n_features: Option<usize>,
 }
 
 impl SVMClassifier {
-    pub fn new(params: ModelParams) -> Self {
-        SVMClassifier {
-            model: None,
+    pub fn new(params: ModelConfig) -> Self {
+        Self {
             params,
-            predictions: None,
+            model: None,
+            calibrator: None,
+            n_features: None,
         }
+    }
+
+    fn build_model(&self) -> LinearSVC {
+        if let ModelType::SVM { eps, c, kernel, .. } = &self.params.model_type {
+            if kernel != "linear" {
+                log::warn!(
+                    "light-svm currently supports linear kernels; requested `{}` will be treated as linear",
+                    kernel
+                );
+            }
+            let mut params = light_svm::SvmParams::builder()
+                .solver(light_svm::solver::Solver::Dcd)
+                .tol(*eps as f32)
+                .max_epochs(200)
+                .fit_intercept(true)
+                .penalize_intercept(false)
+                .projection(false)
+                .build();
+            params.c_neg = Some(c.0 as f32);
+            params.c_pos = Some(c.1 as f32);
+
+            LinearSVC::builder()
+                .class_strategy(ClassStrategy::Binary)
+                .params(params)
+                .build()
+        } else {
+            panic!("SVMClassifier expected ModelType::SVM configuration");
+        }
+    }
+
+    fn dense_rows(x: &Array2<f32>) -> Vec<Vec<f32>> {
+        (0..x.nrows())
+            .map(|row| x.row_slice(row).to_vec())
+            .collect()
+    }
+
+    fn collect_scores(model: &LinearSVC, csr: &CsrMatrix) -> Vec<f32> {
+        match model.decision_function(csr) {
+            DecisionScores::Binary { scores, .. } => scores,
+            _ => panic!("Binary strategy expected for SVMClassifier"),
+        }
+    }
+
+    fn decision_scores(&self, x: &Array2<f32>) -> Vec<f32> {
+        let model = self.model.as_ref().expect("SVM model not trained");
+        let rows = Self::dense_rows(x);
+        let csr = CsrMatrix::from_dense(&rows, 0.0);
+        Self::collect_scores(model, &csr)
     }
 }
 
-impl SemiSupervisedModel for SVMClassifier {
+impl SVMClassifier {
+    pub fn fit(
+        &mut self,
+        x: &Array2<f32>,
+        y: &[i32],
+        _x_eval: Option<&Array2<f32>>,
+        _y_eval: Option<&[i32]>,
+    ) {
+        let labels: Vec<i32> = y.iter().map(|&val| if val == 1 { 1 } else { -1 }).collect();
+        self.n_features = Some(x.ncols());
+        let dense_rows = Self::dense_rows(x);
+        let dense_matrix = LightDenseMatrix::from_vec_rows(&dense_rows);
+
+        let mut model = self.build_model();
+        model.fit_dense(&dense_matrix, &labels);
+
+        self.model = Some(model);
+        self.calibrator = None;
+    }
+
+    pub fn predict(&self, x: &Array2<f32>) -> Vec<f32> {
+        self.decision_scores(x)
+            .into_iter()
+            .map(|score| if score >= 0.0 { 1.0 } else { 0.0 })
+            .collect()
+    }
+
+    pub fn predict_proba(&mut self, x: &Array2<f32>) -> Vec<f32> {
+        // Return raw decision scores; semi-supervised ranking should be based
+        // on margins rather than calibrated probabilities.
+        self.decision_scores(x)
+    }
+}
+
+impl ClassifierModel for SVMClassifier {
     fn fit(
         &mut self,
         x: &Array2<f32>,
@@ -32,152 +120,84 @@ impl SemiSupervisedModel for SVMClassifier {
         x_eval: Option<&Array2<f32>>,
         y_eval: Option<&[i32]>,
     ) {
-        // Convert y to [0, 1] for regular binary labels
-        // Note: we set targets (original 1) as 1 and decoys (original -1) as 0, so that the scores are positive for targets and negative for decoys
-        // TODO: this maybe should be done outside of the model
-        // let y = y.iter().map(|&l| if l == 1 { 1 } else { 0 }).collect::<Vec<i32>>();
-        // Convert y to [true, false] for binary classification
-        let y = y.iter().map(|&l| l == 1).collect::<Vec<bool>>();
-
-        // let y_eval = y_eval.map(|y_e| y_e.iter().map(|&l| if l == 1 { 1 } else { 0 }).collect::<Vec<i32>>());
-        // let y_eval = y_eval.map(|y_e| y_e.iter().map(|&l| l == 1).collect::<Vec<bool>>());
-
-        // Convert y and y_eval to ArrayBase<OwnedRepr<i32>, Dim<[usize; 1]>>
-        let y = Array1::from_vec(y);
-        // let y = CountedTargets::new(y);
-
-        // let y_eval = y_eval.map(|y_e| Array1::from_vec(y_e));
-
-        // Convert feature matrix from f32 to f64
-        let x_f64 = x.mapv(|v| v as f64);
-
-        // Convert feature matrix into Dataset
-        log::trace!("Preparing dataset...");
-        let dataset = Dataset::new(x_f64.to_owned(), y);
-
-        // Extract SVM parameters from ModelParams
-        if let ModelType::SVM {
-            eps,
-            c,
-            kernel,
-            gaussian_kernel_eps,
-            polynomial_kernel_constant,
-            polynomial_kernel_degree,
-        } = &self.params.model_type
-        {
-            let (c1, c2) = *c;
-            let eps = *eps;
-            let kernel = kernel.clone();
-
-            let mut model: SvmParams<f64, Pr> =
-                Svm::<f64, Pr>::params().eps(eps).pos_neg_weights(c1, c2);
-
-            // Chain the kernel configuration based on the kernel type
-            model = match kernel.as_str() {
-                "linear" => model.linear_kernel(),
-                "gauss" => model.gaussian_kernel(*gaussian_kernel_eps),
-                "poly" => model.polynomial_kernel(*polynomial_kernel_constant, *polynomial_kernel_degree),
-                _ => {
-                    eprintln!("Error: Unsupported kernel type: {}. Valid options are: linear, gauss, poly", kernel);
-                    return; // Exit early if the kernel type is unsupported
-                }
-            };
-
-            // Fit the model
-            log::trace!("Fitting model...");
-            self.model = Some(<SvmParams<f64, Pr> as linfa::traits::Fit<_, _, _>>::fit(&model, &dataset).unwrap());
-            log::trace!("Model fitted successfully.");
-        } else {
-            eprintln!("Error: Expected ModelType::SVM but got another type.");
-        }
+        SVMClassifier::fit(self, x, y, x_eval, y_eval)
     }
 
     fn predict(&self, x: &Array2<f32>) -> Vec<f32> {
-        todo!()
+        SVMClassifier::predict(self, x)
     }
 
     fn predict_proba(&mut self, x: &Array2<f32>) -> Vec<f32> {
-        // Convert feature matrix from f32 to f64
-        let x_f64 = x.mapv(|v| v as f64);
-        let predictions = self.model.as_ref().unwrap().predict(x_f64);
-        self.predictions = Some(predictions.clone());
-        // let tmp = predictions.records();
-        let tmp: Vec<Pr> = predictions.targets().to_vec();
-        // Convert predictions from ArrayBase<OwnedRepr<f64>, Dim<[usize; 1]>> to Vec<f32>
-        tmp.iter().map(|&v| *v).collect::<Vec<f32>>()
+        SVMClassifier::predict_proba(self, x)
+    }
+
+    fn clone_box(&self) -> Box<dyn ClassifierModel> {
+        Box::new(SVMClassifier::new(self.params.clone()))
+    }
+
+    fn feature_weights(&self) -> Option<Vec<f32>> {
+        let model = self.model.as_ref()?;
+        let n_features = self.n_features?;
+        if n_features == 0 {
+            return None;
+        }
+
+        let mut basis: Vec<Vec<f32>> = Vec::with_capacity(n_features + 1);
+        basis.push(vec![0.0; n_features]);
+        for idx in 0..n_features {
+            let mut row = vec![0.0; n_features];
+            row[idx] = 1.0;
+            basis.push(row);
+        }
+
+        let csr = CsrMatrix::from_dense(&basis, 0.0);
+        let scores = Self::collect_scores(model, &csr);
+        if scores.len() != n_features + 1 {
+            return None;
+        }
+
+        let bias = scores[0];
+        let weights = scores[1..]
+            .iter()
+            .map(|score| score - bias)
+            .collect::<Vec<f32>>();
+        Some(weights)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use linfa::DatasetBase;
-    use linfa::metrics::ToConfusionMatrix;
-    use ndarray::{Array1, Array2};
+    use crate::math::{Array1, Array2};
 
     #[test]
-    fn test_svm_classifier() {
-        // Create a feature matrix with 5 features and 10 samples
+    fn test_svm_classifier_linear() {
         let x = Array2::from_shape_vec(
-            (10, 5),
+            (6, 2),
             vec![
-                0.1, 1.0, 5.0, 0.2, -0.3, 0.4, -1.0, 5.0, 0.8, 0.1, 0.6, 1.0, 5.0, 1.2, 0.2, 0.9,
-                -1.0, 5.0, 1.8, -0.1, 1.2, 1.0, 5.0, 2.4, 0.3, 1.5, -1.0, 5.0, 3.0, 0.0, 1.8, 1.0,
-                5.0, 3.6, -0.2, 2.1, -1.0, 5.0, 4.2, 0.4, 2.4, 1.0, 5.0, 4.8, -0.1, 2.7, -1.0, 5.0,
-                5.4, 0.2,
+                0.0, 0.0, 1.0, 1.1, 2.0, 1.9, 3.0, 3.0, -1.0, -1.1, -2.0, -2.0,
             ],
         )
         .unwrap();
+        let y = Array1::from_vec(vec![1, 1, 1, 1, -1, -1]);
 
-        // Create a target vector perfectly correlated with the second feature
-        let y = Array1::from_vec(vec![
-            1i32, -1i32, 1i32, -1i32, 1i32, -1i32, 1i32, -1i32, 1i32, -1i32,
-        ]);
-
-        // Convert y to [0, 1]
-        let y = y.mapv(|x| if x == 1 { 0 } else { 1 });
-
-        println!("y.to_vec(): {:?}", y.to_vec());
-
-        // Create SVM parameters
-        let params = ModelParams {
-            learning_rate: 0.001,
+        let params = ModelConfig {
+            learning_rate: 0.01,
             model_type: ModelType::SVM {
-                eps: 0.0000001,
+                eps: 1e-4,
                 c: (1.0, 1.0),
                 kernel: "linear".to_string(),
-                gaussian_kernel_eps: 0.1,
-                polynomial_kernel_constant: 1.0,
-                polynomial_kernel_degree: 1.0,
+                gaussian_kernel_eps: 0.0,
+                polynomial_kernel_constant: 0.0,
+                polynomial_kernel_degree: 0.0,
             },
         };
 
-        // Initialize the SVM classifier
         let mut classifier = SVMClassifier::new(params);
+        classifier.fit(&x, y.as_slice(), None, None);
+        let probs = classifier.predict_proba(&x);
 
-        // Fit the classifier
-        classifier.fit(&x, &y.to_vec(), None, None);
-
-        // Make predictions
-        let predictions = classifier.predict_proba(&x);
-
-        println!("Predictions: {:?}", predictions);
-
-        // Convert predictions to Array1<bool> (binary classification)
-        // Convert predictions (Vec<f32>) to Array1<f32>
-        let preds = Array1::from_vec(predictions).mapv(|x| x > 0.5);
-
-        // Convert ground truth to Array1<bool>
-        let y = y.mapv(|x| x != 0);
-
-        // Create a DatasetBase for ground truth
-        let ground_truth = DatasetBase::new(x.clone(), y);
-
-        // Compute the confusion matrix using fully qualified syntax
-        let cm = <Array1<bool> as ToConfusionMatrix<bool, _>>::confusion_matrix(&preds, &ground_truth).unwrap();
-
-        println!("Confusion Matrix: {:?}", cm);
-
-        println!("accuracy {}, MCC {}", cm.accuracy(), cm.mcc());
+        assert_eq!(probs.len(), x.nrows());
+        assert!(probs.iter().all(|p| *p >= 0.0 && *p <= 1.0));
     }
 }
