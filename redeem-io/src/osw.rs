@@ -61,7 +61,7 @@ pub struct OswFeatureTable {
 
 #[cfg(feature = "sqlite")]
 pub fn read_feature_rows(path: &std::path::Path, cfg: &OswReadConfig) -> Result<OswFeatureTable> {
-    use rusqlite::{Connection, Row};
+    use rusqlite::Connection;
 
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
@@ -86,7 +86,7 @@ pub fn write_score_table(
 ) -> Result<()> {
     use rusqlite::{params, Connection};
 
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     let ddl = format!(
         "CREATE TABLE IF NOT EXISTS {table} (
             FEATURE_ID INTEGER PRIMARY KEY,
@@ -103,9 +103,11 @@ pub fn write_score_table(
         "INSERT OR REPLACE INTO {table} (FEATURE_ID, SCORE, RANK, PVALUE, QVALUE, PEP)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
     );
-    let mut stmt = tx.prepare(&sql)?;
-    for r in rows {
-        stmt.execute(params![r.feature_id, r.score, r.rank, r.pvalue, r.qvalue, r.pep])?;
+    {
+        let mut stmt = tx.prepare(&sql)?;
+        for r in rows {
+            stmt.execute(params![r.feature_id, r.score, r.rank, r.pvalue, r.qvalue, r.pep])?;
+        }
     }
     tx.commit()?;
     Ok(())
@@ -129,16 +131,59 @@ fn list_var_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<Stri
 }
 
 #[cfg(feature = "sqlite")]
+fn get_f32_or_zero(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<f32> {
+    let v: Option<f32> = row.get(idx)?;
+    Ok(v.unwrap_or(0.0))
+}
+
+#[cfg(feature = "sqlite")]
+fn filter_all_null_columns(
+    conn: &rusqlite::Connection,
+    table: &str,
+    cols: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut keep = Vec::new();
+    let mut dropped = Vec::new();
+    for c in cols {
+        let sql = format!("SELECT 1 FROM {table} WHERE {c} IS NOT NULL LIMIT 1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        if rows.next()?.is_some() {
+            keep.push(c);
+        } else {
+            dropped.push(c);
+        }
+    }
+    Ok((keep, dropped))
+}
+
+#[cfg(feature = "sqlite")]
 fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result<OswFeatureTable> {
     use rusqlite::Row;
 
     let mut feature_cols = list_var_columns(conn, "FEATURE_MS2")?;
     feature_cols.sort();
+    let (feature_cols, dropped_ms2) =
+        filter_all_null_columns(conn, "FEATURE_MS2", feature_cols)?;
+    if !dropped_ms2.is_empty() {
+        eprintln!(
+            "warning: dropping all-NULL FEATURE_MS2 columns: {}",
+            dropped_ms2.join(", ")
+        );
+    }
 
     let mut ms1_cols: Vec<String> = Vec::new();
     if cfg.level == OswLevel::Ms1Ms2 {
         ms1_cols = list_var_columns(conn, "FEATURE_MS1")?;
         ms1_cols.sort();
+        let (kept, dropped) = filter_all_null_columns(conn, "FEATURE_MS1", ms1_cols)?;
+        if !dropped.is_empty() {
+            eprintln!(
+                "warning: dropping all-NULL FEATURE_MS1 columns: {}",
+                dropped.join(", ")
+            );
+        }
+        ms1_cols = kept;
     }
 
     let mut select_cols: Vec<String> = Vec::new();
@@ -184,13 +229,13 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
         let mut feats = Vec::new();
 
         for _ in 0..feature_cols.len() {
-            let v: f32 = row.get(idx)?;
+            let v = get_f32_or_zero(row, idx)?;
             feats.push(v);
             idx += 1;
         }
         if cfg.level == OswLevel::Ms1Ms2 {
             for _ in 0..ms1_cols.len() {
-                let v: f32 = row.get(idx)?;
+                let v = get_f32_or_zero(row, idx)?;
                 feats.push(v);
                 idx += 1;
             }
@@ -225,11 +270,18 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
 }
 
 #[cfg(feature = "sqlite")]
-fn read_ms1_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result<OswFeatureTable> {
+fn read_ms1_features(conn: &rusqlite::Connection, _cfg: &OswReadConfig) -> Result<OswFeatureTable> {
     use rusqlite::Row;
 
     let mut feature_cols = list_var_columns(conn, "FEATURE_MS1")?;
     feature_cols.sort();
+    let (feature_cols, dropped) = filter_all_null_columns(conn, "FEATURE_MS1", feature_cols)?;
+    if !dropped.is_empty() {
+        eprintln!(
+            "warning: dropping all-NULL FEATURE_MS1 columns: {}",
+            dropped.join(", ")
+        );
+    }
 
     let mut select_cols: Vec<String> = Vec::new();
     select_cols.push("fm.FEATURE_ID".to_string());
@@ -261,7 +313,7 @@ fn read_ms1_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
         let mut idx = 5usize;
         let mut feats = Vec::new();
         for _ in 0..feature_cols.len() {
-            let v: f32 = row.get(idx)?;
+            let v = get_f32_or_zero(row, idx)?;
             feats.push(v);
             idx += 1;
         }
@@ -296,6 +348,14 @@ fn read_transition_features(
 
     let mut feature_cols = list_var_columns(conn, "FEATURE_TRANSITION")?;
     feature_cols.sort();
+    let (feature_cols, dropped) =
+        filter_all_null_columns(conn, "FEATURE_TRANSITION", feature_cols)?;
+    if !dropped.is_empty() {
+        eprintln!(
+            "warning: dropping all-NULL FEATURE_TRANSITION columns: {}",
+            dropped.join(", ")
+        );
+    }
 
     let mut select_cols: Vec<String> = Vec::new();
     select_cols.push("ft.FEATURE_ID".to_string());
@@ -340,7 +400,7 @@ fn read_transition_features(
         let mut idx = 6usize;
         let mut feats = Vec::new();
         for _ in 0..feature_cols.len() {
-            let v: f32 = row.get(idx)?;
+            let v = get_f32_or_zero(row, idx)?;
             feats.push(v);
             idx += 1;
         }
