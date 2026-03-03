@@ -1,0 +1,32 @@
+[package]
+name = "redeem-topaz"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true, optional = true }
+
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+redeem-io = { path = "../redeem-io", default-features = false }
+
+[features]
+default = ["xrun"]
+
+# modules
+xrun = []
+diagnostics = []
+
+# CPU preprocessing parallelism (trace building / bagging)
+rayon = ["dep:rayon"]
+
+# keep heavy IO out of this crate (reserve for redeem-io)
+io-sqlite = ["redeem-io/sqlite"]
+io-parquet = ["redeem-io/parquet"]
+
+# enable CUDA backend for candle
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
