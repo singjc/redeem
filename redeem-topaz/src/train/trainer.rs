@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::model::topaz::{TopazBagRanker, TopazConfig};
+use crate::train::scheduler::CosineWarmupScheduler;
 use crate::train::losses;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{self as nn, optim::AdamW, Optimizer, VarBuilder, VarMap};
@@ -141,6 +142,39 @@ impl Trainer {
         let mut out = Vec::with_capacity(batches.len());
         for batch in batches {
             out.push(self.train_step(batch)?);
+        }
+        Ok(out)
+    }
+
+    /// Train for multiple epochs with optional cosine warmup scheduler.
+    pub fn train_epochs(
+        &mut self,
+        batches: &[TrainBatch],
+        max_epochs: usize,
+        scheduler: Option<&CosineWarmupScheduler>,
+    ) -> Result<Vec<TrainMetrics>> {
+        let mut out = Vec::new();
+        let mut step = 0usize;
+        let total_steps = max_epochs.max(1) * batches.len().max(1);
+        let sched = scheduler.cloned().unwrap_or_else(|| {
+            CosineWarmupScheduler::new(
+                self.config.learning_rate as f64,
+                total_steps,
+                self.config.warmup_frac as f64,
+                self.config.warmup_steps,
+                self.config.min_lr_ratio as f64,
+            )
+        });
+
+        for _epoch in 0..max_epochs.max(1) {
+            for batch in batches {
+                if self.config.use_lr_scheduler {
+                    let lr = sched.lr_at_step(step);
+                    self.opt.set_learning_rate(lr);
+                }
+                out.push(self.train_step(batch)?);
+                step += 1;
+            }
         }
         Ok(out)
     }
