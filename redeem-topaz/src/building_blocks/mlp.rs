@@ -19,6 +19,7 @@ pub struct CandidateScorer {
     feat_dim_used: usize,
     body: nn::Sequential,
     head: nn::Linear,
+    hidden_dim: usize,
 }
 
 impl CandidateScorer {
@@ -44,7 +45,7 @@ impl CandidateScorer {
         }
         let head = nn::linear(d, 1, vb.pp("head"))?;
 
-        Ok(Self { use_features, feat_dim_used, body: seq, head })
+        Ok(Self { use_features, feat_dim_used, body: seq, head, hidden_dim: d })
     }
 
     pub fn penultimate(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<Tensor> {
@@ -55,6 +56,17 @@ impl CandidateScorer {
     pub fn forward(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<Tensor> {
         let h = self.penultimate(feat, emb, coe)?;
         h.apply(&self.head)?.squeeze(1)
+    }
+
+    /// Return (logits, hidden) where hidden is the penultimate layer.
+    pub fn forward_with_hidden(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<(Tensor, Tensor)> {
+        let h = self.penultimate(feat, emb, coe)?;
+        let logits = h.apply(&self.head)?.squeeze(1)?;
+        Ok((logits, h))
+    }
+
+    pub fn hidden_dim(&self) -> usize {
+        self.hidden_dim
     }
 
     fn concat_input(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<Tensor> {

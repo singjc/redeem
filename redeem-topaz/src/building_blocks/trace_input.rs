@@ -1,8 +1,9 @@
 // redeem-topaz/src/building_blocks/trace_input.rs
 
 use candle_core::{Result, Tensor};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceInputMode {
     Single,
     Dual,
