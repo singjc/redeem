@@ -1,0 +1,17 @@
+[package]
+name = "redeem-io"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+rusqlite = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+parquet = ["dep:parquet", "dep:flate2"]
