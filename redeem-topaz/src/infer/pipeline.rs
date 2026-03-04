@@ -793,6 +793,121 @@ pub fn build_trace_tensors_from_parquet(
     build_trace_tensors_from_source(rows, &mut reader, cfg)
 }
 
+#[cfg(feature = "io-parquet")]
+pub fn build_trace_tensors_from_parquet_map(
+    rows: &[FeatureRow],
+    xic_map: &HashMap<u64, std::path::PathBuf>,
+    cfg: &TraceBuildConfig,
+    fetch_cfg: &XicFetchConfig,
+) -> Result<Vec<f32>> {
+    let n = rows.len();
+    let c_total = cfg.total_c();
+    let mut out = vec![0f32; n * c_total * cfg.l];
+    if n == 0 || c_total == 0 || cfg.l == 0 {
+        return Ok(out);
+    }
+
+    let mut by_run: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for row in rows {
+        by_run
+            .entry(row.run_id)
+            .or_default()
+            .insert(row.precursor_id);
+    }
+
+    let mut run_to_path: HashMap<u64, std::path::PathBuf> = HashMap::new();
+    let mut path_to_prec: HashMap<std::path::PathBuf, HashSet<u64>> = HashMap::new();
+    let mut missing_runs = Vec::new();
+    for (run_id, precs) in by_run {
+        if let Some(path) = xic_map.get(&run_id) {
+            run_to_path.insert(run_id, path.clone());
+            path_to_prec
+                .entry(path.clone())
+                .or_default()
+                .extend(precs);
+        } else {
+            missing_runs.push(run_id);
+        }
+    }
+    if !missing_runs.is_empty() {
+        missing_runs.sort_unstable();
+        missing_runs.dedup();
+        log::warn!(
+            "XIC map is missing {} run_ids (will leave traces zeroed): {:?}",
+            missing_runs.len(),
+            missing_runs
+        );
+    }
+
+    let mut xic_by_path: HashMap<std::path::PathBuf, HashMap<u64, PrecursorXic>> = HashMap::new();
+    for (path, prec_set) in path_to_prec {
+        if prec_set.is_empty() {
+            continue;
+        }
+        let mut reader = crate::io::xic_parquet::XicParquetReader::new(&path);
+        if let Some(levels) = &fetch_cfg.ms_levels {
+            reader.filter_ms_level(levels.clone());
+        }
+        if let Some(flag) = fetch_cfg.detecting_transition {
+            reader.filter_detecting_transition(flag);
+        }
+        if let Some(flag) = fetch_cfg.decoy {
+            reader.filter_decoy(flag);
+        }
+        reader.filter_precursor_id(prec_set.iter().copied());
+        let fetched = reader.fetch()?;
+        let mut map: HashMap<u64, PrecursorXic> = HashMap::new();
+        for xic in fetched {
+            map.insert(xic.precursor_id, xic);
+        }
+        xic_by_path.insert(path, map);
+    }
+
+    for (i, row) in rows.iter().enumerate() {
+        let mut trace_row = vec![0f32; c_total * cfg.l];
+        if let Some(path) = run_to_path.get(&row.run_id) {
+            if let Some(run_map) = xic_by_path.get(path) {
+                if let Some(xic) = run_map.get(&row.precursor_id) {
+                    let (ms1_series, ms2_series) = split_ms1_ms2(xic);
+
+                    let mut offset = 0usize;
+                    if cfg.ms1_cmax > 0 {
+                        if ms1_series.is_empty()
+                            && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed)
+                        {
+                            log::warn!(
+                                "missing MS1 traces for at least one precursor; padding zeros"
+                            );
+                        }
+                        let t_ms1 = extract_trace_tensor_centered(
+                            &ms1_series,
+                            row.exp_rt,
+                            cfg.l,
+                            cfg.ms1_cmax,
+                            cfg.normalize_max,
+                        );
+                        trace_row[offset..offset + cfg.ms1_cmax * cfg.l].copy_from_slice(&t_ms1);
+                        offset += cfg.ms1_cmax * cfg.l;
+                    }
+                    let t_ms2 = extract_trace_tensor_centered(
+                        &ms2_series,
+                        row.exp_rt,
+                        cfg.l,
+                        cfg.ms2_cmax,
+                        cfg.normalize_max,
+                    );
+                    trace_row[offset..offset + cfg.ms2_cmax * cfg.l].copy_from_slice(&t_ms2);
+                }
+            }
+        }
+
+        let dst = i * c_total * cfg.l;
+        out[dst..dst + c_total * cfg.l].copy_from_slice(&trace_row);
+    }
+
+    Ok(out)
+}
+
 #[cfg(feature = "io-sqlite")]
 pub fn read_osw_features(
     path: &Path,

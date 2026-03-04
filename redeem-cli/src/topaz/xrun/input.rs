@@ -29,6 +29,9 @@ impl TopazXrunSweepConfig {
         if let Some(p) = matches.get_one::<PathBuf>("xic_path") {
             cfg.inner.xic_path = p.clone();
         }
+        if let Some(p) = matches.get_one::<PathBuf>("xic_map_path") {
+            cfg.inner.xic_map_path = Some(p.clone());
+        }
         if let Some(p) = matches.get_one::<PathBuf>("checkpoint") {
             cfg.inner.checkpoint = p.clone();
         }

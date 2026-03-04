@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use candle_core::Device;
 
@@ -20,6 +20,7 @@ use crate::checkpoint::save_checkpoint;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::{
     build_trace_tensors_from_parquet,
+    build_trace_tensors_from_parquet_map,
     build_score_table_from_rows,
     score_candidates,
     score_bags_from_rows_with_cols,
@@ -127,6 +128,7 @@ impl Default for FeatureSelectConfig {
 pub struct TrainRunConfig {
     pub osw_path: PathBuf,
     pub xic_path: PathBuf,
+    pub xic_map_path: Option<PathBuf>,
     pub output_prefix: PathBuf,
     pub device: String,
     pub bag_k: usize,
@@ -152,6 +154,7 @@ impl Default for TrainRunConfig {
         Self {
             osw_path: PathBuf::new(),
             xic_path: PathBuf::new(),
+            xic_map_path: None,
             output_prefix: PathBuf::from("topaz_checkpoint"),
             device: "cpu".to_string(),
             bag_k: 5,
@@ -184,6 +187,7 @@ impl Default for TrainRunConfig {
 pub struct InferRunConfig {
     pub osw_path: PathBuf,
     pub xic_path: PathBuf,
+    pub xic_map_path: Option<PathBuf>,
     pub checkpoint: PathBuf,
     pub output_tsv: PathBuf,
     pub output_osw: Option<PathBuf>,
@@ -204,6 +208,7 @@ impl Default for InferRunConfig {
         Self {
             osw_path: PathBuf::new(),
             xic_path: PathBuf::new(),
+            xic_map_path: None,
             checkpoint: PathBuf::from("topaz_checkpoint"),
             output_tsv: PathBuf::from("score_topaz.tsv"),
             output_osw: None,
@@ -241,6 +246,7 @@ pub struct InferRunOutput {
 pub struct XrunSweepConfig {
     pub osw_path: PathBuf,
     pub xic_path: PathBuf,
+    pub xic_map_path: Option<PathBuf>,
     pub checkpoint: PathBuf,
     pub output_tsv: PathBuf,
     pub device: String,
@@ -264,6 +270,7 @@ impl Default for XrunSweepConfig {
         Self {
             osw_path: PathBuf::new(),
             xic_path: PathBuf::new(),
+            xic_map_path: None,
             checkpoint: PathBuf::from("topaz_checkpoint"),
             output_tsv: PathBuf::from("xrun_sweep.tsv"),
             device: "cpu".to_string(),
@@ -425,6 +432,56 @@ fn log_run_id_summary(rows: &[FeatureRow], xic_path: &Path) {
         Err(e) => {
             log::warn!("Failed to read XIC run_ids: {e:#}");
         }
+    }
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read xic_map: {path:?}"))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut map: HashMap<u64, PathBuf> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        if first.eq_ignore_ascii_case("run_id") {
+            continue;
+        }
+        let run_id: u64 = match first.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(path_str) = parts.next() else { continue; };
+        let mut p = PathBuf::from(path_str);
+        if p.is_relative() {
+            p = base.join(p);
+        }
+        map.insert(run_id, p);
+    }
+    if map.is_empty() {
+        bail!("xic_map has no usable entries: {path:?}");
+    }
+    Ok(map)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn build_traces_for_rows(
+    rows: &[FeatureRow],
+    xic_path: &Path,
+    xic_map_path: &Option<PathBuf>,
+    trace: &TraceBuildConfig,
+    fetch: &XicFetchConfig,
+) -> Result<Vec<f32>> {
+    if let Some(map_path) = xic_map_path {
+        let map = read_xic_map(map_path)?;
+        log::info!("Using XIC map with {} entries from {:?}", map.len(), map_path);
+        build_trace_tensors_from_parquet_map(rows, &map, trace, fetch)
+    } else {
+        build_trace_tensors_from_parquet(rows, xic_path, trace, fetch)
     }
 }
 
@@ -606,11 +663,23 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
             bail!("no rows after train subsample");
         }
     }
-    let x_tr = build_trace_tensors_from_parquet(&rows_tr, &cfg.xic_path, &cfg.trace, &cfg.fetch)?;
+    let x_tr = build_traces_for_rows(
+        &rows_tr,
+        &cfg.xic_path,
+        &cfg.xic_map_path,
+        &cfg.trace,
+        &cfg.fetch,
+    )?;
     let x_va = if rows_va.is_empty() {
         Vec::new()
     } else {
-        build_trace_tensors_from_parquet(&rows_va, &cfg.xic_path, &cfg.trace, &cfg.fetch)?
+        build_traces_for_rows(
+            &rows_va,
+            &cfg.xic_path,
+            &cfg.xic_map_path,
+            &cfg.trace,
+            &cfg.fetch,
+        )?
     };
 
     let (rows_tr, x_tr) = if cfg.restrict_osw_to_xic_map {
@@ -747,7 +816,13 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     }
     log_run_id_summary(&rows, &cfg.xic_path);
 
-    let mut x_trace = build_trace_tensors_from_parquet(&rows, &cfg.xic_path, &cfg.trace, &cfg.fetch)?;
+    let mut x_trace = build_traces_for_rows(
+        &rows,
+        &cfg.xic_path,
+        &cfg.xic_map_path,
+        &cfg.trace,
+        &cfg.fetch,
+    )?;
     if cfg.restrict_osw_to_xic_map {
         let filtered = filter_rows_by_trace(rows, x_trace, cfg.trace.total_c(), cfg.trace.l);
         rows = filtered.0;
@@ -874,7 +949,13 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     };
     log_run_id_summary(&rows_aligned, &cfg.xic_path);
 
-    let x_trace = build_trace_tensors_from_parquet(&rows_aligned, &cfg.xic_path, &cfg.trace, &cfg.fetch)?;
+    let x_trace = build_traces_for_rows(
+        &rows_aligned,
+        &cfg.xic_path,
+        &cfg.xic_map_path,
+        &cfg.trace,
+        &cfg.fetch,
+    )?;
     let (rows_aligned, x_trace) = if cfg.restrict_osw_to_xic_map {
         filter_rows_by_trace(rows_aligned, x_trace, cfg.trace.total_c(), cfg.trace.l)
     } else {

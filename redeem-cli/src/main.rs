@@ -241,6 +241,13 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("xic_map_path")
+                                .long("xic-map")
+                                .help("Optional TSV mapping OSW run_id -> XIC parquet path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
                             Arg::new("output_prefix")
                                 .long("output")
                                 .value_parser(clap::value_parser!(PathBuf))
@@ -332,6 +339,13 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("xic_map_path")
+                                .long("xic-map")
+                                .help("Optional TSV mapping OSW run_id -> XIC parquet path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
                             Arg::new("checkpoint")
                                 .long("checkpoint")
                                 .value_parser(clap::value_parser!(PathBuf))
@@ -390,6 +404,13 @@ fn main() -> Result<()> {
                         .arg(
                             Arg::new("xic_path")
                                 .long("xic")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_map_path")
+                                .long("xic-map")
+                                .help("Optional TSV mapping OSW run_id -> XIC parquet path")
                                 .value_parser(clap::value_parser!(PathBuf))
                                 .value_hint(ValueHint::FilePath),
                         )

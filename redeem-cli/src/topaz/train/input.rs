@@ -29,6 +29,9 @@ impl TopazTrainConfig {
         if let Some(p) = matches.get_one::<PathBuf>("xic_path") {
             cfg.inner.xic_path = p.clone();
         }
+        if let Some(p) = matches.get_one::<PathBuf>("xic_map_path") {
+            cfg.inner.xic_map_path = Some(p.clone());
+        }
         if let Some(p) = matches.get_one::<PathBuf>("output_prefix") {
             cfg.inner.output_prefix = p.clone();
         }
