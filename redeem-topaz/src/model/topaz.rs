@@ -5,6 +5,9 @@ use candle_nn::VarBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::building_blocks::trace_input::TraceInputMode;
+use crate::model_interface::{
+    BagRankerInterface, BagRankerWithHiddenInterface, CandidateScorerInterface, ModelInterface,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopazConfig {
@@ -128,6 +131,44 @@ impl TopazBagRanker {
         let win = win.broadcast_mul(&has.unsqueeze(1)?)?;
 
         Ok((cand, bag, win))
+    }
+}
+
+impl ModelInterface for TopazBagRanker {
+    type Config = TopazConfig;
+    type Input = (Tensor, Tensor, Tensor); // (xb, tb, mask)
+    type Output = (Tensor, Tensor); // (cand, bag)
+
+    fn new(vb: VarBuilder, cfg: &Self::Config) -> Result<Self> {
+        TopazBagRanker::new(vb, cfg)
+    }
+
+    fn forward(&self, input: &Self::Input) -> Result<Self::Output> {
+        self.forward_bags(&input.0, &input.1, &input.2)
+    }
+}
+
+impl CandidateScorerInterface for TopazBagRanker {
+    fn forward_candidates(&self, x_feat: &Tensor, x_trace: &Tensor) -> Result<Tensor> {
+        let (emb, coe) = self.trace_enc.forward(x_trace)?;
+        self.scorer.forward(x_feat, &emb, &coe)
+    }
+}
+
+impl BagRankerInterface for TopazBagRanker {
+    fn forward_bags(&self, xb: &Tensor, tb: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
+        TopazBagRanker::forward_bags(self, xb, tb, mask)
+    }
+}
+
+impl BagRankerWithHiddenInterface for TopazBagRanker {
+    fn forward_bags_with_hidden(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        TopazBagRanker::forward_bags_with_hidden(self, xb, tb, mask)
     }
 }
 

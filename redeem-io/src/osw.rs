@@ -131,9 +131,9 @@ fn list_var_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<Stri
 }
 
 #[cfg(feature = "sqlite")]
-fn get_f32_or_zero(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<f32> {
+fn get_f32_or_nan(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<f32> {
     let v: Option<f32> = row.get(idx)?;
-    Ok(v.unwrap_or(0.0))
+    Ok(v.unwrap_or(f32::NAN))
 }
 
 #[cfg(feature = "sqlite")]
@@ -229,13 +229,13 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
         let mut feats = Vec::new();
 
         for _ in 0..feature_cols.len() {
-            let v = get_f32_or_zero(row, idx)?;
+            let v = get_f32_or_nan(row, idx)?;
             feats.push(v);
             idx += 1;
         }
         if cfg.level == OswLevel::Ms1Ms2 {
             for _ in 0..ms1_cols.len() {
-                let v = get_f32_or_zero(row, idx)?;
+                let v = get_f32_or_nan(row, idx)?;
                 feats.push(v);
                 idx += 1;
             }
@@ -313,7 +313,7 @@ fn read_ms1_features(conn: &rusqlite::Connection, _cfg: &OswReadConfig) -> Resul
         let mut idx = 5usize;
         let mut feats = Vec::new();
         for _ in 0..feature_cols.len() {
-            let v = get_f32_or_zero(row, idx)?;
+            let v = get_f32_or_nan(row, idx)?;
             feats.push(v);
             idx += 1;
         }
@@ -400,7 +400,7 @@ fn read_transition_features(
         let mut idx = 6usize;
         let mut feats = Vec::new();
         for _ in 0..feature_cols.len() {
-            let v = get_f32_or_zero(row, idx)?;
+            let v = get_f32_or_nan(row, idx)?;
             feats.push(v);
             idx += 1;
         }

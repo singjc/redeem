@@ -1,34 +1,15 @@
-use candle_core::{DType, Result, Tensor};
+use candle_core::{Result, Tensor};
 
-use crate::model::topaz::TopazBagRanker;
+use crate::model_interface::CandidateScorerInterface;
 
 /// Scoring rows (candidates) in chunks.
 pub fn score_candidates(
-    model: &TopazBagRanker,
+    model: &impl CandidateScorerInterface,
     x_feat: &Tensor,  // (N,D)
     x_trace: &Tensor, // (N,C,L)
     batch_size: usize,
 ) -> Result<Tensor> {
-    let (n, _d) = x_feat.dims2()?;
-    let mut out: Vec<Tensor> = Vec::new();
-    let bs = batch_size.max(1);
-
-    let mut i = 0usize;
-    while i < n {
-        let take = (n - i).min(bs);
-        let xf = x_feat.narrow(0, i, take)?;
-        let tf = x_trace.narrow(0, i, take)?;
-        let (emb, coe) = model.trace_enc.forward(&tf)?;
-        let logits = model.scorer.forward(&xf, &emb, &coe)?;
-        out.push(logits);
-        i += take;
-    }
-
-    if out.is_empty() {
-        Tensor::zeros((0usize,), DType::F32, x_feat.device())
-    } else {
-        Tensor::cat(&out, 0)
-    }
+    model.score_candidates_chunked(x_feat, x_trace, batch_size)
 }
 
 pub struct ScoreRows;

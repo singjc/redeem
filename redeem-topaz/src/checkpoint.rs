@@ -8,6 +8,7 @@ use candle_nn::VarMap;
 use crate::config::Config;
 use crate::infer::TraceBuildConfig;
 use crate::model::topaz::TopazConfig;
+use crate::preprocess::Preprocessor;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMeta {
@@ -15,6 +16,7 @@ pub struct CheckpointMeta {
     pub train: Option<Config>,
     pub trace: Option<TraceBuildConfig>,
     pub feature_cols: Vec<String>,
+    pub preprocess: Option<Preprocessor>,
     pub version: u32,
 }
 

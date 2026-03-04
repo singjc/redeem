@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::building_blocks::bagging::{make_bags_with_traces, Bags};
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::rows_to_feature_matrix;
 use crate::io::osw::FeatureRow;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -11,6 +10,7 @@ use crate::train::trainer::TrainBatch;
 use anyhow::Result;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use candle_core::{Device, Tensor};
+use crate::preprocess::Preprocessor;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrainFilter {
@@ -105,6 +105,12 @@ pub fn filter_training_rows(rows: Vec<FeatureRow>, filt: &TrainFilter) -> Vec<Fe
     limit_precursors(rows, filt.max_precursors, filt.seed)
 }
 
+/// Fit preprocessing statistics on the provided rows.
+pub fn fit_preprocessor_from_rows(rows: &[FeatureRow], feat_dim: usize) -> Preprocessor {
+    let x = rows_to_feature_matrix(rows, feat_dim);
+    Preprocessor::fit(&x, rows.len(), feat_dim)
+}
+
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn bags_to_train_batches(
     bags: Bags,
@@ -142,6 +148,7 @@ pub fn build_train_batches_from_osw_xic(
     trace_cfg: &crate::infer::TraceBuildConfig,
     fetch_cfg: &crate::infer::XicFetchConfig,
     model_cfg: &crate::model::topaz::TopazConfig,
+    pre: Option<&Preprocessor>,
     filt: &TrainFilter,
     bag_k: usize,
     batch_size: usize,
@@ -156,7 +163,11 @@ pub fn build_train_batches_from_osw_xic(
     let x_trace = crate::infer::build_trace_tensors_from_parquet(&rows, xic_path, trace_cfg, fetch_cfg)?;
     let n = rows.len();
     let c_total = trace_cfg.total_c();
-    let x_feat = rows_to_feature_matrix(&rows, model_cfg.feat_dim);
+    let x_feat = crate::infer::rows_to_feature_matrix_preprocessed(
+        &rows,
+        model_cfg.feat_dim,
+        pre,
+    );
 
     let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();

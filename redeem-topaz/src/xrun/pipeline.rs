@@ -2,8 +2,9 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 
 use crate::building_blocks::bagging::make_bags_with_traces;
-use crate::infer::rows_to_feature_matrix;
-use crate::model::topaz::TopazBagRanker;
+use crate::infer::rows_to_feature_matrix_preprocessed;
+use crate::preprocess::Preprocessor;
+use crate::model_interface::BagRankerWithHiddenInterface;
 use crate::xrun::sequence::build_xrun_sequences_from_bags;
 use crate::xrun::calibrator::XrunAttentionCalibrator;
 use crate::io::osw::FeatureRow;
@@ -38,7 +39,7 @@ impl Default for XrunPredictConfig {
 }
 
 pub fn score_bags_with_hidden_chunked(
-    model: &TopazBagRanker,
+    model: &impl BagRankerWithHiddenInterface,
     xb: &Tensor,
     tb: &Tensor,
     mask: &Tensor,
@@ -76,7 +77,7 @@ pub fn score_bags_with_hidden_chunked(
 
 /// Build bag-level inputs and compute (bag_score, winner_hidden) for XRUN.
 pub fn build_xrun_bag_data_from_rows(
-    model: &TopazBagRanker,
+    model: &impl BagRankerWithHiddenInterface,
     rows: &[FeatureRow],
     x_trace: &[f32],
     feat_dim: usize,
@@ -85,9 +86,10 @@ pub fn build_xrun_bag_data_from_rows(
     k: usize,
     device: &Device,
     batch_size: usize,
+    pre: Option<&Preprocessor>,
 ) -> Result<XrunBagData> {
     let n = rows.len();
-    let x_feat = rows_to_feature_matrix(rows, feat_dim);
+    let x_feat = rows_to_feature_matrix_preprocessed(rows, feat_dim, pre);
     let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 

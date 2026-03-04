@@ -15,7 +15,8 @@ use crate::io::osw::FeatureRow;
 #[cfg(feature = "io-sqlite")]
 use crate::io::osw::OswFeatureTable;
 use crate::io::xic::{PrecursorXic, TransitionTrace, XicSource};
-use crate::model::topaz::TopazBagRanker;
+use crate::model_interface::{BagRankerWithHiddenInterface, CandidateScorerInterface};
+use crate::preprocess::Preprocessor;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::model::topaz::TopazConfig;
 
@@ -69,6 +70,19 @@ pub fn rows_to_feature_matrix(rows: &[FeatureRow], feat_dim: usize) -> Vec<f32> 
         }
     }
     out
+}
+
+/// Build a dense (N, D) feature matrix with optional preprocessing.
+pub fn rows_to_feature_matrix_preprocessed(
+    rows: &[FeatureRow],
+    feat_dim: usize,
+    pre: Option<&Preprocessor>,
+) -> Vec<f32> {
+    let mut x = rows_to_feature_matrix(rows, feat_dim);
+    if let Some(p) = pre {
+        p.transform_in_place(&mut x, rows.len(), feat_dim);
+    }
+    x
 }
 
 fn sort_series(series: &mut [TransitionTrace]) {
@@ -175,7 +189,7 @@ pub fn build_trace_tensors_from_source(
 
 /// Score candidates directly from rows + traces.
 pub fn score_rows_from_rows(
-    model: &TopazBagRanker,
+    model: &impl CandidateScorerInterface,
     rows: &[FeatureRow],
     x_trace: &[f32],
     feat_dim: usize,
@@ -183,12 +197,13 @@ pub fn score_rows_from_rows(
     l: usize,
     device: &Device,
     batch_size: usize,
+    pre: Option<&Preprocessor>,
 ) -> Result<Vec<f32>> {
     let n = rows.len();
     if n == 0 {
         return Ok(Vec::new());
     }
-    let x_feat = rows_to_feature_matrix(rows, feat_dim);
+    let x_feat = rows_to_feature_matrix_preprocessed(rows, feat_dim, pre);
     let x_feat_t = Tensor::from_vec(x_feat, (n, feat_dim), device)?;
     let x_trace_t = Tensor::from_vec(x_trace.to_vec(), (n, c_total, l), device)?;
     let scores_t = score_candidates(model, &x_feat_t, &x_trace_t, batch_size.max(1))?;
@@ -197,7 +212,7 @@ pub fn score_rows_from_rows(
 
 /// Score bags from rows + traces, returning bag-level diagnostics.
 pub fn score_bags_from_rows(
-    model: &TopazBagRanker,
+    model: &impl BagRankerWithHiddenInterface,
     rows: &[FeatureRow],
     x_trace: &[f32],
     feat_dim: usize,
@@ -206,6 +221,7 @@ pub fn score_bags_from_rows(
     bag_k: usize,
     device: &Device,
     batch_size: usize,
+    pre: Option<&Preprocessor>,
 ) -> Result<BagScoreOutput> {
     let n = rows.len();
     if n == 0 {
@@ -219,7 +235,7 @@ pub fn score_bags_from_rows(
         });
     }
 
-    let x_feat = rows_to_feature_matrix(rows, feat_dim);
+    let x_feat = rows_to_feature_matrix_preprocessed(rows, feat_dim, pre);
     let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
@@ -309,7 +325,7 @@ pub fn read_osw_features(
 /// End-to-end inference: OSW + XIC -> candidate scores -> SCORE table.
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 pub fn infer_score_table_from_osw_xic(
-    model: &TopazBagRanker,
+    model: &impl CandidateScorerInterface,
     device: &Device,
     model_cfg: &TopazConfig,
     osw_path: &Path,
@@ -319,6 +335,7 @@ pub fn infer_score_table_from_osw_xic(
     fetch_cfg: &XicFetchConfig,
     batch_size: usize,
     pep_bins: usize,
+    pre: Option<&Preprocessor>,
 ) -> Result<Vec<ScoreTableRow>> {
     let table = read_osw_features(osw_path, osw_cfg)?;
     let rows = table.rows;
@@ -334,7 +351,7 @@ pub fn infer_score_table_from_osw_xic(
         );
     }
 
-    let x_feat = rows_to_feature_matrix(&rows, model_cfg.feat_dim);
+    let x_feat = rows_to_feature_matrix_preprocessed(&rows, model_cfg.feat_dim, pre);
     let x_trace = build_trace_tensors_from_parquet(&rows, xic_path, trace_cfg, fetch_cfg)?;
 
     let n = rows.len();
