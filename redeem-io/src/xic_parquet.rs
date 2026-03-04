@@ -150,12 +150,55 @@ impl XicParquetReader {
         Self::decode_raw_doubles(&buf)
     }
 
+    fn decode_zlib_bytes(data: &[u8]) -> Result<Vec<u8>> {
+        let mut decoder = ZlibDecoder::new(data);
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn looks_like_zlib(data: &[u8]) -> bool {
+        if data.len() < 2 {
+            return false;
+        }
+        if data[0] != 0x78 {
+            return false;
+        }
+        matches!(data[1], 0x01 | 0x5e | 0x9c | 0xda)
+    }
+
     fn decode_array(data: &[u8], comp: i64) -> Result<Vec<f64>> {
         match comp {
             0 => Self::decode_raw_doubles(data),
             1 => Self::decode_zlib_doubles(data),
-            5 => msnumpress::decode_linear(data),
-            6 => msnumpress::decode_slof(data),
+            5 => {
+                match msnumpress::decode_linear(data) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        if Self::looks_like_zlib(data) {
+                            let buf = Self::decode_zlib_bytes(data)?;
+                            msnumpress::decode_linear(&buf)
+                                .map_err(|e2| anyhow::anyhow!("msnumpress linear decode failed after zlib fallback: {e2}"))
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            }
+            6 => {
+                match msnumpress::decode_slof(data) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        if Self::looks_like_zlib(data) {
+                            let buf = Self::decode_zlib_bytes(data)?;
+                            msnumpress::decode_slof(&buf)
+                                .map_err(|e2| anyhow::anyhow!("msnumpress slof decode failed after zlib fallback: {e2}"))
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            }
             _ => bail!("unsupported compression id {comp}"),
         }
     }

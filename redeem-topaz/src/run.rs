@@ -497,6 +497,35 @@ fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn filter_rows_by_xic_map(
+    rows: Vec<FeatureRow>,
+    xic_map_path: &Option<PathBuf>,
+) -> Result<Vec<FeatureRow>> {
+    let Some(map_path) = xic_map_path else {
+        return Ok(rows);
+    };
+    let map = read_xic_map(map_path)?;
+    let allowed: HashSet<u64> = map.keys().copied().collect();
+    let before = rows.len();
+    let out: Vec<FeatureRow> = rows
+        .into_iter()
+        .filter(|r| allowed.contains(&r.run_id))
+        .collect();
+    let dropped = before.saturating_sub(out.len());
+    if dropped > 0 {
+        log::info!(
+            "Filtered OSW rows by XIC map run_ids: dropped {} of {}",
+            dropped,
+            before
+        );
+    }
+    if out.is_empty() {
+        log::warn!("No OSW rows remain after XIC map filtering");
+    }
+    Ok(out)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn build_traces_for_rows(
     rows: &[FeatureRow],
     xic_path: &Path,
@@ -650,11 +679,17 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     let device = get_device(&cfg.device)?;
 
     let table = read_feature_rows(&cfg.osw_path, &cfg.osw)?;
-    let rows = filter_training_rows(table.rows, &cfg.filter);
+    let mut rows = filter_training_rows(table.rows, &cfg.filter);
     if rows.is_empty() {
         bail!("no rows after filtering");
     }
     log_run_id_summary(&rows, &cfg.xic_path);
+    if cfg.restrict_osw_to_xic_map {
+        rows = filter_rows_by_xic_map(rows, &cfg.xic_map_path)?;
+        if rows.is_empty() {
+            bail!("no rows after XIC map restriction; check run_id mapping");
+        }
+    }
 
     let mut selected_cols = resolve_feature_cols(&table.feature_cols, &cfg.feature_select);
     let mut model_cfg = cfg.model.clone();
@@ -843,6 +878,12 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         bail!("no rows in OSW");
     }
     log_run_id_summary(&rows, &cfg.xic_path);
+    if cfg.restrict_osw_to_xic_map {
+        rows = filter_rows_by_xic_map(rows, &cfg.xic_map_path)?;
+        if rows.is_empty() {
+            bail!("no rows after XIC map restriction; check run_id mapping");
+        }
+    }
 
     let mut x_trace = build_traces_for_rows(
         &rows,
@@ -970,12 +1011,18 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     load_checkpoint_weights(&base, &mut varmap)?;
 
     let table = read_feature_rows(&cfg.osw_path, &cfg.osw)?;
-    let rows_aligned = if meta.model.use_heuristic_features {
+    let mut rows_aligned = if meta.model.use_heuristic_features {
         align_rows_to_cols(&table.rows, &table.feature_cols, &meta.feature_cols)
     } else {
         table.rows
     };
     log_run_id_summary(&rows_aligned, &cfg.xic_path);
+    if cfg.restrict_osw_to_xic_map {
+        rows_aligned = filter_rows_by_xic_map(rows_aligned, &cfg.xic_map_path)?;
+        if rows_aligned.is_empty() {
+            bail!("no rows after XIC map restriction; check run_id mapping");
+        }
+    }
 
     let x_trace = build_traces_for_rows(
         &rows_aligned,
