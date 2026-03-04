@@ -1,38 +1,53 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 
 use candle_core::Device;
-use candle_nn::{VarBuilder, VarMap};
 
-use crate::checkpoint::{CheckpointMeta, save_checkpoint};
+use crate::checkpoint::CheckpointMeta;
 use crate::config::Config as TrainConfig;
+use crate::infer::{TraceBuildConfig, XicFetchConfig};
+use crate::io::osw::OswReadConfig;
+use crate::model::topaz::TopazConfig;
+use crate::train::TrainFilter;
+use crate::xrun::XrunTrainConfig;
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use candle_nn::{VarBuilder, VarMap};
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::checkpoint::save_checkpoint;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::{
     build_trace_tensors_from_parquet,
     build_score_table_from_rows,
     score_candidates,
-    score_bags_from_rows,
-    score_bags_with_heads_from_rows,
+    score_bags_from_rows_with_cols,
+    score_bags_with_heads_from_rows_with_cols,
     tdc_summary,
-    TraceBuildConfig,
-    XicFetchConfig,
-    rows_to_feature_matrix_preprocessed,
     rows_to_feature_matrix_with_cols,
 };
-use crate::io::osw::{read_feature_rows, OswReadConfig};
-use crate::model::topaz::{TopazBagRanker, TopazConfig};
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::io::osw::read_feature_rows;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::model::topaz::TopazBagRanker;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::{
     bags_to_train_batches,
     filter_training_rows,
-    fit_preprocessor_from_rows,
+    fit_preprocessor_from_rows_with_cols,
     split_rows_by_precursor,
-    TrainFilter,
+    subsample_train_rows_by_bag,
     Trainer,
 };
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::diagnostics::{print_trace_summary, trace_summary, warn_if_missing_ms1};
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::pipeline::build_xrun_bag_data_from_rows;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::sequence::build_xrun_sequences_from_bags;
-use crate::xrun::train::{split_train_val, XrunDataset, XrunTrainConfig, XrunTrainer, XrunPoolMode};
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::xrun::train::{split_train_val, XrunDataset, XrunTrainer, XrunPoolMode};
 
 #[cfg(feature = "io-sqlite")]
 use crate::io::osw::ScoreRow as OswScoreRow;
@@ -63,6 +78,48 @@ impl Default for DiagnosticsConfig {
     }
 }
 
+pub const DEFAULT_LIB_COLS: &[&str] = &[
+    "var_norm_rt_score",
+    "var_library_corr",
+    "var_library_dotprod",
+    "var_library_manhattan",
+    "var_library_rmsd",
+    "var_library_rootmeansquare",
+    "var_library_sangle",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureMode {
+    All,
+    #[serde(alias = "lib", alias = "library", alias = "default")]
+    DefaultLib,
+    Custom,
+    None,
+}
+
+impl Default for FeatureMode {
+    fn default() -> Self {
+        FeatureMode::All
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeatureSelectConfig {
+    pub mode: FeatureMode,
+    pub cols: Option<Vec<String>>,
+}
+
+impl Default for FeatureSelectConfig {
+    fn default() -> Self {
+        Self {
+            mode: FeatureMode::All,
+            cols: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrainRunConfig {
@@ -74,6 +131,8 @@ pub struct TrainRunConfig {
     pub batch_size: usize,
     pub max_epochs: usize,
     pub val_frac: f32,
+    pub train_frac: f32,
+    pub train_stratify_run: bool,
     pub seed: u64,
     pub model: TopazConfig,
     pub train: TrainConfig,
@@ -81,6 +140,7 @@ pub struct TrainRunConfig {
     pub fetch: XicFetchConfig,
     pub osw: OswReadConfig,
     pub filter: TrainFilter,
+    pub feature_select: FeatureSelectConfig,
     pub diagnostics: DiagnosticsConfig,
     pub restrict_osw_to_xic_map: bool,
 }
@@ -96,6 +156,8 @@ impl Default for TrainRunConfig {
             batch_size: 128,
             max_epochs: 5,
             val_frac: 0.1,
+            train_frac: 1.0,
+            train_stratify_run: false,
             seed: 0,
             model: TopazConfig::default(),
             train: TrainConfig::default(),
@@ -108,6 +170,7 @@ impl Default for TrainRunConfig {
             fetch: XicFetchConfig::default(),
             osw: OswReadConfig::default(),
             filter: TrainFilter::default(),
+            feature_select: FeatureSelectConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             restrict_osw_to_xic_map: false,
         }
@@ -229,6 +292,59 @@ pub struct XrunSweepRow {
     pub pool: String,
     pub tau: f64,
     pub best_val: f32,
+}
+
+fn resolve_feature_cols(osw_cols: &[String], cfg: &FeatureSelectConfig) -> Vec<String> {
+    match cfg.mode {
+        FeatureMode::All => return osw_cols.iter().map(|c| c.to_lowercase()).collect(),
+        FeatureMode::None => return Vec::new(),
+        _ => {}
+    }
+
+    let osw_set: HashSet<String> = osw_cols.iter().map(|c| c.to_lowercase()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    let mut push_col = |name: &str| {
+        let lc = name.to_lowercase();
+        if out.iter().any(|c| c == &lc) {
+            return;
+        }
+        if !osw_set.contains(&lc) {
+            missing.push(lc.clone());
+        }
+        out.push(lc);
+    };
+
+    match cfg.mode {
+        FeatureMode::DefaultLib => {
+            for &c in DEFAULT_LIB_COLS {
+                push_col(c);
+            }
+        }
+        FeatureMode::Custom => {
+            let Some(cols) = &cfg.cols else {
+                eprintln!("warning: feature_select.mode=custom but no cols provided");
+                return Vec::new();
+            };
+            if cols.is_empty() {
+                eprintln!("warning: feature_select.cols is empty; disabling heuristic features");
+                return Vec::new();
+            }
+            for c in cols {
+                push_col(c);
+            }
+        }
+        FeatureMode::All | FeatureMode::None => {}
+    }
+
+    if !missing.is_empty() {
+        eprintln!(
+            "warning: requested feature columns not found in OSW (will be imputed): {}",
+            missing.join(", ")
+        );
+    }
+    out
 }
 
 fn align_rows_to_cols(
@@ -389,6 +505,7 @@ fn read_checkpoint_meta(base: &Path) -> Result<CheckpointMeta> {
     Ok(meta)
 }
 
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn load_checkpoint_weights(base: &Path, varmap: &mut VarMap) -> Result<()> {
     let weights = base.with_extension("safetensors");
     varmap.load(&weights)?;
@@ -429,16 +546,41 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         bail!("no rows after filtering");
     }
 
-    let feat_dim = table.feature_cols.len();
-    if cfg.model.use_heuristic_features && cfg.model.feat_dim != feat_dim {
-        bail!(
-            "feature dim mismatch: model expects {}, OSW has {}",
-            cfg.model.feat_dim,
-            feat_dim
-        );
+    let mut selected_cols = resolve_feature_cols(&table.feature_cols, &cfg.feature_select);
+    let mut model_cfg = cfg.model.clone();
+    if !model_cfg.use_heuristic_features && !selected_cols.is_empty() {
+        eprintln!("warning: model.use_heuristic_features=false; ignoring selected feature columns");
+        selected_cols.clear();
+    }
+    if selected_cols.is_empty() {
+        model_cfg.use_heuristic_features = false;
+        model_cfg.feat_dim = 0;
+    } else {
+        model_cfg.use_heuristic_features = true;
+        if model_cfg.feat_dim != selected_cols.len() {
+            if model_cfg.feat_dim != 0 {
+                eprintln!(
+                    "warning: overriding model.feat_dim={} to match selected columns ({})",
+                    model_cfg.feat_dim,
+                    selected_cols.len()
+                );
+            }
+            model_cfg.feat_dim = selected_cols.len();
+        }
     }
 
-    let (rows_tr, rows_va) = split_rows_by_precursor(&rows, cfg.val_frac, cfg.seed);
+    let (mut rows_tr, rows_va) = split_rows_by_precursor(&rows, cfg.val_frac, cfg.seed);
+    if cfg.train_frac < 1.0 {
+        rows_tr = subsample_train_rows_by_bag(
+            rows_tr,
+            cfg.train_frac,
+            cfg.train_stratify_run,
+            cfg.seed,
+        );
+        if rows_tr.is_empty() {
+            bail!("no rows after train subsample");
+        }
+    }
     let x_tr = build_trace_tensors_from_parquet(&rows_tr, &cfg.xic_path, &cfg.trace, &cfg.fetch)?;
     let x_va = if rows_va.is_empty() {
         Vec::new()
@@ -451,14 +593,21 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     } else {
         (rows_tr, x_tr)
     };
+    if cfg.restrict_osw_to_xic_map && rows_tr.is_empty() {
+        bail!("all training rows were dropped after XIC restriction; check run_id match and xic_path");
+    }
     let (rows_va, x_va) = if cfg.restrict_osw_to_xic_map {
         filter_rows_by_trace(rows_va, x_va, cfg.trace.total_c(), cfg.trace.l)
     } else {
         (rows_va, x_va)
     };
 
-    let pre = if cfg.model.use_heuristic_features {
-        Some(fit_preprocessor_from_rows(&rows_tr, feat_dim))
+    let pre = if model_cfg.use_heuristic_features {
+        Some(fit_preprocessor_from_rows_with_cols(
+            &rows_tr,
+            &table.feature_cols,
+            &selected_cols,
+        ))
     } else {
         None
     };
@@ -488,11 +637,16 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         }
     }
 
-    let x_feat = rows_to_feature_matrix_preprocessed(
-        &rows_tr,
-        cfg.model.feat_dim,
-        pre.as_ref(),
-    );
+    let x_feat = if model_cfg.use_heuristic_features {
+        rows_to_feature_matrix_with_cols(
+            &rows_tr,
+            &table.feature_cols,
+            &selected_cols,
+            pre.as_ref(),
+        )
+    } else {
+        Vec::new()
+    };
 
     let y_rows: Vec<u8> = rows_tr.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
     let pid_rows: Vec<String> = rows_tr.iter().map(|r| r.group_id.clone()).collect();
@@ -500,7 +654,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     let bags = crate::building_blocks::bagging::make_bags_with_traces(
         &x_feat,
         rows_tr.len(),
-        cfg.model.feat_dim,
+        model_cfg.feat_dim,
         &x_tr,
         cfg.trace.total_c(),
         cfg.trace.l,
@@ -510,15 +664,16 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     );
     let batches = bags_to_train_batches(bags, &device, cfg.batch_size)?;
 
-    let mut trainer = Trainer::new(cfg.train.clone(), &cfg.model, &device)?;
+    let mut trainer = Trainer::new(cfg.train.clone(), &model_cfg, &device)?;
     let _metrics = trainer.train_epochs(&batches, cfg.max_epochs, None)?;
 
     if !rows_va.is_empty() {
-        let out = score_bags_from_rows(
+        let out = score_bags_from_rows_with_cols(
             &trainer.model,
             &rows_va,
             &x_va,
-            cfg.model.feat_dim,
+            &table.feature_cols,
+            &selected_cols,
             cfg.trace.total_c(),
             cfg.trace.l,
             cfg.bag_k,
@@ -534,10 +689,10 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     }
 
     let meta = CheckpointMeta {
-        model: cfg.model.clone(),
+        model: model_cfg,
         train: Some(cfg.train.clone()),
         trace: Some(cfg.trace.clone()),
-        feature_cols: table.feature_cols,
+        feature_cols: selected_cols,
         preprocess: pre,
         version: 1,
     };
@@ -617,11 +772,12 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             .clone()
             .unwrap_or_else(|| PathBuf::from("head_embeddings"));
         std::fs::create_dir_all(&outdir)?;
-        let out = score_bags_with_heads_from_rows(
+        let out = score_bags_with_heads_from_rows_with_cols(
             &model,
             &rows,
             &x_trace,
-            meta.model.feat_dim,
+            &table.feature_cols,
+            &meta.feature_cols,
             cfg.trace.total_c(),
             cfg.trace.l,
             cfg.bag_k,

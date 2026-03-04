@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::building_blocks::bagging::{make_bags_with_traces, Bags};
-use crate::infer::rows_to_feature_matrix;
+use crate::infer::{rows_to_feature_matrix, rows_to_feature_matrix_with_cols};
 use crate::io::osw::FeatureRow;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::trainer::TrainBatch;
@@ -106,6 +106,90 @@ pub fn filter_training_rows(rows: Vec<FeatureRow>, filt: &TrainFilter) -> Vec<Fe
     limit_precursors(rows, filt.max_precursors, filt.seed)
 }
 
+/// Subsample training rows by bag (group_id), optionally stratified by run.
+pub fn subsample_train_rows_by_bag(
+    rows: Vec<FeatureRow>,
+    frac: f32,
+    stratify_run: bool,
+    seed: u64,
+) -> Vec<FeatureRow> {
+    if rows.is_empty() {
+        return rows;
+    }
+    if frac >= 1.0 {
+        return rows;
+    }
+    if frac <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut bag_ids: Vec<String> = Vec::new();
+    let mut bag_run: Vec<u64> = Vec::new();
+    let mut bag_is_decoy: Vec<bool> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for r in &rows {
+        if !seen.contains_key(&r.group_id) {
+            let idx = bag_ids.len();
+            seen.insert(r.group_id.clone(), idx);
+            bag_ids.push(r.group_id.clone());
+            bag_run.push(r.run_id);
+            bag_is_decoy.push(r.is_decoy);
+        }
+    }
+
+    let n_bags = bag_ids.len();
+    if n_bags == 0 {
+        return Vec::new();
+    }
+
+    let mut keep_idx: Vec<usize> = Vec::new();
+    if stratify_run {
+        let mut by_run: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, &run_id) in bag_run.iter().enumerate() {
+            by_run.entry(run_id).or_default().push(i);
+        }
+        for (run_id, mut idxs) in by_run {
+            if idxs.is_empty() {
+                continue;
+            }
+            shuffle_indices(&mut idxs, seed ^ run_id);
+            let n_keep = ((idxs.len() as f32) * frac).ceil() as usize;
+            let n_keep = n_keep.max(1).min(idxs.len());
+            keep_idx.extend_from_slice(&idxs[..n_keep]);
+        }
+    } else {
+        let mut idxs: Vec<usize> = (0..n_bags).collect();
+        shuffle_indices(&mut idxs, seed);
+        let n_keep = ((n_bags as f32) * frac).ceil() as usize;
+        let n_keep = n_keep.max(1).min(n_bags);
+        keep_idx.extend_from_slice(&idxs[..n_keep]);
+    }
+
+    keep_idx.sort_unstable();
+    keep_idx.dedup();
+
+    let mut kept_targets = 0usize;
+    let mut kept_decoys = 0usize;
+    for &i in &keep_idx {
+        if bag_is_decoy[i] {
+            kept_decoys += 1;
+        } else {
+            kept_targets += 1;
+        }
+    }
+    eprintln!(
+        "Train subsample: kept_bags={}/{} (targets={} decoys={}) frac={}",
+        keep_idx.len(),
+        n_bags,
+        kept_targets,
+        kept_decoys,
+        frac
+    );
+
+    let keep_set: HashSet<&str> = keep_idx.iter().map(|&i| bag_ids[i].as_str()).collect();
+    rows.into_iter().filter(|r| keep_set.contains(r.group_id.as_str())).collect()
+}
+
 /// Split rows by unique precursor_id (no leakage across candidates).
 pub fn split_rows_by_precursor(
     rows: &[FeatureRow],
@@ -148,6 +232,17 @@ pub fn split_rows_by_precursor(
 pub fn fit_preprocessor_from_rows(rows: &[FeatureRow], feat_dim: usize) -> Preprocessor {
     let x = rows_to_feature_matrix(rows, feat_dim);
     Preprocessor::fit(&x, rows.len(), feat_dim)
+}
+
+/// Fit preprocessing stats aligned to a target column order.
+pub fn fit_preprocessor_from_rows_with_cols(
+    rows: &[FeatureRow],
+    osw_cols: &[String],
+    target_cols: &[String],
+) -> Preprocessor {
+    let d = target_cols.len();
+    let x = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, None);
+    Preprocessor::fit(&x, rows.len(), d)
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]

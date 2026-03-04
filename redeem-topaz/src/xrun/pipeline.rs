@@ -2,7 +2,7 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 
 use crate::building_blocks::bagging::make_bags_with_traces;
-use crate::infer::rows_to_feature_matrix_preprocessed;
+use crate::infer::{rows_to_feature_matrix_preprocessed, rows_to_feature_matrix_with_cols};
 use crate::preprocess::Preprocessor;
 use crate::model_interface::BagRankerWithHiddenInterface;
 use crate::xrun::sequence::build_xrun_sequences_from_bags;
@@ -97,6 +97,55 @@ pub fn build_xrun_bag_data_from_rows(
         &x_feat,
         n,
         feat_dim,
+        x_trace,
+        c_total,
+        l,
+        &y_rows,
+        &pid_rows,
+        k,
+    );
+
+    let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
+    let tb = Tensor::from_vec(bags.t_bag, (bags.b, bags.k, bags.c, bags.l), device)?;
+    let mask_u8: Vec<u8> = bags.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
+    let mask = Tensor::from_vec(mask_u8, (bags.b, bags.k), device)?;
+
+    let (bag_score, bag_hidden, hidden_dim) =
+        score_bags_with_hidden_chunked(model, &xb, &tb, &mask, batch_size)?;
+
+    Ok(XrunBagData {
+        bag_score,
+        bag_hidden,
+        hidden_dim,
+        bag_y: bags.y_bag,
+        bag_pid: bags.bag_pid,
+    })
+}
+
+/// Build bag-level inputs and compute (bag_score, winner_hidden) with explicit feature columns.
+pub fn build_xrun_bag_data_from_rows_with_cols(
+    model: &impl BagRankerWithHiddenInterface,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    k: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&Preprocessor>,
+) -> Result<XrunBagData> {
+    let n = rows.len();
+    let d = target_cols.len();
+    let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
+    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
+
+    let bags = make_bags_with_traces(
+        &x_feat,
+        n,
+        d,
         x_trace,
         c_total,
         l,

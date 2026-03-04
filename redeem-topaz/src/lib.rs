@@ -20,6 +20,8 @@ pub use model_interface::{
 pub use preprocess::Preprocessor;
 pub use run::{
     DiagnosticsConfig,
+    FeatureMode,
+    FeatureSelectConfig,
     TrainRunConfig,
     TrainRunOutput,
     InferRunConfig,

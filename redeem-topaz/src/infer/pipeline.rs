@@ -273,6 +273,30 @@ pub fn score_rows_from_rows(
     Ok(scores_t.to_vec1::<f32>()?)
 }
 
+/// Score candidates directly from rows + traces with explicit feature columns.
+pub fn score_rows_from_rows_with_cols(
+    model: &impl CandidateScorerInterface,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&Preprocessor>,
+) -> Result<Vec<f32>> {
+    let n = rows.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
+    let x_feat_t = Tensor::from_vec(x_feat, (n, target_cols.len()), device)?;
+    let x_trace_t = Tensor::from_vec(x_trace.to_vec(), (n, c_total, l), device)?;
+    let scores_t = score_candidates(model, &x_feat_t, &x_trace_t, batch_size.max(1))?;
+    Ok(scores_t.to_vec1::<f32>()?)
+}
+
 /// Score bags from rows + traces, returning bag-level diagnostics.
 pub fn score_bags_from_rows(
     model: &impl BagRankerWithHiddenInterface,
@@ -306,6 +330,92 @@ pub fn score_bags_from_rows(
         &x_feat,
         n,
         feat_dim,
+        x_trace,
+        c_total,
+        l,
+        &y_rows,
+        &pid_rows,
+        bag_k,
+    );
+
+    let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
+    let tb = Tensor::from_vec(bags.t_bag, (bags.b, bags.k, bags.c, bags.l), device)?;
+    let mask_u8: Vec<u8> = bags.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
+    let mask = Tensor::from_vec(mask_u8, (bags.b, bags.k), device)?;
+
+    let b = bags.b;
+    let mut bag_scores = Vec::with_capacity(b);
+    let mut hidden: Vec<f32> = Vec::new();
+    let mut hidden_dim = 0usize;
+    let bs = batch_size.max(1);
+
+    let mut i = 0usize;
+    while i < b {
+        let take = (b - i).min(bs);
+        let xb_i = xb.narrow(0, i, take)?;
+        let tb_i = tb.narrow(0, i, take)?;
+        let m_i = mask.narrow(0, i, take)?;
+
+        let (_cand, bag, win) = model.forward_bags_with_hidden(&xb_i, &tb_i, &m_i)?;
+        let bag_vec = bag.to_vec1::<f32>()?;
+        bag_scores.extend(bag_vec);
+
+        let win_vec = win.to_vec2::<f32>()?;
+        if hidden_dim == 0 {
+            hidden_dim = win_vec.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        for row in win_vec {
+            hidden.extend(row);
+        }
+        i += take;
+    }
+
+    let is_decoy: Vec<bool> = bags.y_bag.iter().map(|&y| y < 0.5).collect();
+    Ok(BagScoreOutput {
+        bag_score: bag_scores,
+        bag_y: bags.y_bag,
+        is_decoy,
+        bag_pid: bags.bag_pid,
+        winner_hidden: hidden,
+        hidden_dim,
+    })
+}
+
+/// Score bags from rows + traces with explicit feature columns.
+pub fn score_bags_from_rows_with_cols(
+    model: &impl BagRankerWithHiddenInterface,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    bag_k: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&Preprocessor>,
+) -> Result<BagScoreOutput> {
+    let n = rows.len();
+    if n == 0 {
+        return Ok(BagScoreOutput {
+            bag_score: Vec::new(),
+            bag_y: Vec::new(),
+            is_decoy: Vec::new(),
+            bag_pid: Vec::new(),
+            winner_hidden: Vec::new(),
+            hidden_dim: 0,
+        });
+    }
+
+    let d = target_cols.len();
+    let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
+    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
+
+    let bags = make_bags_with_traces(
+        &x_feat,
+        n,
+        d,
         x_trace,
         c_total,
         l,
@@ -404,6 +514,160 @@ pub fn score_bags_with_heads_from_rows(
         &x_feat,
         n,
         feat_dim,
+        x_trace,
+        c_total,
+        l,
+        &y_rows,
+        &pid_rows,
+        bag_k,
+    );
+
+    let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
+    let tb = Tensor::from_vec(bags.t_bag, (bags.b, bags.k, bags.c, bags.l), device)?;
+    let mask_u8: Vec<u8> = bags.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
+    let mask = Tensor::from_vec(mask_u8, (bags.b, bags.k), device)?;
+
+    let b = bags.b;
+    let mut bag_scores = Vec::with_capacity(b);
+    let mut hidden: Vec<f32> = Vec::new();
+    let mut hidden_dim = 0usize;
+
+    let mut emb_ms2 = Vec::new();
+    let mut emb_ms1 = Vec::new();
+    let mut emb_all = Vec::new();
+    let mut coe_ms2 = Vec::new();
+    let mut coe_ms1 = Vec::new();
+    let mut coe_ms12 = Vec::new();
+    let mut coe_all = Vec::new();
+    let mut emb_ms2_dim = 0usize;
+    let mut emb_ms1_dim = 0usize;
+    let mut emb_all_dim = 0usize;
+    let mut coe_ms2_dim = 0usize;
+    let mut coe_ms1_dim = 0usize;
+    let mut coe_ms12_dim = 0usize;
+    let mut coe_all_dim = 0usize;
+
+    let bs = batch_size.max(1);
+    let mut i = 0usize;
+    while i < b {
+        let take = (b - i).min(bs);
+        let xb_i = xb.narrow(0, i, take)?;
+        let tb_i = tb.narrow(0, i, take)?;
+        let m_i = mask.narrow(0, i, take)?;
+
+        let (_cand, bag, win, comps) = model.forward_bags_with_heads(&xb_i, &tb_i, &m_i)?;
+        let bag_vec = bag.to_vec1::<f32>()?;
+        bag_scores.extend(bag_vec);
+
+        let win_vec = win.to_vec2::<f32>()?;
+        if hidden_dim == 0 {
+            hidden_dim = win_vec.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        for row in win_vec {
+            hidden.extend(row);
+        }
+
+        let emb2 = comps.emb_ms2.to_vec2::<f32>()?;
+        let emb1 = comps.emb_ms1.to_vec2::<f32>()?;
+        let emba = comps.emb_all.to_vec2::<f32>()?;
+        let coe2 = comps.coe_ms2.to_vec2::<f32>()?;
+        let coe1 = comps.coe_ms1.to_vec2::<f32>()?;
+        let coe12 = comps.coe_ms12.to_vec2::<f32>()?;
+        let coea = comps.coe_all.to_vec2::<f32>()?;
+
+        if emb_ms2_dim == 0 { emb_ms2_dim = emb2.get(0).map(|v| v.len()).unwrap_or(0); }
+        if emb_ms1_dim == 0 { emb_ms1_dim = emb1.get(0).map(|v| v.len()).unwrap_or(0); }
+        if emb_all_dim == 0 { emb_all_dim = emba.get(0).map(|v| v.len()).unwrap_or(0); }
+        if coe_ms2_dim == 0 { coe_ms2_dim = coe2.get(0).map(|v| v.len()).unwrap_or(0); }
+        if coe_ms1_dim == 0 { coe_ms1_dim = coe1.get(0).map(|v| v.len()).unwrap_or(0); }
+        if coe_ms12_dim == 0 { coe_ms12_dim = coe12.get(0).map(|v| v.len()).unwrap_or(0); }
+        if coe_all_dim == 0 { coe_all_dim = coea.get(0).map(|v| v.len()).unwrap_or(0); }
+
+        for row in emb2 { emb_ms2.extend(row); }
+        for row in emb1 { emb_ms1.extend(row); }
+        for row in emba { emb_all.extend(row); }
+        for row in coe2 { coe_ms2.extend(row); }
+        for row in coe1 { coe_ms1.extend(row); }
+        for row in coe12 { coe_ms12.extend(row); }
+        for row in coea { coe_all.extend(row); }
+
+        i += take;
+    }
+
+    let is_decoy: Vec<bool> = bags.y_bag.iter().map(|&y| y < 0.5).collect();
+    Ok(BagHeadOutput {
+        bag_score: bag_scores,
+        bag_y: bags.y_bag,
+        is_decoy,
+        bag_pid: bags.bag_pid,
+        winner_hidden: hidden,
+        hidden_dim,
+        emb_ms2,
+        emb_ms2_dim,
+        emb_ms1,
+        emb_ms1_dim,
+        emb_all,
+        emb_all_dim,
+        coe_ms2,
+        coe_ms2_dim,
+        coe_ms1,
+        coe_ms1_dim,
+        coe_ms12,
+        coe_ms12_dim,
+        coe_all,
+        coe_all_dim,
+    })
+}
+
+/// Score bags + heads with explicit feature columns.
+pub fn score_bags_with_heads_from_rows_with_cols(
+    model: &crate::model::topaz::TopazBagRanker,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    bag_k: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&Preprocessor>,
+) -> Result<BagHeadOutput> {
+    let n = rows.len();
+    if n == 0 {
+        return Ok(BagHeadOutput {
+            bag_score: Vec::new(),
+            bag_y: Vec::new(),
+            is_decoy: Vec::new(),
+            bag_pid: Vec::new(),
+            winner_hidden: Vec::new(),
+            hidden_dim: 0,
+            emb_ms2: Vec::new(),
+            emb_ms2_dim: 0,
+            emb_ms1: Vec::new(),
+            emb_ms1_dim: 0,
+            emb_all: Vec::new(),
+            emb_all_dim: 0,
+            coe_ms2: Vec::new(),
+            coe_ms2_dim: 0,
+            coe_ms1: Vec::new(),
+            coe_ms1_dim: 0,
+            coe_ms12: Vec::new(),
+            coe_ms12_dim: 0,
+            coe_all: Vec::new(),
+            coe_all_dim: 0,
+        });
+    }
+
+    let d = target_cols.len();
+    let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
+    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
+
+    let bags = make_bags_with_traces(
+        &x_feat,
+        n,
+        d,
         x_trace,
         c_total,
         l,

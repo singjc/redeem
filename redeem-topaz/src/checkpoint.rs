@@ -30,6 +30,9 @@ fn paths_for<P: AsRef<Path>>(path: P) -> (PathBuf, PathBuf) {
 /// Save weights to `.safetensors` + metadata to `.json`.
 pub fn save_checkpoint<P: AsRef<Path>>(path: P, varmap: &VarMap, meta: &CheckpointMeta) -> Result<()> {
     let (weights, meta_path) = paths_for(path);
+    if let Some(parent) = weights.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     varmap.save(&weights)?;
     let json = serde_json::to_string_pretty(meta)?;
     std::fs::write(meta_path, json)?;

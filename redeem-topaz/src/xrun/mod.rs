@@ -8,6 +8,7 @@ pub use pipeline::{
     apply_xrun_deltas,
     apply_xrun_deltas_to_rows,
     build_xrun_bag_data_from_rows,
+    build_xrun_bag_data_from_rows_with_cols,
     score_bags_with_hidden_chunked,
     xrun_predict_deltas_for_bags,
     XrunBagData,
