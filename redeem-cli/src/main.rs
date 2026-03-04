@@ -13,6 +13,12 @@ use redeem_cli::properties::inference::inference;
 use redeem_cli::properties::inference::input::PropertyInferenceConfig;
 use redeem_cli::properties::train::input::PropertyTrainConfig;
 use redeem_cli::properties::train::trainer;
+use redeem_cli::topaz::infer as topaz_infer;
+use redeem_cli::topaz::infer::input::TopazInferConfig;
+use redeem_cli::topaz::train as topaz_train;
+use redeem_cli::topaz::train::input::TopazTrainConfig;
+use redeem_cli::topaz::xrun as topaz_xrun;
+use redeem_cli::topaz::xrun::input::TopazXrunSweepConfig;
 
 fn main() -> Result<()> {
     env_logger::Builder::default()
@@ -209,6 +215,183 @@ fn main() -> Result<()> {
                         ),
                 )
         )
+        .subcommand(
+            Command::new("topaz")
+                .about("Train or run TOPAZ trace-first DIA scorer")
+                .subcommand(
+                    Command::new("train")
+                        .about("Train TOPAZ from OSW + XIC")
+                        .arg(
+                            Arg::new("config")
+                                .help("Path to training configuration file (omit to print a template)")
+                                .required(false)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("osw_path")
+                                .long("osw")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_path")
+                                .long("xic")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("output_prefix")
+                                .long("output")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("device")
+                                .long("device")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
+                            Arg::new("batch_size")
+                                .long("batch-size")
+                                .value_parser(clap::value_parser!(usize)),
+                        )
+                        .arg(
+                            Arg::new("epochs")
+                                .long("epochs")
+                                .value_parser(clap::value_parser!(usize)),
+                        )
+                        .arg(
+                            Arg::new("bag_k")
+                                .long("bag-k")
+                                .value_parser(clap::value_parser!(usize)),
+                        )
+                        .arg(
+                            Arg::new("val_frac")
+                                .long("val-frac")
+                                .value_parser(clap::value_parser!(f32)),
+                        )
+                        .arg(
+                            Arg::new("seed")
+                                .long("seed")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
+                            Arg::new("restrict_xic")
+                                .long("restrict-osw-to-xic-map")
+                                .help("Drop rows with no XIC traces")
+                                .action(ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
+                    Command::new("infer")
+                        .about("Run TOPAZ inference on OSW + XIC")
+                        .arg(
+                            Arg::new("config")
+                                .help("Path to inference configuration file (omit to print a template)")
+                                .required(false)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("osw_path")
+                                .long("osw")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_path")
+                                .long("xic")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("checkpoint")
+                                .long("checkpoint")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("output_tsv")
+                                .long("output-tsv")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("output_osw")
+                                .long("output-osw")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("device")
+                                .long("device")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
+                            Arg::new("batch_size")
+                                .long("batch-size")
+                                .value_parser(clap::value_parser!(usize)),
+                        )
+                        .arg(
+                            Arg::new("pep_bins")
+                                .long("pep-bins")
+                                .value_parser(clap::value_parser!(usize)),
+                        )
+                        .arg(
+                            Arg::new("restrict_xic")
+                                .long("restrict-osw-to-xic-map")
+                                .help("Drop rows with no XIC traces")
+                                .action(ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
+                    Command::new("xrun-sweep")
+                        .about("Run XRUN calibrator sweep")
+                        .arg(
+                            Arg::new("config")
+                                .help("Path to XRUN sweep configuration file (omit to print a template)")
+                                .required(false)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("osw_path")
+                                .long("osw")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_path")
+                                .long("xic")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("checkpoint")
+                                .long("checkpoint")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("output_tsv")
+                                .long("output-tsv")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("device")
+                                .long("device")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
+                            Arg::new("restrict_xic")
+                                .long("restrict-osw-to-xic-map")
+                                .help("Drop rows with no XIC traces")
+                                .action(ArgAction::SetTrue),
+                        ),
+                ),
+        )
         .help_template(
             "{usage-heading} {usage}\n\n\
              {about-with-newline}\n\
@@ -220,6 +403,7 @@ fn main() -> Result<()> {
     match matches.subcommand() {
         Some(("properties", sub_m)) => handle_properties(sub_m),
         Some(("classifiers", sub_m)) => handle_classifiers(sub_m),
+        Some(("topaz", sub_m)) => handle_topaz(sub_m),
         _ => unreachable!("Subcommand is required by CLI configuration"),
     }
 }
@@ -378,6 +562,64 @@ fn handle_classifiers(matches: &ArgMatches) -> Result<()> {
                 result.predictions.as_slice().len()
             );
             Ok(())
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn handle_topaz(matches: &ArgMatches) -> Result<()> {
+    match matches.subcommand() {
+        Some(("train", sub)) => {
+            let config_path: Option<&PathBuf> = sub.get_one("config");
+            if config_path.is_none() {
+                let default = TopazTrainConfig::default();
+                let json = serde_json::to_string_pretty(&default)?;
+                eprintln!(
+                    "\n\u{2139}\u{fe0f}  No config file provided.\n\n\
+                     Save the following JSON template to a file (e.g. topaz_train.json),\n\
+                     fill in the fields, and re-run:\n\n\
+                       redeem topaz train topaz_train.json\n"
+                );
+                println!("{}", json);
+                std::process::exit(0);
+            }
+
+            let cfg = TopazTrainConfig::from_arguments(config_path.unwrap(), sub)?;
+            topaz_train::run(&cfg)
+        }
+        Some(("infer", sub)) => {
+            let config_path: Option<&PathBuf> = sub.get_one("config");
+            if config_path.is_none() {
+                let default = TopazInferConfig::default();
+                let json = serde_json::to_string_pretty(&default)?;
+                eprintln!(
+                    "\n\u{2139}\u{fe0f}  No config file provided.\n\n\
+                     Save the following JSON template to a file (e.g. topaz_infer.json),\n\
+                     fill in the fields, and re-run:\n\n\
+                       redeem topaz infer topaz_infer.json\n"
+                );
+                println!("{}", json);
+                std::process::exit(0);
+            }
+            let cfg = TopazInferConfig::from_arguments(config_path.unwrap(), sub)?;
+            topaz_infer::run(&cfg)
+        }
+        Some(("xrun-sweep", sub)) => {
+            let config_path: Option<&PathBuf> = sub.get_one("config");
+            if config_path.is_none() {
+                let default = TopazXrunSweepConfig::default();
+                let json = serde_json::to_string_pretty(&default)?;
+                eprintln!(
+                    "\n\u{2139}\u{fe0f}  No config file provided.\n\n\
+                     Save the following JSON template to a file (e.g. xrun_sweep.json),\n\
+                     fill in the fields, and re-run:\n\n\
+                       redeem topaz xrun-sweep xrun_sweep.json\n"
+                );
+                println!("{}", json);
+                std::process::exit(0);
+            }
+            let cfg = TopazXrunSweepConfig::from_arguments(config_path.unwrap(), sub)?;
+            topaz_xrun::run(&cfg)
         }
         _ => unreachable!(),
     }
