@@ -856,6 +856,22 @@ pub fn build_trace_tensors_from_parquet_map(
         }
         reader.filter_precursor_id(prec_set.iter().copied());
         let fetched = reader.fetch()?;
+        let requested = prec_set.len();
+        let fetched_count = fetched.len();
+        if fetched_count == 0 {
+            log::warn!(
+                "XIC map path {:?}: fetched 0 of {} precursors",
+                path,
+                requested
+            );
+        } else {
+            log::info!(
+                "XIC map path {:?}: fetched {} of {} precursors",
+                path,
+                fetched_count,
+                requested
+            );
+        }
         let mut map: HashMap<u64, PrecursorXic> = HashMap::new();
         for xic in fetched {
             map.insert(xic.precursor_id, xic);

@@ -745,15 +745,19 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         )?
     };
 
-    let (rows_tr, x_tr) = if cfg.restrict_osw_to_xic_map {
+    let apply_trace_filter = cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_none();
+    if cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_some() {
+        log::info!("XIC map provided; skipping trace-based restriction (run_id filter only)");
+    }
+    let (rows_tr, x_tr) = if apply_trace_filter {
         filter_rows_by_trace(rows_tr, x_tr, cfg.trace.total_c(), cfg.trace.l)
     } else {
         (rows_tr, x_tr)
     };
-    if cfg.restrict_osw_to_xic_map && rows_tr.is_empty() {
+    if apply_trace_filter && rows_tr.is_empty() {
         bail!("all training rows were dropped after XIC restriction; check run_id match and xic_path");
     }
-    let (rows_va, x_va) = if cfg.restrict_osw_to_xic_map {
+    let (rows_va, x_va) = if apply_trace_filter {
         filter_rows_by_trace(rows_va, x_va, cfg.trace.total_c(), cfg.trace.l)
     } else {
         (rows_va, x_va)
@@ -892,7 +896,11 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         &cfg.trace,
         &cfg.fetch,
     )?;
-    if cfg.restrict_osw_to_xic_map {
+    let apply_trace_filter = cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_none();
+    if cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_some() {
+        log::info!("XIC map provided; skipping trace-based restriction (run_id filter only)");
+    }
+    if apply_trace_filter {
         let filtered = filter_rows_by_trace(rows, x_trace, cfg.trace.total_c(), cfg.trace.l);
         rows = filtered.0;
         x_trace = filtered.1;
@@ -1031,7 +1039,11 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
         &cfg.trace,
         &cfg.fetch,
     )?;
-    let (rows_aligned, x_trace) = if cfg.restrict_osw_to_xic_map {
+    let apply_trace_filter = cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_none();
+    if cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_some() {
+        log::info!("XIC map provided; skipping trace-based restriction (run_id filter only)");
+    }
+    let (rows_aligned, x_trace) = if apply_trace_filter {
         filter_rows_by_trace(rows_aligned, x_trace, cfg.trace.total_c(), cfg.trace.l)
     } else {
         (rows_aligned, x_trace)
