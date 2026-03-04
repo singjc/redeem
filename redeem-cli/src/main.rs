@@ -272,9 +272,35 @@ fn main() -> Result<()> {
                                 .value_parser(clap::value_parser!(f32)),
                         )
                         .arg(
+                            Arg::new("train_frac")
+                                .long("train-frac")
+                                .help("Fraction of training bags to keep")
+                                .value_parser(clap::value_parser!(f32)),
+                        )
+                        .arg(
+                            Arg::new("train_stratify_run")
+                                .long("train-stratify-run")
+                                .help("Stratify train subsampling by run_id")
+                                .action(ArgAction::SetTrue),
+                        )
+                        .arg(
                             Arg::new("seed")
                                 .long("seed")
                                 .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
+                            Arg::new("feature_mode")
+                                .long("feature-mode")
+                                .help("Heuristic feature selection: all | default-lib | custom | none")
+                                .value_parser(["all", "default-lib", "lib", "custom", "none"])
+                                .value_hint(ValueHint::Other),
+                        )
+                        .arg(
+                            Arg::new("feature_cols")
+                                .long("feature-cols")
+                                .help("Comma-separated list of heuristic feature columns to include")
+                                .value_delimiter(',')
+                                .num_args(1..),
                         )
                         .arg(
                             Arg::new("restrict_xic")
