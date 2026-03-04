@@ -879,11 +879,49 @@ pub fn build_trace_tensors_from_parquet_map(
         xic_by_path.insert(path, map);
     }
 
+    let mut logged_runs: HashSet<u64> = HashSet::new();
     for (i, row) in rows.iter().enumerate() {
         let mut trace_row = vec![0f32; c_total * cfg.l];
         if let Some(path) = run_to_path.get(&row.run_id) {
             if let Some(run_map) = xic_by_path.get(path) {
                 if let Some(xic) = run_map.get(&row.precursor_id) {
+                    if !logged_runs.contains(&row.run_id) {
+                        let (ms1_series, ms2_series) = split_ms1_ms2(xic);
+                        let (probe_series, label) = if !ms2_series.is_empty() {
+                            (&ms2_series, "ms2")
+                        } else {
+                            (&ms1_series, "ms1")
+                        };
+                        if let Some(first) = probe_series.get(0) {
+                            let mut min_rt = f32::INFINITY;
+                            let mut max_rt = f32::NEG_INFINITY;
+                            let mut max_int = 0f32;
+                            for p in &first.points {
+                                if p.rt < min_rt { min_rt = p.rt; }
+                                if p.rt > max_rt { max_rt = p.rt; }
+                                if p.intensity.abs() > max_int {
+                                    max_int = p.intensity.abs();
+                                }
+                            }
+                            log::info!(
+                                "XIC probe run_id={} ({label}): exp_rt={} rt_range=[{}, {}] max_intensity={}",
+                                row.run_id,
+                                row.exp_rt,
+                                min_rt,
+                                max_rt,
+                                max_int
+                            );
+                        } else {
+                            log::warn!(
+                                "XIC probe run_id={} has no {} transitions for precursor_id={}",
+                                row.run_id,
+                                label,
+                                row.precursor_id
+                            );
+                        }
+                        logged_runs.insert(row.run_id);
+                    }
+
                     let (ms1_series, ms2_series) = split_ms1_ms2(xic);
 
                     let mut offset = 0usize;

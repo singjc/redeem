@@ -129,7 +129,7 @@ impl TopazBagRanker {
         let cand_masked = ((&cand * &m)? + (&neg_big * (&ones - &m)?)?)?;
         let bag = cand_masked.max(1)?;
 
-        let k_best = cand_masked.argmax(1)?; // (B,)
+        let k_best = cand_masked.argmax(1)?.to_dtype(DType::I64)?; // (B,)
         let idx = Tensor::arange(0i64, k as i64, cand.device())?
             .reshape((1, k))?
             .broadcast_as((b, k))?;
@@ -169,7 +169,7 @@ impl TopazBagRanker {
         let cand_masked = ((&cand * &m)? + (&neg_big * (&ones - &m)?)?)?;
         let bag = cand_masked.max(1)?;
 
-        let k_best = cand_masked.argmax(1)?;
+        let k_best = cand_masked.argmax(1)?.to_dtype(DType::I64)?;
         let idx = Tensor::arange(0i64, k as i64, cand.device())?
             .reshape((1, k))?
             .broadcast_as((b, k))?;
