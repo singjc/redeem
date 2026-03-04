@@ -13,6 +13,7 @@ rayon = { workspace = true, optional = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 redeem-io = { path = "../redeem-io", default-features = false }
+rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
@@ -28,7 +29,7 @@ diagnostics = []
 rayon = ["dep:rayon"]
 
 # keep heavy IO out of this crate (reserve for redeem-io)
-io-sqlite = ["redeem-io/sqlite"]
+io-sqlite = ["redeem-io/sqlite", "dep:rusqlite"]
 io-parquet = ["redeem-io/parquet"]
 
 # enable CUDA backend for candle

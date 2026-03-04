@@ -11,8 +11,9 @@ use anyhow::Result;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use candle_core::{Device, Tensor};
 use crate::preprocess::Preprocessor;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrainFilter {
     /// Keep only these run IDs (if provided).
     pub run_ids: Option<Vec<u64>>,
@@ -105,6 +106,44 @@ pub fn filter_training_rows(rows: Vec<FeatureRow>, filt: &TrainFilter) -> Vec<Fe
     limit_precursors(rows, filt.max_precursors, filt.seed)
 }
 
+/// Split rows by unique precursor_id (no leakage across candidates).
+pub fn split_rows_by_precursor(
+    rows: &[FeatureRow],
+    val_frac: f32,
+    seed: u64,
+) -> (Vec<FeatureRow>, Vec<FeatureRow>) {
+    let mut precs: Vec<u64> = rows.iter().map(|r| r.precursor_id).collect();
+    precs.sort_unstable();
+    precs.dedup();
+    if precs.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut idxs: Vec<usize> = (0..precs.len()).collect();
+    shuffle_indices(&mut idxs, seed);
+    let frac = val_frac.max(0.0).min(1.0);
+    let mut n_val = ((precs.len() as f32) * frac).floor() as usize;
+    if precs.len() > 1 {
+        n_val = n_val.clamp(1, precs.len() - 1);
+    } else {
+        n_val = 0;
+    }
+    let val_set: std::collections::HashSet<u64> = idxs
+        .into_iter()
+        .take(n_val)
+        .map(|i| precs[i])
+        .collect();
+    let mut tr = Vec::new();
+    let mut va = Vec::new();
+    for r in rows {
+        if val_set.contains(&r.precursor_id) {
+            va.push(r.clone());
+        } else {
+            tr.push(r.clone());
+        }
+    }
+    (tr, va)
+}
+
 /// Fit preprocessing statistics on the provided rows.
 pub fn fit_preprocessor_from_rows(rows: &[FeatureRow], feat_dim: usize) -> Preprocessor {
     let x = rows_to_feature_matrix(rows, feat_dim);
@@ -112,7 +151,7 @@ pub fn fit_preprocessor_from_rows(rows: &[FeatureRow], feat_dim: usize) -> Prepr
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn bags_to_train_batches(
+pub fn bags_to_train_batches(
     bags: Bags,
     device: &Device,
     batch_size: usize,

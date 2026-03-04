@@ -2,6 +2,7 @@
 
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{self as nn, Module, VarBuilder};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
 struct DropoutAlways(nn::Dropout);
@@ -12,7 +13,7 @@ impl Module for DropoutAlways {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrunConfig {
     pub in_dim: usize,
     pub d_model: usize,
@@ -64,7 +65,7 @@ impl XrunAttentionCalibrator {
     /// x: (B,R,D)  mask: (B,R) bool
     /// returns (delta: (B,R), attn: (B,R))
     pub fn forward_masked(&self, x: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (b, r, d) = x.dims3()?;
+        let (b, r, _d) = x.dims3()?;
 
         let r_proj = x.apply(&self.proj)?; // (B,R,dm)
 

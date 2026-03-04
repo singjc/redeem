@@ -1,10 +1,12 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{self as nn, optim::AdamW, Optimizer, VarBuilder, VarMap};
 
 use crate::xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum XrunPoolMode {
     Max,
     Lse,
@@ -12,14 +14,15 @@ pub enum XrunPoolMode {
     AttnMean,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum XrunVarWeight {
     Uniform,
     Attn,
     Pool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrunTrainConfig {
     pub d_model: usize,
     pub attn_hidden: usize,

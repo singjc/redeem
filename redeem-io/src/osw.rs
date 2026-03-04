@@ -1,6 +1,7 @@
 // redeem-io/src/osw.rs
 
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct FeatureRow {
@@ -23,7 +24,7 @@ pub struct ScoreRow {
     pub pep: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OswLevel {
     Ms2,
     Ms1,
@@ -32,7 +33,7 @@ pub enum OswLevel {
     Alignment,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OswReadConfig {
     pub level: OswLevel,
     pub ipf_max_rank: i32,

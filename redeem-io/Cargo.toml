@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 
 rusqlite = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }

@@ -55,6 +55,17 @@ pub struct TopazBagRanker {
     pub scorer: crate::building_blocks::mlp::CandidateScorer,
 }
 
+#[derive(Debug, Clone)]
+pub struct BagHeadComponents {
+    pub emb_ms2: Tensor,
+    pub emb_ms1: Tensor,
+    pub emb_all: Tensor,
+    pub coe_ms2: Tensor,
+    pub coe_ms1: Tensor,
+    pub coe_ms12: Tensor,
+    pub coe_all: Tensor,
+}
+
 impl TopazBagRanker {
     pub fn new(vb: VarBuilder, cfg: &TopazConfig) -> Result<Self> {
         let trace_enc = crate::building_blocks::conv_encoder::TraceEncoder::new(
@@ -131,6 +142,81 @@ impl TopazBagRanker {
         let win = win.broadcast_mul(&has.unsqueeze(1)?)?;
 
         Ok((cand, bag, win))
+    }
+
+    /// Forward for bags, returning winner hidden and per-head components.
+    /// Returns (cand_logits: (B,K), bag_logits: (B,), winner_hidden: (B,H), components).
+    pub fn forward_bags_with_heads(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, BagHeadComponents)> {
+        let (b, k, d) = xb.dims3()?;
+        let (_, _, c, l) = tb.dims4()?;
+
+        let xf = xb.reshape((b * k, d))?;
+        let tf = tb.reshape((b * k, c, l))?;
+
+        let (emb_all, coe_all, comps) = self.trace_enc.forward_with_heads(&tf)?;
+        let (logits, hidden) = self.scorer.forward_with_hidden(&xf, &emb_all, &coe_all)?;
+        let cand = logits.reshape((b, k))?;
+        let hidden = hidden.reshape((b, k, self.scorer.hidden_dim()))?;
+
+        let m = mask.to_dtype(DType::F32)?;
+        let neg_big = Tensor::full(-1e9f32, (b, k), cand.device())?;
+        let ones = m.ones_like()?;
+        let cand_masked = ((&cand * &m)? + (&neg_big * (&ones - &m)?)?)?;
+        let bag = cand_masked.max(1)?;
+
+        let k_best = cand_masked.argmax(1)?;
+        let idx = Tensor::arange(0i64, k as i64, cand.device())?
+            .reshape((1, k))?
+            .broadcast_as((b, k))?;
+        let k_best = k_best.reshape((b, 1))?.broadcast_as((b, k))?;
+        let onehot = idx.eq(&k_best)?;
+        let onehot_f = onehot.to_dtype(DType::F32)?;
+
+        let win = hidden.broadcast_mul(&onehot_f.unsqueeze(2)?)?.sum(1)?;
+        let has = m.sum(1)?.gt(0.0f32)?.to_dtype(DType::F32)?;
+        let win = win.broadcast_mul(&has.unsqueeze(1)?)?;
+
+        fn select_win(
+            comp: &Tensor,
+            b: usize,
+            k: usize,
+            onehot_f: &Tensor,
+        ) -> Result<Tensor> {
+            let (n, d) = comp.dims2()?;
+            if d == 0 || n == 0 {
+                return Tensor::zeros((b, 0), DType::F32, comp.device());
+            }
+            let comp_bk = comp.reshape((b, k, d))?;
+            comp_bk.broadcast_mul(&onehot_f.unsqueeze(2)?)?.sum(1)
+        }
+
+        let emb_ms2 = select_win(&comps.emb_ms2, b, k, &onehot_f)?;
+        let emb_ms1 = select_win(&comps.emb_ms1, b, k, &onehot_f)?;
+        let emb_all = select_win(&comps.emb_all, b, k, &onehot_f)?;
+        let coe_ms2 = select_win(&comps.coe_ms2, b, k, &onehot_f)?;
+        let coe_ms1 = select_win(&comps.coe_ms1, b, k, &onehot_f)?;
+        let coe_ms12 = select_win(&comps.coe_ms12, b, k, &onehot_f)?;
+        let coe_all = select_win(&comps.coe_all, b, k, &onehot_f)?;
+
+        Ok((
+            cand,
+            bag,
+            win,
+            BagHeadComponents {
+                emb_ms2,
+                emb_ms1,
+                emb_all,
+                coe_ms2,
+                coe_ms1,
+                coe_ms12,
+                coe_all,
+            },
+        ))
     }
 }
 

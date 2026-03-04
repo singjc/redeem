@@ -83,7 +83,6 @@ pub fn build_xrun_sequences_from_bags(
             idx.sort_by(|&a, &b| run_ids[a].cmp(&run_ids[b]));
         }
 
-        let take = idx.len();
         for (ri, &bi) in idx.iter().enumerate() {
             idx_mat[pi * r + ri] = bi as i64;
             mask[pi * r + ri] = true;

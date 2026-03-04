@@ -14,9 +14,12 @@ pub use pipeline::{
     build_trace_tensors_from_source,
     rows_to_feature_matrix,
     rows_to_feature_matrix_preprocessed,
+    rows_to_feature_matrix_with_cols,
     score_bags_from_rows,
+    score_bags_with_heads_from_rows,
     score_rows_from_rows,
     BagScoreOutput,
+    BagHeadOutput,
     TraceBuildConfig,
     XicFetchConfig,
 };

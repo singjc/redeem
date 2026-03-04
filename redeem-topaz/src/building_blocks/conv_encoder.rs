@@ -62,6 +62,17 @@ pub struct TraceEncoder {
     beta: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TraceHeadComponents {
+    pub emb_ms2: Tensor,
+    pub emb_ms1: Tensor,
+    pub emb_all: Tensor,
+    pub coe_ms2: Tensor,
+    pub coe_ms1: Tensor,
+    pub coe_ms12: Tensor,
+    pub coe_all: Tensor,
+}
+
 impl TraceEncoder {
     pub fn new(vb: VarBuilder, cfg: &TopazConfig) -> Result<Self> {
         let dual_mul = if cfg.trace_input_mode == TraceInputMode::Dual { 2 } else { 1 };
@@ -195,6 +206,85 @@ impl TraceEncoder {
         };
 
         Ok((emb, coe, coe_ms12))
+    }
+
+    /// Forward returning per-head components for diagnostics.
+    pub fn forward_with_heads(&self, x: &Tensor) -> Result<(Tensor, Tensor, TraceHeadComponents)> {
+        let (n, c_total, l) = x.dims3()?;
+        let expected = if self.ms1_c > 0 { self.ms1_c + self.ms2_c } else { self.ms2_c };
+
+        let x = if c_total != expected {
+            if c_total < expected {
+                let pad = Tensor::zeros((n, expected - c_total, l), x.dtype(), x.device())?;
+                Tensor::cat(&[x.clone(), pad], 1)?
+            } else {
+                x.narrow(1, 0, expected)?
+            }
+        } else {
+            x.clone()
+        };
+
+        let (ms1, ms2) = if self.ms1_c > 0 {
+            let a = x.narrow(1, 0, self.ms1_c)?;
+            let b = x.narrow(1, self.ms1_c, self.ms2_c)?;
+            (Some(a), b)
+        } else {
+            (None, x)
+        };
+        let device = ms2.device();
+
+        let coe_ms2 = if self.use_coelution {
+            if let Some(head) = &self.ms2_coe {
+                head.forward(&ms2)?
+            } else {
+                Tensor::zeros((n, 0), DType::F32, device)?
+            }
+        } else {
+            Tensor::zeros((n, 0), DType::F32, device)?
+        };
+
+        let mut coe_ms1 = Tensor::zeros((n, 0), DType::F32, device)?;
+        let mut coe_ms12 = Tensor::zeros((n, 0), DType::F32, device)?;
+        if let (Some(ms1x), Some(head1)) = (ms1.as_ref(), &self.ms1_coe) {
+            if self.use_coelution {
+                coe_ms1 = head1.forward(ms1x)?;
+                coe_ms12 = self.ms12_features(ms1x, &ms2)?;
+            }
+        }
+
+        let coe_all = if self.use_coelution {
+            if self.ms1_c > 0 && self.ms1_coe.is_some() {
+                Tensor::cat(&[coe_ms2.clone(), coe_ms1.clone(), coe_ms12.clone()], 1)?
+            } else {
+                coe_ms2.clone()
+            }
+        } else {
+            Tensor::zeros((n, 0), DType::F32, device)?
+        };
+
+        let emb_ms2 = self.ms2.forward(&ms2)?;
+        let emb_ms1 = if let (Some(ms1x), Some(branch)) = (ms1, self.ms1.as_ref()) {
+            branch.forward(&ms1x)?
+        } else {
+            Tensor::zeros((n, 0), DType::F32, device)?
+        };
+        let emb_all = if emb_ms1.elem_count() > 0 {
+            Tensor::cat(&[emb_ms2.clone(), emb_ms1.clone()], 1)?
+        } else {
+            emb_ms2.clone()
+        };
+
+        let comps = TraceHeadComponents {
+            emb_ms2,
+            emb_ms1,
+            emb_all: emb_all.clone(),
+            coe_ms2,
+            coe_ms1,
+            coe_ms12,
+            coe_all: coe_all.clone(),
+        };
+
+        Ok((emb_all, coe_all, comps))
     }
 
     /// Port of Python `_ms12_features`.
