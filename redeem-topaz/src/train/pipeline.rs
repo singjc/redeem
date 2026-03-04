@@ -177,7 +177,7 @@ pub fn subsample_train_rows_by_bag(
             kept_targets += 1;
         }
     }
-    eprintln!(
+    log::info!(
         "Train subsample: kept_bags={}/{} (targets={} decoys={}) frac={}",
         keep_idx.len(),
         n_bags,

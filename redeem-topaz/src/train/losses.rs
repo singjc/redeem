@@ -59,7 +59,7 @@ pub fn inbag_ranking_loss(
     let s_masked = (s.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
 
     let s_best = s_masked.max(1)?;
-    let k_best = s_masked.argmax(1)?;
+    let k_best = s_masked.argmax(1)?.to_dtype(DType::I64)?;
 
     let idx = Tensor::arange(0i64, k as i64, s.device())?
         .reshape((1, k))?
@@ -98,7 +98,7 @@ pub fn winner_margin_loss(
     let s_masked = (s.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
 
     let s_best = s_masked.max(1)?;
-    let k_best = s_masked.argmax(1)?;
+    let k_best = s_masked.argmax(1)?.to_dtype(DType::I64)?;
 
     let idx = Tensor::arange(0i64, k as i64, s.device())?
         .reshape((1, k))?

@@ -392,7 +392,7 @@ impl XrunTrainer {
 
             let tr_loss = if tr_batches > 0 { tr_loss / tr_batches as f32 } else { f32::INFINITY };
             let va_loss = if va_batches > 0 { va_loss / va_batches as f32 } else { f32::INFINITY };
-            eprintln!("[xrun] Epoch {:02} train={:.4} val={:.4}", epoch, tr_loss, va_loss);
+            log::info!("[xrun] Epoch {:02} train={:.4} val={:.4}", epoch, tr_loss, va_loss);
 
             if va_loss < best_val - 1e-4 {
                 best_val = va_loss;
@@ -408,7 +408,7 @@ impl XrunTrainer {
             } else {
                 bad += 1;
                 if bad >= self.cfg.patience.max(1) {
-                    eprintln!("[xrun] Early stopping (best val={:.4})", best_val);
+                    log::info!("[xrun] Early stopping (best val={:.4})", best_val);
                     break;
                 }
             }

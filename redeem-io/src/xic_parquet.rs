@@ -49,6 +49,29 @@ impl XicParquetReader {
 }
 
 #[cfg(feature = "parquet")]
+pub fn list_run_ids(path: &Path) -> Result<Vec<u64>> {
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let col_idx = XicParquetReader::build_index(&reader)?;
+    let idx_run = XicParquetReader::ensure_idx(&col_idx, "RUN_ID")?;
+    let mut set: HashSet<u64> = HashSet::new();
+    let mut iter = reader.get_row_iter(None)?;
+    while let Some(row) = iter.next() {
+        let row = row?;
+        let run = XicParquetReader::get_i64(&row, idx_run, "RUN_ID")? as u64;
+        set.insert(run);
+    }
+    let mut out: Vec<u64> = set.into_iter().collect();
+    out.sort_unstable();
+    Ok(out)
+}
+
+#[cfg(not(feature = "parquet"))]
+pub fn list_run_ids(_path: &Path) -> Result<Vec<u64>> {
+    bail!("XIC parquet reader not available (enable feature `parquet`)")
+}
+
+#[cfg(feature = "parquet")]
 #[derive(Debug, Clone, Default)]
 struct XicParquetFilters {
     run_id: Option<u64>,

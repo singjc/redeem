@@ -25,6 +25,7 @@ rayon = "1.5"
 rusqlite = "0.32.1"
 parquet = "53.0.0"
 flate2 = "1.0"
+log = "0.4"
 
 # Candle pinned once, workspace-wide
 candle-core = { version = "0.8.4", default-features = false, features = [] }

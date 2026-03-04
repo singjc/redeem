@@ -218,8 +218,8 @@ pub fn build_trace_tensors_from_source(
                     if ms1_series.is_empty()
                         && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed)
                     {
-                        eprintln!(
-                            "warning: missing MS1 traces for at least one precursor; padding zeros"
+                        log::warn!(
+                            "missing MS1 traces for at least one precursor; padding zeros"
                         );
                     }
                     let t_ms1 = extract_trace_tensor_centered(
@@ -874,7 +874,7 @@ mod tests {
             "/home/singjc/Documents/github/PASS01508_DIAlignR_Spyo/2026026_for_ptsc_model/hroest_K120808_Strep0%PlasmaBiolRepl1_R01_SW.xic",
         );
         if !osw_path.exists() || !xic_path.exists() {
-            eprintln!("skipping test_osw_xic_end_to_end_tsv: sample files not found");
+            log::info!("skipping test_osw_xic_end_to_end_tsv: sample files not found");
             return Ok(());
         }
 
@@ -884,7 +884,7 @@ mod tests {
         };
         let table = read_osw_features(osw_path, &osw_cfg)?;
         if table.rows.is_empty() {
-            eprintln!("skipping test_osw_xic_end_to_end_tsv: OSW has no rows");
+            log::info!("skipping test_osw_xic_end_to_end_tsv: OSW has no rows");
             return Ok(());
         }
 

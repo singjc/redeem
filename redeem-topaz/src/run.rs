@@ -43,6 +43,8 @@ use crate::train::{
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::diagnostics::{print_trace_summary, trace_summary, warn_if_missing_ms1};
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::io::osw::FeatureRow;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::pipeline::build_xrun_bag_data_from_rows;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::sequence::build_xrun_sequences_from_bags;
@@ -324,11 +326,11 @@ fn resolve_feature_cols(osw_cols: &[String], cfg: &FeatureSelectConfig) -> Vec<S
         }
         FeatureMode::Custom => {
             let Some(cols) = &cfg.cols else {
-                eprintln!("warning: feature_select.mode=custom but no cols provided");
+                log::warn!("feature_select.mode=custom but no cols provided");
                 return Vec::new();
             };
             if cols.is_empty() {
-                eprintln!("warning: feature_select.cols is empty; disabling heuristic features");
+                log::warn!("feature_select.cols is empty; disabling heuristic features");
                 return Vec::new();
             }
             for c in cols {
@@ -339,8 +341,8 @@ fn resolve_feature_cols(osw_cols: &[String], cfg: &FeatureSelectConfig) -> Vec<S
     }
 
     if !missing.is_empty() {
-        eprintln!(
-            "warning: requested feature columns not found in OSW (will be imputed): {}",
+        log::warn!(
+            "requested feature columns not found in OSW (will be imputed): {}",
             missing.join(", ")
         );
     }
@@ -402,6 +404,28 @@ fn filter_rows_by_trace(
         }
     }
     (out_rows, out_trace)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn log_run_id_summary(rows: &[FeatureRow], xic_path: &Path) {
+    if !log::log_enabled!(log::Level::Info) {
+        return;
+    }
+    let mut osw_runs: Vec<u64> = rows.iter().map(|r| r.run_id).collect();
+    osw_runs.sort_unstable();
+    osw_runs.dedup();
+    log::info!("OSW run_ids (n={}): {:?}", osw_runs.len(), osw_runs);
+
+    match crate::io::xic_parquet::list_run_ids(xic_path) {
+        Ok(mut runs) => {
+            runs.sort_unstable();
+            runs.dedup();
+            log::info!("XIC run_ids (n={}): {:?}", runs.len(), runs);
+        }
+        Err(e) => {
+            log::warn!("Failed to read XIC run_ids: {e:#}");
+        }
+    }
 }
 
 fn write_head_embeddings_tsv(
@@ -545,11 +569,12 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     if rows.is_empty() {
         bail!("no rows after filtering");
     }
+    log_run_id_summary(&rows, &cfg.xic_path);
 
     let mut selected_cols = resolve_feature_cols(&table.feature_cols, &cfg.feature_select);
     let mut model_cfg = cfg.model.clone();
     if !model_cfg.use_heuristic_features && !selected_cols.is_empty() {
-        eprintln!("warning: model.use_heuristic_features=false; ignoring selected feature columns");
+        log::warn!("model.use_heuristic_features=false; ignoring selected feature columns");
         selected_cols.clear();
     }
     if selected_cols.is_empty() {
@@ -559,8 +584,8 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         model_cfg.use_heuristic_features = true;
         if model_cfg.feat_dim != selected_cols.len() {
             if model_cfg.feat_dim != 0 {
-                eprintln!(
-                    "warning: overriding model.feat_dim={} to match selected columns ({})",
+                log::warn!(
+                    "overriding model.feat_dim={} to match selected columns ({})",
                     model_cfg.feat_dim,
                     selected_cols.len()
                 );
@@ -682,7 +707,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
             pre.as_ref(),
         )?;
         let summ = tdc_summary(&out.bag_score, &out.is_decoy, 0.01);
-        eprintln!(
+        log::info!(
             "VAL TDC summary @q=0.01: cutoff={:.4} targets={} decoys={}",
             summ.cutoff, summ.n_targets, summ.n_decoys
         );
@@ -720,6 +745,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     if rows.is_empty() {
         bail!("no rows in OSW");
     }
+    log_run_id_summary(&rows, &cfg.xic_path);
 
     let mut x_trace = build_trace_tensors_from_parquet(&rows, &cfg.xic_path, &cfg.trace, &cfg.fetch)?;
     if cfg.restrict_osw_to_xic_map {
@@ -817,7 +843,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                     0.01,
                     &outdir,
                 )?;
-                eprintln!(
+                log::info!(
                     "Rank1 disagreement summary: rows={} cutoff_pstc={:?} cutoff_ms2={:?}",
                     summ.rows, summ.pstc_cutoff, summ.ms2_cutoff
                 );
@@ -846,6 +872,7 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     } else {
         table.rows
     };
+    log_run_id_summary(&rows_aligned, &cfg.xic_path);
 
     let x_trace = build_trace_tensors_from_parquet(&rows_aligned, &cfg.xic_path, &cfg.trace, &cfg.fetch)?;
     let (rows_aligned, x_trace) = if cfg.restrict_osw_to_xic_map {

@@ -79,11 +79,11 @@ pub fn trace_summary(
 
 pub fn print_trace_summary(summary: &TraceSummary, label: &str) {
     if summary.n == 0 || summary.l == 0 {
-        eprintln!("Trace summary ({label}): empty");
+        log::info!("Trace summary ({label}): empty");
         return;
     }
     if summary.ms1_cmax > 0 {
-        eprintln!(
+        log::info!(
             "Trace summary ({label}): N={} L={} | MS1 C={} nonzero_rows={} | MS2 C={} nonzero_rows={}",
             summary.n,
             summary.l,
@@ -93,7 +93,7 @@ pub fn print_trace_summary(summary: &TraceSummary, label: &str) {
             summary.ms2_nonzero_rows
         );
     } else {
-        eprintln!(
+        log::info!(
             "Trace summary ({label}): N={} L={} | C={} nonzero_rows={}",
             summary.n,
             summary.l,
@@ -108,8 +108,8 @@ pub fn warn_if_missing_ms1(summary: &TraceSummary, context: &str) {
         return;
     }
     if summary.ms1_nonzero_rows == 0 {
-        eprintln!(
-            "warning: ms1_cmax={} but no MS1 traces found in {}; using zero-padded MS1 channels.",
+        log::warn!(
+            "ms1_cmax={} but no MS1 traces found in {}; using zero-padded MS1 channels.",
             summary.ms1_cmax, context
         );
     }
@@ -336,7 +336,7 @@ pub fn write_rank1_disagreement_tsvs(
     let conn = Connection::open(osw_path)?;
     let rows = load_rank1_join(&conn, pstc_table)?;
     if rows.is_empty() {
-        eprintln!("warning: rank1 disagreement analysis found no joined rows");
+        log::warn!("rank1 disagreement analysis found no joined rows");
         return Ok(Rank1DisagreementSummary {
             rows: 0,
             pstc_cutoff: None,
@@ -464,11 +464,11 @@ pub fn write_rank1_disagreement_tsvs(
 
     if !by_run_rows.is_empty() {
         let cap = by_run_rows.len().min(10);
-        eprintln!(
+        log::info!(
             "Rank-1 disagreement targets by run (top {cap} by total_targets):"
         );
         for (run, counts, _total) in by_run_rows.iter().take(cap) {
-            eprintln!(
+            log::info!(
                 "  run {run}: both={} pstc_only={} ms2_only={} neither={}",
                 counts[0], counts[1], counts[2], counts[3]
             );
