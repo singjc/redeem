@@ -440,6 +440,7 @@ fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read xic_map: {path:?}"))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut map: HashMap<u64, PathBuf> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -458,7 +459,34 @@ fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
         let Some(path_str) = parts.next() else { continue; };
         let mut p = PathBuf::from(path_str);
         if p.is_relative() {
-            p = base.join(p);
+            let base_candidate = base.join(&p);
+            let cwd_candidate = cwd.join(&p);
+            let base_exists = base_candidate.exists();
+            let cwd_exists = cwd_candidate.exists();
+            p = match (base_exists, cwd_exists) {
+                (true, true) => {
+                    log::warn!(
+                        "XIC map path {} exists relative to both {:?} and {:?}; using {:?}",
+                        path_str,
+                        base,
+                        cwd,
+                        base_candidate
+                    );
+                    base_candidate
+                }
+                (true, false) => base_candidate,
+                (false, true) => cwd_candidate,
+                (false, false) => {
+                    log::warn!(
+                        "XIC map path {} not found relative to {:?} or {:?}; using {:?}",
+                        path_str,
+                        base,
+                        cwd,
+                        base_candidate
+                    );
+                    base_candidate
+                }
+            };
         }
         map.insert(run_id, p);
     }
