@@ -28,6 +28,7 @@ pub fn run(cfg: &TopazTrainConfig) -> Result<()> {
                 &report_path,
                 cfg.inner.seed,
                 Some(&cfg.inner.osw_path),
+                None,
             ) {
                 log::warn!("Failed to write TOPAZ report: {e:#}");
             } else {

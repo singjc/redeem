@@ -23,6 +23,22 @@ pub struct PrecursorMeta {
 }
 
 #[derive(Debug, Clone)]
+pub struct FeatureMeta {
+    pub feature_id: u64,
+    pub run_id: u64,
+    pub precursor_id: u64,
+    pub is_decoy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoreTableEntry {
+    pub feature_id: u64,
+    pub score: f32,
+    pub rank: Option<i32>,
+    pub qvalue: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ScoreRow {
     pub feature_id: u64,
     pub score: f32,
@@ -112,8 +128,120 @@ pub fn read_precursor_meta(path: &std::path::Path) -> Result<HashMap<u64, Precur
     Ok(out)
 }
 
+#[cfg(feature = "sqlite")]
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
+    )?;
+    let mut rows = stmt.query([table])?;
+    Ok(rows.next()?.is_some())
+}
+
+#[cfg(feature = "sqlite")]
+fn list_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    let mut cols = Vec::new();
+    for r in rows {
+        cols.push(r?);
+    }
+    Ok(cols)
+}
+
+#[cfg(feature = "sqlite")]
+pub fn read_feature_meta(path: &std::path::Path) -> Result<HashMap<u64, FeatureMeta>> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let sql = r#"
+        SELECT f.ID, f.RUN_ID, f.PRECURSOR_ID, p.DECOY
+        FROM FEATURE f
+        JOIN PRECURSOR p ON p.ID = f.PRECURSOR_ID
+    "#;
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        let feature_id: i64 = row.get(0)?;
+        let run_id: i64 = row.get(1)?;
+        let precursor_id: i64 = row.get(2)?;
+        let decoy: i64 = row.get(3)?;
+        Ok(FeatureMeta {
+            feature_id: feature_id as u64,
+            run_id: run_id as u64,
+            precursor_id: precursor_id as u64,
+            is_decoy: decoy == 1,
+        })
+    })?;
+    let mut out = HashMap::new();
+    for r in rows {
+        let meta = r?;
+        out.insert(meta.feature_id, meta);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "sqlite")]
+pub fn read_score_table(
+    path: &std::path::Path,
+    table: &str,
+) -> Result<Vec<ScoreTableEntry>> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if !table_exists(&conn, table)? {
+        return Ok(Vec::new());
+    }
+    let cols = list_columns(&conn, table)?;
+    let cols_upper: Vec<String> = cols.iter().map(|c| c.to_uppercase()).collect();
+    let has_score = cols_upper.iter().any(|c| c == "SCORE");
+    if !has_score {
+        return Ok(Vec::new());
+    }
+    let has_rank = cols_upper.iter().any(|c| c == "RANK");
+    let has_q = cols_upper.iter().any(|c| c == "QVALUE");
+
+    let rank_expr = if has_rank { "RANK" } else { "NULL" };
+    let q_expr = if has_q { "QVALUE" } else { "NULL" };
+    let sql = format!(
+        "SELECT FEATURE_ID, SCORE, {rank_expr} AS RANK, {q_expr} AS QVALUE FROM {table}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        let feature_id: i64 = row.get(0)?;
+        let score: Option<f32> = row.get(1)?;
+        let rank: Option<i64> = row.get(2)?;
+        let qvalue: Option<f32> = row.get(3)?;
+        Ok(ScoreTableEntry {
+            feature_id: feature_id as u64,
+            score: score.unwrap_or(0.0),
+            rank: rank.map(|r| r as i32),
+            qvalue,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 #[cfg(not(feature = "sqlite"))]
 pub fn read_precursor_meta(_path: &std::path::Path) -> Result<HashMap<u64, PrecursorMeta>> {
+    bail!("redeem-io compiled without feature `sqlite`")
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub fn read_feature_meta(_path: &std::path::Path) -> Result<HashMap<u64, FeatureMeta>> {
+    bail!("redeem-io compiled without feature `sqlite`")
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub fn read_score_table(
+    _path: &std::path::Path,
+    _table: &str,
+) -> Result<Vec<ScoreTableEntry>> {
     bail!("redeem-io compiled without feature `sqlite`")
 }
 
