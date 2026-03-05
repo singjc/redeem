@@ -32,6 +32,12 @@ impl TopazXrunSweepConfig {
         if let Some(p) = matches.get_one::<PathBuf>("xic_map_path") {
             cfg.inner.xic_map_path = Some(p.clone());
         }
+        if let Some(p) = matches.get_one::<PathBuf>("xic_cache_dir") {
+            cfg.inner.xic_cache_dir = Some(p.clone());
+        }
+        if let Some(v) = matches.get_one::<u64>("xic_cache_max_bytes") {
+            cfg.inner.xic_cache_max_bytes = Some(*v);
+        }
         if let Some(p) = matches.get_one::<PathBuf>("checkpoint") {
             cfg.inner.checkpoint = p.clone();
         }

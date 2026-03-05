@@ -172,32 +172,24 @@ impl XicParquetReader {
             0 => Self::decode_raw_doubles(data),
             1 => Self::decode_zlib_doubles(data),
             5 => {
-                match msnumpress::decode_linear(data) {
-                    Ok(v) => Ok(v),
-                    Err(e) => {
-                        if Self::looks_like_zlib(data) {
-                            let buf = Self::decode_zlib_bytes(data)?;
-                            msnumpress::decode_linear(&buf)
-                                .map_err(|e2| anyhow::anyhow!("msnumpress linear decode failed after zlib fallback: {e2}"))
-                        } else {
-                            Err(e)
+                if Self::looks_like_zlib(data) {
+                    if let Ok(buf) = Self::decode_zlib_bytes(data) {
+                        if let Ok(v) = msnumpress::decode_linear(&buf) {
+                            return Ok(v);
                         }
                     }
                 }
+                msnumpress::decode_linear(data)
             }
             6 => {
-                match msnumpress::decode_slof(data) {
-                    Ok(v) => Ok(v),
-                    Err(e) => {
-                        if Self::looks_like_zlib(data) {
-                            let buf = Self::decode_zlib_bytes(data)?;
-                            msnumpress::decode_slof(&buf)
-                                .map_err(|e2| anyhow::anyhow!("msnumpress slof decode failed after zlib fallback: {e2}"))
-                        } else {
-                            Err(e)
+                if Self::looks_like_zlib(data) {
+                    if let Ok(buf) = Self::decode_zlib_bytes(data) {
+                        if let Ok(v) = msnumpress::decode_slof(&buf) {
+                            return Ok(v);
                         }
                     }
                 }
+                msnumpress::decode_slof(data)
             }
             _ => bail!("unsupported compression id {comp}"),
         }

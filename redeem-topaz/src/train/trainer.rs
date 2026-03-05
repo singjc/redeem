@@ -27,6 +27,13 @@ pub struct TrainMetrics {
     pub loss_ms12: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct TrainHistory {
+    pub epochs_ran: usize,
+    pub best_epoch: usize,
+    pub best_val: f32,
+}
+
 pub struct Trainer {
     pub config: Config,
     pub varmap: VarMap,
@@ -138,6 +145,37 @@ impl Trainer {
         })
     }
 
+    fn bag_logits(&self, batch: &TrainBatch) -> Result<Tensor> {
+        let (b, k, d) = batch.xb.dims3()?;
+        let (_, _, c, l) = batch.tb.dims4()?;
+
+        let xf = batch.xb.reshape((b * k, d))?;
+        let tf = batch.tb.reshape((b * k, c, l))?;
+
+        let (emb, coe, _coe_ms12) = self.model.trace_enc.forward_components(&tf)?;
+        let logits = self.model.scorer.forward(&xf, &emb, &coe)?;
+        let cand = logits.reshape((b, k))?;
+
+        let m = batch.mask.to_dtype(DType::F32)?;
+        let neg_big = Tensor::full(-1e9f32, (b, k), cand.device())?;
+        let ones = m.ones_like()?;
+        let cand_masked = (cand.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
+        cand_masked.max(1)
+    }
+
+    pub fn eval_bag_loss(&self, batches: &[TrainBatch]) -> Result<f32> {
+        if batches.is_empty() {
+            return Ok(f32::INFINITY);
+        }
+        let mut sum = 0f32;
+        for batch in batches {
+            let bag = self.bag_logits(batch)?;
+            let loss = losses::bce_with_logits(&bag, &batch.yb)?;
+            sum += loss.to_scalar::<f32>()?;
+        }
+        Ok(sum / batches.len() as f32)
+    }
+
     pub fn train_one_epoch(&mut self, batches: &[TrainBatch]) -> Result<Vec<TrainMetrics>> {
         let mut out = Vec::with_capacity(batches.len());
         for batch in batches {
@@ -177,6 +215,120 @@ impl Trainer {
             }
         }
         Ok(out)
+    }
+
+    /// Train with optional early stopping on validation bag loss.
+    pub fn train_epochs_early_stop(
+        &mut self,
+        train_batches: &[TrainBatch],
+        val_batches: &[TrainBatch],
+        max_epochs: usize,
+        scheduler: Option<&CosineWarmupScheduler>,
+    ) -> Result<TrainHistory> {
+        if train_batches.is_empty() {
+            return Ok(TrainHistory { epochs_ran: 0, best_epoch: 0, best_val: f32::INFINITY });
+        }
+        let mut step = 0usize;
+        let total_steps = max_epochs.max(1) * train_batches.len().max(1);
+        let sched = scheduler.cloned().unwrap_or_else(|| {
+            CosineWarmupScheduler::new(
+                self.config.learning_rate as f64,
+                total_steps,
+                self.config.warmup_frac as f64,
+                self.config.warmup_steps,
+                self.config.min_lr_ratio as f64,
+            )
+        });
+
+        let mut best_val = f32::INFINITY;
+        let mut best_epoch = 0usize;
+        let mut bad = 0usize;
+        let min_delta = 1e-4f32;
+        let patience = self.config.patience.max(1);
+
+        let mut best_path = None;
+        if !val_batches.is_empty() {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "redeem_topaz_best_{}_{}.safetensors",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            best_path = Some(p);
+        }
+
+        let mut epochs_ran = 0usize;
+        for epoch in 1..=max_epochs.max(1) {
+            let mut train_sum = 0f32;
+            for batch in train_batches {
+                if self.config.use_lr_scheduler {
+                    let lr = sched.lr_at_step(step);
+                    self.opt.set_learning_rate(lr);
+                }
+                let metrics = self.train_step(batch)?;
+                train_sum += metrics.loss;
+                step += 1;
+            }
+            epochs_ran = epoch;
+            let train_loss = train_sum / train_batches.len() as f32;
+            if val_batches.is_empty() {
+                if self.config.use_lr_scheduler {
+                    log::info!(
+                        "Epoch {:02} train={:.4} lr={:.3e}",
+                        epoch,
+                        train_loss,
+                        self.opt.learning_rate()
+                    );
+                } else {
+                    log::info!("Epoch {:02} train={:.4}", epoch, train_loss);
+                }
+                continue;
+            }
+
+            let val_loss = self.eval_bag_loss(val_batches)?;
+            if self.config.use_lr_scheduler {
+                log::info!(
+                    "Epoch {:02} train={:.4} val={:.4} lr={:.3e}",
+                    epoch,
+                    train_loss,
+                    val_loss,
+                    self.opt.learning_rate()
+                );
+            } else {
+                log::info!("Epoch {:02} train={:.4} val={:.4}", epoch, train_loss, val_loss);
+            }
+
+            if val_loss + min_delta < best_val {
+                best_val = val_loss;
+                best_epoch = epoch;
+                bad = 0;
+                if let Some(path) = &best_path {
+                    if let Err(err) = self.varmap.save(path) {
+                        log::warn!("Failed to save best checkpoint snapshot: {err}");
+                    }
+                }
+            } else {
+                bad += 1;
+                if bad >= patience {
+                    log::info!("Early stopping (best val={:.4})", best_val);
+                    break;
+                }
+            }
+        }
+
+        if let Some(path) = &best_path {
+            if best_epoch > 0 {
+                if let Err(err) = self.varmap.load(path) {
+                    log::warn!("Failed to restore best checkpoint snapshot: {err}");
+                }
+            }
+            let _ = std::fs::remove_file(path);
+        }
+
+        Ok(TrainHistory { epochs_ran, best_epoch, best_val })
     }
 }
 

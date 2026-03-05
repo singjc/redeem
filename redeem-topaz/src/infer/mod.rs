@@ -29,7 +29,13 @@ pub use pipeline::{
 #[cfg(feature = "io-parquet")]
 pub use pipeline::build_trace_tensors_from_parquet;
 #[cfg(feature = "io-parquet")]
+pub use pipeline::build_trace_tensors_from_parquet_cached;
+#[cfg(feature = "io-parquet")]
 pub use pipeline::build_trace_tensors_from_parquet_map;
+#[cfg(feature = "io-parquet")]
+pub use pipeline::build_trace_tensors_from_parquet_map_cached;
+#[cfg(feature = "io-parquet")]
+pub use pipeline::{SharedXicCache, XicDiskCache, XicCacheStats};
 #[cfg(feature = "io-sqlite")]
 pub use pipeline::read_osw_features;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]

@@ -248,6 +248,19 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("xic_cache_dir")
+                                .long("xic-cache-dir")
+                                .help("Optional on-disk cache directory for decoded XICs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
+                        )
+                        .arg(
+                            Arg::new("xic_cache_max_bytes")
+                                .long("xic-cache-max-bytes")
+                                .help("Max disk cache size in bytes (0 = no cap)")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
                             Arg::new("output_prefix")
                                 .long("output")
                                 .value_parser(clap::value_parser!(PathBuf))
@@ -346,6 +359,19 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("xic_cache_dir")
+                                .long("xic-cache-dir")
+                                .help("Optional on-disk cache directory for decoded XICs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
+                        )
+                        .arg(
+                            Arg::new("xic_cache_max_bytes")
+                                .long("xic-cache-max-bytes")
+                                .help("Max disk cache size in bytes (0 = no cap)")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
                             Arg::new("checkpoint")
                                 .long("checkpoint")
                                 .value_parser(clap::value_parser!(PathBuf))
@@ -415,6 +441,19 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("xic_cache_dir")
+                                .long("xic-cache-dir")
+                                .help("Optional on-disk cache directory for decoded XICs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
+                        )
+                        .arg(
+                            Arg::new("xic_cache_max_bytes")
+                                .long("xic-cache-max-bytes")
+                                .help("Max disk cache size in bytes (0 = no cap)")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
                             Arg::new("checkpoint")
                                 .long("checkpoint")
                                 .value_parser(clap::value_parser!(PathBuf))
@@ -436,6 +475,18 @@ fn main() -> Result<()> {
                                 .long("restrict-osw-to-xic-map")
                                 .help("Drop rows with no XIC traces")
                                 .action(ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
+                    Command::new("clear-xic-cache")
+                        .about("Clear the TOPAZ XIC on-disk cache directory")
+                        .arg(
+                            Arg::new("dir")
+                                .long("dir")
+                                .help("XIC cache directory to remove")
+                                .required(true)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
                         ),
                 ),
         )
@@ -667,6 +718,14 @@ fn handle_topaz(matches: &ArgMatches) -> Result<()> {
             }
             let cfg = TopazXrunSweepConfig::from_arguments(config_path.unwrap(), sub)?;
             topaz_xrun::run(&cfg)
+        }
+        Some(("clear-xic-cache", sub)) => {
+            let dir = sub
+                .get_one::<PathBuf>("dir")
+                .expect("dir is required");
+            redeem_cli::topaz::cache::clear_xic_cache(dir)?;
+            log::info!("Cleared XIC cache at {:?}", dir);
+            Ok(())
         }
         _ => unreachable!(),
     }

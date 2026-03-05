@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub learning_rate: f32,
     pub weight_decay: f32,
@@ -15,6 +16,7 @@ pub struct Config {
     pub winner_margin: f32,
     pub lambda_ms12: f32,
     pub ms12_soft_temp: f32,
+    pub patience: usize,
 }
 
 impl Default for Config {
@@ -33,6 +35,7 @@ impl Default for Config {
             winner_margin: 1.0,
             lambda_ms12: 0.0,
             ms12_soft_temp: 1.0,
+            patience: 10,
         }
     }
 }
