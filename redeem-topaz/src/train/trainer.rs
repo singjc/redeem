@@ -40,6 +40,7 @@ pub struct Trainer {
     pub model: TopazBagRanker,
     pub opt: AdamW,
     pub ms12_head: Option<nn::Linear>,
+    pub pos_weight: Option<f32>,
 }
 
 impl Trainer {
@@ -61,7 +62,15 @@ impl Trainer {
         };
         let opt = AdamW::new(varmap.all_vars(), params)?;
 
-        Ok(Self { config: cfg, varmap, model, opt, ms12_head })
+        Ok(Self { config: cfg, varmap, model, opt, ms12_head, pos_weight: None })
+    }
+
+    pub fn set_pos_weight(&mut self, pos_weight: f32) {
+        if pos_weight.is_finite() && pos_weight > 0.0 {
+            self.pos_weight = Some(pos_weight);
+        } else {
+            self.pos_weight = None;
+        }
     }
 
     pub fn train_step(&mut self, batch: &TrainBatch) -> Result<TrainMetrics> {
@@ -81,7 +90,7 @@ impl Trainer {
         let cand_masked = (cand.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
         let bag = cand_masked.max(1)?;
 
-        let loss_bag = losses::bce_with_logits(&bag, &batch.yb)?;
+        let loss_bag = losses::bce_with_logits_weighted(&bag, &batch.yb, self.pos_weight)?;
 
         let mut loss = loss_bag.clone();
         let mut loss_pair = Tensor::zeros((), DType::F32, bag.device())?;
@@ -128,7 +137,11 @@ impl Trainer {
                 let w = w.broadcast_div(&denom)?;
                 let ms12_soft = ms12.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?;
                 let ms12_logit = ms12_soft.apply(head)?.squeeze(1)?;
-                loss_ms12 = losses::bce_with_logits(&ms12_logit, &batch.yb)?;
+                loss_ms12 = losses::bce_with_logits_weighted(
+                    &ms12_logit,
+                    &batch.yb,
+                    self.pos_weight,
+                )?;
                 loss = (loss + (loss_ms12.clone() * self.config.lambda_ms12 as f64)?)?;
             }
         }
@@ -153,7 +166,7 @@ impl Trainer {
         let tf = batch.tb.reshape((b * k, c, l))?;
 
         let (emb, coe, _coe_ms12) = self.model.trace_enc.forward_components(&tf)?;
-        let logits = self.model.scorer.forward(&xf, &emb, &coe)?;
+        let logits = self.model.scorer.forward_eval(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
 
         let m = batch.mask.to_dtype(DType::F32)?;
@@ -170,7 +183,7 @@ impl Trainer {
         let mut sum = 0f32;
         for batch in batches {
             let bag = self.bag_logits(batch)?;
-            let loss = losses::bce_with_logits(&bag, &batch.yb)?;
+            let loss = losses::bce_with_logits_weighted(&bag, &batch.yb, self.pos_weight)?;
             sum += loss.to_scalar::<f32>()?;
         }
         Ok(sum / batches.len() as f32)

@@ -20,6 +20,31 @@ pub fn bce_with_logits(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
     loss.mean_all()
 }
 
+/// Binary cross-entropy with logits and optional positive class weight.
+/// If `pos_weight` is None or <= 0, falls back to standard BCE.
+pub fn bce_with_logits_weighted(
+    logits: &Tensor,
+    targets: &Tensor,
+    pos_weight: Option<f32>,
+) -> Result<Tensor> {
+    let Some(w) = pos_weight else {
+        return bce_with_logits(logits, targets);
+    };
+    if w <= 0.0 {
+        return bce_with_logits(logits, targets);
+    }
+    let logits = logits.to_dtype(DType::F32)?;
+    let targets = targets.to_dtype(DType::F32)?;
+    let sp_pos = softplus(&logits.neg()?)?;
+    let sp_neg = softplus(&logits)?;
+    let y_pos = targets.broadcast_mul(&sp_pos)?;
+    let y_neg = (targets.ones_like()? - &targets)?.broadcast_mul(&sp_neg)?;
+    let w_t = Tensor::full(w, targets.dims(), targets.device())?;
+    let y_pos = y_pos.broadcast_mul(&w_t)?;
+    let loss = y_pos.broadcast_add(&y_neg)?;
+    loss.mean_all()
+}
+
 /// Pairwise pos-neg separation: softplus(-(pos - neg)), averaged over all pos-neg pairs.
 pub fn pairwise_pos_neg_softplus(bag_logits: &Tensor, y_bag: &Tensor) -> Result<Tensor> {
     let s = bag_logits.to_dtype(DType::F32)?;

@@ -91,7 +91,7 @@ impl TopazBagRanker {
         let tf = tb.reshape((b * k, c, l))?;
 
         let (emb, coe) = self.trace_enc.forward(&tf)?; // (B*K, E), (B*K, Coe)
-        let logits = self.scorer.forward(&xf, &emb, &coe)?; // (B*K,)
+        let logits = self.scorer.forward_eval(&xf, &emb, &coe)?; // (B*K,)
         let cand = logits.reshape((b, k))?;
 
         // masked max over K (avoid -inf with float mask)
@@ -119,7 +119,7 @@ impl TopazBagRanker {
         let tf = tb.reshape((b * k, c, l))?;
 
         let (emb, coe) = self.trace_enc.forward(&tf)?;
-        let (logits, hidden) = self.scorer.forward_with_hidden(&xf, &emb, &coe)?;
+        let (logits, hidden) = self.scorer.forward_with_hidden_eval(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
         let hidden = hidden.reshape((b, k, self.scorer.hidden_dim()))?;
 
@@ -237,7 +237,7 @@ impl ModelInterface for TopazBagRanker {
 impl CandidateScorerInterface for TopazBagRanker {
     fn forward_candidates(&self, x_feat: &Tensor, x_trace: &Tensor) -> Result<Tensor> {
         let (emb, coe) = self.trace_enc.forward(x_trace)?;
-        self.scorer.forward(x_feat, &emb, &coe)
+        self.scorer.forward_eval(x_feat, &emb, &coe)
     }
 }
 

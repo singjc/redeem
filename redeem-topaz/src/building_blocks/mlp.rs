@@ -1,23 +1,31 @@
 // redeem-topaz/src/building_blocks/mlp.rs
 
 use candle_core::{Result, Tensor};
-use candle_nn::{self as nn, Module, VarBuilder};
+use candle_nn::{self as nn, VarBuilder};
 
 use crate::model::topaz::TopazConfig;
 
 #[derive(Clone, Debug)]
-struct DropoutAlways(nn::Dropout);
+struct LayerBlock {
+    lin: nn::Linear,
+    dropout: Option<nn::Dropout>,
+}
 
-impl Module for DropoutAlways {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.0.forward(xs, true)
+impl LayerBlock {
+    fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let h = xs.apply(&self.lin)?.apply(&nn::Activation::Relu)?;
+        if let Some(d) = &self.dropout {
+            d.forward(&h, train)
+        } else {
+            Ok(h)
+        }
     }
 }
 
 pub struct CandidateScorer {
     use_features: bool,
     feat_dim_used: usize,
-    body: nn::Sequential,
+    layers: Vec<LayerBlock>,
     head: nn::Linear,
     hidden_dim: usize,
 }
@@ -33,24 +41,43 @@ impl CandidateScorer {
         let feat_dim_used = if use_features { cfg.feat_dim } else { 0 };
         let in_dim = feat_dim_used + trace_emb_dim + coelution_dim;
 
-        let mut seq = nn::seq();
+        let mut layers = Vec::with_capacity(cfg.mlp_hidden.len());
         let mut d = in_dim;
         for (i, &h) in cfg.mlp_hidden.iter().enumerate() {
             let lin = nn::linear(d, h, vb.pp(format!("lin{i}")))?;
-            seq = seq.add(lin).add(nn::Activation::Relu);
-            if cfg.dropout > 0.0 {
-                seq = seq.add(DropoutAlways(nn::Dropout::new(cfg.dropout as f32)));
-            }
+            let dropout = if cfg.dropout > 0.0 {
+                Some(nn::Dropout::new(cfg.dropout as f32))
+            } else {
+                None
+            };
+            layers.push(LayerBlock { lin, dropout });
             d = h;
         }
         let head = nn::linear(d, 1, vb.pp("head"))?;
 
-        Ok(Self { use_features, feat_dim_used, body: seq, head, hidden_dim: d })
+        Ok(Self { use_features, feat_dim_used, layers, head, hidden_dim: d })
     }
 
     pub fn penultimate(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<Tensor> {
-        let x = self.concat_input(feat, emb, coe)?;
-        x.apply(&self.body)
+        self.penultimate_internal(feat, emb, coe, true)
+    }
+
+    pub fn penultimate_eval(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<Tensor> {
+        self.penultimate_internal(feat, emb, coe, false)
+    }
+
+    fn penultimate_internal(
+        &self,
+        feat: &Tensor,
+        emb: &Tensor,
+        coe: &Tensor,
+        train: bool,
+    ) -> Result<Tensor> {
+        let mut x = self.concat_input(feat, emb, coe)?;
+        for layer in &self.layers {
+            x = layer.forward(&x, train)?;
+        }
+        Ok(x)
     }
 
     pub fn forward(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<Tensor> {
@@ -58,9 +85,26 @@ impl CandidateScorer {
         h.apply(&self.head)?.squeeze(1)
     }
 
+    pub fn forward_eval(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<Tensor> {
+        let h = self.penultimate_eval(feat, emb, coe)?;
+        h.apply(&self.head)?.squeeze(1)
+    }
+
     /// Return (logits, hidden) where hidden is the penultimate layer.
     pub fn forward_with_hidden(&self, feat: &Tensor, emb: &Tensor, coe: &Tensor) -> Result<(Tensor, Tensor)> {
         let h = self.penultimate(feat, emb, coe)?;
+        let logits = h.apply(&self.head)?.squeeze(1)?;
+        Ok((logits, h))
+    }
+
+    /// Return (logits, hidden) with dropout disabled.
+    pub fn forward_with_hidden_eval(
+        &self,
+        feat: &Tensor,
+        emb: &Tensor,
+        coe: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let h = self.penultimate_eval(feat, emb, coe)?;
         let logits = h.apply(&self.head)?.squeeze(1)?;
         Ok((logits, h))
     }

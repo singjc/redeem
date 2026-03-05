@@ -935,9 +935,29 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         &pid_rows,
         cfg.bag_k,
     );
+    let (mut n_pos, mut n_neg) = (0usize, 0usize);
+    for &y in &bags.y_bag {
+        if y > 0.5 {
+            n_pos += 1;
+        } else {
+            n_neg += 1;
+        }
+    }
+    let pos_weight = if n_pos > 0 {
+        n_neg as f32 / n_pos as f32
+    } else {
+        1.0
+    };
     let batches = bags_to_train_batches(bags, &device, cfg.batch_size)?;
 
     let mut trainer = Trainer::new(cfg.train.clone(), &model_cfg, &device)?;
+    trainer.set_pos_weight(pos_weight);
+    log::info!(
+        "Using pos_weight={:.4} (n_pos={}, n_neg={})",
+        pos_weight,
+        n_pos,
+        n_neg
+    );
     let val_batches = if !rows_va.is_empty() {
         let y_rows_va: Vec<u8> = rows_va.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
         let pid_rows_va: Vec<String> = rows_va.iter().map(|r| r.group_id.clone()).collect();
@@ -1097,7 +1117,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
 
     let mut offset = 0usize;
     for chunk in rows.chunks(chunk_size) {
-        let mut x_trace = build_traces_for_rows(
+        let x_trace = build_traces_for_rows(
             chunk,
             &cfg.xic_path,
             &cfg.xic_map_path,

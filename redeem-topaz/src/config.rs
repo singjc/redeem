@@ -35,7 +35,7 @@ impl Default for Config {
             winner_margin: 1.0,
             lambda_ms12: 0.0,
             ms12_soft_temp: 1.0,
-            patience: 10,
+            patience: 3,
         }
     }
 }
