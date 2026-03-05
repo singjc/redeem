@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
-use plotly::common::{Line, Marker, Mode};
-use plotly::layout::Axis;
+use plotly::common::{HoverInfo, Line, Marker, Mode};
+use plotly::layout::{Axis, BarMode};
 use plotly::{Histogram, Layout, Plot, Scatter};
 use rand::prelude::*;
 use report_builder::{Report, ReportSection};
@@ -10,11 +10,22 @@ use std::path::Path;
 const DEFAULT_PCA_MAX_ROWS: usize = 50_000;
 const POWER_ITERS: usize = 50;
 
-pub fn write_topaz_report(head_embeddings_path: &Path, report_path: &Path, seed: u64) -> Result<()> {
+pub fn write_topaz_report(
+    head_embeddings_path: &Path,
+    report_path: &Path,
+    seed: u64,
+    osw_path: Option<&Path>,
+) -> Result<()> {
     let emb = load_head_embeddings_tsv(head_embeddings_path)?;
     if emb.hidden_dim == 0 || emb.n == 0 {
         bail!("head embeddings are empty: {:?}", head_embeddings_path);
     }
+
+    let precursor_meta = if let Some(path) = osw_path {
+        redeem_topaz::io::osw::read_precursor_meta(path).ok()
+    } else {
+        None
+    };
 
     let pca = pca2(&emb.hidden, emb.n, emb.hidden_dim, DEFAULT_PCA_MAX_ROWS, seed);
     let bag_scores_f32: Vec<f32> = emb.bag_score.iter().map(|&v| v as f32).collect();
@@ -29,8 +40,14 @@ pub fn write_topaz_report(head_embeddings_path: &Path, report_path: &Path, seed:
     );
 
     let mut section = ReportSection::new("Embeddings");
-    section.add_plot(plot_embedding_scatter(&pca, &emb.bag_score, &emb.is_decoy, cutoff));
-    section.add_plot(plot_score_histogram(&emb.bag_score, &emb.is_decoy));
+    section.add_plot(plot_embedding_with_marginal_hist(
+        &pca,
+        &emb.bag_score,
+        &emb.is_decoy,
+        &emb.bag_pid,
+        precursor_meta.as_ref(),
+        cutoff,
+    ));
     report.add_section(section);
 
     report.save_to_file(&report_path.to_string_lossy().to_string())?;
@@ -43,6 +60,7 @@ struct HeadEmbeddings {
     hidden: Vec<f64>,
     bag_score: Vec<f64>,
     is_decoy: Vec<bool>,
+    bag_pid: Vec<String>,
 }
 
 fn load_head_embeddings_tsv(path: &Path) -> Result<HeadEmbeddings> {
@@ -60,6 +78,10 @@ fn load_head_embeddings_tsv(path: &Path) -> Result<HeadEmbeddings> {
         .iter()
         .position(|h| h == "is_decoy")
         .ok_or_else(|| anyhow::anyhow!("missing is_decoy column in {:?}", path))?;
+    let idx_pid = headers
+        .iter()
+        .position(|h| h == "bag_pid")
+        .ok_or_else(|| anyhow::anyhow!("missing bag_pid column in {:?}", path))?;
     let mut win_idxs = Vec::new();
     for (i, h) in headers.iter().enumerate() {
         if h.starts_with("win_hidden_") {
@@ -74,13 +96,16 @@ fn load_head_embeddings_tsv(path: &Path) -> Result<HeadEmbeddings> {
     let mut hidden = Vec::new();
     let mut bag_score = Vec::new();
     let mut is_decoy = Vec::new();
+    let mut bag_pid = Vec::new();
 
     for rec in rdr.records() {
         let rec = rec?;
         let score = rec.get(idx_score).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
         let decoy = rec.get(idx_decoy).unwrap_or("0") == "1";
+        let pid = rec.get(idx_pid).unwrap_or("").to_string();
         bag_score.push(score);
         is_decoy.push(decoy);
+        bag_pid.push(pid);
         for &idx in &win_idxs {
             let v = rec.get(idx).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
             hidden.push(v);
@@ -94,6 +119,7 @@ fn load_head_embeddings_tsv(path: &Path) -> Result<HeadEmbeddings> {
         hidden,
         bag_score,
         is_decoy,
+        bag_pid,
     })
 }
 
@@ -199,30 +225,50 @@ fn normalize(v: &mut [f64]) {
     }
 }
 
-fn plot_embedding_scatter(
+fn plot_embedding_with_marginal_hist(
     pca: &[(f64, f64)],
     bag_score: &[f64],
     is_decoy: &[bool],
+    bag_pid: &[String],
+    precursor_meta: Option<&std::collections::HashMap<u64, redeem_topaz::io::osw::PrecursorMeta>>,
     cutoff: Option<f64>,
 ) -> Plot {
     let mut t_x = Vec::new();
     let mut t_y = Vec::new();
+    let mut t_hover = Vec::new();
     let mut d_x = Vec::new();
     let mut d_y = Vec::new();
+    let mut d_hover = Vec::new();
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
-    for ((_, y), decoy, score) in pca
-        .iter()
-        .zip(is_decoy.iter())
-        .zip(bag_score.iter())
-        .map(|((p, d), s)| (p, d, s))
-    {
-        if *decoy {
-            d_x.push(*score);
-            d_y.push(*y);
+    for (i, ((_, y), decoy)) in pca.iter().zip(is_decoy.iter()).enumerate() {
+        let score = bag_score[i];
+        let pid = bag_pid.get(i).cloned().unwrap_or_default();
+        let (run_id, prec_id) = parse_bag_pid(&pid);
+        let pep = precursor_meta
+            .and_then(|m| prec_id.and_then(|id| m.get(&id)))
+            .map(|m| format!("{} / z={}", m.modified_sequence, m.charge))
+            .unwrap_or_else(|| {
+                if let Some(id) = prec_id {
+                    format!("precursor_id={id}")
+                } else {
+                    pid.clone()
+                }
+            });
+        let decoy_label = if *decoy { "decoy" } else { "target" };
+        let hover = if let Some(r) = run_id {
+            format!("{pep}<br>run_id={r}<br>{decoy_label}<br>score={score:.3}")
         } else {
-            t_x.push(*score);
+            format!("{pep}<br>{decoy_label}<br>score={score:.3}")
+        };
+        if *decoy {
+            d_x.push(score);
+            d_y.push(*y);
+            d_hover.push(hover);
+        } else {
+            t_x.push(score);
             t_y.push(*y);
+            t_hover.push(hover);
         }
         if *y < y_min {
             y_min = *y;
@@ -236,13 +282,17 @@ fn plot_embedding_scatter(
         Scatter::new(t_x, t_y)
             .name("Target")
             .mode(Mode::Markers)
-            .marker(Marker::new().color("rgba(31, 119, 180, 0.7)").size(4)),
+            .marker(Marker::new().color("rgba(31, 119, 180, 0.7)").size(4))
+            .hover_info(HoverInfo::Text)
+            .hover_text_array(t_hover),
     );
     plot.add_trace(
         Scatter::new(d_x, d_y)
             .name("Decoy")
             .mode(Mode::Markers)
-            .marker(Marker::new().color("rgba(214, 39, 40, 0.7)").size(4)),
+            .marker(Marker::new().color("rgba(214, 39, 40, 0.7)").size(4))
+            .hover_info(HoverInfo::Text)
+            .hover_text_array(d_hover),
     );
     if let Some(cut) = cutoff {
         let y0 = if y_min.is_finite() { y_min } else { 0.0 };
@@ -254,43 +304,56 @@ fn plot_embedding_scatter(
                 .line(Line::new().color("rgba(0,0,0,0.8)")),
         );
     }
+
+    // Marginal histogram on top.
+    let mut t_hist = Vec::new();
+    let mut d_hist = Vec::new();
+    for (s, decoy) in bag_score.iter().zip(is_decoy.iter()) {
+        if *decoy {
+            d_hist.push(*s);
+        } else {
+            t_hist.push(*s);
+        }
+    }
+    plot.add_trace(
+        Histogram::new(t_hist)
+            .name("Target")
+            .opacity(0.6)
+            .marker(Marker::new().color("rgba(31, 119, 180, 0.6)"))
+            .y_axis("y2"),
+    );
+    plot.add_trace(
+        Histogram::new(d_hist)
+            .name("Decoy")
+            .opacity(0.6)
+            .marker(Marker::new().color("rgba(214, 39, 40, 0.6)"))
+            .y_axis("y2"),
+    );
     plot.set_layout(
         Layout::new()
             .title("Winner Hidden PCA2")
-            .x_axis(Axis::new().title("PSTC bag score (max candidate logit)"))
-            .y_axis(Axis::new().title("Embedding PC2 (winner hidden)")),
+            .x_axis(
+                Axis::new()
+                    .title("PSTC bag score (max candidate logit)")
+                    .domain(&[0.0, 1.0]),
+            )
+            .y_axis(
+                Axis::new()
+                    .title("Embedding PC2 (winner hidden)")
+                    .domain(&[0.0, 0.78]),
+            )
+            .y_axis2(Axis::new().title("Count").domain(&[0.82, 1.0]).show_tick_labels(false))
+            .bar_mode(BarMode::Overlay),
     );
     plot
 }
 
-fn plot_score_histogram(scores: &[f64], is_decoy: &[bool]) -> Plot {
-    let mut t = Vec::new();
-    let mut d = Vec::new();
-    for (s, decoy) in scores.iter().zip(is_decoy.iter()) {
-        if *decoy {
-            d.push(*s);
-        } else {
-            t.push(*s);
-        }
+fn parse_bag_pid(pid: &str) -> (Option<u64>, Option<u64>) {
+    let mut it = pid.split('_');
+    let run = it.next().and_then(|v| v.parse::<u64>().ok());
+    let prec = it.next().and_then(|v| v.parse::<u64>().ok());
+    if it.next().is_some() {
+        return (None, None);
     }
-    let mut plot = Plot::new();
-    plot.add_trace(
-        Histogram::new(t)
-            .name("Target")
-            .opacity(0.7)
-            .marker(Marker::new().color("rgba(31, 119, 180, 0.7)")),
-    );
-    plot.add_trace(
-        Histogram::new(d)
-            .name("Decoy")
-            .opacity(0.7)
-            .marker(Marker::new().color("rgba(214, 39, 40, 0.7)")),
-    );
-    plot.set_layout(
-        Layout::new()
-            .title("Bag Score Histogram")
-            .x_axis(Axis::new().title("bag_score"))
-            .y_axis(Axis::new().title("Count")),
-    );
-    plot
+    (run, prec)
 }
