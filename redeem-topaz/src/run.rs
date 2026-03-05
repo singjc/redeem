@@ -154,6 +154,7 @@ pub struct TrainRunConfig {
     pub xic_cache_max_precursors: usize,
     pub xic_cache_dir: Option<PathBuf>,
     pub xic_cache_max_bytes: Option<u64>,
+    pub trace_chunk_size: usize,
 }
 
 impl Default for TrainRunConfig {
@@ -188,6 +189,7 @@ impl Default for TrainRunConfig {
             xic_cache_max_precursors: 50_000,
             xic_cache_dir: None,
             xic_cache_max_bytes: None,
+            trace_chunk_size: 5000,
         }
     }
 }
@@ -214,6 +216,7 @@ pub struct InferRunConfig {
     pub xic_cache_max_precursors: usize,
     pub xic_cache_dir: Option<PathBuf>,
     pub xic_cache_max_bytes: Option<u64>,
+    pub trace_chunk_size: usize,
 }
 
 impl Default for InferRunConfig {
@@ -243,6 +246,7 @@ impl Default for InferRunConfig {
             xic_cache_max_precursors: 50_000,
             xic_cache_dir: None,
             xic_cache_max_bytes: None,
+            trace_chunk_size: 5000,
         }
     }
 }
@@ -1067,59 +1071,125 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     } else {
         None
     };
-    let mut x_trace = build_traces_for_rows(
-        &rows,
-        &cfg.xic_path,
-        &cfg.xic_map_path,
-        &cfg.trace,
-        &cfg.fetch,
-        cache_opt,
-        disk_cache.as_ref(),
-    )?;
-    log_xic_cache_stats("infer", &cache_stats);
     let apply_trace_filter = cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_none();
     if cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_some() {
         log::info!("XIC map provided; skipping trace-based restriction (run_id filter only)");
     }
-    if apply_trace_filter {
-        let filtered = filter_rows_by_trace(rows, x_trace, cfg.trace.total_c(), cfg.trace.l);
-        rows = filtered.0;
-        x_trace = filtered.1;
-    }
 
     let target_cols = meta.feature_cols.clone();
-    let x_feat = if meta.model.use_heuristic_features {
-        rows_to_feature_matrix_with_cols(
-            &rows,
-            &table.feature_cols,
-            &target_cols,
-            meta.preprocess.as_ref(),
-        )
+    let feat_dim = if meta.model.use_heuristic_features { meta.model.feat_dim } else { 0 };
+    let chunk_size = if cfg.trace_chunk_size == 0 {
+        rows.len().max(1)
     } else {
-        Vec::new()
+        cfg.trace_chunk_size.max(1)
     };
-    if cfg.diagnostics.trace_summary {
-        let sum = trace_summary(
+
+    let mut scores: Vec<f32> = if apply_trace_filter {
+        Vec::new()
+    } else {
+        vec![0f32; rows.len()]
+    };
+    let mut rows_scored: Vec<FeatureRow> = Vec::new();
+
+    let mut sum_n = 0usize;
+    let mut sum_ms1 = 0usize;
+    let mut sum_ms2 = 0usize;
+
+    let mut offset = 0usize;
+    for chunk in rows.chunks(chunk_size) {
+        let mut x_trace = build_traces_for_rows(
+            chunk,
+            &cfg.xic_path,
+            &cfg.xic_map_path,
+            &cfg.trace,
+            &cfg.fetch,
+            cache_opt,
+            disk_cache.as_ref(),
+        )?;
+
+        let (chunk_rows, x_trace) = if apply_trace_filter {
+            let (rows_f, x_tr_f) = filter_rows_by_trace(
+                chunk.to_vec(),
+                x_trace,
+                cfg.trace.total_c(),
+                cfg.trace.l,
+            );
+            if rows_f.is_empty() {
+                continue;
+            }
+            (rows_f, x_tr_f)
+        } else {
+            (Vec::new(), x_trace)
+        };
+
+        let row_slice: &[FeatureRow] = if apply_trace_filter {
+            &chunk_rows
+        } else {
+            chunk
+        };
+        let n_chunk = row_slice.len();
+        if n_chunk == 0 {
+            continue;
+        }
+
+        if cfg.diagnostics.trace_summary {
+            let sum = trace_summary(
+                &x_trace,
+                n_chunk,
+                cfg.trace.total_c(),
+                cfg.trace.l,
+                cfg.trace.ms1_cmax,
+                cfg.trace.ms2_cmax,
+            );
+            sum_n += sum.n;
+            sum_ms1 += sum.ms1_nonzero_rows;
+            sum_ms2 += sum.ms2_nonzero_rows;
+        }
+
+        let x_feat = if meta.model.use_heuristic_features {
+            rows_to_feature_matrix_with_cols(
+                row_slice,
+                &table.feature_cols,
+                &target_cols,
+                meta.preprocess.as_ref(),
+            )
+        } else {
+            Vec::new()
+        };
+        let x_feat_t = candle_core::Tensor::from_vec(x_feat, (n_chunk, feat_dim), &device)?;
+        let x_trace_t = candle_core::Tensor::from_slice(
             &x_trace,
-            rows.len(),
-            cfg.trace.total_c(),
-            cfg.trace.l,
-            cfg.trace.ms1_cmax,
-            cfg.trace.ms2_cmax,
-        );
+            (n_chunk, cfg.trace.total_c(), cfg.trace.l),
+            &device,
+        )?;
+        let scores_t = score_candidates(&model, &x_feat_t, &x_trace_t, cfg.batch_size.max(1))?;
+        let scores_chunk = scores_t.to_vec1::<f32>()?;
+
+        if apply_trace_filter {
+            rows_scored.extend(chunk_rows);
+            scores.extend(scores_chunk);
+        } else {
+            scores[offset..offset + n_chunk].copy_from_slice(&scores_chunk);
+            offset += n_chunk;
+        }
+    }
+
+    log_xic_cache_stats("infer", &cache_stats);
+    if apply_trace_filter {
+        rows = rows_scored;
+    }
+    if cfg.diagnostics.trace_summary {
+        let sum = crate::infer::diagnostics::TraceSummary {
+            n: sum_n,
+            l: cfg.trace.l,
+            ms1_cmax: cfg.trace.ms1_cmax,
+            ms2_cmax: cfg.trace.ms2_cmax,
+            ms1_nonzero_rows: sum_ms1,
+            ms2_nonzero_rows: sum_ms2,
+        };
         print_trace_summary(&sum, "infer");
         warn_if_missing_ms1(&sum, "infer");
     }
-
-    let n = rows.len();
-    let x_feat_t = candle_core::Tensor::from_vec(x_feat, (n, meta.model.feat_dim), &device)?;
-    let x_trace_t = candle_core::Tensor::from_slice(
-        &x_trace,
-        (n, cfg.trace.total_c(), cfg.trace.l),
-        &device,
-    )?;
-    let scores_t = score_candidates(&model, &x_feat_t, &x_trace_t, cfg.batch_size.max(1))?;
-    let scores = scores_t.to_vec1::<f32>()?;
 
     let table_rows = build_score_table_from_rows(&rows, &scores, cfg.pep_bins);
     crate::infer::write_score_tsv(&cfg.output_tsv, &table_rows)?;
@@ -1130,22 +1200,38 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             .head_embeddings_outdir
             .clone()
             .unwrap_or_else(|| PathBuf::from("head_embeddings"));
-        std::fs::create_dir_all(&outdir)?;
-        let out = score_bags_with_heads_from_rows_with_cols(
-            &model,
-            &rows,
-            &x_trace,
-            &table.feature_cols,
-            &meta.feature_cols,
-            cfg.trace.total_c(),
-            cfg.trace.l,
-            cfg.bag_k,
-            &device,
-            cfg.batch_size,
-            meta.preprocess.as_ref(),
-        )?;
-        let out_path = outdir.join("head_embeddings.tsv");
-        write_head_embeddings_tsv(&out_path, &out)?;
+        if cfg.trace_chunk_size > 0 {
+            log::warn!(
+                "save_head_embeddings is disabled during chunked inference (trace_chunk_size>0). \
+                 Set trace_chunk_size=0 to enable full-trace embedding export."
+            );
+        } else {
+            std::fs::create_dir_all(&outdir)?;
+            let x_trace = build_traces_for_rows(
+                &rows,
+                &cfg.xic_path,
+                &cfg.xic_map_path,
+                &cfg.trace,
+                &cfg.fetch,
+                cache_opt,
+                disk_cache.as_ref(),
+            )?;
+            let out = score_bags_with_heads_from_rows_with_cols(
+                &model,
+                &rows,
+                &x_trace,
+                &table.feature_cols,
+                &meta.feature_cols,
+                cfg.trace.total_c(),
+                cfg.trace.l,
+                cfg.bag_k,
+                &device,
+                cfg.batch_size,
+                meta.preprocess.as_ref(),
+            )?;
+            let out_path = outdir.join("head_embeddings.tsv");
+            write_head_embeddings_tsv(&out_path, &out)?;
+        }
     }
 
     if let Some(osw_path) = &cfg.output_osw {
