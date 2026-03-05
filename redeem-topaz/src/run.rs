@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use std::collections::HashMap;
 
 use candle_core::Device;
 
@@ -611,6 +613,46 @@ fn build_traces_for_train_val(
     Ok((x_tr, x_va))
 }
 
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn select_bag_winners(
+    rows: &[FeatureRow],
+    scores: &[f32],
+) -> (Vec<FeatureRow>, Vec<String>, Vec<f32>, Vec<bool>, Vec<f32>) {
+    let mut bag_idx: HashMap<String, usize> = HashMap::new();
+    let mut bag_pid: Vec<String> = Vec::new();
+    let mut bag_score: Vec<f32> = Vec::new();
+    let mut bag_is_decoy: Vec<bool> = Vec::new();
+    let mut bag_row_idx: Vec<usize> = Vec::new();
+
+    for (i, row) in rows.iter().enumerate() {
+        let pid = row.group_id.clone();
+        if let Some(&bi) = bag_idx.get(&pid) {
+            if scores[i] > bag_score[bi] {
+                bag_score[bi] = scores[i];
+                bag_row_idx[bi] = i;
+            }
+        } else {
+            let bi = bag_pid.len();
+            bag_idx.insert(pid.clone(), bi);
+            bag_pid.push(pid);
+            bag_score.push(scores[i]);
+            bag_is_decoy.push(row.is_decoy);
+            bag_row_idx.push(i);
+        }
+    }
+
+    let mut winner_rows = Vec::with_capacity(bag_row_idx.len());
+    for &idx in &bag_row_idx {
+        winner_rows.push(rows[idx].clone());
+    }
+    let bag_y: Vec<f32> = bag_is_decoy
+        .iter()
+        .map(|&d| if d { 0.0 } else { 1.0 })
+        .collect();
+
+    (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y)
+}
+
 fn write_head_embeddings_tsv(
     path: &Path,
     out: &crate::infer::BagHeadOutput,
@@ -952,6 +994,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
 
     let mut trainer = Trainer::new(cfg.train.clone(), &model_cfg, &device)?;
     trainer.set_pos_weight(pos_weight);
+    trainer.set_shuffle_seed(cfg.seed);
     log::info!(
         "Using pos_weight={:.4} (n_pos={}, n_neg={})",
         pos_weight,
@@ -1221,10 +1264,42 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             .clone()
             .unwrap_or_else(|| PathBuf::from("head_embeddings"));
         if cfg.trace_chunk_size > 0 {
-            log::warn!(
-                "save_head_embeddings is disabled during chunked inference (trace_chunk_size>0). \
-                 Set trace_chunk_size=0 to enable full-trace embedding export."
-            );
+            std::fs::create_dir_all(&outdir)?;
+            log::info!("Computing head embeddings in a chunk-safe second pass...");
+            let (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y) =
+                select_bag_winners(&rows, &scores);
+            if winner_rows.is_empty() {
+                log::warn!("No winner rows found for head embeddings.");
+            } else {
+                let x_trace = build_traces_for_rows(
+                    &winner_rows,
+                    &cfg.xic_path,
+                    &cfg.xic_map_path,
+                    &cfg.trace,
+                    &cfg.fetch,
+                    cache_opt,
+                    disk_cache.as_ref(),
+                )?;
+                let mut out = score_bags_with_heads_from_rows_with_cols(
+                    &model,
+                    &winner_rows,
+                    &x_trace,
+                    &table.feature_cols,
+                    &meta.feature_cols,
+                    cfg.trace.total_c(),
+                    cfg.trace.l,
+                    1,
+                    &device,
+                    cfg.batch_size,
+                    meta.preprocess.as_ref(),
+                )?;
+                out.bag_pid = bag_pid;
+                out.bag_score = bag_score;
+                out.is_decoy = bag_is_decoy;
+                out.bag_y = bag_y;
+                let out_path = outdir.join("head_embeddings.tsv");
+                write_head_embeddings_tsv(&out_path, &out)?;
+            }
         } else {
             std::fs::create_dir_all(&outdir)?;
             let x_trace = build_traces_for_rows(

@@ -83,11 +83,21 @@ impl TraceBuildConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XicFetchConfig {
     pub ms_levels: Option<Vec<i64>>,
     pub detecting_transition: Option<i64>,
     pub decoy: Option<i64>,
+}
+
+impl Default for XicFetchConfig {
+    fn default() -> Self {
+        Self {
+            ms_levels: None,
+            detecting_transition: Some(1),
+            decoy: None,
+        }
+    }
 }
 
 #[cfg(feature = "io-parquet")]

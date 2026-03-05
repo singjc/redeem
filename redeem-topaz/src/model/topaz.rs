@@ -159,7 +159,7 @@ impl TopazBagRanker {
         let tf = tb.reshape((b * k, c, l))?;
 
         let (emb_all, coe_all, comps) = self.trace_enc.forward_with_heads(&tf)?;
-        let (logits, hidden) = self.scorer.forward_with_hidden(&xf, &emb_all, &coe_all)?;
+        let (logits, hidden) = self.scorer.forward_with_hidden_eval(&xf, &emb_all, &coe_all)?;
         let cand = logits.reshape((b, k))?;
         let hidden = hidden.reshape((b, k, self.scorer.hidden_dim()))?;
 

@@ -23,7 +23,12 @@ pub fn run(cfg: &TopazTrainConfig) -> Result<()> {
         let head_path = outdir.join("head_embeddings.tsv");
         if head_path.exists() {
             let report_path = outdir.join("topaz_report.html");
-            if let Err(e) = write_topaz_report(&head_path, &report_path, cfg.inner.seed) {
+            if let Err(e) = write_topaz_report(
+                &head_path,
+                &report_path,
+                cfg.inner.seed,
+                Some(&cfg.inner.osw_path),
+            ) {
                 log::warn!("Failed to write TOPAZ report: {e:#}");
             } else {
                 log::info!("Wrote TOPAZ report to {:?}", report_path);

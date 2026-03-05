@@ -16,6 +16,7 @@ pub struct Config {
     pub winner_margin: f32,
     pub lambda_ms12: f32,
     pub ms12_soft_temp: f32,
+    pub max_grad_norm: f32,
     pub patience: usize,
 }
 
@@ -35,6 +36,7 @@ impl Default for Config {
             winner_margin: 1.0,
             lambda_ms12: 0.0,
             ms12_soft_temp: 1.0,
+            max_grad_norm: 5.0,
             patience: 3,
         }
     }

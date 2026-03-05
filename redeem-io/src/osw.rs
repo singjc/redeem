@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct FeatureRow {
@@ -12,6 +13,13 @@ pub struct FeatureRow {
     pub exp_rt: f32,
     pub is_decoy: bool,
     pub features: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrecursorMeta {
+    pub precursor_id: u64,
+    pub modified_sequence: String,
+    pub charge: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +80,41 @@ pub fn read_feature_rows(path: &std::path::Path, cfg: &OswReadConfig) -> Result<
         OswLevel::Transition => read_transition_features(&conn, cfg),
         OswLevel::Alignment => bail!("alignment-level OSW read not implemented yet"),
     }
+}
+
+#[cfg(feature = "sqlite")]
+pub fn read_precursor_meta(path: &std::path::Path) -> Result<HashMap<u64, PrecursorMeta>> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let sql = r#"
+        SELECT ppm.PRECURSOR_ID, pep.MODIFIED_SEQUENCE, prec.CHARGE
+        FROM PRECURSOR_PEPTIDE_MAPPING ppm
+        JOIN PEPTIDE pep ON ppm.PEPTIDE_ID = pep.ID
+        JOIN PRECURSOR prec ON prec.ID = ppm.PRECURSOR_ID
+    "#;
+    let mut stmt = conn.prepare(sql)?;
+    let mut out: HashMap<u64, PrecursorMeta> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        let prec_id: i64 = row.get(0)?;
+        let seq: String = row.get(1)?;
+        let charge: i32 = row.get(2)?;
+        Ok((prec_id as u64, seq, charge))
+    })?;
+    for r in rows {
+        let (prec_id, seq, charge) = r?;
+        out.entry(prec_id).or_insert(PrecursorMeta {
+            precursor_id: prec_id,
+            modified_sequence: seq,
+            charge,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub fn read_precursor_meta(_path: &std::path::Path) -> Result<HashMap<u64, PrecursorMeta>> {
+    bail!("redeem-io compiled without feature `sqlite`")
 }
 
 #[cfg(not(feature = "sqlite"))]

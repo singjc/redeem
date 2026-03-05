@@ -41,6 +41,7 @@ pub struct Trainer {
     pub opt: AdamW,
     pub ms12_head: Option<nn::Linear>,
     pub pos_weight: Option<f32>,
+    pub shuffle_seed: Option<u64>,
 }
 
 impl Trainer {
@@ -62,7 +63,15 @@ impl Trainer {
         };
         let opt = AdamW::new(varmap.all_vars(), params)?;
 
-        Ok(Self { config: cfg, varmap, model, opt, ms12_head, pos_weight: None })
+        Ok(Self {
+            config: cfg,
+            varmap,
+            model,
+            opt,
+            ms12_head,
+            pos_weight: None,
+            shuffle_seed: None,
+        })
     }
 
     pub fn set_pos_weight(&mut self, pos_weight: f32) {
@@ -71,6 +80,38 @@ impl Trainer {
         } else {
             self.pos_weight = None;
         }
+    }
+
+    pub fn set_shuffle_seed(&mut self, seed: u64) {
+        self.shuffle_seed = Some(seed);
+    }
+
+    fn clip_grad_norm(&self, grads: &mut candle_core::backprop::GradStore) -> Result<()> {
+        let max_norm = self.config.max_grad_norm;
+        if !(max_norm > 0.0) {
+            return Ok(());
+        }
+        let mut sum = 0f64;
+        for var in self.varmap.all_vars() {
+            if let Some(g) = grads.get(&var) {
+                let g = g.to_dtype(DType::F32)?;
+                let v = g.sqr()?.sum_all()?.to_scalar::<f32>()?;
+                sum += v as f64;
+            }
+        }
+        let norm = sum.sqrt() as f32;
+        if norm <= max_norm || norm == 0.0 {
+            return Ok(());
+        }
+        let scale = max_norm / norm;
+        for var in self.varmap.all_vars() {
+            if let Some(g) = grads.remove(&var) {
+                let scale_t = Tensor::full(scale, g.dims(), g.device())?;
+                let scaled = g.broadcast_mul(&scale_t)?;
+                grads.insert(&var, scaled);
+            }
+        }
+        Ok(())
     }
 
     pub fn train_step(&mut self, batch: &TrainBatch) -> Result<TrainMetrics> {
@@ -146,7 +187,9 @@ impl Trainer {
             }
         }
 
-        self.opt.backward_step(&loss)?;
+        let mut grads = loss.backward()?;
+        self.clip_grad_norm(&mut grads)?;
+        self.opt.step(&grads)?;
 
         Ok(TrainMetrics {
             loss: loss.to_scalar::<f32>()?,
@@ -191,8 +234,13 @@ impl Trainer {
 
     pub fn train_one_epoch(&mut self, batches: &[TrainBatch]) -> Result<Vec<TrainMetrics>> {
         let mut out = Vec::with_capacity(batches.len());
-        for batch in batches {
-            out.push(self.train_step(batch)?);
+        let mut order: Vec<usize> = (0..batches.len()).collect();
+        if batches.len() > 1 {
+            let seed = self.shuffle_seed.unwrap_or(0).wrapping_add(1);
+            shuffle_indices(&mut order, seed);
+        }
+        for &bi in &order {
+            out.push(self.train_step(&batches[bi])?);
         }
         Ok(out)
     }
@@ -217,8 +265,14 @@ impl Trainer {
             )
         });
 
-        for _epoch in 0..max_epochs.max(1) {
-            for batch in batches {
+        for epoch in 0..max_epochs.max(1) {
+            let mut order: Vec<usize> = (0..batches.len()).collect();
+            if batches.len() > 1 {
+                let seed = self.shuffle_seed.unwrap_or(0).wrapping_add(epoch as u64 + 1);
+                shuffle_indices(&mut order, seed);
+            }
+            for &bi in &order {
+                let batch = &batches[bi];
                 if self.config.use_lr_scheduler {
                     let lr = sched.lr_at_step(step);
                     self.opt.set_learning_rate(lr);
@@ -276,7 +330,13 @@ impl Trainer {
         let mut epochs_ran = 0usize;
         for epoch in 1..=max_epochs.max(1) {
             let mut train_sum = 0f32;
-            for batch in train_batches {
+            let mut order: Vec<usize> = (0..train_batches.len()).collect();
+            if train_batches.len() > 1 {
+                let seed = self.shuffle_seed.unwrap_or(0).wrapping_add(epoch as u64);
+                shuffle_indices(&mut order, seed);
+            }
+            for &bi in &order {
+                let batch = &train_batches[bi];
                 if self.config.use_lr_scheduler {
                     let lr = sched.lr_at_step(step);
                     self.opt.set_learning_rate(lr);
@@ -342,6 +402,17 @@ impl Trainer {
         }
 
         Ok(TrainHistory { epochs_ran, best_epoch, best_val })
+    }
+}
+
+fn shuffle_indices(idxs: &mut [usize], seed: u64) {
+    let mut state = seed.wrapping_add(0x9e3779b97f4a7c15);
+    for i in (1..idxs.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state as usize) % (i + 1);
+        idxs.swap(i, j);
     }
 }
 

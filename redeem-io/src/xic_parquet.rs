@@ -312,9 +312,12 @@ impl XicParquetReader {
             }
 
             if let Some(flag) = self.filters.detecting_transition {
-                let detect = Self::get_i64_opt(&row, idx_detect);
-                if detect != Some(flag) {
-                    continue;
+                // Match Python: apply detecting_transition filter only to MS2 rows.
+                if ms_level_i64 != 1 {
+                    let detect = Self::get_i64_opt(&row, idx_detect);
+                    if detect != Some(flag) {
+                        continue;
+                    }
                 }
             }
 
