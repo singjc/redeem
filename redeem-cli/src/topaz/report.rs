@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use plotly::common::{
     DashType, HoverInfo, Line, Marker, Mode, Orientation, Pattern, PatternShape,
 };
-use plotly::layout::{Axis, BarMode};
+use plotly::layout::{Axis, AxisType, BarMode};
 use plotly::{Bar, Histogram, Layout, Plot, Scatter};
 use rand::prelude::*;
 use report_builder::{Report, ReportSection};
@@ -82,8 +82,14 @@ pub fn write_topaz_report(
     {
         let pairs = build_score_pairs(scores, ms2, meta, precursor_meta.as_ref());
         if !pairs.is_empty() {
+            let topaz_cutoff = cutoff_from_score_rows(scores, 0.01);
+            let ms2_cutoff = cutoff_from_score_rows(ms2, 0.01);
             let mut sec = ReportSection::new("TOPAZ vs SCORE_MS2");
-            sec.add_plot(plot_score_scatter_with_marginals(&pairs));
+            sec.add_plot(plot_score_scatter_with_marginals(
+                &pairs,
+                topaz_cutoff,
+                ms2_cutoff,
+            ));
             report.add_section(sec);
         }
     }
@@ -279,6 +285,16 @@ fn compute_id_counts(
     })
 }
 
+fn cutoff_from_score_rows(rows: &[ScoreLite], q_cut: f64) -> Option<f64> {
+    rows.iter()
+        .filter(|row| row.rank.unwrap_or(1) == 1)
+        .filter_map(|row| match row.qvalue {
+            Some(q) if q <= q_cut => Some(row.score),
+            _ => None,
+        })
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
 fn pca2(hidden: &[f64], n: usize, d: usize, max_rows: usize, seed: u64) -> Vec<(f64, f64)> {
     let m = n.min(max_rows).max(1);
     let mut idx: Vec<usize> = (0..n).collect();
@@ -436,6 +452,7 @@ fn plot_embedding_with_marginal_hist(
     let mut plot = Plot::new();
     plot.add_trace(
         Scatter::new(t_x, t_y)
+            .web_gl_mode(true)
             .name("Target")
             .mode(Mode::Markers)
             .marker(Marker::new().color("rgba(31, 119, 180, 0.7)").size(4))
@@ -444,6 +461,7 @@ fn plot_embedding_with_marginal_hist(
     );
     plot.add_trace(
         Scatter::new(d_x, d_y)
+            .web_gl_mode(true)
             .name("Decoy")
             .mode(Mode::Markers)
             .marker(Marker::new().color("rgba(214, 39, 40, 0.7)").size(4))
@@ -457,7 +475,7 @@ fn plot_embedding_with_marginal_hist(
             Scatter::new(vec![cut, cut], vec![y0, y1])
                 .name("Cutoff (TDC q=0.01)")
                 .mode(Mode::Lines)
-                .line(Line::new().color("rgba(0,0,0,0.8)")),
+                .line(Line::new().color("rgba(0,0,0,0.8)").dash(DashType::Dash)),
         );
     }
 
@@ -561,13 +579,21 @@ fn build_score_pairs(
     out
 }
 
-fn plot_score_scatter_with_marginals(pairs: &[ScorePair]) -> Plot {
+fn plot_score_scatter_with_marginals(
+    pairs: &[ScorePair],
+    topaz_cutoff: Option<f64>,
+    ms2_cutoff: Option<f64>,
+) -> Plot {
     let mut t_x = Vec::new();
     let mut t_y = Vec::new();
     let mut t_hover = Vec::new();
     let mut d_x = Vec::new();
     let mut d_y = Vec::new();
     let mut d_hover = Vec::new();
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
 
     for p in pairs {
         if p.decoy {
@@ -579,11 +605,16 @@ fn plot_score_scatter_with_marginals(pairs: &[ScorePair]) -> Plot {
             t_y.push(p.y);
             t_hover.push(p.hover.clone());
         }
+        x_min = x_min.min(p.x);
+        x_max = x_max.max(p.x);
+        y_min = y_min.min(p.y);
+        y_max = y_max.max(p.y);
     }
 
     let mut plot = Plot::new();
     plot.add_trace(
         Scatter::new(t_x.clone(), t_y.clone())
+            .web_gl_mode(true)
             .name("Target")
             .mode(Mode::Markers)
             .marker(Marker::new().color("rgba(31, 119, 180, 0.7)").size(4))
@@ -592,12 +623,50 @@ fn plot_score_scatter_with_marginals(pairs: &[ScorePair]) -> Plot {
     );
     plot.add_trace(
         Scatter::new(d_x.clone(), d_y.clone())
+            .web_gl_mode(true)
             .name("Decoy")
             .mode(Mode::Markers)
             .marker(Marker::new().color("rgba(214, 39, 40, 0.7)").size(4))
             .hover_info(HoverInfo::Text)
             .hover_text_array(d_hover),
     );
+
+    if let Some(cut) = topaz_cutoff {
+        plot.add_trace(
+            Scatter::new(
+                vec![cut, cut],
+                vec![
+                    if y_min.is_finite() { y_min } else { 0.0 },
+                    if y_max.is_finite() { y_max } else { 1.0 },
+                ],
+            )
+            .name("TOPAZ cutoff (1% FDR)")
+            .mode(Mode::Lines)
+            .line(
+                Line::new()
+                    .color("rgba(31, 119, 180, 0.95)")
+                    .dash(DashType::Dash),
+            ),
+        );
+    }
+    if let Some(cut) = ms2_cutoff {
+        plot.add_trace(
+            Scatter::new(
+                vec![
+                    if x_min.is_finite() { x_min } else { 0.0 },
+                    if x_max.is_finite() { x_max } else { 1.0 },
+                ],
+                vec![cut, cut],
+            )
+            .name("SCORE_MS2 cutoff (1% FDR)")
+            .mode(Mode::Lines)
+            .line(
+                Line::new()
+                    .color("rgba(255, 127, 14, 0.95)")
+                    .dash(DashType::Dash),
+            ),
+        );
+    }
 
     // Marginal histograms.
     plot.add_trace(
@@ -707,6 +776,7 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
             .marker(Marker::new().color("rgba(31, 119, 180, 0.8)"))
             .hover_info(HoverInfo::Text)
             .hover_text_array(hover_topaz)
+            .alignment_group("ids")
             .offset_group("topaz")
             .legend_group("TOPAZ"),
     );
@@ -726,6 +796,7 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
             )
             .hover_info(HoverInfo::Text)
             .hover_text_array(hover_topaz_gap)
+            .alignment_group("ids")
             .offset_group("topaz")
             .legend_group("TOPAZ"),
     );
@@ -761,6 +832,7 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
                 .marker(Marker::new().color("rgba(255, 127, 14, 0.8)"))
                 .hover_info(HoverInfo::Text)
                 .hover_text_array(hover_ms2)
+                .alignment_group("ids")
                 .offset_group("ms2")
                 .legend_group("SCORE_MS2"),
         );
@@ -780,6 +852,7 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
                 )
                 .hover_info(HoverInfo::Text)
                 .hover_text_array(hover_ms2_gap)
+                .alignment_group("ids")
                 .offset_group("ms2")
                 .legend_group("SCORE_MS2"),
         );
@@ -788,7 +861,7 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
     plot.set_layout(
         Layout::new()
             .title("Identifications @1% FDR (union vs per-run)")
-            .x_axis(Axis::new().title("Run ID"))
+            .x_axis(Axis::new().title("Run ID").type_(AxisType::Category))
             .y_axis(Axis::new().title("Unique precursor IDs"))
             .bar_mode(BarMode::Stack),
     );
