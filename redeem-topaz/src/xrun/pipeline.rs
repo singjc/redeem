@@ -1,5 +1,6 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
+use serde::{Deserialize, Serialize};
 
 use crate::building_blocks::bagging::make_bags_with_traces;
 use crate::infer::{rows_to_feature_matrix_preprocessed, rows_to_feature_matrix_with_cols};
@@ -25,7 +26,7 @@ pub struct XrunBagData {
     pub bag_pid: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrunPredictConfig {
     pub max_runs: usize,
     pub sort_by: String, // "run" | "score"

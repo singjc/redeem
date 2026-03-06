@@ -7,12 +7,20 @@ use std::collections::HashMap;
 
 use candle_core::Device;
 
-use crate::checkpoint::CheckpointMeta;
+use crate::checkpoint::{
+    load_xrun_checkpoint,
+    read_xrun_checkpoint_meta,
+    save_xrun_checkpoint,
+    xrun_checkpoint_exists,
+    CheckpointMeta,
+    XrunCheckpointMeta,
+};
 use crate::config::Config as TrainConfig;
 use crate::infer::{TraceBuildConfig, XicFetchConfig};
 use crate::io::osw::OswReadConfig;
 use crate::model::topaz::TopazConfig;
 use crate::train::TrainFilter;
+use crate::xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
 use crate::xrun::XrunTrainConfig;
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -52,7 +60,13 @@ use crate::infer::diagnostics::{print_trace_summary, trace_summary, warn_if_miss
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::io::osw::FeatureRow;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use crate::xrun::pipeline::build_xrun_bag_data_from_rows;
+use crate::xrun::pipeline::{
+    apply_xrun_deltas,
+    apply_xrun_deltas_to_rows,
+    build_xrun_bag_data_from_rows,
+    build_xrun_bag_data_from_rows_with_cols,
+    XrunPredictConfig,
+};
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::sequence::build_xrun_sequences_from_bags;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -72,6 +86,28 @@ pub struct DiagnosticsConfig {
     pub rank1_outdir: Option<PathBuf>,
     pub save_head_embeddings: bool,
     pub head_embeddings_outdir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct XrunRunConfig {
+    pub enabled: bool,
+    pub max_runs: usize,
+    pub sort_by: String,
+    pub batch_size: usize,
+    pub train: XrunTrainConfig,
+}
+
+impl Default for XrunRunConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_runs: 64,
+            sort_by: "run".to_string(),
+            batch_size: 256,
+            train: XrunTrainConfig::default(),
+        }
+    }
 }
 
 impl Default for DiagnosticsConfig {
@@ -97,7 +133,7 @@ pub const DEFAULT_LIB_COLS: &[&str] = &[
     "var_library_sangle",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureMode {
     All,
@@ -136,6 +172,7 @@ pub struct TrainRunConfig {
     pub xic_path: PathBuf,
     pub xic_map_path: Option<PathBuf>,
     pub output_prefix: PathBuf,
+    pub init_checkpoint: Option<PathBuf>,
     pub device: String,
     pub bag_k: usize,
     pub batch_size: usize,
@@ -157,6 +194,7 @@ pub struct TrainRunConfig {
     pub xic_cache_dir: Option<PathBuf>,
     pub xic_cache_max_bytes: Option<u64>,
     pub trace_chunk_size: usize,
+    pub xrun: XrunRunConfig,
 }
 
 impl Default for TrainRunConfig {
@@ -166,6 +204,7 @@ impl Default for TrainRunConfig {
             xic_path: PathBuf::new(),
             xic_map_path: None,
             output_prefix: PathBuf::from("topaz_checkpoint"),
+            init_checkpoint: None,
             device: "cpu".to_string(),
             bag_k: 5,
             batch_size: 128,
@@ -192,6 +231,7 @@ impl Default for TrainRunConfig {
             xic_cache_dir: None,
             xic_cache_max_bytes: None,
             trace_chunk_size: 5000,
+            xrun: XrunRunConfig::default(),
         }
     }
 }
@@ -219,6 +259,7 @@ pub struct InferRunConfig {
     pub xic_cache_dir: Option<PathBuf>,
     pub xic_cache_max_bytes: Option<u64>,
     pub trace_chunk_size: usize,
+    pub xrun: XrunRunConfig,
 }
 
 impl Default for InferRunConfig {
@@ -249,6 +290,7 @@ impl Default for InferRunConfig {
             xic_cache_dir: None,
             xic_cache_max_bytes: None,
             trace_chunk_size: 5000,
+            xrun: XrunRunConfig::default(),
         }
     }
 }
@@ -781,6 +823,138 @@ fn load_checkpoint_weights(base: &Path, varmap: &mut VarMap) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn load_xrun_calibrator(
+    base: &Path,
+    device: &Device,
+) -> Result<Option<(VarMap, XrunAttentionCalibrator, XrunCheckpointMeta)>> {
+    if !xrun_checkpoint_exists(base) {
+        return Ok(None);
+    }
+    let meta = read_xrun_checkpoint_meta(base)?;
+    let mut varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, device);
+    let calibrator = XrunAttentionCalibrator::new(
+        vb.pp("xrun"),
+        XrunConfig {
+            in_dim: meta.in_dim,
+            d_model: meta.train.d_model,
+            attn_hidden: meta.train.attn_hidden,
+            head_hidden: meta.train.head_hidden.clone(),
+            dropout: meta.train.dropout,
+            center_delta: meta.train.center_delta,
+            delta_clip: meta.train.delta_clip,
+        },
+    )?;
+    load_xrun_checkpoint(base, &mut varmap)?;
+    Ok(Some((varmap, calibrator, meta)))
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+#[derive(Debug, Clone)]
+struct XrunAppliedScores {
+    row_scores: Vec<f32>,
+    bag_pid: Vec<String>,
+    bag_score: Vec<f32>,
+    bag_is_decoy: Vec<bool>,
+    bag_y: Vec<f32>,
+    delta_bag: Vec<f32>,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn apply_xrun_to_row_scores(
+    rows: &[FeatureRow],
+    row_scores: &[f32],
+    model: &TopazBagRanker,
+    table_feature_cols: &[String],
+    target_cols: &[String],
+    trace_cfg: &TraceBuildConfig,
+    fetch_cfg: &XicFetchConfig,
+    xic_path: &Path,
+    xic_map_path: &Option<PathBuf>,
+    cache_opt: Option<&SharedXicCache>,
+    disk_cache: Option<&XicDiskCache>,
+    xrun_cfg: &XrunRunConfig,
+    xrun_model: &XrunAttentionCalibrator,
+    xrun_meta: &XrunCheckpointMeta,
+    device: &Device,
+    base_batch_size: usize,
+    pre: Option<&crate::Preprocessor>,
+) -> Result<XrunAppliedScores> {
+    let (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y) = select_bag_winners(rows, row_scores);
+    if winner_rows.is_empty() {
+        return Ok(XrunAppliedScores {
+            row_scores: row_scores.to_vec(),
+            bag_pid,
+            bag_score,
+            bag_is_decoy,
+            bag_y,
+            delta_bag: Vec::new(),
+        });
+    }
+
+    let x_trace = build_traces_for_rows(
+        &winner_rows,
+        xic_path,
+        xic_map_path,
+        trace_cfg,
+        fetch_cfg,
+        cache_opt,
+        disk_cache,
+    )?;
+    let head_out = score_bags_with_heads_from_rows_with_cols(
+        model,
+        &winner_rows,
+        &x_trace,
+        table_feature_cols,
+        target_cols,
+        trace_cfg.total_c(),
+        trace_cfg.l,
+        1,
+        device,
+        base_batch_size,
+        pre,
+    )?;
+
+    let predict_cfg = XrunPredictConfig {
+        max_runs: if xrun_cfg.max_runs > 0 {
+            xrun_cfg.max_runs
+        } else {
+            xrun_meta.predict.max_runs
+        },
+        sort_by: if !xrun_cfg.sort_by.is_empty() {
+            xrun_cfg.sort_by.clone()
+        } else {
+            xrun_meta.predict.sort_by.clone()
+        },
+        batch_size: if xrun_cfg.batch_size > 0 {
+            xrun_cfg.batch_size
+        } else {
+            xrun_meta.predict.batch_size
+        },
+    };
+    let bag_data = crate::xrun::XrunBagData {
+        bag_score: bag_score.clone(),
+        bag_hidden: head_out.winner_hidden.clone(),
+        hidden_dim: head_out.hidden_dim,
+        bag_y: bag_y.clone(),
+        bag_pid: bag_pid.clone(),
+    };
+    let (delta_bag, _attn_entropy) =
+        crate::xrun::xrun_predict_deltas_for_bags(xrun_model, &bag_data, &predict_cfg, device)?;
+    let row_scores = apply_xrun_deltas_to_rows(row_scores, rows, &bag_pid, &delta_bag);
+    let bag_score = apply_xrun_deltas(&bag_score, &delta_bag);
+
+    Ok(XrunAppliedScores {
+        row_scores,
+        bag_pid,
+        bag_score,
+        bag_is_decoy,
+        bag_y,
+        delta_bag,
+    })
+}
+
 fn get_device(device_str: &str) -> Result<Device> {
     if device_str.starts_with("cuda") {
         let cuda_index = if device_str == "cuda" {
@@ -808,6 +982,15 @@ fn get_device(device_str: &str) -> Result<Device> {
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     let device = get_device(&cfg.device)?;
+    let init_base: Option<PathBuf> = cfg
+        .init_checkpoint
+        .as_ref()
+        .map(|path| checkpoint_base(path.as_path()));
+    let init_meta = if let Some(base) = init_base.as_ref() {
+        Some(read_checkpoint_meta(base)?)
+    } else {
+        None
+    };
 
     let table = read_feature_rows(&cfg.osw_path, &cfg.osw)?;
     let mut rows = filter_training_rows(table.rows, &cfg.filter);
@@ -822,8 +1005,33 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         }
     }
 
-    let mut selected_cols = resolve_feature_cols(&table.feature_cols, &cfg.feature_select);
-    let mut model_cfg = cfg.model.clone();
+    let mut selected_cols = if let Some(meta) = init_meta.as_ref() {
+        if cfg.feature_select.mode != FeatureMode::All || cfg.feature_select.cols.is_some() {
+            log::warn!("init_checkpoint provided; using feature columns stored in checkpoint");
+        }
+        meta.feature_cols.clone()
+    } else {
+        resolve_feature_cols(&table.feature_cols, &cfg.feature_select)
+    };
+    let mut model_cfg = if let Some(meta) = init_meta.as_ref() {
+        if meta.model.l != cfg.trace.l
+            || meta.model.ms1_cmax != cfg.trace.ms1_cmax
+            || meta.model.ms2_cmax != cfg.trace.ms2_cmax
+        {
+            bail!(
+                "init_checkpoint trace/model mismatch: checkpoint expects l={}, ms1_cmax={}, ms2_cmax={}, current config has l={}, ms1_cmax={}, ms2_cmax={}",
+                meta.model.l,
+                meta.model.ms1_cmax,
+                meta.model.ms2_cmax,
+                cfg.trace.l,
+                cfg.trace.ms1_cmax,
+                cfg.trace.ms2_cmax
+            );
+        }
+        meta.model.clone()
+    } else {
+        cfg.model.clone()
+    };
     if !model_cfg.use_heuristic_features && !selected_cols.is_empty() {
         log::warn!("model.use_heuristic_features=false; ignoring selected feature columns");
         selected_cols.clear();
@@ -834,6 +1042,13 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     } else {
         model_cfg.use_heuristic_features = true;
         if model_cfg.feat_dim != selected_cols.len() {
+            if init_meta.is_some() {
+                bail!(
+                    "init_checkpoint feature dim mismatch: checkpoint expects {}, recovered {} columns",
+                    model_cfg.feat_dim,
+                    selected_cols.len()
+                );
+            }
             if model_cfg.feat_dim != 0 {
                 log::warn!(
                     "overriding model.feat_dim={} to match selected columns ({})",
@@ -907,7 +1122,13 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         (rows_va, x_va)
     };
 
-    let pre = if model_cfg.use_heuristic_features {
+    let pre = if let Some(meta) = init_meta.as_ref() {
+        if model_cfg.use_heuristic_features {
+            meta.preprocess.clone()
+        } else {
+            None
+        }
+    } else if model_cfg.use_heuristic_features {
         Some(fit_preprocessor_from_rows_with_cols(
             &rows_tr,
             &table.feature_cols,
@@ -993,6 +1214,10 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     let batches = bags_to_train_batches(bags, &device, cfg.batch_size)?;
 
     let mut trainer = Trainer::new(cfg.train.clone(), &model_cfg, &device)?;
+    if let Some(base) = init_base.as_ref() {
+        load_checkpoint_weights(base, &mut trainer.varmap)?;
+        log::info!("Loaded initialization checkpoint from {:?}", base);
+    }
     trainer.set_pos_weight(pos_weight);
     trainer.set_shuffle_seed(cfg.seed);
     log::info!(
@@ -1083,6 +1308,70 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         version: 1,
     };
     save_checkpoint(&cfg.output_prefix, &trainer.varmap, &meta)?;
+
+    if cfg.xrun.enabled {
+        let mut rows_all = rows_tr.clone();
+        rows_all.extend(rows_va.iter().cloned());
+        let mut x_all = x_tr.clone();
+        x_all.extend_from_slice(&x_va);
+        let bag_data = build_xrun_bag_data_from_rows_with_cols(
+            &trainer.model,
+            &rows_all,
+            &x_all,
+            &table.feature_cols,
+            &meta.feature_cols,
+            cfg.trace.total_c(),
+            cfg.trace.l,
+            cfg.bag_k,
+            &device,
+            cfg.xrun.batch_size.max(1),
+            meta.preprocess.as_ref(),
+        )?;
+        let seq = build_xrun_sequences_from_bags(
+            &bag_data.bag_pid,
+            &bag_data.bag_score,
+            &bag_data.bag_hidden,
+            bag_data.hidden_dim,
+            &bag_data.bag_y,
+            cfg.xrun.max_runs,
+            &cfg.xrun.sort_by,
+        );
+        let ds = XrunDataset {
+            xseq: seq.xseq,
+            mask: seq.mask,
+            y: seq.y_prec,
+            p: seq.p,
+            r: seq.r,
+            din: seq.din,
+        };
+        let (tr_ds, va_ds) = split_train_val(&ds, cfg.val_frac, cfg.seed);
+        if tr_ds.p == 0 || va_ds.p == 0 {
+            log::warn!(
+                "Skipping XRUN training because train/val sequence split is empty (train_p={}, val_p={})",
+                tr_ds.p,
+                va_ds.p
+            );
+        } else {
+            let mut xrun_trainer = XrunTrainer::new(cfg.xrun.train.clone(), ds.din, &device)?;
+            let xrun_meta = xrun_trainer.train(&tr_ds, &va_ds, &device)?;
+            let xrun_ckpt_meta = XrunCheckpointMeta {
+                train: cfg.xrun.train.clone(),
+                predict: XrunPredictConfig {
+                    max_runs: cfg.xrun.max_runs,
+                    sort_by: cfg.xrun.sort_by.clone(),
+                    batch_size: cfg.xrun.batch_size.max(1),
+                },
+                in_dim: ds.din,
+                best_val: Some(xrun_meta.best_val),
+                version: 1,
+            };
+            save_xrun_checkpoint(&cfg.output_prefix, &xrun_trainer.varmap, &xrun_ckpt_meta)?;
+            log::info!(
+                "Saved XRUN calibrator alongside checkpoint (best_val={:.4})",
+                xrun_meta.best_val
+            );
+        }
+    }
 
     Ok(TrainRunOutput {
         checkpoint_prefix: cfg.output_prefix.clone(),
@@ -1254,6 +1543,39 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         warn_if_missing_ms1(&sum, "infer");
     }
 
+    let xrun_applied = if cfg.xrun.enabled {
+        let (_xrun_varmap, xrun_model, xrun_meta) = load_xrun_calibrator(&base, &device)?
+            .ok_or_else(|| anyhow::anyhow!("XRUN enabled but no XRUN checkpoint sidecar found for {:?}", base))?;
+        let applied = apply_xrun_to_row_scores(
+            &rows,
+            &scores,
+            &model,
+            &table.feature_cols,
+            &target_cols,
+            &cfg.trace,
+            &cfg.fetch,
+            &cfg.xic_path,
+            &cfg.xic_map_path,
+            cache_opt,
+            disk_cache.as_ref(),
+            &cfg.xrun,
+            &xrun_model,
+            &xrun_meta,
+            &device,
+            cfg.batch_size.max(1),
+            meta.preprocess.as_ref(),
+        )?;
+        log::info!(
+            "Applied XRUN calibration to {} bags using {:?} pooling",
+            applied.bag_pid.len(),
+            xrun_meta.train.pool
+        );
+        scores = applied.row_scores.clone();
+        Some(applied)
+    } else {
+        None
+    };
+
     let table_rows = build_score_table_from_rows(&rows, &scores, cfg.pep_bins);
     crate::infer::write_score_tsv(&cfg.output_tsv, &table_rows)?;
 
@@ -1311,7 +1633,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 cache_opt,
                 disk_cache.as_ref(),
             )?;
-            let out = score_bags_with_heads_from_rows_with_cols(
+            let mut out = score_bags_with_heads_from_rows_with_cols(
                 &model,
                 &rows,
                 &x_trace,
@@ -1324,6 +1646,17 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 cfg.batch_size,
                 meta.preprocess.as_ref(),
             )?;
+            if let Some(applied) = xrun_applied.as_ref() {
+                let mut bag_score_map = HashMap::new();
+                for (pid, score) in applied.bag_pid.iter().zip(applied.bag_score.iter()) {
+                    bag_score_map.insert(pid.clone(), *score);
+                }
+                for (i, pid) in out.bag_pid.iter().enumerate() {
+                    if let Some(score) = bag_score_map.get(pid) {
+                        out.bag_score[i] = *score;
+                    }
+                }
+            }
             let out_path = outdir.join("head_embeddings.tsv");
             write_head_embeddings_tsv(&out_path, &out)?;
         }

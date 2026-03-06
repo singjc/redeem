@@ -56,6 +56,9 @@ impl TopazInferConfig {
         if let Some(v) = matches.get_one::<usize>("pep_bins") {
             cfg.inner.pep_bins = *v;
         }
+        if matches.get_flag("xrun") {
+            cfg.inner.xrun.enabled = true;
+        }
         if matches.get_flag("restrict_xic") {
             cfg.inner.restrict_osw_to_xic_map = true;
         }

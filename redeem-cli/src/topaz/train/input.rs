@@ -38,6 +38,9 @@ impl TopazTrainConfig {
         if let Some(v) = matches.get_one::<u64>("xic_cache_max_bytes") {
             cfg.inner.xic_cache_max_bytes = Some(*v);
         }
+        if let Some(p) = matches.get_one::<PathBuf>("init_checkpoint") {
+            cfg.inner.init_checkpoint = Some(p.clone());
+        }
         if let Some(p) = matches.get_one::<PathBuf>("output_prefix") {
             cfg.inner.output_prefix = p.clone();
         }
@@ -79,6 +82,15 @@ impl TopazTrainConfig {
         if let Some(values) = matches.get_many::<String>("feature_cols") {
             cfg.inner.feature_select.cols = Some(values.cloned().collect());
             cfg.inner.feature_select.mode = FeatureMode::Custom;
+        }
+        if let Some(values) = matches.get_many::<String>("trainable_prefixes") {
+            cfg.inner.train.trainable_prefixes = values.cloned().collect();
+        }
+        if let Some(values) = matches.get_many::<String>("frozen_prefixes") {
+            cfg.inner.train.frozen_prefixes = values.cloned().collect();
+        }
+        if matches.get_flag("xrun") {
+            cfg.inner.xrun.enabled = true;
         }
 
         Ok(cfg)

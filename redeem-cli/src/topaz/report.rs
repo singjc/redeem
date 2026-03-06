@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use plotly::common::{
     DashType, HoverInfo, Line, Marker, Mode, Orientation, Pattern, PatternShape,
 };
-use plotly::layout::{Axis, AxisType, BarMode};
+use plotly::layout::{Axis, BarMode};
 use plotly::{Bar, Histogram, Layout, Plot, Scatter};
 use rand::prelude::*;
 use report_builder::{Report, ReportSection};
@@ -741,8 +741,19 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
             run_set.insert(*r);
         }
     }
+
     let runs: Vec<u64> = run_set.into_iter().collect();
     let run_labels: Vec<String> = runs.iter().map(|r| r.to_string()).collect();
+
+    // Central x positions for each run
+    let centers: Vec<f64> = (0..runs.len()).map(|i| i as f64).collect();
+
+    // Offset the two methods left/right around each run center
+    let dx = 0.22;
+    let topaz_x: Vec<f64> = centers.iter().map(|x| x - dx).collect();
+    let ms2_x: Vec<f64> = centers.iter().map(|x| x + dx).collect();
+
+    let bar_width = 0.38;
 
     let topaz_vals: Vec<usize> = runs
         .iter()
@@ -758,6 +769,7 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
         .zip(topaz_vals.iter())
         .map(|(r, v)| format!("run_id={r}<br>topaz_ids={v}<br>union_ids={}", topaz.union))
         .collect();
+
     let hover_topaz_gap: Vec<String> = runs
         .iter()
         .zip(topaz_gap.iter())
@@ -770,19 +782,22 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
         .collect();
 
     let mut plot = Plot::new();
+
+    // TOPAZ stack
     plot.add_trace(
-        Bar::new(run_labels.clone(), topaz_vals)
+        Bar::new(topaz_x.clone(), topaz_vals)
             .name("TOPAZ per-run")
+            .width(bar_width)
             .marker(Marker::new().color("rgba(31, 119, 180, 0.8)"))
             .hover_info(HoverInfo::Text)
             .hover_text_array(hover_topaz)
-            .alignment_group("ids")
-            .offset_group("topaz")
             .legend_group("TOPAZ"),
     );
+
     plot.add_trace(
-        Bar::new(run_labels.clone(), topaz_gap)
+        Bar::new(topaz_x.clone(), topaz_gap)
             .name("TOPAZ union (1% FDR)")
+            .width(bar_width)
             .marker(
                 Marker::new()
                     .color("rgba(31, 119, 180, 0.15)")
@@ -796,8 +811,6 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
             )
             .hover_info(HoverInfo::Text)
             .hover_text_array(hover_topaz_gap)
-            .alignment_group("ids")
-            .offset_group("topaz")
             .legend_group("TOPAZ"),
     );
 
@@ -806,15 +819,18 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
             .iter()
             .map(|r| *ms2.per_run.get(r).unwrap_or(&0))
             .collect();
+
         let ms2_gap: Vec<usize> = ms2_vals
             .iter()
             .map(|v| ms2.union.saturating_sub(*v))
             .collect();
+
         let hover_ms2: Vec<String> = runs
             .iter()
             .zip(ms2_vals.iter())
             .map(|(r, v)| format!("run_id={r}<br>ms2_ids={v}<br>union_ids={}", ms2.union))
             .collect();
+
         let hover_ms2_gap: Vec<String> = runs
             .iter()
             .zip(ms2_gap.iter())
@@ -826,19 +842,21 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
             })
             .collect();
 
+        // SCORE_MS2 stack
         plot.add_trace(
-            Bar::new(run_labels.clone(), ms2_vals)
+            Bar::new(ms2_x.clone(), ms2_vals)
                 .name("SCORE_MS2 per-run")
+                .width(bar_width)
                 .marker(Marker::new().color("rgba(255, 127, 14, 0.8)"))
                 .hover_info(HoverInfo::Text)
                 .hover_text_array(hover_ms2)
-                .alignment_group("ids")
-                .offset_group("ms2")
                 .legend_group("SCORE_MS2"),
         );
+
         plot.add_trace(
-            Bar::new(run_labels.clone(), ms2_gap)
+            Bar::new(ms2_x.clone(), ms2_gap)
                 .name("SCORE_MS2 union (1% FDR)")
+                .width(bar_width)
                 .marker(
                     Marker::new()
                         .color("rgba(255, 127, 14, 0.15)")
@@ -852,8 +870,6 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
                 )
                 .hover_info(HoverInfo::Text)
                 .hover_text_array(hover_ms2_gap)
-                .alignment_group("ids")
-                .offset_group("ms2")
                 .legend_group("SCORE_MS2"),
         );
     }
@@ -861,10 +877,16 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
     plot.set_layout(
         Layout::new()
             .title("Identifications @1% FDR (union vs per-run)")
-            .x_axis(Axis::new().title("Run ID").type_(AxisType::Category))
+            .x_axis(
+                Axis::new()
+                    .title("Run ID")
+                    .tick_values(centers.clone())
+                    .tick_text(run_labels),
+            )
             .y_axis(Axis::new().title("Unique precursor IDs"))
             .bar_mode(BarMode::Stack),
     );
+
     plot
 }
 

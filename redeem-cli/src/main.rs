@@ -261,6 +261,13 @@ fn main() -> Result<()> {
                                 .value_parser(clap::value_parser!(u64)),
                         )
                         .arg(
+                            Arg::new("init_checkpoint")
+                                .long("init-checkpoint")
+                                .help("Initialize TOPAZ weights from an existing checkpoint prefix or .safetensors path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
                             Arg::new("output_prefix")
                                 .long("output")
                                 .value_parser(clap::value_parser!(PathBuf))
@@ -321,6 +328,26 @@ fn main() -> Result<()> {
                                 .help("Comma-separated list of heuristic feature columns to include")
                                 .value_delimiter(',')
                                 .num_args(1..),
+                        )
+                        .arg(
+                            Arg::new("trainable_prefixes")
+                                .long("trainable-prefixes")
+                                .help("Comma-separated parameter prefixes to optimize during fine-tuning")
+                                .value_delimiter(',')
+                                .num_args(1..),
+                        )
+                        .arg(
+                            Arg::new("frozen_prefixes")
+                                .long("frozen-prefixes")
+                                .help("Comma-separated parameter prefixes to freeze during fine-tuning")
+                                .value_delimiter(',')
+                                .num_args(1..),
+                        )
+                        .arg(
+                            Arg::new("xrun")
+                                .long("xrun")
+                                .help("Train and save an XRUN calibrator alongside the TOPAZ checkpoint")
+                                .action(ArgAction::SetTrue),
                         )
                         .arg(
                             Arg::new("restrict_xic")
@@ -403,6 +430,12 @@ fn main() -> Result<()> {
                             Arg::new("pep_bins")
                                 .long("pep-bins")
                                 .value_parser(clap::value_parser!(usize)),
+                        )
+                        .arg(
+                            Arg::new("xrun")
+                                .long("xrun")
+                                .help("Apply the saved XRUN calibrator sidecar during inference")
+                                .action(ArgAction::SetTrue),
                         )
                         .arg(
                             Arg::new("restrict_xic")

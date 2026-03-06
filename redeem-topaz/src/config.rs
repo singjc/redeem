@@ -18,6 +18,8 @@ pub struct Config {
     pub ms12_soft_temp: f32,
     pub max_grad_norm: f32,
     pub patience: usize,
+    pub trainable_prefixes: Vec<String>,
+    pub frozen_prefixes: Vec<String>,
 }
 
 impl Default for Config {
@@ -38,6 +40,8 @@ impl Default for Config {
             ms12_soft_temp: 1.0,
             max_grad_norm: 5.0,
             patience: 3,
+            trainable_prefixes: Vec::new(),
+            frozen_prefixes: Vec::new(),
         }
     }
 }

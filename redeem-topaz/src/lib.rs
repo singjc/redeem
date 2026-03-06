@@ -26,6 +26,7 @@ pub use run::{
     TrainRunOutput,
     InferRunConfig,
     InferRunOutput,
+    XrunRunConfig,
     XrunSweepConfig,
     XrunSweepRow,
     run_training,

@@ -44,6 +44,50 @@ pub struct Trainer {
     pub shuffle_seed: Option<u64>,
 }
 
+fn starts_with_any(name: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|p| !p.is_empty() && name.starts_with(p))
+}
+
+fn select_optimizer_vars(cfg: &Config, varmap: &VarMap) -> Result<Vec<candle_core::Var>> {
+    let data = varmap.data().lock().unwrap();
+    let mut names: Vec<String> = data.keys().cloned().collect();
+    names.sort();
+    let mut vars = Vec::new();
+    let mut selected_names = Vec::new();
+    for name in names {
+        let trainable = if cfg.trainable_prefixes.is_empty() {
+            true
+        } else {
+            starts_with_any(&name, &cfg.trainable_prefixes)
+        };
+        let frozen = starts_with_any(&name, &cfg.frozen_prefixes);
+        if trainable && !frozen {
+            if let Some(var) = data.get(&name) {
+                vars.push(var.clone());
+                selected_names.push(name);
+            }
+        }
+    }
+    drop(data);
+    if vars.is_empty() {
+        candle_core::bail!(
+            "no trainable variables matched trainable_prefixes={:?} frozen_prefixes={:?}",
+            cfg.trainable_prefixes,
+            cfg.frozen_prefixes
+        );
+    }
+    if !cfg.trainable_prefixes.is_empty() || !cfg.frozen_prefixes.is_empty() {
+        log::info!(
+            "Optimizer will update {} tensors (trainable_prefixes={:?}, frozen_prefixes={:?})",
+            vars.len(),
+            cfg.trainable_prefixes,
+            cfg.frozen_prefixes
+        );
+        log::debug!("Trainable tensor names: {:?}", selected_names);
+    }
+    Ok(vars)
+}
+
 impl Trainer {
     pub fn new(cfg: Config, model_cfg: &TopazConfig, device: &Device) -> Result<Self> {
         let varmap = VarMap::new();
@@ -61,7 +105,8 @@ impl Trainer {
             weight_decay: cfg.weight_decay as f64,
             ..Default::default()
         };
-        let opt = AdamW::new(varmap.all_vars(), params)?;
+        let opt_vars = select_optimizer_vars(&cfg, &varmap)?;
+        let opt = AdamW::new(opt_vars, params)?;
 
         Ok(Self {
             config: cfg,
@@ -421,6 +466,7 @@ mod tests {
     use super::*;
     use crate::model::topaz::TopazConfig;
     use candle_core::Tensor;
+    use candle_nn::{self as nn, VarBuilder};
 
     #[test]
     fn test_forward_backward_smoke() -> Result<()> {
@@ -462,6 +508,44 @@ mod tests {
 
         assert!(m1.loss.is_finite());
         assert!(m2.loss.is_finite());
+        Ok(())
+    }
+
+    #[test]
+    fn test_optimizer_prefix_filter_selects_subset() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let _keep = nn::linear(4, 3, vb.pp("keep"))?;
+        let _freeze = nn::linear(4, 3, vb.pp("freeze"))?;
+
+        let total = varmap.data().lock().unwrap().len();
+        assert!(total >= 4);
+
+        let mut cfg = Config::default();
+        cfg.trainable_prefixes = vec!["keep".to_string()];
+        let keep_only = select_optimizer_vars(&cfg, &varmap)?;
+        let keep_expected = varmap
+            .data()
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|name| name.starts_with("keep"))
+            .count();
+        assert_eq!(keep_only.len(), keep_expected);
+
+        let mut cfg = Config::default();
+        cfg.frozen_prefixes = vec!["freeze".to_string()];
+        let no_freeze = select_optimizer_vars(&cfg, &varmap)?;
+        let freeze_expected = varmap
+            .data()
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|name| name.starts_with("freeze"))
+            .count();
+        assert_eq!(no_freeze.len(), total - freeze_expected);
+
         Ok(())
     }
 }
