@@ -2,8 +2,8 @@
 
 use std::io::Write;
 
-use redeem_cli::properties::util::validate_tsv_or_csv_file;
 use redeem_cli::classifiers::score::score::ScoreConfig;
+use redeem_cli::properties::util::validate_tsv_or_csv_file;
 
 // ---------------------------------------------------------------------------
 // validate_tsv_or_csv_file
@@ -76,10 +76,8 @@ fn score_config_loads_from_file() {
     let json = serde_json::to_string_pretty(&ScoreConfig::default()).unwrap();
     std::fs::write(&path, json).unwrap();
 
-    let loaded: ScoreConfig = serde_json::from_str(
-        &std::fs::read_to_string(&path).unwrap(),
-    )
-    .unwrap();
+    let loaded: ScoreConfig =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(loaded.train_fdr > 0.0);
 }
 

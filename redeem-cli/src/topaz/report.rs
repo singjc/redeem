@@ -1,12 +1,10 @@
-use anyhow::{bail, Result};
-use plotly::common::{
-    DashType, HoverInfo, Line, Marker, Mode, Orientation, Pattern, PatternShape,
-};
+use anyhow::{Result, bail};
+use plotly::common::{DashType, HoverInfo, Line, Marker, Mode, Orientation, Pattern, PatternShape};
 use plotly::layout::{Axis, BarMode};
 use plotly::{Bar, Histogram, Layout, Plot, Scatter};
 use rand::prelude::*;
-use report_builder::{Report, ReportSection};
 use redeem_topaz::infer::stats::tdc_summary;
+use report_builder::{Report, ReportSection};
 use std::path::Path;
 
 const DEFAULT_PCA_MAX_ROWS: usize = 50_000;
@@ -41,12 +39,26 @@ pub fn write_topaz_report(
     let ms2_scores = osw_path
         .and_then(|p| redeem_topaz::io::osw::read_score_table(p, "SCORE_MS2").ok())
         .filter(|rows| !rows.is_empty())
-        .map(|rows| rows.into_iter().map(ScoreLite::from_ms2).collect::<Vec<_>>());
+        .map(|rows| {
+            rows.into_iter()
+                .map(ScoreLite::from_ms2)
+                .collect::<Vec<_>>()
+        });
 
-    let pca = pca2(&emb.hidden, emb.n, emb.hidden_dim, DEFAULT_PCA_MAX_ROWS, seed);
+    let pca = pca2(
+        &emb.hidden,
+        emb.n,
+        emb.hidden_dim,
+        DEFAULT_PCA_MAX_ROWS,
+        seed,
+    );
     let bag_scores_f32: Vec<f32> = emb.bag_score.iter().map(|&v| v as f32).collect();
     let tdc = tdc_summary(&bag_scores_f32, &emb.is_decoy, 0.01);
-    let cutoff = if tdc.cutoff.is_finite() { Some(tdc.cutoff as f64) } else { None };
+    let cutoff = if tdc.cutoff.is_finite() {
+        Some(tdc.cutoff as f64)
+    } else {
+        None
+    };
 
     let mut report = Report::new(
         "ReDeeM TOPAZ Report",
@@ -77,9 +89,11 @@ pub fn write_topaz_report(
         }
     }
 
-    if let (Some(scores), Some(meta), Some(ms2)) =
-        (topaz_scores.as_ref(), feature_meta.as_ref(), ms2_scores.as_ref())
-    {
+    if let (Some(scores), Some(meta), Some(ms2)) = (
+        topaz_scores.as_ref(),
+        feature_meta.as_ref(),
+        ms2_scores.as_ref(),
+    ) {
         let pairs = build_score_pairs(scores, ms2, meta, precursor_meta.as_ref());
         if !pairs.is_empty() {
             let topaz_cutoff = cutoff_from_score_rows(scores, 0.01);
@@ -169,7 +183,11 @@ fn load_head_embeddings_tsv(path: &Path) -> Result<HeadEmbeddings> {
 
     for rec in rdr.records() {
         let rec = rec?;
-        let score = rec.get(idx_score).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        let score = rec
+            .get(idx_score)
+            .unwrap_or("0")
+            .parse::<f64>()
+            .unwrap_or(0.0);
         let decoy = rec.get(idx_decoy).unwrap_or("0") == "1";
         let pid = rec.get(idx_pid).unwrap_or("").to_string();
         bag_score.push(score);
@@ -212,11 +230,7 @@ fn load_score_tsv(path: &Path) -> Result<Vec<ScoreLite>> {
     let mut out = Vec::new();
     for rec in rdr.records() {
         let rec = rec?;
-        let fid = rec
-            .get(idx_feat)
-            .unwrap_or("0")
-            .parse::<u64>()
-            .unwrap_or(0);
+        let fid = rec.get(idx_feat).unwrap_or("0").parse::<u64>().unwrap_or(0);
         let score = rec
             .get(idx_score)
             .unwrap_or("0")
@@ -275,7 +289,8 @@ fn compute_id_counts(
             .insert(m.precursor_id);
         union.insert(m.precursor_id);
     }
-    let mut per_run_counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut per_run_counts: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::new();
     for (run, set) in per_run {
         per_run_counts.insert(run, set.len());
     }
@@ -516,7 +531,12 @@ fn plot_embedding_with_marginal_hist(
                     .title("Embedding PC2 (winner hidden)")
                     .domain(&[0.0, 0.78]),
             )
-            .y_axis2(Axis::new().title("Count").domain(&[0.82, 1.0]).show_tick_labels(false))
+            .y_axis2(
+                Axis::new()
+                    .title("Count")
+                    .domain(&[0.82, 1.0])
+                    .show_tick_labels(false),
+            )
             .bar_mode(BarMode::Overlay),
     );
     plot
@@ -708,11 +728,7 @@ fn plot_score_scatter_with_marginals(
                     .title("TOPAZ score (max candidate logit)")
                     .domain(&[0.0, 0.78]),
             )
-            .y_axis(
-                Axis::new()
-                    .title("SCORE_MS2")
-                    .domain(&[0.0, 0.78]),
-            )
+            .y_axis(Axis::new().title("SCORE_MS2").domain(&[0.0, 0.78]))
             .x_axis2(
                 Axis::new()
                     .title("Count")

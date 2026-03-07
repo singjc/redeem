@@ -48,10 +48,7 @@ fn version_flag() {
 #[test]
 fn properties_no_subcommand_errors() {
     // The CLI hits unreachable!() when no subcommand is given to `properties`
-    cmd()
-        .arg("properties")
-        .assert()
-        .failure();
+    cmd().arg("properties").assert().failure();
 }
 
 #[test]
@@ -91,18 +88,12 @@ fn properties_inference_no_config_prints_template() {
 #[test]
 fn classifiers_no_subcommand_errors() {
     // The CLI hits unreachable!() when no subcommand is given to `classifiers`
-    cmd()
-        .arg("classifiers")
-        .assert()
-        .failure();
+    cmd().arg("classifiers").assert().failure();
 }
 
 #[test]
 fn classifiers_score_no_pin_errors() {
-    cmd()
-        .args(["classifiers", "score"])
-        .assert()
-        .failure();
+    cmd().args(["classifiers", "score"]).assert().failure();
 }
 
 #[test]

@@ -1,7 +1,9 @@
 //! Integration tests for the preprocessing module (Scaler, normalize_scores).
 
 use redeem_classifiers::math::Array2;
-use redeem_classifiers::preprocessing::{fit_scaler, fit_transform, normalize_scores, transform_all};
+use redeem_classifiers::preprocessing::{
+    fit_scaler, fit_transform, normalize_scores, transform_all,
+};
 
 // ---------------------------------------------------------------------------
 // Scaler fit / transform
@@ -9,16 +11,8 @@ use redeem_classifiers::preprocessing::{fit_scaler, fit_transform, normalize_sco
 
 #[test]
 fn fit_scaler_computes_mean_and_std() {
-    let x = Array2::from_shape_vec(
-        (4, 2),
-        vec![
-            1.0, 10.0,
-            2.0, 20.0,
-            3.0, 30.0,
-            4.0, 40.0,
-        ],
-    )
-    .unwrap();
+    let x =
+        Array2::from_shape_vec((4, 2), vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0]).unwrap();
 
     let sc = fit_scaler(&x);
     assert_eq!(sc.mean.len(), 2);
@@ -30,11 +24,7 @@ fn fit_scaler_computes_mean_and_std() {
 
 #[test]
 fn transform_all_centers_data() {
-    let x = Array2::from_shape_vec(
-        (4, 1),
-        vec![1.0, 2.0, 3.0, 4.0],
-    )
-    .unwrap();
+    let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
     let sc = fit_scaler(&x);
     let t = transform_all(&x, &sc);
@@ -50,16 +40,8 @@ fn transform_all_centers_data() {
 
 #[test]
 fn fit_transform_returns_standardized() {
-    let x = Array2::from_shape_vec(
-        (4, 2),
-        vec![
-            1.0, 100.0,
-            2.0, 200.0,
-            3.0, 300.0,
-            4.0, 400.0,
-        ],
-    )
-    .unwrap();
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 100.0, 2.0, 200.0, 3.0, 300.0, 4.0, 400.0])
+        .unwrap();
 
     let t = fit_transform(&x);
     assert_eq!(t.shape(), (4, 2));
@@ -110,7 +92,10 @@ fn normalize_scores_single_element() {
     normalize_scores(&mut scores);
     // With one element, mean=42, var=0 → std clamped to 1e-6
     // Result: (42 - 42) / 1e-6 = 0
-    assert!(scores[0].abs() < 1e-2, "single-element should normalize to ~0");
+    assert!(
+        scores[0].abs() < 1e-2,
+        "single-element should normalize to ~0"
+    );
 }
 
 #[test]

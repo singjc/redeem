@@ -3,7 +3,7 @@ use clap::ArgMatches;
 use std::fs;
 use std::path::PathBuf;
 
-use redeem_topaz::{TrainRunConfig, FeatureMode};
+use redeem_topaz::{FeatureMode, TrainRunConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,7 +14,9 @@ pub struct TopazTrainConfig {
 
 impl Default for TopazTrainConfig {
     fn default() -> Self {
-        Self { inner: TrainRunConfig::default() }
+        Self {
+            inner: TrainRunConfig::default(),
+        }
     }
 }
 

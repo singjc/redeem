@@ -1,8 +1,8 @@
 //! Integration tests for stats (TDC q-value estimation) and config types.
 
+use redeem_classifiers::config::{ModelConfig, ModelType};
 use redeem_classifiers::math::Array1;
 use redeem_classifiers::stats::tdc;
-use redeem_classifiers::config::{ModelConfig, ModelType};
 
 // ---------------------------------------------------------------------------
 // TDC q-value estimation
@@ -44,7 +44,10 @@ fn tdc_ascending_order() {
     let qvals = tdc(&scores, &target, false);
     assert_eq!(qvals.len(), 4);
     // Better scores (lower) should have lower q-values
-    assert!(qvals[0] <= qvals[3], "lower score should have lower q-value");
+    assert!(
+        qvals[0] <= qvals[3],
+        "lower score should have lower q-value"
+    );
 }
 
 #[test]
@@ -90,7 +93,9 @@ fn model_config_default_values() {
     let cfg = ModelConfig::default();
     assert!(cfg.learning_rate > 0.0);
     match cfg.model_type {
-        ModelType::GBDT { num_boost_round, .. } => {
+        ModelType::GBDT {
+            num_boost_round, ..
+        } => {
             assert!(num_boost_round > 0);
         }
         #[allow(unreachable_patterns)]

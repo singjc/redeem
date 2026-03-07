@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 
-use crate::math::{Array1, Array2};
 use crate::error::ExperimentError;
+use crate::math::{Array1, Array2};
 use crate::stats::tdc;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -58,7 +58,11 @@ pub struct Experiment {
 }
 
 impl Experiment {
-    pub fn new(x: Array2<f32>, y: Array1<i32>, psm_metadata: PsmMetadata) -> Result<Self, ExperimentError> {
+    pub fn new(
+        x: Array2<f32>,
+        y: Array1<i32>,
+        psm_metadata: PsmMetadata,
+    ) -> Result<Self, ExperimentError> {
         let n_samples = x.nrows();
 
         // Validate dimensions
@@ -69,25 +73,23 @@ impl Experiment {
         // Check classes
         let has_target = y.iter().any(|&label| label == 1);
         let has_decoy = y.iter().any(|&label| label == -1);
-        
+
         match (has_target, has_decoy) {
             (false, false) => return Err(ExperimentError::SingleClass(true)), // Arbitrary
             (true, false) => return Err(ExperimentError::SingleClass(true)),
             (false, true) => return Err(ExperimentError::SingleClass(false)),
             (true, true) => (), // Continue
         }
-        
-        Ok(
-            Experiment {
-                x,
-                y,
-                is_train: Array1::from_elem(n_samples, false),
-                is_top_peak: Array1::from_elem(n_samples, false),
-                tg_num_id: Array1::from_elem(n_samples, 0),
-                classifier_score: Array1::from_elem(n_samples, 0.0),
-                psm_metadata,
-            }
-        )
+
+        Ok(Experiment {
+            x,
+            y,
+            is_train: Array1::from_elem(n_samples, false),
+            is_top_peak: Array1::from_elem(n_samples, false),
+            tg_num_id: Array1::from_elem(n_samples, 0),
+            classifier_score: Array1::from_elem(n_samples, 0.0),
+            psm_metadata,
+        })
     }
 
     pub fn log_input_data_summary(&self) {
@@ -385,10 +387,7 @@ impl PsmMetadata {
                 .collect::<Vec<_>>()
         });
         PsmMetadata {
-            spec_id: indices
-                .iter()
-                .map(|&i| self.spec_id[i].clone())
-                .collect(),
+            spec_id: indices.iter().map(|&i| self.spec_id[i].clone()).collect(),
             file_id: indices.iter().map(|&i| self.file_id[i]).collect(),
             feature_names: self.feature_names.clone(),
             scan_nr,

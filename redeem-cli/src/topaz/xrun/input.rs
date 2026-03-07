@@ -14,7 +14,9 @@ pub struct TopazXrunSweepConfig {
 
 impl Default for TopazXrunSweepConfig {
     fn default() -> Self {
-        Self { inner: XrunSweepConfig::default() }
+        Self {
+            inner: XrunSweepConfig::default(),
+        }
     }
 }
 

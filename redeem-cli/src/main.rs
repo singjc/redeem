@@ -4,11 +4,11 @@ use log::LevelFilter;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use redeem_cli::classifiers::score::score::{
-    load_score_config, score_pin, write_score_output, write_score_report, ScoreConfig,
-};
 use redeem_classifiers::config::ModelType;
 use redeem_classifiers::data_handling::RankGrouping;
+use redeem_cli::classifiers::score::score::{
+    ScoreConfig, load_score_config, score_pin, write_score_output, write_score_report,
+};
 use redeem_cli::properties::inference::inference;
 use redeem_cli::properties::inference::input::PropertyInferenceConfig;
 use redeem_cli::properties::train::input::PropertyTrainConfig;
@@ -691,10 +691,7 @@ fn handle_classifiers(matches: &ArgMatches) -> Result<()> {
 
             if score_matches.get_one::<PathBuf>("config").is_none() {
                 let default_json = serde_json::to_string_pretty(&config).unwrap_or_default();
-                eprintln!(
-                    "[ReDeeM::Classifiers] Default config:\n{}",
-                    default_json
-                );
+                eprintln!("[ReDeeM::Classifiers] Default config:\n{}", default_json);
             }
 
             let result = score_pin(pin_path, &config)?;
@@ -771,9 +768,7 @@ fn handle_topaz(matches: &ArgMatches) -> Result<()> {
             topaz_xrun::run(&cfg)
         }
         Some(("clear-xic-cache", sub)) => {
-            let dir = sub
-                .get_one::<PathBuf>("dir")
-                .expect("dir is required");
+            let dir = sub.get_one::<PathBuf>("dir").expect("dir is required");
             redeem_cli::topaz::cache::clear_xic_cache(dir)?;
             log::info!("Cleared XIC cache at {:?}", dir);
             Ok(())

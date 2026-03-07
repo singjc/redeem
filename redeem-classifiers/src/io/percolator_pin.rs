@@ -67,7 +67,10 @@ pub fn read_pin_tsv<P: AsRef<Path>>(path: P) -> Result<PinData> {
 }
 
 /// Read a Percolator .pin TSV file using a custom configuration.
-pub fn read_pin_tsv_with_config<P: AsRef<Path>>(path: P, config: &PinReaderConfig) -> Result<PinData> {
+pub fn read_pin_tsv_with_config<P: AsRef<Path>>(
+    path: P,
+    config: &PinReaderConfig,
+) -> Result<PinData> {
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(b'\t')
         .has_headers(true)
@@ -94,7 +97,9 @@ pub fn read_pin_tsv_with_config<P: AsRef<Path>>(path: P, config: &PinReaderConfi
         Some(name) => find_column(&headers, name),
         None => find_any_column(
             &headers,
-            &["FileId", "FileIdx", "FileName", "File", "SpecFile", "RawFile"],
+            &[
+                "FileId", "FileIdx", "FileName", "File", "SpecFile", "RawFile",
+            ],
         ),
     };
     let exp_mass_idx = find_any_column(&headers, &["ExpMass"]);

@@ -14,7 +14,9 @@ pub struct TopazInferConfig {
 
 impl Default for TopazInferConfig {
     fn default() -> Self {
-        Self { inner: InferRunConfig::default() }
+        Self {
+            inner: InferRunConfig::default(),
+        }
     }
 }
 
