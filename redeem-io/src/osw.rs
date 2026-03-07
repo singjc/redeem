@@ -1,9 +1,10 @@
-// redeem-io/src/osw.rs
+//! SQLite-backed OSW feature-table reading and score-table writeback.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// One candidate feature row extracted from an OSW file.
 #[derive(Debug, Clone)]
 pub struct FeatureRow {
     pub feature_id: u64,
@@ -15,6 +16,7 @@ pub struct FeatureRow {
     pub features: Vec<f32>,
 }
 
+/// Peptide/precursor metadata used by reports and diagnostics.
 #[derive(Debug, Clone)]
 pub struct PrecursorMeta {
     pub precursor_id: u64,
@@ -22,6 +24,7 @@ pub struct PrecursorMeta {
     pub charge: i32,
 }
 
+/// Minimal feature metadata keyed by `FEATURE_ID`.
 #[derive(Debug, Clone)]
 pub struct FeatureMeta {
     pub feature_id: u64,
@@ -30,6 +33,7 @@ pub struct FeatureMeta {
     pub is_decoy: bool,
 }
 
+/// Compact score-table view used when reading an existing OSW score table.
 #[derive(Debug, Clone)]
 pub struct ScoreTableEntry {
     pub feature_id: u64,
@@ -38,6 +42,7 @@ pub struct ScoreTableEntry {
     pub qvalue: Option<f32>,
 }
 
+/// Full OSW score-table row written by TOPAZ.
 #[derive(Debug, Clone)]
 pub struct ScoreRow {
     pub feature_id: u64,
@@ -48,6 +53,7 @@ pub struct ScoreRow {
     pub pep: f32,
 }
 
+/// Feature granularity to read from an OSW file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OswLevel {
     Ms2,
@@ -57,6 +63,8 @@ pub enum OswLevel {
     Alignment,
 }
 
+/// OSW reader configuration mirroring the PyProphet/OpenSWATH feature-table
+/// choices used by TOPAZ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OswReadConfig {
     pub level: OswLevel,
@@ -78,12 +86,14 @@ impl Default for OswReadConfig {
     }
 }
 
+/// Result of reading an OSW feature table.
 #[derive(Debug, Clone)]
 pub struct OswFeatureTable {
     pub rows: Vec<FeatureRow>,
     pub feature_cols: Vec<String>,
 }
 
+/// Read feature rows from an OSW SQLite file.
 #[cfg(feature = "sqlite")]
 pub fn read_feature_rows(path: &std::path::Path, cfg: &OswReadConfig) -> Result<OswFeatureTable> {
     use rusqlite::Connection;
@@ -98,6 +108,7 @@ pub fn read_feature_rows(path: &std::path::Path, cfg: &OswReadConfig) -> Result<
     }
 }
 
+/// Read precursor metadata keyed by `PRECURSOR_ID`.
 #[cfg(feature = "sqlite")]
 pub fn read_precursor_meta(path: &std::path::Path) -> Result<HashMap<u64, PrecursorMeta>> {
     use rusqlite::Connection;
@@ -151,6 +162,7 @@ fn list_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>>
     Ok(cols)
 }
 
+/// Read feature metadata keyed by `FEATURE_ID`.
 #[cfg(feature = "sqlite")]
 pub fn read_feature_meta(path: &std::path::Path) -> Result<HashMap<u64, FeatureMeta>> {
     use rusqlite::Connection;
@@ -182,6 +194,7 @@ pub fn read_feature_meta(path: &std::path::Path) -> Result<HashMap<u64, FeatureM
     Ok(out)
 }
 
+/// Read an existing OSW score table by name.
 #[cfg(feature = "sqlite")]
 pub fn read_score_table(
     path: &std::path::Path,

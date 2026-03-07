@@ -1,4 +1,4 @@
-// redeem-io/src/msnumpress.rs
+//! Minimal MSNumpress decoding utilities used for OpenMS parquet chromatograms.
 
 use anyhow::{bail, Result};
 
@@ -11,6 +11,7 @@ fn decode_fixed_point(data: &[u8]) -> Result<f64> {
     Ok(f64::from_be_bytes(buf))
 }
 
+/// Decode the variable-length integer format used by MSNumpress linear coding.
 pub fn decode_int(
     data: &[u8],
     di: &mut usize,
@@ -66,6 +67,7 @@ pub fn decode_int(
     Ok(())
 }
 
+/// Decode MSNumpress linear-compressed doubles.
 pub fn decode_linear(data: &[u8]) -> Result<Vec<f64>> {
     let data_size = data.len();
     if data_size < 8 {
@@ -133,6 +135,7 @@ pub fn decode_linear(data: &[u8]) -> Result<Vec<f64>> {
     Ok(result)
 }
 
+/// Decode MSNumpress short-logged-float compressed doubles.
 pub fn decode_slof(data: &[u8]) -> Result<Vec<f64>> {
     let data_size = data.len();
     if data_size < 8 {

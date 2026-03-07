@@ -1,4 +1,11 @@
-// redeem-io/src/lib.rs
+//! IO helpers shared by ReDeeM models.
+//!
+//! This crate intentionally keeps file-format concerns separate from the model
+//! crates. At the moment it focuses on:
+//!
+//! - OSW feature-table reading and score-table writeback via SQLite.
+//! - OpenMS chromatogram parquet decoding, including MSNumpress payloads.
+//! - Simple in-memory XIC domain types reused by `redeem-topaz`.
 
 pub mod osw;
 pub mod xic;

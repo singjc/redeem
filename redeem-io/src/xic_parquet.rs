@@ -1,4 +1,4 @@
-// redeem-io/src/xic_parquet.rs
+//! Reader for OpenMS chromatogram parquet files (`*.xic`).
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ use parquet::record::{Row, RowAccessor};
 #[cfg(feature = "parquet")]
 use flate2::read::ZlibDecoder;
 
+/// Builder-style reader for parquet-backed XIC data.
 #[derive(Debug, Clone)]
 pub struct XicParquetReader {
     path: PathBuf,
@@ -31,6 +32,7 @@ pub struct XicParquetReader {
 }
 
 impl XicParquetReader {
+    /// Create a reader for one parquet file.
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
@@ -39,16 +41,19 @@ impl XicParquetReader {
         }
     }
 
+    /// Return the underlying parquet path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Convenience adapter for the [`crate::xic::XicSource`] style API.
     pub fn read_precursors(&self, _run_id: u64, _precursor_ids: &[u64]) -> Result<Vec<PrecursorXic>> {
         bail!("XIC parquet reader not implemented yet (enable feature `parquet` for full support)")
     }
 }
 
 #[cfg(feature = "parquet")]
+/// List all run IDs present in a parquet XIC file.
 pub fn list_run_ids(path: &Path) -> Result<Vec<u64>> {
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file)?;
@@ -83,11 +88,13 @@ struct XicParquetFilters {
 
 #[cfg(feature = "parquet")]
 impl XicParquetReader {
+    /// Restrict subsequent fetches to a single run.
     pub fn filter_run_id(&mut self, run_id: u64) -> &mut Self {
         self.filters.run_id = Some(run_id);
         self
     }
 
+    /// Restrict subsequent fetches to a set of precursor IDs.
     pub fn filter_precursor_id<I, T>(&mut self, precursor_ids: I) -> &mut Self
     where
         I: IntoIterator<Item = T>,
@@ -98,6 +105,7 @@ impl XicParquetReader {
         self
     }
 
+    /// Restrict subsequent fetches to one or more MS levels.
     pub fn filter_ms_level<I, T>(&mut self, ms_levels: I) -> &mut Self
     where
         I: IntoIterator<Item = T>,
@@ -108,21 +116,26 @@ impl XicParquetReader {
         self
     }
 
+    /// Restrict subsequent fetches to rows with a specific
+    /// `DETECTING_TRANSITION` flag.
     pub fn filter_detecting_transition(&mut self, flag: impl Into<i64>) -> &mut Self {
         self.filters.detecting_transition = Some(flag.into());
         self
     }
 
+    /// Restrict subsequent fetches to a specific decoy flag.
     pub fn filter_decoy(&mut self, flag: impl Into<i64>) -> &mut Self {
         self.filters.decoy = Some(flag.into());
         self
     }
 
+    /// Clear all accumulated filters.
     pub fn clear_filters(&mut self) -> &mut Self {
         self.filters = XicParquetFilters::default();
         self
     }
 
+    /// Execute the filtered parquet scan and return grouped precursor traces.
     pub fn fetch(&mut self) -> Result<Vec<PrecursorXic>> {
         if self.filters.run_id.is_none() && self.filters.precursor_ids.is_none() {
             bail!("missing filters: set run_id or precursor_ids before fetch() to avoid full scan");
