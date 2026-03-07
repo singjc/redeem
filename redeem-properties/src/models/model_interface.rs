@@ -177,9 +177,9 @@ pub fn create_var_map(
 ) -> Result<()> {
     let mut ws = var_map.data().lock().unwrap();
 
-        for (name, tensor) in tensor_data {
-            ws.insert(name, Var::from_tensor(&tensor.to_device(device)?)?);
-        }
+    for (name, tensor) in tensor_data {
+        ws.insert(name, Var::from_tensor(&tensor.to_device(device)?)?);
+    }
 
     Ok(())
 }
@@ -212,9 +212,9 @@ pub fn infer_cnn_tf_hyperparams(
 
     // Helper to get shape dims for a tensor name
     let get_dims = |name: &str| -> Result<Vec<usize>> {
-        let var = data.get(name).ok_or_else(|| {
-            anyhow::anyhow!("Tensor '{}' not found in checkpoint", name)
-        })?;
+        let var = data
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Tensor '{}' not found in checkpoint", name))?;
         Ok(var.shape().dims().to_vec())
     };
 
@@ -223,24 +223,40 @@ pub fn infer_cnn_tf_hyperparams(
     let mod_nn_name = format!("{}.mod_nn.nn.weight", encoder_prefix);
     let mod_dims = get_dims(&mod_nn_name)?;
     let mod_hidden_dim = mod_dims[0] + 6; // add back the k=6 fixed features
-    log::debug!("[infer_cnn_tf_hyperparams] mod_hidden_dim = {} (from {} shape {:?}, +k=6)", mod_hidden_dim, mod_nn_name, mod_dims);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] mod_hidden_dim = {} (from {} shape {:?}, +k=6)",
+        mod_hidden_dim,
+        mod_nn_name,
+        mod_dims
+    );
 
     // 2. hidden_dim from proj_q.weight of layer 0: [hidden_dim, hidden_dim]
     let proj_q_name = format!("{}.input_transformer.layer_0.proj_q.weight", encoder_prefix);
     let proj_q_dims = get_dims(&proj_q_name)?;
     let hidden_dim = proj_q_dims[0];
-    log::debug!("[infer_cnn_tf_hyperparams] hidden_dim = {} (from {})", hidden_dim, proj_q_name);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] hidden_dim = {} (from {})",
+        hidden_dim,
+        proj_q_name
+    );
 
     // 3. ff_dim from lin1.weight of layer 0: [ff_dim, hidden_dim]
     let lin1_name = format!("{}.input_transformer.layer_0.lin1.weight", encoder_prefix);
     let lin1_dims = get_dims(&lin1_name)?;
     let ff_dim = lin1_dims[0];
-    log::debug!("[infer_cnn_tf_hyperparams] ff_dim = {} (from {})", ff_dim, lin1_name);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] ff_dim = {} (from {})",
+        ff_dim,
+        lin1_name
+    );
 
     // 4. Count transformer layers
     let mut num_layers = 0usize;
     loop {
-        let layer_name = format!("{}.input_transformer.layer_{}.proj_q.weight", encoder_prefix, num_layers);
+        let layer_name = format!(
+            "{}.input_transformer.layer_{}.proj_q.weight",
+            encoder_prefix, num_layers
+        );
         if data.contains_key(&layer_name) {
             num_layers += 1;
         } else {
@@ -268,7 +284,11 @@ pub fn infer_cnn_tf_hyperparams(
     } else {
         1
     };
-    log::debug!("[infer_cnn_tf_hyperparams] num_heads = {} (inferred, head_dim={})", num_heads, hidden_dim / num_heads);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] num_heads = {} (inferred, head_dim={})",
+        num_heads,
+        hidden_dim / num_heads
+    );
 
     Ok(InferredHyperparams {
         mod_hidden_dim,
@@ -918,8 +938,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                     .par_chunks(validation_batch_size)
                     .enumerate()
                     .map(|(idx, batch_data)| {
-                        
-
                         let (input_val, target_val) =
                             self.prepare_batch_inputs(batch_data, &modifications)?;
                         let predicted = self.forward(&input_val)?;
@@ -1130,8 +1148,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
         let progress = Progress::new(inference_data.len(), "[inference] Batch:");
         let mut result: Vec<Option<PeptideData>> = vec![None; inference_data.len()];
 
-
-
         inference_data
             .par_chunks(batch_size)
             .enumerate()
@@ -1144,9 +1160,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                 // Now run model forward.
                 let predicted = self.forward(&input_tensor)?;
 
-
                 let predictions = predicted.to_vec1::<f32>()?;
-
 
                 let updated = predictions
                     .into_iter()
@@ -1290,11 +1304,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                     }
                 }
 
-                Tensor::from_vec(
-                    targets,
-                    (batch_size, max_frag_len, 8),
-                    &self.get_device(),
-                )?
+                Tensor::from_vec(targets, (batch_size, max_frag_len, 8), &self.get_device())?
             }
         };
 
@@ -1349,7 +1359,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
     fn save(&mut self, path: &str) -> Result<()> {
         let p = PathBuf::from(path);
         info!("Saving {} model weights to: {:?}", self.get_model_arch(), p);
-    self.get_mut_varmap().save(&p)?;
+        self.get_mut_varmap().save(&p)?;
         Ok(())
     }
 
@@ -1392,7 +1402,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
 
     // TODO: Maybe move to ms2_bert_model, since it's specific to that model
     fn process_predictions(&self, predicts: &Tensor, min_inten: f32) -> Result<Tensor> {
-
         // Reshape and get max
         let (batch_size, seq_len, feature_size) = predicts.shape().dims3()?;
         let reshaped = predicts.reshape((batch_size, ()))?;
@@ -1410,7 +1419,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
 
         // Divide predicts by broadcasted apex_intens
         let normalized = predicts.div(&broadcasted_apex_intens)?;
-
 
         // Replace values < min_inten with 0.0
         let zeros = Tensor::zeros_like(&normalized)?;

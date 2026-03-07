@@ -98,10 +98,7 @@ impl DecoderLinear {
     /// This auto-detects both 3-layer (alphapeptdeep: linear→PReLU→linear) and
     /// 5-layer (redeem: linear→PReLU→linear→PReLU→linear) architectures by
     /// scanning for `{prefix}.nn.{i}.weight` entries in the varmap.
-    pub fn from_varmap_dynamic(
-        varmap: &candle_nn::VarMap,
-        prefix: &str,
-    ) -> Result<Self> {
+    pub fn from_varmap_dynamic(varmap: &candle_nn::VarMap, prefix: &str) -> Result<Self> {
         let data = varmap.data().lock().unwrap();
 
         // Collect all indices that have a .weight tensor under {prefix}.nn.{i}.weight
@@ -121,12 +118,14 @@ impl DecoderLinear {
 
         log::debug!(
             "[DecoderLinear::from_varmap_dynamic] prefix='{}', found weight indices: {:?}",
-            prefix, layer_indices
+            prefix,
+            layer_indices
         );
 
         if layer_indices.is_empty() {
             return Err(candle_core::Error::Msg(format!(
-                "No decoder layers found with prefix '{}.nn.'", prefix
+                "No decoder layers found with prefix '{}.nn.'",
+                prefix
             )));
         }
 
@@ -158,7 +157,8 @@ impl DecoderLinear {
                 sequential = sequential.add(prelu);
             } else {
                 return Err(candle_core::Error::Msg(format!(
-                    "Unexpected tensor rank for {}: {:?}", weight_name, dims
+                    "Unexpected tensor rank for {}: {:?}",
+                    weight_name, dims
                 )));
             }
         }

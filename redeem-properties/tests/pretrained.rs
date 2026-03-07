@@ -35,7 +35,12 @@ fn parse_alphapeptdeep_rt_aliases() {
     ] {
         let pm = PretrainedModel::from_str(alias)
             .unwrap_or_else(|e| panic!("failed to parse '{}': {}", alias, e));
-        assert_eq!(pm, PretrainedModel::AlphapeptdeepRtCnnLstm, "alias = {}", alias);
+        assert_eq!(
+            pm,
+            PretrainedModel::AlphapeptdeepRtCnnLstm,
+            "alias = {}",
+            alias
+        );
     }
 }
 
@@ -48,7 +53,12 @@ fn parse_alphapeptdeep_ccs_aliases() {
     ] {
         let pm = PretrainedModel::from_str(alias)
             .unwrap_or_else(|e| panic!("failed to parse '{}': {}", alias, e));
-        assert_eq!(pm, PretrainedModel::AlphapeptdeepCcsCnnLstm, "alias = {}", alias);
+        assert_eq!(
+            pm,
+            PretrainedModel::AlphapeptdeepCcsCnnLstm,
+            "alias = {}",
+            alias
+        );
     }
 }
 
@@ -62,7 +72,12 @@ fn parse_alphapeptdeep_ms2_aliases() {
     ] {
         let pm = PretrainedModel::from_str(alias)
             .unwrap_or_else(|e| panic!("failed to parse '{}': {}", alias, e));
-        assert_eq!(pm, PretrainedModel::AlphapeptdeepMs2Bert, "alias = {}", alias);
+        assert_eq!(
+            pm,
+            PretrainedModel::AlphapeptdeepMs2Bert,
+            "alias = {}",
+            alias
+        );
     }
 }
 
@@ -98,8 +113,14 @@ fn display_returns_human_readable_name() {
 fn arch_returns_expected_strings() {
     assert_eq!(PretrainedModel::RedeemRtCnnTf.arch(), "rt_cnn_tf");
     assert_eq!(PretrainedModel::RedeemCcsCnnTf.arch(), "ccs_cnn_tf");
-    assert_eq!(PretrainedModel::AlphapeptdeepRtCnnLstm.arch(), "rt_cnn_lstm");
-    assert_eq!(PretrainedModel::AlphapeptdeepCcsCnnLstm.arch(), "ccs_cnn_lstm");
+    assert_eq!(
+        PretrainedModel::AlphapeptdeepRtCnnLstm.arch(),
+        "rt_cnn_lstm"
+    );
+    assert_eq!(
+        PretrainedModel::AlphapeptdeepCcsCnnLstm.arch(),
+        "ccs_cnn_lstm"
+    );
     assert_eq!(PretrainedModel::AlphapeptdeepMs2Bert.arch(), "ms2_bert");
 }
 
