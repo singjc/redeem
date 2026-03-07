@@ -417,6 +417,24 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("output_table")
+                                .long("output-table")
+                                .help("OSW table name for the primary/final TOPAZ scores")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
+                            Arg::new("output_table_base")
+                                .long("output-table-base")
+                                .help("Optional OSW table name for uncalibrated base TOPAZ scores")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
+                            Arg::new("output_table_xrun")
+                                .long("output-table-xrun")
+                                .help("Optional OSW table name for XRUN-calibrated TOPAZ scores")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
                             Arg::new("device")
                                 .long("device")
                                 .value_parser(clap::builder::NonEmptyStringValueParser::new()),

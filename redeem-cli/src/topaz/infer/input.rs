@@ -47,6 +47,15 @@ impl TopazInferConfig {
         if let Some(p) = matches.get_one::<PathBuf>("output_osw") {
             cfg.inner.output_osw = Some(p.clone());
         }
+        if let Some(name) = matches.get_one::<String>("output_table") {
+            cfg.inner.output_table = name.clone();
+        }
+        if let Some(name) = matches.get_one::<String>("output_table_base") {
+            cfg.inner.output_table_base = Some(name.clone());
+        }
+        if let Some(name) = matches.get_one::<String>("output_table_xrun") {
+            cfg.inner.output_table_xrun = Some(name.clone());
+        }
         if let Some(d) = matches.get_one::<String>("device") {
             cfg.inner.device = d.clone();
         }
