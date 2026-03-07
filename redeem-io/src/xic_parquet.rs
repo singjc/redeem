@@ -1,6 +1,14 @@
 //! Reader for OpenMS chromatogram parquet files (`*.xic`).
+//!
+//! The parquet file contains one row per chromatogram, not one row per
+//! precursor. This reader is therefore responsible for:
+//!
+//! - filtering parquet rows to the requested run/precursor subset,
+//! - decoding compressed RT/intensity arrays,
+//! - regrouping transition rows into one [`PrecursorXic`] per precursor,
+//! - exposing a builder-style filtering API that matches how TOPAZ fetches XICs.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::xic::PrecursorXic;
@@ -17,13 +25,18 @@ use crate::msnumpress;
 #[cfg(feature = "parquet")]
 use crate::xic::{TransitionTrace, XicPoint, XicSource};
 #[cfg(feature = "parquet")]
+use flate2::read::ZlibDecoder;
+#[cfg(feature = "parquet")]
 use parquet::file::reader::{FileReader, SerializedFileReader};
 #[cfg(feature = "parquet")]
 use parquet::record::{Row, RowAccessor};
-#[cfg(feature = "parquet")]
-use flate2::read::ZlibDecoder;
 
 /// Builder-style reader for parquet-backed XIC data.
+///
+/// The typical usage pattern is:
+/// `filter_run_id(...).filter_precursor_id(...).filter_ms_level(...).fetch()`.
+/// Filters are accumulated on the reader and applied together when `fetch()` is
+/// called.
 #[derive(Debug, Clone)]
 pub struct XicParquetReader {
     path: PathBuf,
@@ -33,6 +46,9 @@ pub struct XicParquetReader {
 
 impl XicParquetReader {
     /// Create a reader for one parquet file.
+    ///
+    /// The file is not scanned until a later call such as [`Self::fetch`] or
+    /// [`list_run_ids`].
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
@@ -47,13 +63,22 @@ impl XicParquetReader {
     }
 
     /// Convenience adapter for the [`crate::xic::XicSource`] style API.
-    pub fn read_precursors(&self, _run_id: u64, _precursor_ids: &[u64]) -> Result<Vec<PrecursorXic>> {
+    ///
+    /// Without the `parquet` feature this remains a stub and returns an error.
+    pub fn read_precursors(
+        &self,
+        _run_id: u64,
+        _precursor_ids: &[u64],
+    ) -> Result<Vec<PrecursorXic>> {
         bail!("XIC parquet reader not implemented yet (enable feature `parquet` for full support)")
     }
 }
 
 #[cfg(feature = "parquet")]
 /// List all run IDs present in a parquet XIC file.
+///
+/// This is mainly used for diagnostics and for checking whether an XIC-map
+/// file is needed to translate OSW run IDs to parquet files.
 pub fn list_run_ids(path: &Path) -> Result<Vec<u64>> {
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file)?;
@@ -72,6 +97,7 @@ pub fn list_run_ids(path: &Path) -> Result<Vec<u64>> {
 }
 
 #[cfg(not(feature = "parquet"))]
+/// Stub used when `redeem-io` is built without parquet support.
 pub fn list_run_ids(_path: &Path) -> Result<Vec<u64>> {
     bail!("XIC parquet reader not available (enable feature `parquet`)")
 }
@@ -89,12 +115,17 @@ struct XicParquetFilters {
 #[cfg(feature = "parquet")]
 impl XicParquetReader {
     /// Restrict subsequent fetches to a single run.
+    ///
+    /// This is a logical filter on the parquet `RUN_ID` column.
     pub fn filter_run_id(&mut self, run_id: u64) -> &mut Self {
         self.filters.run_id = Some(run_id);
         self
     }
 
     /// Restrict subsequent fetches to a set of precursor IDs.
+    ///
+    /// Only chromatogram rows whose `PRECURSOR_ID` is in the provided set will
+    /// be materialized during [`Self::fetch`].
     pub fn filter_precursor_id<I, T>(&mut self, precursor_ids: I) -> &mut Self
     where
         I: IntoIterator<Item = T>,
@@ -106,6 +137,8 @@ impl XicParquetReader {
     }
 
     /// Restrict subsequent fetches to one or more MS levels.
+    ///
+    /// Typical values are `1` for precursor traces and `2` for fragment traces.
     pub fn filter_ms_level<I, T>(&mut self, ms_levels: I) -> &mut Self
     where
         I: IntoIterator<Item = T>,
@@ -136,6 +169,9 @@ impl XicParquetReader {
     }
 
     /// Execute the filtered parquet scan and return grouped precursor traces.
+    ///
+    /// The result is grouped by `PRECURSOR_ID`: multiple parquet rows are
+    /// merged into one [`PrecursorXic`] containing all matching traces.
     pub fn fetch(&mut self) -> Result<Vec<PrecursorXic>> {
         if self.filters.run_id.is_none() && self.filters.precursor_ids.is_none() {
             bail!("missing filters: set run_id or precursor_ids before fetch() to avoid full scan");
@@ -209,7 +245,11 @@ impl XicParquetReader {
     }
 
     fn build_index(reader: &SerializedFileReader<File>) -> Result<HashMap<String, usize>> {
-        let schema = reader.metadata().file_metadata().schema_descr().root_schema();
+        let schema = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .root_schema();
         let mut map = HashMap::new();
         for (i, field) in schema.get_fields().iter().enumerate() {
             map.insert(field.name().to_string(), i);
@@ -218,7 +258,8 @@ impl XicParquetReader {
     }
 
     fn get_i64(row: &Row, idx: usize, name: &str) -> Result<i64> {
-        row.get_long(idx).map_err(|e| anyhow::anyhow!("missing {name}: {e}"))
+        row.get_long(idx)
+            .map_err(|e| anyhow::anyhow!("missing {name}: {e}"))
     }
 
     fn get_i64_opt(row: &Row, idx: Option<usize>) -> Option<i64> {
@@ -226,11 +267,14 @@ impl XicParquetReader {
     }
 
     fn get_string_opt(row: &Row, idx: Option<usize>) -> Option<String> {
-        idx.and_then(|i| row.get_string(i).ok()).map(|s| s.to_string())
+        idx.and_then(|i| row.get_string(i).ok())
+            .map(|s| s.to_string())
     }
 
     fn get_bytes(row: &Row, idx: usize, name: &str) -> Result<Vec<u8>> {
-        let b = row.get_bytes(idx).map_err(|e| anyhow::anyhow!("missing {name}: {e}"))?;
+        let b = row
+            .get_bytes(idx)
+            .map_err(|e| anyhow::anyhow!("missing {name}: {e}"))?;
         Ok(b.data().to_vec())
     }
 
@@ -244,8 +288,7 @@ impl XicParquetReader {
         traces.sort_by(|a, b| {
             let ml_a = a.ms_level.unwrap_or(255);
             let ml_b = b.ms_level.unwrap_or(255);
-            ml_a
-                .cmp(&ml_b)
+            ml_a.cmp(&ml_b)
                 .then_with(|| a.ordinal.cmp(&b.ordinal))
                 .then_with(|| a.annotation.cmp(&b.annotation))
         });
@@ -256,11 +299,9 @@ impl XicParquetReader {
         b: Option<HashSet<u64>>,
     ) -> Option<HashSet<u64>> {
         match (a, b) {
-            (Some(left), Some(right)) => Some(
-                left.intersection(&right)
-                    .copied()
-                    .collect::<HashSet<u64>>(),
-            ),
+            (Some(left), Some(right)) => {
+                Some(left.intersection(&right).copied().collect::<HashSet<u64>>())
+            }
             (Some(left), None) => Some(left),
             (None, Some(right)) => Some(right),
             (None, None) => None,
@@ -370,7 +411,10 @@ impl XicParquetReader {
 
             let mut points = Vec::with_capacity(n);
             for i in 0..n {
-                points.push(XicPoint { rt: rts[i] as f32, intensity: ints[i] as f32 });
+                points.push(XicPoint {
+                    rt: rts[i] as f32,
+                    intensity: ints[i] as f32,
+                });
             }
 
             let trace = TransitionTrace {
@@ -387,13 +431,19 @@ impl XicParquetReader {
             for &pid in want.iter() {
                 if let Some(mut traces) = map.remove(&pid) {
                     Self::sort_traces(&mut traces);
-                    out.push(PrecursorXic { precursor_id: pid, transitions: traces });
+                    out.push(PrecursorXic {
+                        precursor_id: pid,
+                        transitions: traces,
+                    });
                 }
             }
         } else {
             for (pid, mut traces) in map {
                 Self::sort_traces(&mut traces);
-                out.push(PrecursorXic { precursor_id: pid, transitions: traces });
+                out.push(PrecursorXic {
+                    precursor_id: pid,
+                    transitions: traces,
+                });
             }
             out.sort_by_key(|p| p.precursor_id);
         }
@@ -404,7 +454,11 @@ impl XicParquetReader {
 
 #[cfg(feature = "parquet")]
 impl XicSource for XicParquetReader {
-    fn fetch_precursors(&mut self, run_id: u64, precursor_ids: &[u64]) -> Result<Vec<PrecursorXic>> {
+    fn fetch_precursors(
+        &mut self,
+        run_id: u64,
+        precursor_ids: &[u64],
+    ) -> Result<Vec<PrecursorXic>> {
         if precursor_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -416,7 +470,8 @@ impl XicSource for XicParquetReader {
         }
 
         let requested: HashSet<u64> = precursor_ids.iter().copied().collect();
-        let combined = Self::intersect_precursors(self.filters.precursor_ids.clone(), Some(requested));
+        let combined =
+            Self::intersect_precursors(self.filters.precursor_ids.clone(), Some(requested));
         self.fetch_internal(Some(run_id), combined)
     }
 }

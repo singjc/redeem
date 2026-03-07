@@ -1,65 +1,106 @@
 //! SQLite-backed OSW feature-table reading and score-table writeback.
+//!
+//! This module provides the narrow OSW operations needed by TOPAZ:
+//! - read candidate-level feature tables from one of the OpenSWATH feature
+//!   tables (`FEATURE_MS2`, `FEATURE_MS1`, `FEATURE_TRANSITION`),
+//! - read lightweight metadata for reports and diagnostics,
+//! - write TOPAZ score tables back into the OSW SQLite file.
+//!
+//! The returned row type is intentionally normalized so that the rest of the
+//! code does not need to care which SQL table the features came from.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// One candidate feature row extracted from an OSW file.
+///
+/// Each row corresponds to one scored candidate peak group (or transition-level
+/// candidate when `OswLevel::Transition` is used).
 #[derive(Debug, Clone)]
 pub struct FeatureRow {
+    /// Stable OSW `FEATURE.ID`.
     pub feature_id: u64,
+    /// OSW `PRECURSOR_ID` for the row.
     pub precursor_id: u64,
+    /// OSW `RUN_ID` for the row.
     pub run_id: u64,
+    /// Bagging key used by TOPAZ. Typically `RUN_ID_PRECURSOR_ID`.
     pub group_id: String,
+    /// Experimental apex retention time reported by OpenSWATH.
     pub exp_rt: f32,
+    /// `true` for decoy rows, `false` for targets.
     pub is_decoy: bool,
+    /// Selected scalar features in the same order as `OswFeatureTable.feature_cols`.
     pub features: Vec<f32>,
 }
 
 /// Peptide/precursor metadata used by reports and diagnostics.
 #[derive(Debug, Clone)]
 pub struct PrecursorMeta {
+    /// OSW `PRECURSOR.ID`.
     pub precursor_id: u64,
+    /// Modified peptide sequence associated with the precursor.
     pub modified_sequence: String,
+    /// Precursor charge state.
     pub charge: i32,
 }
 
 /// Minimal feature metadata keyed by `FEATURE_ID`.
 #[derive(Debug, Clone)]
 pub struct FeatureMeta {
+    /// OSW `FEATURE.ID`.
     pub feature_id: u64,
+    /// OSW `RUN_ID`.
     pub run_id: u64,
+    /// OSW `PRECURSOR_ID`.
     pub precursor_id: u64,
+    /// `true` for decoy rows, `false` for targets.
     pub is_decoy: bool,
 }
 
 /// Compact score-table view used when reading an existing OSW score table.
 #[derive(Debug, Clone)]
 pub struct ScoreTableEntry {
+    /// OSW `FEATURE_ID`.
     pub feature_id: u64,
+    /// Primary score column.
     pub score: f32,
+    /// Optional rank column if the table contains `RANK`.
     pub rank: Option<i32>,
+    /// Optional q-value column if the table contains `QVALUE`.
     pub qvalue: Option<f32>,
 }
 
 /// Full OSW score-table row written by TOPAZ.
 #[derive(Debug, Clone)]
 pub struct ScoreRow {
+    /// OSW `FEATURE_ID`.
     pub feature_id: u64,
+    /// TOPAZ score.
     pub score: f32,
+    /// Rank within the corresponding run/precursor group.
     pub rank: i32,
+    /// Decoy-tail p-value.
     pub pvalue: f32,
+    /// Target-decoy q-value.
     pub qvalue: f32,
+    /// Posterior error probability estimate.
     pub pep: f32,
 }
 
 /// Feature granularity to read from an OSW file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OswLevel {
+    /// Read `FEATURE_MS2`.
     Ms2,
+    /// Read `FEATURE_MS1`.
     Ms1,
+    /// Read `FEATURE_MS2` and append matching `FEATURE_MS1` columns.
     Ms1Ms2,
+    /// Read `FEATURE_TRANSITION` after applying IPF-related restrictions.
     Transition,
+    /// Placeholder for alignment-level reading. Not implemented.
     Alignment,
 }
 
@@ -67,10 +108,15 @@ pub enum OswLevel {
 /// choices used by TOPAZ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OswReadConfig {
+    /// Which feature table(s) to read.
     pub level: OswLevel,
+    /// Maximum `SCORE_MS2.RANK` kept for transition-level/IPF reads.
     pub ipf_max_rank: i32,
+    /// Maximum `SCORE_MS2.PEP` kept for transition-level/IPF reads.
     pub ipf_max_pep: f32,
+    /// Maximum isotope-overlap score kept for transition-level/IPF reads.
     pub ipf_max_transition_isotope_overlap: f32,
+    /// Minimum transition signal-to-noise score kept for transition-level/IPF reads.
     pub ipf_min_transition_sn: f32,
 }
 
@@ -87,6 +133,9 @@ impl Default for OswReadConfig {
 }
 
 /// Result of reading an OSW feature table.
+///
+/// `feature_cols` gives the exact order of the scalar values stored in
+/// `FeatureRow.features`.
 #[derive(Debug, Clone)]
 pub struct OswFeatureTable {
     pub rows: Vec<FeatureRow>,
@@ -94,6 +143,10 @@ pub struct OswFeatureTable {
 }
 
 /// Read feature rows from an OSW SQLite file.
+///
+/// The selected SQL feature table depends on `cfg.level`. The resulting rows
+/// are normalized into a single [`FeatureRow`] representation that can be fed
+/// directly into TOPAZ preprocessing and bagging.
 #[cfg(feature = "sqlite")]
 pub fn read_feature_rows(path: &std::path::Path, cfg: &OswReadConfig) -> Result<OswFeatureTable> {
     use rusqlite::Connection;
@@ -109,6 +162,9 @@ pub fn read_feature_rows(path: &std::path::Path, cfg: &OswReadConfig) -> Result<
 }
 
 /// Read precursor metadata keyed by `PRECURSOR_ID`.
+///
+/// This is used mainly by reports so that points in embedding plots can be
+/// annotated with peptide sequence and charge state.
 #[cfg(feature = "sqlite")]
 pub fn read_precursor_meta(path: &std::path::Path) -> Result<HashMap<u64, PrecursorMeta>> {
     use rusqlite::Connection;
@@ -141,9 +197,8 @@ pub fn read_precursor_meta(path: &std::path::Path) -> Result<HashMap<u64, Precur
 
 #[cfg(feature = "sqlite")]
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1")?;
     let mut rows = stmt.query([table])?;
     Ok(rows.next()?.is_some())
 }
@@ -163,6 +218,9 @@ fn list_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>>
 }
 
 /// Read feature metadata keyed by `FEATURE_ID`.
+///
+/// This is the lightest-weight way to recover run/precursor/decoy context for
+/// an already-scored feature table.
 #[cfg(feature = "sqlite")]
 pub fn read_feature_meta(path: &std::path::Path) -> Result<HashMap<u64, FeatureMeta>> {
     use rusqlite::Connection;
@@ -195,11 +253,11 @@ pub fn read_feature_meta(path: &std::path::Path) -> Result<HashMap<u64, FeatureM
 }
 
 /// Read an existing OSW score table by name.
+///
+/// Missing optional columns such as `RANK` or `QVALUE` are tolerated; they are
+/// returned as `None` in the resulting [`ScoreTableEntry`] values.
 #[cfg(feature = "sqlite")]
-pub fn read_score_table(
-    path: &std::path::Path,
-    table: &str,
-) -> Result<Vec<ScoreTableEntry>> {
+pub fn read_score_table(path: &std::path::Path, table: &str) -> Result<Vec<ScoreTableEntry>> {
     use rusqlite::Connection;
 
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -217,9 +275,8 @@ pub fn read_score_table(
 
     let rank_expr = if has_rank { "RANK" } else { "NULL" };
     let q_expr = if has_q { "QVALUE" } else { "NULL" };
-    let sql = format!(
-        "SELECT FEATURE_ID, SCORE, {rank_expr} AS RANK, {q_expr} AS QVALUE FROM {table}"
-    );
+    let sql =
+        format!("SELECT FEATURE_ID, SCORE, {rank_expr} AS RANK, {q_expr} AS QVALUE FROM {table}");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         let feature_id: i64 = row.get(0)?;
@@ -241,35 +298,36 @@ pub fn read_score_table(
 }
 
 #[cfg(not(feature = "sqlite"))]
+/// Stub used when `redeem-io` is built without SQLite support.
 pub fn read_precursor_meta(_path: &std::path::Path) -> Result<HashMap<u64, PrecursorMeta>> {
     bail!("redeem-io compiled without feature `sqlite`")
 }
 
 #[cfg(not(feature = "sqlite"))]
+/// Stub used when `redeem-io` is built without SQLite support.
 pub fn read_feature_meta(_path: &std::path::Path) -> Result<HashMap<u64, FeatureMeta>> {
     bail!("redeem-io compiled without feature `sqlite`")
 }
 
 #[cfg(not(feature = "sqlite"))]
-pub fn read_score_table(
-    _path: &std::path::Path,
-    _table: &str,
-) -> Result<Vec<ScoreTableEntry>> {
+/// Stub used when `redeem-io` is built without SQLite support.
+pub fn read_score_table(_path: &std::path::Path, _table: &str) -> Result<Vec<ScoreTableEntry>> {
     bail!("redeem-io compiled without feature `sqlite`")
 }
 
 #[cfg(not(feature = "sqlite"))]
+/// Stub used when `redeem-io` is built without SQLite support.
 pub fn read_feature_rows(_path: &std::path::Path, _cfg: &OswReadConfig) -> Result<OswFeatureTable> {
     bail!("redeem-io compiled without feature `sqlite`")
 }
 
 #[cfg(feature = "sqlite")]
-pub fn write_score_table(
-    path: &std::path::Path,
-    table: &str,
-    rows: &[ScoreRow],
-) -> Result<()> {
-    use rusqlite::{params, Connection};
+/// Write or update a TOPAZ-compatible score table in an OSW file.
+///
+/// The target table is created if missing. Existing rows with the same
+/// `FEATURE_ID` are replaced.
+pub fn write_score_table(path: &std::path::Path, table: &str, rows: &[ScoreRow]) -> Result<()> {
+    use rusqlite::{Connection, params};
 
     let mut conn = Connection::open(path)?;
     let ddl = format!(
@@ -291,7 +349,14 @@ pub fn write_score_table(
     {
         let mut stmt = tx.prepare(&sql)?;
         for r in rows {
-            stmt.execute(params![r.feature_id, r.score, r.rank, r.pvalue, r.qvalue, r.pep])?;
+            stmt.execute(params![
+                r.feature_id,
+                r.score,
+                r.rank,
+                r.pvalue,
+                r.qvalue,
+                r.pep
+            ])?;
         }
     }
     tx.commit()?;
@@ -348,8 +413,7 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
 
     let mut feature_cols = list_var_columns(conn, "FEATURE_MS2")?;
     feature_cols.sort();
-    let (feature_cols, dropped_ms2) =
-        filter_all_null_columns(conn, "FEATURE_MS2", feature_cols)?;
+    let (feature_cols, dropped_ms2) = filter_all_null_columns(conn, "FEATURE_MS2", feature_cols)?;
     if !dropped_ms2.is_empty() {
         eprintln!(
             "warning: dropping all-NULL FEATURE_MS2 columns: {}",
@@ -451,7 +515,10 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
         );
     }
 
-    Ok(OswFeatureTable { rows: out, feature_cols: feature_cols_out })
+    Ok(OswFeatureTable {
+        rows: out,
+        feature_cols: feature_cols_out,
+    })
 }
 
 #[cfg(feature = "sqlite")]
@@ -521,7 +588,10 @@ fn read_ms1_features(conn: &rusqlite::Connection, _cfg: &OswReadConfig) -> Resul
 
     let feature_cols_out = feature_cols.iter().map(|c| c.to_lowercase()).collect();
 
-    Ok(OswFeatureTable { rows: out, feature_cols: feature_cols_out })
+    Ok(OswFeatureTable {
+        rows: out,
+        feature_cols: feature_cols_out,
+    })
 }
 
 #[cfg(feature = "sqlite")]
@@ -608,14 +678,14 @@ fn read_transition_features(
 
     let feature_cols_out = feature_cols.iter().map(|c| c.to_lowercase()).collect();
 
-    Ok(OswFeatureTable { rows: out, feature_cols: feature_cols_out })
+    Ok(OswFeatureTable {
+        rows: out,
+        feature_cols: feature_cols_out,
+    })
 }
 
 #[cfg(not(feature = "sqlite"))]
-pub fn write_score_table(
-    _path: &std::path::Path,
-    _table: &str,
-    _rows: &[ScoreRow],
-) -> Result<()> {
+/// Stub used when `redeem-io` is built without SQLite support.
+pub fn write_score_table(_path: &std::path::Path, _table: &str, _rows: &[ScoreRow]) -> Result<()> {
     bail!("redeem-io compiled without feature `sqlite`")
 }
