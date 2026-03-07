@@ -1,4 +1,12 @@
-// redeem-topaz/src/xrun/calibrator.rs
+//! Attention-based cross-run calibrator used to predict additive per-run score
+//! deltas.
+//!
+//! Shape notation used here:
+//!
+//! - `P`: number of precursor sequences in a batch.
+//! - `R`: number of run positions per sequence.
+//! - `D_in`: XRUN input width.
+//! - `D_model`: internal projected width.
 
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{self as nn, Module, VarBuilder};
@@ -13,6 +21,10 @@ impl Module for DropoutAlways {
     }
 }
 
+/// Network configuration for the XRUN attention calibrator.
+///
+/// The calibrator reads per-run items of the form `(bag_score, winner_hidden)`
+/// and predicts an additive score correction for each run position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrunConfig {
     pub in_dim: usize,
@@ -24,6 +36,15 @@ pub struct XrunConfig {
     pub delta_clip: Option<f64>,
 }
 
+/// Lightweight attention model that reads `(bag_score, winner_hidden)` sequences
+/// and predicts one delta per run.
+///
+/// For each precursor sequence, the model:
+/// - projects each run item into an internal representation,
+/// - computes attention weights over runs,
+/// - forms a context vector,
+/// - predicts one additive delta per run conditioned on both the local run
+///   state and the precursor-wide context.
 pub struct XrunAttentionCalibrator {
     proj: nn::Sequential,
     attn: nn::Sequential,
@@ -32,6 +53,7 @@ pub struct XrunAttentionCalibrator {
 }
 
 impl XrunAttentionCalibrator {
+    /// Construct a calibrator from [`XrunConfig`].
     pub fn new(vb: VarBuilder, cfg: XrunConfig) -> Result<Self> {
         let mut proj = nn::seq();
         proj = proj
@@ -59,11 +81,25 @@ impl XrunAttentionCalibrator {
         }
         delta = delta.add(nn::linear(d, 1, vb.pp("delta_out"))?);
 
-        Ok(Self { proj, attn, delta, cfg })
+        Ok(Self {
+            proj,
+            attn,
+            delta,
+            cfg,
+        })
     }
 
-    /// x: (B,R,D)  mask: (B,R) bool
-    /// returns (delta: (B,R), attn: (B,R))
+    /// Predict per-run deltas and attention weights for a masked sequence batch.
+    ///
+    /// # Inputs
+    /// - `x`: `(P, R, D_in)` where each run item typically contains one base
+    ///   bag score followed by the winner-hidden embedding.
+    /// - `mask`: `(P, R)` validity mask; `0` marks padded run positions.
+    ///
+    /// # Output
+    /// Returns `(delta, attn)` where both tensors have shape `(P, R)`:
+    /// - `delta`: additive correction to apply to each run's bag score
+    /// - `attn`: precursor-specific attention distribution over runs
     pub fn forward_masked(&self, x: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
         let (b, r, _d) = x.dims3()?;
 
@@ -93,7 +129,10 @@ impl XrunAttentionCalibrator {
         // center per precursor
         if self.cfg.center_delta {
             let denom = m.sum_keepdim(1)?.maximum(1.0f32)?;
-            let mu = dlt.broadcast_mul(&m)?.sum_keepdim(1)?.broadcast_div(&denom)?; // (B,1)
+            let mu = dlt
+                .broadcast_mul(&m)?
+                .sum_keepdim(1)?
+                .broadcast_div(&denom)?; // (B,1)
             let mu = mu.broadcast_as((b, r))?;
             dlt = (&dlt - &mu)?;
             dlt = (&dlt * &m)?;

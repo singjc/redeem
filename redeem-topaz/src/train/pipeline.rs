@@ -1,18 +1,21 @@
+//! Dataset filtering, splitting, preprocessing, and batch assembly for TOPAZ.
+
 use std::collections::{HashMap, HashSet};
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use crate::building_blocks::bagging::{make_bags_with_traces, Bags};
+use crate::building_blocks::bagging::{Bags, make_bags_with_traces};
 use crate::infer::{rows_to_feature_matrix, rows_to_feature_matrix_with_cols};
 use crate::io::osw::FeatureRow;
+use crate::preprocess::Preprocessor;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::trainer::TrainBatch;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use anyhow::Result;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use candle_core::{Device, Tensor};
-use crate::preprocess::Preprocessor;
 use serde::{Deserialize, Serialize};
 
+/// Row-level filters applied before train/validation splitting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrainFilter {
     /// Keep only these run IDs (if provided).
@@ -39,14 +42,22 @@ fn shuffle_indices(idxs: &mut [usize], seed: u64) {
 fn filter_rows_by_runs(rows: Vec<FeatureRow>, run_ids: &Option<Vec<u64>>) -> Vec<FeatureRow> {
     if let Some(runs) = run_ids {
         let set: HashSet<u64> = runs.iter().copied().collect();
-        rows.into_iter().filter(|r| set.contains(&r.run_id)).collect()
+        rows.into_iter()
+            .filter(|r| set.contains(&r.run_id))
+            .collect()
     } else {
         rows
     }
 }
 
-fn limit_precursors(rows: Vec<FeatureRow>, max_precursors: Option<usize>, seed: u64) -> Vec<FeatureRow> {
-    let Some(max_p) = max_precursors else { return rows };
+fn limit_precursors(
+    rows: Vec<FeatureRow>,
+    max_precursors: Option<usize>,
+    seed: u64,
+) -> Vec<FeatureRow> {
+    let Some(max_p) = max_precursors else {
+        return rows;
+    };
     if max_p == 0 {
         return Vec::new();
     }
@@ -58,12 +69,10 @@ fn limit_precursors(rows: Vec<FeatureRow>, max_precursors: Option<usize>, seed: 
     }
     let mut idxs: Vec<usize> = (0..precs.len()).collect();
     shuffle_indices(&mut idxs, seed);
-    let keep: HashSet<u64> = idxs
-        .into_iter()
-        .take(max_p)
-        .map(|i| precs[i])
-        .collect();
-    rows.into_iter().filter(|r| keep.contains(&r.precursor_id)).collect()
+    let keep: HashSet<u64> = idxs.into_iter().take(max_p).map(|i| precs[i]).collect();
+    rows.into_iter()
+        .filter(|r| keep.contains(&r.precursor_id))
+        .collect()
 }
 
 fn limit_precursors_per_run(
@@ -71,7 +80,9 @@ fn limit_precursors_per_run(
     max_precursors_per_run: Option<usize>,
     seed: u64,
 ) -> Vec<FeatureRow> {
-    let Some(max_p) = max_precursors_per_run else { return rows };
+    let Some(max_p) = max_precursors_per_run else {
+        return rows;
+    };
     if max_p == 0 {
         return Vec::new();
     }
@@ -87,11 +98,7 @@ fn limit_precursors_per_run(
         if precs.len() > max_p {
             let mut idxs: Vec<usize> = (0..precs.len()).collect();
             shuffle_indices(&mut idxs, seed ^ run_id);
-            let keep: HashSet<u64> = idxs
-                .into_iter()
-                .take(max_p)
-                .map(|i| precs[i])
-                .collect();
+            let keep: HashSet<u64> = idxs.into_iter().take(max_p).map(|i| precs[i]).collect();
             rs.retain(|r| keep.contains(&r.precursor_id));
         }
         out.extend(rs);
@@ -106,7 +113,7 @@ pub fn filter_training_rows(rows: Vec<FeatureRow>, filt: &TrainFilter) -> Vec<Fe
     limit_precursors(rows, filt.max_precursors, filt.seed)
 }
 
-/// Subsample training rows by bag (group_id), optionally stratified by run.
+/// Subsample training rows by bag (`group_id`), optionally stratified by run.
 pub fn subsample_train_rows_by_bag(
     rows: Vec<FeatureRow>,
     frac: f32,
@@ -187,10 +194,13 @@ pub fn subsample_train_rows_by_bag(
     );
 
     let keep_set: HashSet<&str> = keep_idx.iter().map(|&i| bag_ids[i].as_str()).collect();
-    rows.into_iter().filter(|r| keep_set.contains(r.group_id.as_str())).collect()
+    rows.into_iter()
+        .filter(|r| keep_set.contains(r.group_id.as_str()))
+        .collect()
 }
 
-/// Split rows by unique precursor_id (no leakage across candidates).
+/// Split rows by unique `precursor_id` to avoid train/validation leakage across
+/// candidates from the same precursor.
 pub fn split_rows_by_precursor(
     rows: &[FeatureRow],
     val_frac: f32,
@@ -211,11 +221,8 @@ pub fn split_rows_by_precursor(
     } else {
         n_val = 0;
     }
-    let val_set: std::collections::HashSet<u64> = idxs
-        .into_iter()
-        .take(n_val)
-        .map(|i| precs[i])
-        .collect();
+    let val_set: std::collections::HashSet<u64> =
+        idxs.into_iter().take(n_val).map(|i| precs[i]).collect();
     let mut tr = Vec::new();
     let mut va = Vec::new();
     for r in rows {
@@ -246,6 +253,7 @@ pub fn fit_preprocessor_from_rows_with_cols(
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Convert flattened bag buffers into a vector of tensor mini-batches.
 pub fn bags_to_train_batches(
     bags: Bags,
     device: &Device,
@@ -267,14 +275,19 @@ pub fn bags_to_train_batches(
         let tb_i = tb.narrow(0, i, take)?;
         let m_i = mask.narrow(0, i, take)?;
         let yb_i = yb.narrow(0, i, take)?;
-        out.push(TrainBatch { xb: xb_i, tb: tb_i, mask: m_i, yb: yb_i });
+        out.push(TrainBatch {
+            xb: xb_i,
+            tb: tb_i,
+            mask: m_i,
+            yb: yb_i,
+        });
         i += take;
     }
     Ok(out)
 }
 
-/// Build training batches from OSW + XIC with filtering support.
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Build training batches directly from OSW and XIC files.
 pub fn build_train_batches_from_osw_xic(
     osw_path: &std::path::Path,
     xic_path: &std::path::Path,
@@ -294,16 +307,16 @@ pub fn build_train_batches_from_osw_xic(
         return Ok(Vec::new());
     }
 
-    let x_trace = crate::infer::build_trace_tensors_from_parquet(&rows, xic_path, trace_cfg, fetch_cfg)?;
+    let x_trace =
+        crate::infer::build_trace_tensors_from_parquet(&rows, xic_path, trace_cfg, fetch_cfg)?;
     let n = rows.len();
     let c_total = trace_cfg.total_c();
-    let x_feat = crate::infer::rows_to_feature_matrix_preprocessed(
-        &rows,
-        model_cfg.feat_dim,
-        pre,
-    );
+    let x_feat = crate::infer::rows_to_feature_matrix_preprocessed(&rows, model_cfg.feat_dim, pre);
 
-    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
     let bags = make_bags_with_traces(

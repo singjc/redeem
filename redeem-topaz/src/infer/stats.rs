@@ -1,4 +1,4 @@
-// redeem-topaz/src/infer/stats.rs
+//! Ranking and statistical post-processing for scored rows.
 
 /// Rank scores within each key, descending (best=1).
 pub fn rank_within_key(keys: &[String], scores: &[f32]) -> Vec<i32> {
@@ -34,7 +34,7 @@ pub fn rank_within_key(keys: &[String], scores: &[f32]) -> Vec<i32> {
     ranks
 }
 
-/// Simple decoy-tail p-values: p = (#decoy score >= s) / (#decoy).
+/// Simple decoy-tail p-values: `p = (#decoy score >= s) / (#decoy)`.
 pub fn decoy_tail_pvalues(scores: &[f32], is_decoy: &[bool]) -> Vec<f32> {
     let n = scores.len();
     let mut decoy_scores: Vec<f32> = scores
@@ -52,16 +52,13 @@ pub fn decoy_tail_pvalues(scores: &[f32], is_decoy: &[bool]) -> Vec<f32> {
     let mut out = vec![1.0f32; n];
     for i in 0..n {
         let s = scores[i];
-        let cnt = decoy_scores
-            .iter()
-            .take_while(|&&d| d >= s)
-            .count() as f32;
+        let cnt = decoy_scores.iter().take_while(|&&d| d >= s).count() as f32;
         out[i] = (cnt / m as f32).max(1.0 / (m as f32 + 1.0));
     }
     out
 }
 
-/// Target-decoy competition q-values from scores (descending).
+/// Target-decoy competition q-values from scores sorted descending.
 pub fn tdc_qvalues(scores: &[f32], is_decoy: &[bool]) -> Vec<f32> {
     let n = scores.len();
     let mut idx: Vec<usize> = (0..n).collect();
@@ -92,7 +89,7 @@ pub fn tdc_qvalues(scores: &[f32], is_decoy: &[bool]) -> Vec<f32> {
     q
 }
 
-/// Binned PEP based on decoy fraction in score bins.
+/// Binned PEP based on the decoy fraction in score bins.
 pub fn binned_pep(scores: &[f32], is_decoy: &[bool], bins: usize) -> Vec<f32> {
     let n = scores.len();
     if n == 0 || bins == 0 {
@@ -127,6 +124,7 @@ pub fn binned_pep(scores: &[f32], is_decoy: &[bool], bins: usize) -> Vec<f32> {
     pep
 }
 
+/// Summary of identifications at a chosen target q-value threshold.
 #[derive(Debug, Clone)]
 pub struct TdcSummary {
     pub cutoff: f32,
@@ -134,7 +132,7 @@ pub struct TdcSummary {
     pub n_decoys: usize,
 }
 
-/// Simple TDC summary at q threshold.
+/// Summarize identifications at a chosen q-value threshold.
 pub fn tdc_summary(scores: &[f32], is_decoy: &[bool], q: f32) -> TdcSummary {
     let qvals = tdc_qvalues(scores, is_decoy);
     let mut cutoff = f32::INFINITY;
@@ -150,8 +148,16 @@ pub fn tdc_summary(scores: &[f32], is_decoy: &[bool], q: f32) -> TdcSummary {
     let mut n_decoys = 0usize;
     for (s, d) in scores.iter().zip(is_decoy.iter()) {
         if *s > cutoff {
-            if *d { n_decoys += 1; } else { n_targets += 1; }
+            if *d {
+                n_decoys += 1;
+            } else {
+                n_targets += 1;
+            }
         }
     }
-    TdcSummary { cutoff, n_targets, n_decoys }
+    TdcSummary {
+        cutoff,
+        n_targets,
+        n_decoys,
+    }
 }

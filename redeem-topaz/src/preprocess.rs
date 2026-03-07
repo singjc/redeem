@@ -1,15 +1,33 @@
+//! Column-wise imputation and standardization for heuristic features.
+
 use serde::{Deserialize, Serialize};
 
-/// Preprocessor: impute non-finite values with column medians, then standardize.
+/// Column-wise imputer and standardizer for heuristic features.
+///
+/// This mirrors the Python preprocessing used before feeding scalar
+/// library/heuristic features into TOPAZ:
+/// - replace non-finite values with a per-column median,
+/// - subtract a per-column mean,
+/// - divide by a per-column standard deviation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preprocessor {
+    /// Median used to replace non-finite values per column.
     pub med: Vec<f32>,
+    /// Mean used for centering per column.
     pub mean: Vec<f32>,
+    /// Standard deviation used for scaling per column.
     pub std: Vec<f32>,
+    /// Small stabilizer retained in the serialized config for compatibility.
     pub eps: f32,
 }
 
 impl Preprocessor {
+    /// Fit imputation and scaling statistics from a flat matrix.
+    ///
+    /// # Inputs
+    /// - `x`: row-major flat matrix with `n * d` values.
+    /// - `n`: number of rows.
+    /// - `d`: number of columns/features.
     pub fn fit(x: &[f32], n: usize, d: usize) -> Self {
         let eps = 1e-8f32;
         let mut med = vec![0f32; d];
@@ -75,9 +93,18 @@ impl Preprocessor {
             std[j] = if s > eps { s } else { 1.0 };
         }
 
-        Self { med, mean, std, eps }
+        Self {
+            med,
+            mean,
+            std,
+            eps,
+        }
     }
 
+    /// Transform a flat matrix in place using the fitted statistics.
+    ///
+    /// The shape convention is the same as [`Self::fit`]: `x` must contain
+    /// `n * d` row-major values.
     pub fn transform_in_place(&self, x: &mut [f32], n: usize, d: usize) {
         if d == 0 || n == 0 {
             return;
@@ -98,6 +125,7 @@ impl Preprocessor {
         }
     }
 
+    /// Return a transformed copy of a flat matrix.
     pub fn transform(&self, x: &[f32], n: usize, d: usize) -> Vec<f32> {
         let mut out = x.to_vec();
         self.transform_in_place(&mut out, n, d);
@@ -114,9 +142,12 @@ mod tests {
         let n = 3usize;
         let d = 2usize;
         let x = vec![
-            1.0, f32::NAN, //
-            3.0, 4.0,     //
-            f32::INFINITY, 6.0,
+            1.0,
+            f32::NAN, //
+            3.0,
+            4.0, //
+            f32::INFINITY,
+            6.0,
         ];
         let pre = Preprocessor::fit(&x, n, d);
         let y = pre.transform(&x, n, d);

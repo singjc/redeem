@@ -1,7 +1,8 @@
-// redeem-topaz/src/xrun/sequence.rs
+//! Sequence construction for XRUN calibration.
 
 use std::collections::HashMap;
 
+/// Dense precursor-by-run tensorization used by the XRUN calibrator.
 #[derive(Debug, Clone)]
 pub struct XrunSeq {
     /// (P,R,Din)
@@ -22,6 +23,7 @@ pub struct XrunSeq {
     pub prec_ids: Vec<u64>,
 }
 
+/// Parse a bag/group identifier of the form `RUN_ID_PRECURSOR_ID`.
 pub fn split_group_id_run_prec(group_id: &str) -> Option<(u64, u64)> {
     let mut it = group_id.splitn(2, '_');
     let a = it.next()?;
@@ -29,6 +31,7 @@ pub fn split_group_id_run_prec(group_id: &str) -> Option<(u64, u64)> {
     Some((a.parse().ok()?, b.parse().ok()?))
 }
 
+/// Build precursor-aligned run sequences from per-bag base TOPAZ outputs.
 pub fn build_xrun_sequences_from_bags(
     bag_pid: &[String],
     bag_score: &[f32],
@@ -105,5 +108,14 @@ pub fn build_xrun_sequences_from_bags(
         prec_out[pi] = prec;
     }
 
-    XrunSeq { xseq, p, r, din, mask, y_prec, idx_mat, prec_ids: prec_out }
+    XrunSeq {
+        xseq,
+        p,
+        r,
+        din,
+        mask,
+        y_prec,
+        idx_mat,
+        prec_ids: prec_out,
+    }
 }

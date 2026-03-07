@@ -1,4 +1,4 @@
-// redeem-topaz/src/infer/score_table.rs
+//! Final score-table assembly and TSV serialization.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::infer::{binned_pep, decoy_tail_pvalues, rank_within_key, tdc_qvalues};
 use crate::io::osw::FeatureRow;
 
+/// One scored feature row enriched with downstream statistical columns.
 #[derive(Debug, Clone)]
 pub struct ScoreTableRow {
     pub feature_id: u64,
@@ -17,6 +18,7 @@ pub struct ScoreTableRow {
     pub pep: f32,
 }
 
+/// Build a score table from plain parallel vectors.
 pub fn build_score_table(
     feature_ids: &[u64],
     scores: &[f32],
@@ -40,7 +42,7 @@ pub fn build_score_table(
     out
 }
 
-/// Build score table rows from feature rows + scores.
+/// Build score table rows from feature rows plus raw model scores.
 pub fn build_score_table_from_rows(
     rows: &[FeatureRow],
     scores: &[f32],
@@ -62,8 +64,7 @@ pub fn build_score_table_from_rows(
     build_score_table(&feature_ids, scores, &ranks, &pvalues, &qvalues, &pep)
 }
 
-/// Write SCORE table to TSV with header:
-/// FEATURE_ID, SCORE, RANK, PVALUE, QVALUE, PEP
+/// Write a score table to TSV.
 pub fn write_score_tsv<P: AsRef<Path>>(path: P, rows: &[ScoreTableRow]) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::new(file);

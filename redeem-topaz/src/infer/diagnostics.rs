@@ -1,9 +1,12 @@
+//! Numeric diagnostics emitted during training and inference.
+
 use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::io::osw::FeatureRow;
-use crate::io::xic::{XicSource, TransitionTrace};
+use crate::io::xic::{TransitionTrace, XicSource};
 
+/// Summary of trace coverage for a batch of extracted windows.
 #[derive(Debug, Clone)]
 pub struct TraceSummary {
     pub n: usize,
@@ -77,6 +80,7 @@ pub fn trace_summary(
     }
 }
 
+/// Log a human-readable trace summary.
 pub fn print_trace_summary(summary: &TraceSummary, label: &str) {
     if summary.n == 0 || summary.l == 0 {
         log::info!("Trace summary ({label}): empty");
@@ -103,6 +107,7 @@ pub fn print_trace_summary(summary: &TraceSummary, label: &str) {
     }
 }
 
+/// Warn when the configured MS1 channels are entirely zero.
 pub fn warn_if_missing_ms1(summary: &TraceSummary, context: &str) {
     if summary.ms1_cmax == 0 {
         return;
@@ -110,7 +115,8 @@ pub fn warn_if_missing_ms1(summary: &TraceSummary, context: &str) {
     if summary.ms1_nonzero_rows == 0 {
         log::warn!(
             "ms1_cmax={} but no MS1 traces found in {}; using zero-padded MS1 channels.",
-            summary.ms1_cmax, context
+            summary.ms1_cmax,
+            context
         );
     }
 }
@@ -175,6 +181,10 @@ use rusqlite::Connection;
 #[cfg(feature = "io-sqlite")]
 use std::path::Path;
 
+/// Summary table used for rank-1 TOPAZ-vs-`SCORE_MS2` disagreement analysis.
+///
+/// The quadrant tuples are `(targets, decoys, total)` counts after comparing
+/// whether each method passes its chosen score cutoff.
 #[derive(Debug, Clone)]
 pub struct Rank1DisagreementSummary {
     pub rows: usize,
@@ -192,9 +202,7 @@ pub struct Rank1DisagreementSummary {
 
 #[cfg(feature = "io-sqlite")]
 fn cutoff_from_table(conn: &Connection, table: &str, q: f32) -> Result<Option<f32>> {
-    let sql = format!(
-        "SELECT MIN(SCORE) AS CUTOFF FROM {table} WHERE RANK=1 AND QVALUE <= ?"
-    );
+    let sql = format!("SELECT MIN(SCORE) AS CUTOFF FROM {table} WHERE RANK=1 AND QVALUE <= ?");
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([q])?;
     if let Some(row) = rows.next()? {
@@ -400,8 +408,16 @@ pub fn write_rank1_disagreement_tsvs(
         } else {
             "neither"
         };
-        let pstc_margin = if let Some(c) = pstc_cut { r.pstc_score - c } else { f32::NAN };
-        let ms2_margin = if let Some(c) = ms2_cut { r.ms2_score - c } else { f32::NAN };
+        let pstc_margin = if let Some(c) = pstc_cut {
+            r.pstc_score - c
+        } else {
+            f32::NAN
+        };
+        let ms2_margin = if let Some(c) = ms2_cut {
+            r.ms2_score - c
+        } else {
+            f32::NAN
+        };
         quad(cat, r.decoy, r.run_id, pstc_margin, ms2_margin);
 
         let tgt = if r.decoy { 0usize } else { 1usize };
@@ -442,8 +458,7 @@ pub fn write_rank1_disagreement_tsvs(
     for cat in ["both", "pstc_only", "ms2_only", "neither"] {
         let mut v = margins.remove(cat).unwrap_or_default();
         let n_targets = v.len();
-        let (mut pstc_vals, mut ms2_vals): (Vec<f32>, Vec<f32>) =
-            v.drain(..).unzip();
+        let (mut pstc_vals, mut ms2_vals): (Vec<f32>, Vec<f32>) = v.drain(..).unzip();
         let pstc_med = median(&mut pstc_vals);
         let ms2_med = median(&mut ms2_vals);
         let pstc_mean = if pstc_vals.is_empty() {
@@ -464,13 +479,14 @@ pub fn write_rank1_disagreement_tsvs(
 
     if !by_run_rows.is_empty() {
         let cap = by_run_rows.len().min(10);
-        log::info!(
-            "Rank-1 disagreement targets by run (top {cap} by total_targets):"
-        );
+        log::info!("Rank-1 disagreement targets by run (top {cap} by total_targets):");
         for (run, counts, _total) in by_run_rows.iter().take(cap) {
             log::info!(
                 "  run {run}: both={} pstc_only={} ms2_only={} neither={}",
-                counts[0], counts[1], counts[2], counts[3]
+                counts[0],
+                counts[1],
+                counts[2],
+                counts[3]
             );
         }
     }

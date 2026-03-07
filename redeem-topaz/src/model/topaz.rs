@@ -1,4 +1,24 @@
-// redeem-topaz/src/model/topaz.rs
+//! The concrete TOPAZ trace-first DIA peak-group scoring model.
+//!
+//! TOPAZ combines three main components:
+//!
+//! 1. [`crate::building_blocks::conv_encoder::TraceEncoder`], which embeds the
+//!    fixed RT-window traces and optionally computes explicit coelution
+//!    statistics.
+//! 2. [`crate::building_blocks::mlp::CandidateScorer`], which fuses heuristic
+//!    features and learned trace representations into candidate logits.
+//! 3. Masked-max multiple-instance learning over the candidate dimension `K`
+//!    to produce one bag score per precursor/run group.
+//!
+//! Shape notation used in this module:
+//!
+//! - `N`: number of flattened candidate rows.
+//! - `B`: number of bags.
+//! - `K`: padded candidate count per bag.
+//! - `D`: heuristic feature dimension.
+//! - `C_total`: total number of trace channels presented to the encoder.
+//! - `L`: fixed trace-window length.
+//! - `E`: learned trace-embedding dimension after branch fusion.
 
 use candle_core::{DType, Result, Tensor};
 use candle_nn::VarBuilder;
@@ -9,24 +29,46 @@ use crate::model_interface::{
     BagRankerInterface, BagRankerWithHiddenInterface, CandidateScorerInterface, ModelInterface,
 };
 
+/// Configuration for the base TOPAZ model.
+///
+/// The model sees:
+/// - heuristic features of size `feat_dim`
+/// - `ms1_cmax + ms2_cmax` trace channels
+/// - a fixed trace length `l`
+///
+/// MS1 channels, when present, are always ordered before MS2 channels.
+/// That means a trace tensor `(N, C_total, L)` is interpreted as
+/// `[MS1 channels | MS2 channels]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopazConfig {
+    /// Number of scalar heuristic/library features per candidate row.
     pub feat_dim: usize,
+    /// Maximum number of MS2 fragment traces kept per candidate.
     pub ms2_cmax: usize,
+    /// Maximum number of MS1 precursor/isotope traces kept per candidate.
     pub ms1_cmax: usize,
+    /// Fixed trace-window length `L`.
     pub l: usize,
 
+    /// Embedding width produced by each trace branch before fusion.
     pub trace_emb_dim: usize,
+    /// Hidden layer sizes for the candidate-scoring MLP.
     pub mlp_hidden: Vec<usize>,
+    /// Dropout probability used in the scorer (and related heads when enabled).
     pub dropout: f64,
 
+    /// Raw-vs-dual trace representation fed to the convolutional encoder.
     pub trace_input_mode: TraceInputMode,
+    /// Whether scalar heuristic features are concatenated with learned trace features.
     pub use_heuristic_features: bool,
+    /// Whether to compute explicit coelution features alongside learned embeddings.
     pub use_coelution_head: bool,
 
-    // coelution
+    /// Temperature-like scaling used when computing soft apex positions.
     pub coelution_beta: f64,
+    /// Maximum lag (in samples) searched by lag-tolerant cosine features.
     pub coelution_max_lag: usize,
+    /// Width of the learned similarity embedding inside the coelution head.
     pub coelution_sim_emb_dim: usize,
 }
 
@@ -50,11 +92,24 @@ impl Default for TopazConfig {
     }
 }
 
+/// Concrete TOPAZ model used for both candidate-level and bag-level scoring.
+///
+/// This type wires together the reusable building blocks into the exact
+/// architecture used by the Rust TOPAZ port: trace encoder, candidate scorer,
+/// and masked-max MIL bag pooling.
 pub struct TopazBagRanker {
+    /// Convolutional trace encoder producing learned embeddings and optional
+    /// coelution features.
     pub trace_enc: crate::building_blocks::conv_encoder::TraceEncoder,
+    /// Candidate-level MLP scorer operating on heuristic features plus trace
+    /// embeddings.
     pub scorer: crate::building_blocks::mlp::CandidateScorer,
 }
 
+/// Per-bag winner-side diagnostic tensors exported for reports.
+///
+/// Each row corresponds to the candidate that won one bag after masked-max
+/// pooling.
 #[derive(Debug, Clone)]
 pub struct BagHeadComponents {
     pub emb_ms2: Tensor,
@@ -67,11 +122,13 @@ pub struct BagHeadComponents {
 }
 
 impl TopazBagRanker {
+    /// Construct a TOPAZ scorer under the provided variable scope.
+    ///
+    /// All parameters are created beneath the supplied `vb` subtree so they can
+    /// be saved and loaded with stable names via Candle's `VarMap`.
     pub fn new(vb: VarBuilder, cfg: &TopazConfig) -> Result<Self> {
-        let trace_enc = crate::building_blocks::conv_encoder::TraceEncoder::new(
-            vb.pp("trace_enc"),
-            cfg,
-        )?;
+        let trace_enc =
+            crate::building_blocks::conv_encoder::TraceEncoder::new(vb.pp("trace_enc"), cfg)?;
         let scorer = crate::building_blocks::mlp::CandidateScorer::new(
             vb.pp("candidate_scorer"),
             cfg,
@@ -81,9 +138,23 @@ impl TopazBagRanker {
         Ok(Self { trace_enc, scorer })
     }
 
-    /// Xb: (B,K,D), Tb: (B,K,C,L), mask: (B,K) bool
-    /// Returns (cand_logits: (B,K), bag_logits: (B,))
-    pub fn forward_bags(&self, xb: &Tensor, tb: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
+    /// Score a batch of bags with masked-max MIL pooling.
+    ///
+    /// # Inputs
+    /// - `xb`: `(B, K, D)` heuristic features.
+    /// - `tb`: `(B, K, C_total, L)` trace windows.
+    /// - `mask`: `(B, K)` validity mask, where `1` marks a real candidate and
+    ///   `0` marks padding.
+    ///
+    /// # Output
+    /// - candidate logits `(B, K)`
+    /// - bag logits `(B,)`
+    pub fn forward_bags(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         let (b, k, d) = xb.dims3()?;
         let (_, _, c, l) = tb.dims4()?;
 
@@ -104,8 +175,11 @@ impl TopazBagRanker {
         Ok((cand, bag))
     }
 
-    /// Forward for bags and also return winner hidden (penultimate) per bag.
-    /// Returns (cand_logits: (B,K), bag_logits: (B,), winner_hidden: (B,H))
+    /// Score bags and return the hidden state of the winning candidate in each
+    /// bag.
+    ///
+    /// The returned hidden tensor has shape `(B, H)` and is the input consumed
+    /// by XRUN together with the bag score.
     pub fn forward_bags_with_hidden(
         &self,
         xb: &Tensor,
@@ -144,8 +218,11 @@ impl TopazBagRanker {
         Ok((cand, bag, win))
     }
 
-    /// Forward for bags, returning winner hidden and per-head components.
-    /// Returns (cand_logits: (B,K), bag_logits: (B,), winner_hidden: (B,H), components).
+    /// Score bags and return winner-side intermediate tensors that are useful
+    /// for diagnostics, reporting, and XRUN calibration.
+    ///
+    /// This is the most verbose forward path and is mainly intended for report
+    /// generation rather than training.
     pub fn forward_bags_with_heads(
         &self,
         xb: &Tensor,
@@ -159,7 +236,9 @@ impl TopazBagRanker {
         let tf = tb.reshape((b * k, c, l))?;
 
         let (emb_all, coe_all, comps) = self.trace_enc.forward_with_heads(&tf)?;
-        let (logits, hidden) = self.scorer.forward_with_hidden_eval(&xf, &emb_all, &coe_all)?;
+        let (logits, hidden) = self
+            .scorer
+            .forward_with_hidden_eval(&xf, &emb_all, &coe_all)?;
         let cand = logits.reshape((b, k))?;
         let hidden = hidden.reshape((b, k, self.scorer.hidden_dim()))?;
 
@@ -181,12 +260,7 @@ impl TopazBagRanker {
         let has = m.sum(1)?.gt(0.0f32)?.to_dtype(DType::F32)?;
         let win = win.broadcast_mul(&has.unsqueeze(1)?)?;
 
-        fn select_win(
-            comp: &Tensor,
-            b: usize,
-            k: usize,
-            onehot_f: &Tensor,
-        ) -> Result<Tensor> {
+        fn select_win(comp: &Tensor, b: usize, k: usize, onehot_f: &Tensor) -> Result<Tensor> {
             let (n, d) = comp.dims2()?;
             if d == 0 || n == 0 {
                 return Tensor::zeros((b, 0), DType::F32, comp.device());

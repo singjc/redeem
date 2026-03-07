@@ -1,10 +1,20 @@
+//! Training loop for the XRUN attention calibrator.
+//!
+//! Shape notation used in this module:
+//!
+//! - `P`: number of precursor sequences.
+//! - `R`: maximum number of run positions kept per precursor.
+//! - `D_in`: XRUN input width, usually `1 + H` for `(bag_score, winner_hidden)`.
+
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{self as nn, optim::AdamW, Optimizer, VarBuilder, VarMap};
+use candle_nn::{self as nn, Optimizer, VarBuilder, VarMap, optim::AdamW};
+use serde::{Deserialize, Serialize};
 
 use crate::xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
 
+/// Pooling strategies used to collapse per-run calibrated scores into a
+/// precursor-level supervision target during XRUN training.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum XrunPoolMode {
@@ -14,6 +24,7 @@ pub enum XrunPoolMode {
     AttnMean,
 }
 
+/// Weighting scheme for the variance regularizer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum XrunVarWeight {
@@ -22,6 +33,9 @@ pub enum XrunVarWeight {
     Pool,
 }
 
+/// Hyper-parameters for XRUN calibrator training.
+///
+/// These settings control only the XRUN sidecar, not the base TOPAZ model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrunTrainConfig {
     pub d_model: usize,
@@ -67,12 +81,19 @@ impl Default for XrunTrainConfig {
     }
 }
 
+/// Summary returned after training an XRUN calibrator.
 #[derive(Debug, Clone)]
 pub struct XrunTrainMeta {
     pub best_val: f32,
     pub epochs: usize,
 }
 
+/// Tensorizable XRUN dataset with precursor-major layout.
+///
+/// The flattened buffers represent:
+/// - `xseq`: `(P, R, D_in)` row-major
+/// - `mask`: `(P, R)` validity mask
+/// - `y`: `(P,)` precursor-level binary labels
 #[derive(Debug, Clone)]
 pub struct XrunDataset {
     pub xseq: Vec<f32>,
@@ -84,6 +105,9 @@ pub struct XrunDataset {
 }
 
 impl XrunDataset {
+    /// Materialize the dataset as Candle tensors on `device`.
+    ///
+    /// Returns `(x, mask, y)` with shapes `(P, R, D_in)`, `(P, R)`, and `(P,)`.
     pub fn to_tensors(&self, device: &Device) -> Result<(Tensor, Tensor, Tensor)> {
         let x = Tensor::from_vec(self.xseq.clone(), (self.p, self.r, self.din), device)?;
         let mask_u8: Vec<u8> = self.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
@@ -129,14 +153,30 @@ fn shuffle_indices(idxs: &mut [usize], seed: u64) {
     }
 }
 
-/// Split XRUN sequences by precursor (rows of Xseq).
-/// Mirrors Python: n_val = ceil(val_frac * P), then clamp to [1, P-1] if P > 1.
+/// Split XRUN sequences by precursor.
+///
+/// This mirrors the Python behavior: `n_val = ceil(val_frac * P)` and is then
+/// clamped to `[1, P-1]` when `P > 1`.
 pub fn split_train_val(ds: &XrunDataset, val_frac: f32, seed: u64) -> (XrunDataset, XrunDataset) {
     let p = ds.p;
     if p == 0 {
         return (
-            XrunDataset { xseq: Vec::new(), mask: Vec::new(), y: Vec::new(), p: 0, r: ds.r, din: ds.din },
-            XrunDataset { xseq: Vec::new(), mask: Vec::new(), y: Vec::new(), p: 0, r: ds.r, din: ds.din },
+            XrunDataset {
+                xseq: Vec::new(),
+                mask: Vec::new(),
+                y: Vec::new(),
+                p: 0,
+                r: ds.r,
+                din: ds.din,
+            },
+            XrunDataset {
+                xseq: Vec::new(),
+                mask: Vec::new(),
+                y: Vec::new(),
+                p: 0,
+                r: ds.r,
+                din: ds.din,
+            },
         );
     }
     let mut idxs: Vec<usize> = (0..p).collect();
@@ -167,7 +207,14 @@ mod tests {
         let xseq: Vec<f32> = (0..p * r * din).map(|v| v as f32).collect();
         let mask = vec![true; p * r];
         let y: Vec<f32> = (0..p).map(|v| v as f32).collect();
-        let ds = XrunDataset { xseq, mask, y, p, r, din };
+        let ds = XrunDataset {
+            xseq,
+            mask,
+            y,
+            p,
+            r,
+            din,
+        };
 
         let (tr, va) = split_train_val(&ds, 0.2, 123);
         assert_eq!(tr.p + va.p, p);
@@ -189,7 +236,11 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     Ok(log1p.broadcast_add(&max0)?)
 }
 
-fn bce_with_logits_pos_weight(logits: &Tensor, targets: &Tensor, pos_weight: f32) -> Result<Tensor> {
+fn bce_with_logits_pos_weight(
+    logits: &Tensor,
+    targets: &Tensor,
+    pos_weight: f32,
+) -> Result<Tensor> {
     let logits = logits.to_dtype(DType::F32)?;
     let targets = targets.to_dtype(DType::F32)?;
     let sp = softplus(&logits)?;
@@ -259,6 +310,7 @@ fn uniform_weights(mask: &Tensor) -> Result<Tensor> {
     Ok(m.broadcast_div(&denom)?)
 }
 
+/// Trainer for the XRUN calibrator network.
 pub struct XrunTrainer {
     pub cfg: XrunTrainConfig,
     pub varmap: VarMap,
@@ -267,6 +319,7 @@ pub struct XrunTrainer {
 }
 
 impl XrunTrainer {
+    /// Construct a new XRUN trainer.
     pub fn new(cfg: XrunTrainConfig, in_dim: usize, device: &Device) -> Result<Self> {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
@@ -288,10 +341,21 @@ impl XrunTrainer {
             ..Default::default()
         };
         let opt = AdamW::new(varmap.all_vars(), params)?;
-        Ok(Self { cfg, varmap, model, opt })
+        Ok(Self {
+            cfg,
+            varmap,
+            model,
+            opt,
+        })
     }
 
-    pub fn train(&mut self, train: &XrunDataset, val: &XrunDataset, device: &Device) -> Result<XrunTrainMeta> {
+    /// Train the calibrator and restore the best validation epoch.
+    pub fn train(
+        &mut self,
+        train: &XrunDataset,
+        val: &XrunDataset,
+        device: &Device,
+    ) -> Result<XrunTrainMeta> {
         let (x_tr, m_tr, y_tr) = train.to_tensors(device)?;
         let (x_va, m_va, y_va) = val.to_tensors(device)?;
 
@@ -317,7 +381,8 @@ impl XrunTrainer {
                 let (delta, attn) = self.model.forward_masked(&xb, &mb)?;
                 let base = xb.narrow(2, 0, 1)?.squeeze(2)?;
                 let s_adj = base.broadcast_add(&delta)?;
-                let (s_pool, w_pool) = pool_scores(&s_adj, &mb, &attn, &self.cfg.pool, self.cfg.tau)?;
+                let (s_pool, w_pool) =
+                    pool_scores(&s_adj, &mb, &attn, &self.cfg.pool, self.cfg.tau)?;
                 let mut loss = bce_with_logits_pos_weight(&s_pool, &yb, pos_weight)?;
 
                 if self.cfg.delta_l2 > 0.0 {
@@ -390,9 +455,22 @@ impl XrunTrainer {
                 s += take;
             }
 
-            let tr_loss = if tr_batches > 0 { tr_loss / tr_batches as f32 } else { f32::INFINITY };
-            let va_loss = if va_batches > 0 { va_loss / va_batches as f32 } else { f32::INFINITY };
-            log::info!("[xrun] Epoch {:02} train={:.4} val={:.4}", epoch, tr_loss, va_loss);
+            let tr_loss = if tr_batches > 0 {
+                tr_loss / tr_batches as f32
+            } else {
+                f32::INFINITY
+            };
+            let va_loss = if va_batches > 0 {
+                va_loss / va_batches as f32
+            } else {
+                f32::INFINITY
+            };
+            log::info!(
+                "[xrun] Epoch {:02} train={:.4} val={:.4}",
+                epoch,
+                tr_loss,
+                va_loss
+            );
 
             if va_loss < best_val - 1e-4 {
                 best_val = va_loss;
@@ -419,6 +497,9 @@ impl XrunTrainer {
             let _ = std::fs::remove_file(&p);
         }
 
-        Ok(XrunTrainMeta { best_val, epochs: self.cfg.max_epochs.max(1) })
+        Ok(XrunTrainMeta {
+            best_val,
+            epochs: self.cfg.max_epochs.max(1),
+        })
     }
 }

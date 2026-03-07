@@ -1,6 +1,14 @@
+//! Checkpoint persistence for TOPAZ base weights and XRUN sidecars.
+//!
+//! Base model state and cross-run calibration state are intentionally stored as
+//! separate artifacts so that a trained TOPAZ network can be reused with or
+//! without XRUN calibration.
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use candle_core::safetensors::Load;
 use serde::{Deserialize, Serialize};
 
 use candle_nn::VarMap;
@@ -11,6 +19,7 @@ use crate::model::topaz::TopazConfig;
 use crate::preprocess::Preprocessor;
 use crate::xrun::{XrunPredictConfig, XrunTrainConfig};
 
+/// Metadata stored alongside the base TOPAZ checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMeta {
     pub model: TopazConfig,
@@ -21,6 +30,7 @@ pub struct CheckpointMeta {
     pub version: u32,
 }
 
+/// Metadata stored alongside the XRUN calibrator checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrunCheckpointMeta {
     pub train: XrunTrainConfig,
@@ -28,6 +38,19 @@ pub struct XrunCheckpointMeta {
     pub in_dim: usize,
     pub best_val: Option<f32>,
     pub version: u32,
+}
+
+/// Summary of a partial checkpoint restore.
+///
+/// This is primarily used during fine-tuning when the current model may add or
+/// remove auxiliary heads relative to the initialization checkpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PartialLoadReport {
+    pub loaded: usize,
+    pub missing_in_checkpoint: Vec<String>,
+    pub shape_mismatch: Vec<String>,
+    pub set_errors: Vec<String>,
+    pub extra_in_checkpoint: Vec<String>,
 }
 
 fn paths_for<P: AsRef<Path>>(path: P) -> (PathBuf, PathBuf) {
@@ -44,8 +67,14 @@ fn xrun_paths_for<P: AsRef<Path>>(path: P) -> (PathBuf, PathBuf) {
     (weights, meta)
 }
 
-/// Save weights to `.safetensors` + metadata to `.json`.
-pub fn save_checkpoint<P: AsRef<Path>>(path: P, varmap: &VarMap, meta: &CheckpointMeta) -> Result<()> {
+/// Save a base TOPAZ checkpoint.
+///
+/// Weights are written to `*.safetensors` and metadata to `*.json`.
+pub fn save_checkpoint<P: AsRef<Path>>(
+    path: P,
+    varmap: &VarMap,
+    meta: &CheckpointMeta,
+) -> Result<()> {
     let (weights, meta_path) = paths_for(path);
     if let Some(parent) = weights.parent() {
         std::fs::create_dir_all(parent)?;
@@ -56,7 +85,7 @@ pub fn save_checkpoint<P: AsRef<Path>>(path: P, varmap: &VarMap, meta: &Checkpoi
     Ok(())
 }
 
-/// Load metadata and populate an existing VarMap from `.safetensors`.
+/// Strictly load a base TOPAZ checkpoint into an existing variable map.
 pub fn load_checkpoint<P: AsRef<Path>>(path: P, varmap: &mut VarMap) -> Result<CheckpointMeta> {
     let (weights, meta_path) = paths_for(path);
     let text = std::fs::read_to_string(meta_path)?;
@@ -65,6 +94,60 @@ pub fn load_checkpoint<P: AsRef<Path>>(path: P, varmap: &mut VarMap) -> Result<C
     Ok(meta)
 }
 
+/// Load only the compatible tensors from a checkpoint.
+///
+/// Tensors that are missing from the checkpoint, have incompatible shapes, or
+/// fail to assign are skipped and recorded in the returned report instead of
+/// causing the whole load to fail.
+pub fn load_checkpoint_partial<P: AsRef<Path>>(
+    path: P,
+    varmap: &mut VarMap,
+) -> Result<(CheckpointMeta, PartialLoadReport)> {
+    let (weights, meta_path) = paths_for(path);
+    let text = std::fs::read_to_string(meta_path)?;
+    let meta: CheckpointMeta = serde_json::from_str(&text)?;
+    let data = unsafe { candle_core::safetensors::MmapedSafetensors::new(&weights)? };
+
+    let available: HashSet<String> = data.tensors().into_iter().map(|(name, _)| name).collect();
+    let mut matched = HashSet::new();
+    let mut report = PartialLoadReport::default();
+
+    let mut tensor_data = varmap.data().lock().unwrap();
+    for (name, var) in tensor_data.iter_mut() {
+        let Ok(view) = data.get(name) else {
+            report.missing_in_checkpoint.push(name.clone());
+            continue;
+        };
+        matched.insert(name.clone());
+
+        let saved_shape = view.shape();
+        let current_shape = var.shape().dims();
+        if saved_shape != current_shape {
+            report.shape_mismatch.push(format!(
+                "{name} (ckpt={saved_shape:?}, current={current_shape:?})"
+            ));
+            continue;
+        }
+
+        let tensor = view.load(var.device())?;
+        if let Err(err) = var.set(&tensor) {
+            report.set_errors.push(format!("{name}: {err}"));
+            continue;
+        }
+        report.loaded += 1;
+    }
+    drop(tensor_data);
+
+    report.extra_in_checkpoint = available
+        .into_iter()
+        .filter(|name| !matched.contains(name))
+        .collect();
+    report.extra_in_checkpoint.sort();
+
+    Ok((meta, report))
+}
+
+/// Save an XRUN calibrator sidecar.
 pub fn save_xrun_checkpoint<P: AsRef<Path>>(
     path: P,
     varmap: &VarMap,
@@ -80,6 +163,10 @@ pub fn save_xrun_checkpoint<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Load an XRUN calibrator sidecar into an existing variable map.
+///
+/// This is the strict variant used for inference: the current calibrator layout
+/// must match the saved XRUN checkpoint exactly.
 pub fn load_xrun_checkpoint<P: AsRef<Path>>(
     path: P,
     varmap: &mut VarMap,
@@ -91,6 +178,7 @@ pub fn load_xrun_checkpoint<P: AsRef<Path>>(
     Ok(meta)
 }
 
+/// Read only the XRUN sidecar metadata.
 pub fn read_xrun_checkpoint_meta<P: AsRef<Path>>(path: P) -> Result<XrunCheckpointMeta> {
     let (_weights, meta_path) = xrun_paths_for(path);
     let text = std::fs::read_to_string(meta_path)?;
@@ -98,6 +186,7 @@ pub fn read_xrun_checkpoint_meta<P: AsRef<Path>>(path: P) -> Result<XrunCheckpoi
     Ok(meta)
 }
 
+/// Return `true` when both XRUN sidecar files exist.
 pub fn xrun_checkpoint_exists<P: AsRef<Path>>(path: P) -> bool {
     let (weights, meta) = xrun_paths_for(path);
     weights.exists() && meta.exists()

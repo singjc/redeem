@@ -1,10 +1,13 @@
+//! Base TOPAZ trainer, early stopping, and optimizer setup.
+
 use crate::config::Config;
 use crate::model::topaz::{TopazBagRanker, TopazConfig};
-use crate::train::scheduler::CosineWarmupScheduler;
 use crate::train::losses;
+use crate::train::scheduler::CosineWarmupScheduler;
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{self as nn, optim::AdamW, Optimizer, VarBuilder, VarMap};
+use candle_nn::{self as nn, Optimizer, VarBuilder, VarMap, optim::AdamW};
 
+/// One tensor mini-batch used by the base TOPAZ trainer.
 #[derive(Debug)]
 pub struct TrainBatch {
     /// (B,K,D)
@@ -17,6 +20,7 @@ pub struct TrainBatch {
     pub yb: Tensor,
 }
 
+/// Scalar losses returned after one optimization step.
 #[derive(Debug, Clone)]
 pub struct TrainMetrics {
     pub loss: f32,
@@ -27,6 +31,7 @@ pub struct TrainMetrics {
     pub loss_ms12: f32,
 }
 
+/// Summary of an early-stopped training run.
 #[derive(Debug, Clone)]
 pub struct TrainHistory {
     pub epochs_ran: usize,
@@ -34,6 +39,8 @@ pub struct TrainHistory {
     pub best_val: f32,
 }
 
+/// Stateful TOPAZ trainer holding the model, optimizer, and optional auxiliary
+/// MS1/MS2 head.
 pub struct Trainer {
     pub config: Config,
     pub varmap: VarMap,
@@ -45,7 +52,9 @@ pub struct Trainer {
 }
 
 fn starts_with_any(name: &str, prefixes: &[String]) -> bool {
-    prefixes.iter().any(|p| !p.is_empty() && name.starts_with(p))
+    prefixes
+        .iter()
+        .any(|p| !p.is_empty() && name.starts_with(p))
 }
 
 fn select_optimizer_vars(cfg: &Config, varmap: &VarMap) -> Result<Vec<candle_core::Var>> {
@@ -89,16 +98,17 @@ fn select_optimizer_vars(cfg: &Config, varmap: &VarMap) -> Result<Vec<candle_cor
 }
 
 impl Trainer {
+    /// Construct a trainer and initialize optimizer parameters.
     pub fn new(cfg: Config, model_cfg: &TopazConfig, device: &Device) -> Result<Self> {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
         let model = TopazBagRanker::new(vb.pp("topaz"), model_cfg)?;
-        let ms12_head = if cfg.lambda_ms12 > 0.0 && model_cfg.ms1_cmax > 0 && model_cfg.use_coelution_head
-        {
-            Some(nn::linear(4, 1, vb.pp("ms12_head"))?)
-        } else {
-            None
-        };
+        let ms12_head =
+            if cfg.lambda_ms12 > 0.0 && model_cfg.ms1_cmax > 0 && model_cfg.use_coelution_head {
+                Some(nn::linear(4, 1, vb.pp("ms12_head"))?)
+            } else {
+                None
+            };
 
         let params = nn::optim::ParamsAdamW {
             lr: cfg.learning_rate as f64,
@@ -119,6 +129,7 @@ impl Trainer {
         })
     }
 
+    /// Set the positive-class weight used by bag BCE.
     pub fn set_pos_weight(&mut self, pos_weight: f32) {
         if pos_weight.is_finite() && pos_weight > 0.0 {
             self.pos_weight = Some(pos_weight);
@@ -127,6 +138,7 @@ impl Trainer {
         }
     }
 
+    /// Set the deterministic seed used for per-epoch batch shuffling.
     pub fn set_shuffle_seed(&mut self, seed: u64) {
         self.shuffle_seed = Some(seed);
     }
@@ -159,6 +171,7 @@ impl Trainer {
         Ok(())
     }
 
+    /// Execute one optimization step on a single batch.
     pub fn train_step(&mut self, batch: &TrainBatch) -> Result<TrainMetrics> {
         let (b, k, d) = batch.xb.dims3()?;
         let (_, _, c, l) = batch.tb.dims4()?;
@@ -223,11 +236,8 @@ impl Trainer {
                 let w = w.broadcast_div(&denom)?;
                 let ms12_soft = ms12.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?;
                 let ms12_logit = ms12_soft.apply(head)?.squeeze(1)?;
-                loss_ms12 = losses::bce_with_logits_weighted(
-                    &ms12_logit,
-                    &batch.yb,
-                    self.pos_weight,
-                )?;
+                loss_ms12 =
+                    losses::bce_with_logits_weighted(&ms12_logit, &batch.yb, self.pos_weight)?;
                 loss = (loss + (loss_ms12.clone() * self.config.lambda_ms12 as f64)?)?;
             }
         }
@@ -264,6 +274,7 @@ impl Trainer {
         cand_masked.max(1)
     }
 
+    /// Evaluate mean bag BCE loss over a validation set.
     pub fn eval_bag_loss(&self, batches: &[TrainBatch]) -> Result<f32> {
         if batches.is_empty() {
             return Ok(f32::INFINITY);
@@ -277,6 +288,7 @@ impl Trainer {
         Ok(sum / batches.len() as f32)
     }
 
+    /// Train for one epoch with deterministic shuffling.
     pub fn train_one_epoch(&mut self, batches: &[TrainBatch]) -> Result<Vec<TrainMetrics>> {
         let mut out = Vec::with_capacity(batches.len());
         let mut order: Vec<usize> = (0..batches.len()).collect();
@@ -313,7 +325,10 @@ impl Trainer {
         for epoch in 0..max_epochs.max(1) {
             let mut order: Vec<usize> = (0..batches.len()).collect();
             if batches.len() > 1 {
-                let seed = self.shuffle_seed.unwrap_or(0).wrapping_add(epoch as u64 + 1);
+                let seed = self
+                    .shuffle_seed
+                    .unwrap_or(0)
+                    .wrapping_add(epoch as u64 + 1);
                 shuffle_indices(&mut order, seed);
             }
             for &bi in &order {
@@ -338,7 +353,11 @@ impl Trainer {
         scheduler: Option<&CosineWarmupScheduler>,
     ) -> Result<TrainHistory> {
         if train_batches.is_empty() {
-            return Ok(TrainHistory { epochs_ran: 0, best_epoch: 0, best_val: f32::INFINITY });
+            return Ok(TrainHistory {
+                epochs_ran: 0,
+                best_epoch: 0,
+                best_val: f32::INFINITY,
+            });
         }
         let mut step = 0usize;
         let total_steps = max_epochs.max(1) * train_batches.len().max(1);
@@ -416,7 +435,12 @@ impl Trainer {
                     self.opt.learning_rate()
                 );
             } else {
-                log::info!("Epoch {:02} train={:.4} val={:.4}", epoch, train_loss, val_loss);
+                log::info!(
+                    "Epoch {:02} train={:.4} val={:.4}",
+                    epoch,
+                    train_loss,
+                    val_loss
+                );
             }
 
             if val_loss + min_delta < best_val {
@@ -446,7 +470,11 @@ impl Trainer {
             let _ = std::fs::remove_file(path);
         }
 
-        Ok(TrainHistory { epochs_ran, best_epoch, best_val })
+        Ok(TrainHistory {
+            epochs_ran,
+            best_epoch,
+            best_val,
+        })
     }
 }
 

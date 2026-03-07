@@ -1,35 +1,58 @@
-// redeem-topaz/src/building_blocks/bagging.rs
+//! Convert flat candidate rows into fixed-size MIL bags.
+//!
+//! Shape notation used in this module:
+//!
+//! - `B`: number of bags.
+//! - `K`: padded candidate capacity per bag.
+//! - `D`: heuristic feature dimension.
+//! - `C`: trace-channel count.
+//! - `L`: fixed trace length.
 
 use std::collections::HashMap;
 
 /// Output of bagging.
+///
+/// All buffers are stored in flattened row-major order so they can be passed
+/// directly into Candle tensor constructors without an intermediate copy.
 #[derive(Debug)]
 pub struct Bags {
-    /// (B,K,D)
+    /// Flattened `(B, K, D)` feature tensor.
     pub x_bag: Vec<f32>,
     pub b: usize,
     pub k: usize,
     pub d: usize,
 
-    /// (B,K,C,L)
+    /// Flattened `(B, K, C, L)` trace tensor.
     pub t_bag: Vec<f32>,
     pub c: usize,
     pub l: usize,
 
-    /// (B,K)
+    /// Flattened `(B, K)` validity mask.
     pub mask: Vec<bool>,
 
-    /// (B,) target=1, decoy=0
+    /// `(B,)` bag labels in TOPAZ convention: target=1, decoy=0.
     pub y_bag: Vec<f32>,
 
-    /// (B,) group ids
+    /// `(B,)` bag identifiers preserving first-seen group order.
     pub bag_pid: Vec<String>,
 }
 
-/// Build fixed-size bags of K candidates.
+/// Build fixed-size bags of `K` candidates.
 ///
-/// - `y_rows`: 0 target, 1 decoy (same as Python) → bag_y = 1 for target, 0 for decoy.
-/// - `pid_rows`: group id per row (e.g., RUNID_PRECID).
+/// # Inputs
+/// - `x_rows`: flattened `(N, D)` heuristic feature matrix.
+/// - `t_rows`: flattened `(N, C, L)` trace tensor.
+/// - `y_rows`: row labels using the Python convention `0=target`, `1=decoy`.
+/// - `pid_rows`: bagging key for each row, for example `RUN_ID_PRECURSOR_ID`.
+/// - `k`: padded candidate capacity per bag.
+///
+/// # Behavior
+/// - group order is stable and follows first occurrence in `pid_rows`
+/// - bag labels are derived from the first row in each group
+/// - TOPAZ label convention is `target=1`, `decoy=0`
+///
+/// # Output
+/// Returns the bagged tensors and metadata in flattened row-major layout.
 pub fn make_bags_with_traces(
     x_rows: &[f32],
     n: usize,
@@ -89,7 +112,18 @@ pub fn make_bags_with_traces(
         }
     }
 
-    Bags { x_bag, b, k, d, t_bag, c, l, mask, y_bag, bag_pid }
+    Bags {
+        x_bag,
+        b,
+        k,
+        d,
+        t_bag,
+        c,
+        l,
+        mask,
+        y_bag,
+        bag_pid,
+    }
 }
 
 #[cfg(test)]
@@ -127,9 +161,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
 
-        let bags = make_bags_with_traces(
-            &x_rows, n, d, &t_rows, c, l, &y_rows, &pid_rows, k,
-        );
+        let bags = make_bags_with_traces(&x_rows, n, d, &t_rows, c, l, &y_rows, &pid_rows, k);
 
         assert_eq!(bags.b, 3);
         assert_eq!(bags.k, 2);

@@ -1,12 +1,33 @@
-// redeem-topaz/src/building_blocks/conv_encoder.rs
+//! Convolutional trace encoder used by TOPAZ.
+//!
+//! The encoder has separate branches for MS2 and optional MS1 channels, then
+//! fuses their outputs into an embedding consumed by the candidate scorer.
+//!
+//! Shape notation used in this module:
+//!
+//! - `N`: number of flattened candidate rows.
+//! - `C`: number of channels for a branch-specific trace tensor.
+//! - `C_total`: total input channels before splitting into MS1/MS2 branches.
+//! - `L`: fixed trace-window length.
+//! - `E`: learned embedding size produced by a branch.
+//!
+//! For TOPAZ, `C_total = ms1_cmax + ms2_cmax` when MS1 is enabled and
+//! `C_total = ms2_cmax` otherwise. The channel layout is always
+//! `[MS1 channels | MS2 channels]`.
 
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
-use crate::building_blocks::trace_input::{make_trace_input, TraceInputMode};
 use crate::building_blocks::coelution::{linspace_0_1, zscore_time};
+use crate::building_blocks::trace_input::{TraceInputMode, make_trace_input};
 use crate::model::topaz::TopazConfig;
 
+/// A single convolutional branch operating on either MS1 or MS2 traces.
+///
+/// This branch consumes one modality-specific tensor `(N, C, L)`, applies a
+/// small stack of 1D convolutions along the retention-time axis, pools the
+/// resulting feature maps over time, and projects the pooled representation to
+/// a fixed embedding size `E`.
 pub struct ConvBranch {
     conv0: nn::Conv1d,
     conv1: nn::Conv1d,
@@ -17,23 +38,56 @@ pub struct ConvBranch {
 }
 
 impl ConvBranch {
-    pub fn new(vb: VarBuilder, cin: usize, emb_dim: usize, trace_input_mode: TraceInputMode) -> Result<Self> {
-        let conv_cfg_k1 = nn::Conv1dConfig { padding: 0, ..Default::default() };
-        let conv_cfg_k3 = nn::Conv1dConfig { padding: 1, ..Default::default() };
+    /// Construct a convolutional branch for `cin` input channels.
+    ///
+    /// `cin` must match the number of channels that will be passed to
+    /// [`Self::forward`]. When `TraceInputMode::Dual` is active, callers should
+    /// pass the expanded channel count because the input transform doubles the
+    /// number of channels.
+    pub fn new(
+        vb: VarBuilder,
+        cin: usize,
+        emb_dim: usize,
+        trace_input_mode: TraceInputMode,
+    ) -> Result<Self> {
+        let conv_cfg_k1 = nn::Conv1dConfig {
+            padding: 0,
+            ..Default::default()
+        };
+        let conv_cfg_k3 = nn::Conv1dConfig {
+            padding: 1,
+            ..Default::default()
+        };
 
         let conv0 = nn::conv1d(cin, 32, 1, conv_cfg_k1, vb.pp("conv0"))?;
         let conv1 = nn::conv1d(32, 64, 3, conv_cfg_k3, vb.pp("conv1"))?;
         let conv2 = nn::conv1d(64, 64, 3, conv_cfg_k3, vb.pp("conv2"))?;
         let proj = nn::linear(128, emb_dim, vb.pp("proj"))?;
 
-        Ok(Self { conv0, conv1, conv2, proj, trace_input_mode, emb_dim })
+        Ok(Self {
+            conv0,
+            conv1,
+            conv2,
+            proj,
+            trace_input_mode,
+            emb_dim,
+        })
     }
 
+    /// Embedding dimensionality produced by this branch.
     pub fn emb_dim(&self) -> usize {
         self.emb_dim
     }
 
-    /// x: (N,C,L)
+    /// Encode a modality-specific trace tensor into one embedding per row.
+    ///
+    /// # Inputs
+    /// - `x`: `(N, C, L)`, where `N` is the candidate count, `C` is the number
+    ///   of channels for this branch (MS1 or MS2), and `L` is the fixed trace
+    ///   window length.
+    ///
+    /// # Output
+    /// Returns `(N, E)` where `E == emb_dim`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x_in = make_trace_input(x, self.trace_input_mode, 1e-6)?;
         let h = x_in.apply(&self.conv0)?.relu()?;
@@ -41,13 +95,25 @@ impl ConvBranch {
         let h = h.apply(&self.conv2)?.relu()?;
 
         // pool along time
-        let h_max = h.max(2)?;  // (N,64)
+        let h_max = h.max(2)?; // (N,64)
         let h_mean = h.mean(2)?; // (N,64)
         let h_pool = Tensor::cat(&[h_max, h_mean], 1)?; // (N,128)
         h_pool.apply(&self.proj)
     }
 }
 
+/// Top-level trace encoder used by the base TOPAZ model.
+///
+/// The encoder owns:
+/// - one mandatory MS2 branch,
+/// - one optional MS1 branch,
+/// - optional explicit coelution heads for MS2 and MS1,
+/// - optional cross-modal MS1/MS2 agreement statistics.
+///
+/// The final trace representation is the concatenation of:
+/// - the MS2 branch embedding,
+/// - the MS1 branch embedding when enabled,
+/// - explicit coelution features when enabled.
 pub struct TraceEncoder {
     ms2_c: usize,
     ms1_c: usize,
@@ -62,20 +128,39 @@ pub struct TraceEncoder {
     beta: f64,
 }
 
+/// Winner-side intermediate tensors exported by
+/// [`TraceEncoder::forward_with_heads`].
+///
+/// These are primarily used for diagnostics, reports, and XRUN calibration
+/// inputs. All tensors are batched over candidate rows:
+/// - `emb_*`: learned embeddings
+/// - `coe_*`: explicit coelution/statistical features
 #[derive(Debug, Clone)]
 pub struct TraceHeadComponents {
+    /// `(N, E_ms2)` MS2-branch embedding.
     pub emb_ms2: Tensor,
+    /// `(N, E_ms1)` MS1-branch embedding or `(N, 0)` when MS1 is disabled.
     pub emb_ms1: Tensor,
+    /// `(N, E_total)` concatenated embedding presented to the scorer.
     pub emb_all: Tensor,
+    /// `(N, Coe_ms2)` explicit MS2 coelution features.
     pub coe_ms2: Tensor,
+    /// `(N, Coe_ms1)` explicit MS1 coelution features.
     pub coe_ms1: Tensor,
+    /// `(N, 4)` handcrafted MS1-vs-MS2 agreement features.
     pub coe_ms12: Tensor,
+    /// `(N, Coe_total)` concatenated explicit coelution feature vector.
     pub coe_all: Tensor,
 }
 
 impl TraceEncoder {
+    /// Build the full trace encoder from [`TopazConfig`].
     pub fn new(vb: VarBuilder, cfg: &TopazConfig) -> Result<Self> {
-        let dual_mul = if cfg.trace_input_mode == TraceInputMode::Dual { 2 } else { 1 };
+        let dual_mul = if cfg.trace_input_mode == TraceInputMode::Dual {
+            2
+        } else {
+            1
+        };
 
         let ms2 = ConvBranch::new(
             vb.pp("ms2"),
@@ -104,7 +189,9 @@ impl TraceEncoder {
                 cfg.coelution_max_lag,
                 cfg.coelution_sim_emb_dim,
             )?)
-        } else { None };
+        } else {
+            None
+        };
 
         let ms1_coe = if use_coelution && cfg.ms1_cmax > 0 {
             Some(crate::building_blocks::coelution::CoelutionHead::new(
@@ -114,7 +201,9 @@ impl TraceEncoder {
                 cfg.coelution_max_lag,
                 cfg.coelution_sim_emb_dim,
             )?)
-        } else { None };
+        } else {
+            None
+        };
 
         Ok(Self {
             ms2_c: cfg.ms2_cmax,
@@ -128,33 +217,70 @@ impl TraceEncoder {
         })
     }
 
+    /// Final trace-embedding dimensionality consumed by the candidate scorer.
+    ///
+    /// This is `E_ms2` for MS2-only models and `E_ms2 + E_ms1` when the MS1
+    /// branch is enabled.
     pub fn emb_out_dim(&self) -> usize {
         let d = self.ms2.emb_dim();
         if self.ms1_c > 0 { 2 * d } else { d }
     }
 
+    /// Total dimensionality of the explicit coelution feature vector.
+    ///
+    /// This is the dimensionality of the second tensor returned by
+    /// [`Self::forward`]. It includes:
+    /// - MS2 coelution features when enabled,
+    /// - MS1 coelution features when enabled,
+    /// - four handcrafted MS1-vs-MS2 agreement features when both branches are
+    ///   present.
     pub fn coelution_dim(&self) -> usize {
         let mut d = 0usize;
         if self.use_coelution {
-            if let Some(c) = &self.ms2_coe { d += c.out_dim(); }
-            if let Some(c) = &self.ms1_coe { d += c.out_dim(); d += 4; }
+            if let Some(c) = &self.ms2_coe {
+                d += c.out_dim();
+            }
+            if let Some(c) = &self.ms1_coe {
+                d += c.out_dim();
+                d += 4;
+            }
         }
         d
     }
 
-    /// Forward on flattened candidates.
-    /// x: (N, C_total, L). If ms1 enabled, layout is [MS1 channels | MS2 channels].
-    /// Returns (emb: (N,E), coe: (N,Coe)).
+    /// Encode flattened candidate traces and return the features consumed by
+    /// the candidate scorer.
+    ///
+    /// # Inputs
+    /// - `x`: `(N, C_total, L)`. `C_total` is the total number of extracted
+    ///   channels. When MS1 is enabled, the layout must be
+    ///   `[MS1 channels | MS2 channels]`.
+    ///
+    /// # Output
+    /// Returns `(embedding, coelution_features)` where:
+    /// - `embedding` has shape `(N, E)`
+    /// - `coelution_features` has shape `(N, Coe)`
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let (emb, coe, _coe_ms12) = self.forward_components(x)?;
         Ok((emb, coe))
     }
 
-    /// Forward returning coelution components (including optional ms12 features).
-    /// Returns (emb, coe_all, coe_ms12).
+    /// Same as [`Self::forward`] but also returns the isolated cross-modal
+    /// MS1-vs-MS2 agreement statistics.
+    ///
+    /// # Output
+    /// Returns `(emb, coe_all, coe_ms12)` where:
+    /// - `emb`: `(N, E)`
+    /// - `coe_all`: `(N, Coe)` full explicit coelution feature vector
+    /// - `coe_ms12`: `(N, 4)` cross-modal agreement features when MS1 is
+    ///   enabled, otherwise `(N, 0)`
     pub fn forward_components(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (n, c_total, l) = x.dims3()?;
-        let expected = if self.ms1_c > 0 { self.ms1_c + self.ms2_c } else { self.ms2_c };
+        let expected = if self.ms1_c > 0 {
+            self.ms1_c + self.ms2_c
+        } else {
+            self.ms2_c
+        };
 
         let x = if c_total != expected {
             // defensive pad/crop (Python prints warning once)
@@ -208,10 +334,20 @@ impl TraceEncoder {
         Ok((emb, coe, coe_ms12))
     }
 
-    /// Forward returning per-head components for diagnostics.
+    /// Encode traces and expose the individual sub-components used by the full
+    /// trace encoder.
+    ///
+    /// This is the most verbose forward path. It is used for diagnostics and
+    /// report generation when the caller wants to inspect MS1-only, MS2-only,
+    /// and combined embeddings/features separately rather than only the final
+    /// concatenated tensors.
     pub fn forward_with_heads(&self, x: &Tensor) -> Result<(Tensor, Tensor, TraceHeadComponents)> {
         let (n, c_total, l) = x.dims3()?;
-        let expected = if self.ms1_c > 0 { self.ms1_c + self.ms2_c } else { self.ms2_c };
+        let expected = if self.ms1_c > 0 {
+            self.ms1_c + self.ms2_c
+        } else {
+            self.ms2_c
+        };
 
         let x = if c_total != expected {
             if c_total < expected {
@@ -287,7 +423,19 @@ impl TraceEncoder {
         Ok((emb_all, coe_all, comps))
     }
 
-    /// Port of Python `_ms12_features`.
+    /// Compute the four handcrafted MS1-vs-MS2 agreement features used by the
+    /// optional auxiliary head.
+    ///
+    /// # Inputs
+    /// - `ms1`: `(N, C_ms1, L)` MS1 trace tensor.
+    /// - `ms2`: `(N, C_ms2, L)` MS2 trace tensor.
+    ///
+    /// # Output
+    /// Returns `(N, 4)` with the following columns:
+    /// - mean pairwise cosine similarity between MS1 and MS2 channels,
+    /// - maximum pairwise cosine similarity,
+    /// - absolute difference between mean soft apex positions,
+    /// - standard deviation of all soft apex positions across MS1 and MS2.
     fn ms12_features(&self, ms1: &Tensor, ms2: &Tensor) -> Result<Tensor> {
         let eps = 1e-6;
 

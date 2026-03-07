@@ -1,9 +1,32 @@
+//! Trace extraction, feature assembly, scoring, and cache management for
+//! TOPAZ inference.
+//!
+//! This module converts row-oriented OSW features plus chromatogram sources
+//! into the tensor layouts expected by the model:
+//!
+//! - row scoring uses `(N, D)` features and `(N, C, L)` traces
+//! - bag scoring uses `(B, K, D)` features and `(B, K, C, L)` traces
+//!
+//! The same utilities are reused during validation, full-data inference, and
+//! XRUN calibration.
+//!
+//! Shape notation used throughout this module:
+//!
+//! - `N`: number of flat candidate rows.
+//! - `B`: number of bags.
+//! - `K`: padded candidate count per bag.
+//! - `D`: heuristic feature dimension.
+//! - `C`: trace-channel count for a built tensor.
+//! - `L`: fixed trace-window length.
+
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(feature = "io-sqlite", feature = "io-parquet"))]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "io-parquet")]
+use filetime::{FileTime, set_file_mtime};
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 #[cfg(feature = "io-parquet")]
@@ -12,47 +35,64 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 #[cfg(feature = "io-parquet")]
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "io-parquet")]
-use filetime::{FileTime, set_file_mtime};
 
 use candle_core::{Device, Tensor};
 
 use crate::building_blocks::bagging::make_bags_with_traces;
 use crate::building_blocks::trace_window::extract_trace_tensor_centered;
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use crate::infer::{build_score_table_from_rows, ScoreTableRow};
 use crate::infer::score_candidates;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::infer::{ScoreTableRow, build_score_table_from_rows};
 use crate::io::osw::FeatureRow;
 #[cfg(feature = "io-sqlite")]
 use crate::io::osw::OswFeatureTable;
 use crate::io::xic::{PrecursorXic, TransitionTrace, XicSource};
-use crate::model_interface::{BagRankerWithHiddenInterface, CandidateScorerInterface};
-use crate::preprocess::Preprocessor;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::model::topaz::TopazConfig;
+use crate::model_interface::{BagRankerWithHiddenInterface, CandidateScorerInterface};
+use crate::preprocess::Preprocessor;
 
 static WARNED_MISSING_MS1: AtomicBool = AtomicBool::new(false);
 
 use serde::{Deserialize, Serialize};
 
+/// Configuration for fixed-width trace-window extraction.
+///
+/// These settings define how precursor chromatograms are converted from
+/// variable-length point lists into fixed-size tensors usable by TOPAZ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceBuildConfig {
+    /// Output trace length `L`, i.e. number of retention-time samples per row.
     pub l: usize,
+    /// Maximum number of MS1 channels to keep. Missing channels are zero-padded.
     pub ms1_cmax: usize,
+    /// Maximum number of MS2 channels to keep. Missing channels are zero-padded.
     pub ms2_cmax: usize,
+    /// Whether to max-normalize each extracted channel after cropping/padding.
     pub normalize_max: bool,
 }
 
+/// Bag-level scoring output containing only the winner hidden vector.
+///
+/// Each entry in the `Vec`s corresponds to one bag, not one raw candidate row.
 #[derive(Debug, Clone)]
 pub struct BagScoreOutput {
+    /// Bag-level logit after masked-max pooling.
     pub bag_score: Vec<f32>,
+    /// Bag label in TOPAZ convention: `1.0` for target bags, `0.0` for decoy bags.
     pub bag_y: Vec<f32>,
+    /// Convenience boolean version of the bag label.
     pub is_decoy: Vec<bool>,
+    /// Bag identifier, usually `RUN_ID_PRECURSOR_ID`.
     pub bag_pid: Vec<String>,
+    /// Flattened `(B, H)` winner-hidden matrix stored row-major.
     pub winner_hidden: Vec<f32>,
+    /// Winner-hidden width `H`.
     pub hidden_dim: usize,
 }
 
+/// Bag-level scoring output with additional intermediate tensors used for
+/// diagnostics and report generation.
 #[derive(Debug, Clone)]
 pub struct BagHeadOutput {
     pub bag_score: Vec<f32>,
@@ -78,11 +118,19 @@ pub struct BagHeadOutput {
 }
 
 impl TraceBuildConfig {
+    /// Total number of channels in the extracted trace tensor.
+    ///
+    /// This is `C = ms1_cmax + ms2_cmax`.
     pub fn total_c(&self) -> usize {
         self.ms1_cmax + self.ms2_cmax
     }
 }
 
+/// Filters used when reading XIC parquet data.
+///
+/// These are pushed down into parquet reads when possible so the XIC reader
+/// only materializes the subset needed for the current training or inference
+/// stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XicFetchConfig {
     pub ms_levels: Option<Vec<i64>>,
@@ -107,6 +155,7 @@ pub(crate) struct CacheKey {
     precursor_id: u64,
 }
 
+/// In-memory LRU cache for decoded precursor chromatograms.
 #[cfg(feature = "io-parquet")]
 #[derive(Debug, Default)]
 pub struct XicCache {
@@ -118,6 +167,10 @@ pub struct XicCache {
 
 #[cfg(feature = "io-parquet")]
 impl XicCache {
+    /// Create an in-memory LRU cache for decoded precursor chromatograms.
+    ///
+    /// `capacity` counts precursor entries, not bytes. A capacity of `0`
+    /// disables the cache.
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -127,6 +180,7 @@ impl XicCache {
         }
     }
 
+    /// Return `true` when the cache is allowed to store entries.
     pub fn is_enabled(&self) -> bool {
         self.capacity > 0
     }
@@ -153,7 +207,9 @@ impl XicCache {
 
     fn evict(&mut self) {
         while self.size > self.capacity {
-            let Some((path, key)) = self.order.pop_front() else { break; };
+            let Some((path, key)) = self.order.pop_front() else {
+                break;
+            };
             if let Some(map) = self.data.get_mut(&path) {
                 if map.remove(&key).is_some() {
                     self.size = self.size.saturating_sub(1);
@@ -166,6 +222,7 @@ impl XicCache {
     }
 }
 
+/// Shared cache statistics gathered across in-memory and on-disk cache use.
 #[cfg(feature = "io-parquet")]
 #[derive(Debug, Clone, Default)]
 pub struct XicCacheStats(Arc<CacheStatsInner>);
@@ -182,30 +239,42 @@ struct CacheStatsInner {
 
 #[cfg(feature = "io-parquet")]
 impl XicCacheStats {
+    /// Create a fresh shared cache-statistics accumulator.
     pub fn new() -> Self {
         Self(Arc::new(CacheStatsInner::default()))
     }
 
     fn inc_mem_hit(&self, n: u64) {
-        self.0.mem_hits.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .mem_hits
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn inc_disk_hit(&self, n: u64) {
-        self.0.disk_hits.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .disk_hits
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn inc_miss(&self, n: u64) {
-        self.0.misses.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .misses
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn inc_store(&self, n: u64) {
-        self.0.stores.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .stores
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn inc_eviction(&self, n: u64) {
-        self.0.evictions.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .evictions
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Return `(mem_hits, disk_hits, misses, stores, evictions)`.
     pub fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.0.mem_hits.load(std::sync::atomic::Ordering::Relaxed),
@@ -217,6 +286,7 @@ impl XicCacheStats {
     }
 }
 
+/// Thread-safe wrapper around [`XicCache`].
 #[cfg(feature = "io-parquet")]
 #[derive(Clone)]
 pub struct SharedXicCache {
@@ -233,6 +303,7 @@ impl Default for SharedXicCache {
 
 #[cfg(feature = "io-parquet")]
 impl SharedXicCache {
+    /// Create a thread-safe shared cache wrapper.
     pub fn new(capacity: usize) -> Self {
         Self {
             cache: Arc::new(Mutex::new(XicCache::new(capacity))),
@@ -240,10 +311,12 @@ impl SharedXicCache {
         }
     }
 
+    /// Return a cloneable handle to the shared statistics object.
     pub fn stats(&self) -> XicCacheStats {
         self.stats.clone()
     }
 
+    /// Return `true` when the underlying cache capacity is non-zero.
     pub fn is_enabled(&self) -> bool {
         self.cache.lock().map(|c| c.is_enabled()).unwrap_or(false)
     }
@@ -260,6 +333,7 @@ impl SharedXicCache {
     }
 }
 
+/// Optional on-disk cache for decoded chromatograms.
 #[cfg(feature = "io-parquet")]
 #[derive(Debug, Clone)]
 pub struct XicDiskCache {
@@ -270,9 +344,21 @@ pub struct XicDiskCache {
 
 #[cfg(feature = "io-parquet")]
 impl XicDiskCache {
-    pub fn new(root: std::path::PathBuf, max_bytes: Option<u64>, stats: XicCacheStats) -> Result<Self> {
+    /// Create an optional on-disk cache rooted at `root`.
+    ///
+    /// When `max_bytes` is set, old cache files are evicted to keep the cache
+    /// under that size budget.
+    pub fn new(
+        root: std::path::PathBuf,
+        max_bytes: Option<u64>,
+        stats: XicCacheStats,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root, max_bytes, stats })
+        Ok(Self {
+            root,
+            max_bytes,
+            stats,
+        })
     }
 
     fn hash_path(path: &Path) -> u64 {
@@ -291,6 +377,7 @@ impl XicDiskCache {
         dir.join(format!("run{}_prec{}.bin", run_id, precursor_id))
     }
 
+    /// Load one cached precursor chromatogram if present.
     pub fn load(
         &self,
         xic_path: &Path,
@@ -310,12 +397,11 @@ impl XicDiskCache {
         Ok(Some(xic))
     }
 
-    pub fn store(
-        &self,
-        xic_path: &Path,
-        run_id: u64,
-        xic: &PrecursorXic,
-    ) -> Result<()> {
+    /// Store one decoded precursor chromatogram on disk.
+    ///
+    /// Writes are best-effort and deduplicated by `(xic_path, run_id,
+    /// precursor_id)`.
+    pub fn store(&self, xic_path: &Path, run_id: u64, xic: &PrecursorXic) -> Result<()> {
         let path = self.file_for(xic_path, run_id, xic.precursor_id);
         if path.exists() {
             return Ok(());
@@ -368,12 +454,7 @@ impl XicDiskCache {
         Ok(())
     }
 
-    fn collect_files(
-        &self,
-        dir: &Path,
-        files: &mut Vec<DiskEntry>,
-        total: &mut u64,
-    ) -> Result<()> {
+    fn collect_files(&self, dir: &Path, files: &mut Vec<DiskEntry>, total: &mut u64) -> Result<()> {
         if !dir.exists() {
             return Ok(());
         }
@@ -392,7 +473,11 @@ impl XicDiskCache {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 *total += size;
-                files.push(DiskEntry { path, size, modified });
+                files.push(DiskEntry {
+                    path,
+                    size,
+                    modified,
+                });
             }
         }
         Ok(())
@@ -469,7 +554,13 @@ fn decode_precursor_xic(data: &[u8]) -> Result<(u64, PrecursorXic)> {
             points,
         });
     }
-    Ok((run_id, PrecursorXic { precursor_id, transitions }))
+    Ok((
+        run_id,
+        PrecursorXic {
+            precursor_id,
+            transitions,
+        },
+    ))
 }
 
 #[cfg(feature = "io-parquet")]
@@ -517,6 +608,8 @@ fn read_f32(data: &[u8], i: &mut usize) -> Result<f32> {
 }
 
 /// Build a dense (N, D) feature matrix from OSW feature rows.
+/// Convert a row slice into a flat `(N * D)` feature buffer without
+/// preprocessing.
 pub fn rows_to_feature_matrix(rows: &[FeatureRow], feat_dim: usize) -> Vec<f32> {
     let n = rows.len();
     let mut out = vec![0f32; n * feat_dim];
@@ -534,6 +627,8 @@ pub fn rows_to_feature_matrix(rows: &[FeatureRow], feat_dim: usize) -> Vec<f32> 
 }
 
 /// Build a dense (N, D) feature matrix with optional preprocessing.
+/// Convert rows into a flat feature buffer and apply an already-fitted
+/// preprocessor when provided.
 pub fn rows_to_feature_matrix_preprocessed(
     rows: &[FeatureRow],
     feat_dim: usize,
@@ -548,6 +643,8 @@ pub fn rows_to_feature_matrix_preprocessed(
 
 /// Build feature matrix aligned to a target column order.
 /// Missing columns are filled with NaN (to be imputed by the preprocessor).
+/// Convert rows into a feature matrix using a named-column projection from the
+/// original OSW feature table.
 pub fn rows_to_feature_matrix_with_cols(
     rows: &[FeatureRow],
     osw_cols: &[String],
@@ -621,7 +718,10 @@ fn fetch_precursors_cached(
     let stats = cache.stats();
 
     for &pid in prec_set {
-        let key = CacheKey { run_id, precursor_id: pid };
+        let key = CacheKey {
+            run_id,
+            precursor_id: pid,
+        };
         if let Some(xic) = cache.get(path, key) {
             stats.inc_mem_hit(1);
             out.insert(pid, xic);
@@ -673,7 +773,14 @@ fn fetch_precursors_cached(
         }
         for xic in fetched {
             let pid = xic.precursor_id;
-            cache.insert(path, CacheKey { run_id, precursor_id: pid }, xic.clone());
+            cache.insert(
+                path,
+                CacheKey {
+                    run_id,
+                    precursor_id: pid,
+                },
+                xic.clone(),
+            );
             if let Some(disk_cache) = disk {
                 let _ = disk_cache.store(path, run_id, &xic);
             }
@@ -737,7 +844,14 @@ fn fetch_precursors_cached_with_fallback(
     let mut map = HashMap::new();
     for xic in fetched {
         let pid = xic.precursor_id;
-        cache.insert(path, CacheKey { run_id, precursor_id: pid }, xic.clone());
+        cache.insert(
+            path,
+            CacheKey {
+                run_id,
+                precursor_id: pid,
+            },
+            xic.clone(),
+        );
         if let Some(disk_cache) = disk {
             let _ = disk_cache.store(path, run_id, &xic);
         }
@@ -749,6 +863,7 @@ fn fetch_precursors_cached_with_fallback(
 /// Build trace tensors for rows using an arbitrary XIC source.
 ///
 /// Output layout: (N, C_total, L) flattened row-major.
+/// Build `(N, C, L)` trace tensors from a generic [`XicSource`].
 pub fn build_trace_tensors_from_source(
     rows: &[FeatureRow],
     xic_source: &mut impl XicSource,
@@ -791,12 +906,8 @@ pub fn build_trace_tensors_from_source(
 
                 let mut offset = 0usize;
                 if cfg.ms1_cmax > 0 {
-                    if ms1_series.is_empty()
-                        && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed)
-                    {
-                        log::warn!(
-                            "missing MS1 traces for at least one precursor; padding zeros"
-                        );
+                    if ms1_series.is_empty() && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed) {
+                        log::warn!("missing MS1 traces for at least one precursor; padding zeros");
                     }
                     let t_ms1 = extract_trace_tensor_centered(
                         &ms1_series,
@@ -838,6 +949,8 @@ pub fn build_trace_tensors_from_source(
 }
 
 /// Score candidates directly from rows + traces.
+/// Score candidate rows directly from row structs plus an already-built trace
+/// tensor buffer.
 pub fn score_rows_from_rows(
     model: &impl CandidateScorerInterface,
     rows: &[FeatureRow],
@@ -861,6 +974,8 @@ pub fn score_rows_from_rows(
 }
 
 /// Score candidates directly from rows + traces with explicit feature columns.
+/// Same as [`score_rows_from_rows`] but with explicit source/target feature
+/// column projection.
 pub fn score_rows_from_rows_with_cols(
     model: &impl CandidateScorerInterface,
     rows: &[FeatureRow],
@@ -885,6 +1000,8 @@ pub fn score_rows_from_rows_with_cols(
 }
 
 /// Score bags from rows + traces, returning bag-level diagnostics.
+/// Score grouped bags from row structs plus an already-built trace tensor
+/// buffer.
 pub fn score_bags_from_rows(
     model: &impl BagRankerWithHiddenInterface,
     rows: &[FeatureRow],
@@ -910,19 +1027,14 @@ pub fn score_bags_from_rows(
     }
 
     let x_feat = rows_to_feature_matrix_preprocessed(rows, feat_dim, pre);
-    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
     let bags = make_bags_with_traces(
-        &x_feat,
-        n,
-        feat_dim,
-        x_trace,
-        c_total,
-        l,
-        &y_rows,
-        &pid_rows,
-        bag_k,
+        &x_feat, n, feat_dim, x_trace, c_total, l, &y_rows, &pid_rows, bag_k,
     );
 
     let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
@@ -969,6 +1081,8 @@ pub fn score_bags_from_rows(
 }
 
 /// Score bags from rows + traces with explicit feature columns.
+/// Same as [`score_bags_from_rows`] but with explicit feature-column
+/// projection.
 pub fn score_bags_from_rows_with_cols(
     model: &impl BagRankerWithHiddenInterface,
     rows: &[FeatureRow],
@@ -996,19 +1110,14 @@ pub fn score_bags_from_rows_with_cols(
 
     let d = target_cols.len();
     let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
-    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
     let bags = make_bags_with_traces(
-        &x_feat,
-        n,
-        d,
-        x_trace,
-        c_total,
-        l,
-        &y_rows,
-        &pid_rows,
-        bag_k,
+        &x_feat, n, d, x_trace, c_total, l, &y_rows, &pid_rows, bag_k,
     );
 
     let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
@@ -1055,6 +1164,7 @@ pub fn score_bags_from_rows_with_cols(
 }
 
 /// Score bags and extract winner head components for diagnostics.
+/// Score bags and export winner-side intermediate tensors.
 pub fn score_bags_with_heads_from_rows(
     model: &crate::model::topaz::TopazBagRanker,
     rows: &[FeatureRow],
@@ -1094,19 +1204,14 @@ pub fn score_bags_with_heads_from_rows(
     }
 
     let x_feat = rows_to_feature_matrix_preprocessed(rows, feat_dim, pre);
-    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
     let bags = make_bags_with_traces(
-        &x_feat,
-        n,
-        feat_dim,
-        x_trace,
-        c_total,
-        l,
-        &y_rows,
-        &pid_rows,
-        bag_k,
+        &x_feat, n, feat_dim, x_trace, c_total, l, &y_rows, &pid_rows, bag_k,
     );
 
     let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
@@ -1162,21 +1267,49 @@ pub fn score_bags_with_heads_from_rows(
         let coe12 = comps.coe_ms12.to_vec2::<f32>()?;
         let coea = comps.coe_all.to_vec2::<f32>()?;
 
-        if emb_ms2_dim == 0 { emb_ms2_dim = emb2.get(0).map(|v| v.len()).unwrap_or(0); }
-        if emb_ms1_dim == 0 { emb_ms1_dim = emb1.get(0).map(|v| v.len()).unwrap_or(0); }
-        if emb_all_dim == 0 { emb_all_dim = emba.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_ms2_dim == 0 { coe_ms2_dim = coe2.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_ms1_dim == 0 { coe_ms1_dim = coe1.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_ms12_dim == 0 { coe_ms12_dim = coe12.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_all_dim == 0 { coe_all_dim = coea.get(0).map(|v| v.len()).unwrap_or(0); }
+        if emb_ms2_dim == 0 {
+            emb_ms2_dim = emb2.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if emb_ms1_dim == 0 {
+            emb_ms1_dim = emb1.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if emb_all_dim == 0 {
+            emb_all_dim = emba.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms2_dim == 0 {
+            coe_ms2_dim = coe2.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms1_dim == 0 {
+            coe_ms1_dim = coe1.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms12_dim == 0 {
+            coe_ms12_dim = coe12.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_all_dim == 0 {
+            coe_all_dim = coea.get(0).map(|v| v.len()).unwrap_or(0);
+        }
 
-        for row in emb2 { emb_ms2.extend(row); }
-        for row in emb1 { emb_ms1.extend(row); }
-        for row in emba { emb_all.extend(row); }
-        for row in coe2 { coe_ms2.extend(row); }
-        for row in coe1 { coe_ms1.extend(row); }
-        for row in coe12 { coe_ms12.extend(row); }
-        for row in coea { coe_all.extend(row); }
+        for row in emb2 {
+            emb_ms2.extend(row);
+        }
+        for row in emb1 {
+            emb_ms1.extend(row);
+        }
+        for row in emba {
+            emb_all.extend(row);
+        }
+        for row in coe2 {
+            coe_ms2.extend(row);
+        }
+        for row in coe1 {
+            coe_ms1.extend(row);
+        }
+        for row in coe12 {
+            coe_ms12.extend(row);
+        }
+        for row in coea {
+            coe_all.extend(row);
+        }
 
         i += take;
     }
@@ -1207,6 +1340,8 @@ pub fn score_bags_with_heads_from_rows(
 }
 
 /// Score bags + heads with explicit feature columns.
+/// Same as [`score_bags_with_heads_from_rows`] but with explicit feature-column
+/// projection.
 pub fn score_bags_with_heads_from_rows_with_cols(
     model: &crate::model::topaz::TopazBagRanker,
     rows: &[FeatureRow],
@@ -1248,19 +1383,14 @@ pub fn score_bags_with_heads_from_rows_with_cols(
 
     let d = target_cols.len();
     let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
-    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
     let bags = make_bags_with_traces(
-        &x_feat,
-        n,
-        d,
-        x_trace,
-        c_total,
-        l,
-        &y_rows,
-        &pid_rows,
-        bag_k,
+        &x_feat, n, d, x_trace, c_total, l, &y_rows, &pid_rows, bag_k,
     );
 
     let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
@@ -1316,21 +1446,49 @@ pub fn score_bags_with_heads_from_rows_with_cols(
         let coe12 = comps.coe_ms12.to_vec2::<f32>()?;
         let coea = comps.coe_all.to_vec2::<f32>()?;
 
-        if emb_ms2_dim == 0 { emb_ms2_dim = emb2.get(0).map(|v| v.len()).unwrap_or(0); }
-        if emb_ms1_dim == 0 { emb_ms1_dim = emb1.get(0).map(|v| v.len()).unwrap_or(0); }
-        if emb_all_dim == 0 { emb_all_dim = emba.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_ms2_dim == 0 { coe_ms2_dim = coe2.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_ms1_dim == 0 { coe_ms1_dim = coe1.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_ms12_dim == 0 { coe_ms12_dim = coe12.get(0).map(|v| v.len()).unwrap_or(0); }
-        if coe_all_dim == 0 { coe_all_dim = coea.get(0).map(|v| v.len()).unwrap_or(0); }
+        if emb_ms2_dim == 0 {
+            emb_ms2_dim = emb2.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if emb_ms1_dim == 0 {
+            emb_ms1_dim = emb1.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if emb_all_dim == 0 {
+            emb_all_dim = emba.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms2_dim == 0 {
+            coe_ms2_dim = coe2.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms1_dim == 0 {
+            coe_ms1_dim = coe1.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms12_dim == 0 {
+            coe_ms12_dim = coe12.get(0).map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_all_dim == 0 {
+            coe_all_dim = coea.get(0).map(|v| v.len()).unwrap_or(0);
+        }
 
-        for row in emb2 { emb_ms2.extend(row); }
-        for row in emb1 { emb_ms1.extend(row); }
-        for row in emba { emb_all.extend(row); }
-        for row in coe2 { coe_ms2.extend(row); }
-        for row in coe1 { coe_ms1.extend(row); }
-        for row in coe12 { coe_ms12.extend(row); }
-        for row in coea { coe_all.extend(row); }
+        for row in emb2 {
+            emb_ms2.extend(row);
+        }
+        for row in emb1 {
+            emb_ms1.extend(row);
+        }
+        for row in emba {
+            emb_all.extend(row);
+        }
+        for row in coe2 {
+            coe_ms2.extend(row);
+        }
+        for row in coe1 {
+            coe_ms1.extend(row);
+        }
+        for row in coe12 {
+            coe_ms12.extend(row);
+        }
+        for row in coea {
+            coe_all.extend(row);
+        }
 
         i += take;
     }
@@ -1360,6 +1518,7 @@ pub fn score_bags_with_heads_from_rows_with_cols(
     })
 }
 
+/// Build trace tensors by loading chromatograms from a parquet XIC file.
 #[cfg(feature = "io-parquet")]
 pub fn build_trace_tensors_from_parquet(
     rows: &[FeatureRow],
@@ -1380,6 +1539,8 @@ pub fn build_trace_tensors_from_parquet(
     build_trace_tensors_from_source(rows, &mut reader, cfg)
 }
 
+/// Parquet-backed trace extraction with shared in-memory and optional on-disk
+/// caching.
 #[cfg(feature = "io-parquet")]
 pub fn build_trace_tensors_from_parquet_cached(
     rows: &[FeatureRow],
@@ -1421,12 +1582,8 @@ pub fn build_trace_tensors_from_parquet_cached(
 
                 let mut offset = 0usize;
                 if cfg.ms1_cmax > 0 {
-                    if ms1_series.is_empty()
-                        && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed)
-                    {
-                        log::warn!(
-                            "missing MS1 traces for at least one precursor; padding zeros"
-                        );
+                    if ms1_series.is_empty() && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed) {
+                        log::warn!("missing MS1 traces for at least one precursor; padding zeros");
                     }
                     let t_ms1 = extract_trace_tensor_centered(
                         &ms1_series,
@@ -1467,6 +1624,7 @@ pub fn build_trace_tensors_from_parquet_cached(
     Ok(out)
 }
 
+/// Build traces for rows using a run-id to parquet-path mapping.
 #[cfg(feature = "io-parquet")]
 pub fn build_trace_tensors_from_parquet_map(
     rows: &[FeatureRow],
@@ -1478,6 +1636,7 @@ pub fn build_trace_tensors_from_parquet_map(
     build_trace_tensors_from_parquet_map_cached(rows, xic_map, cfg, fetch_cfg, &cache, None)
 }
 
+/// Cached version of [`build_trace_tensors_from_parquet_map`].
 #[cfg(feature = "io-parquet")]
 pub fn build_trace_tensors_from_parquet_map_cached(
     rows: &[FeatureRow],
@@ -1641,8 +1800,10 @@ pub fn build_trace_tensors_from_parquet_map_cached(
         .into_iter()
         .map(|(run_id, prec_set, path)| {
             if use_cache {
-                fetch_precursors_cached_with_fallback(path, run_id, &prec_set, cache, disk, fetch_cfg)
-                    .map(|map| (run_id, map))
+                fetch_precursors_cached_with_fallback(
+                    path, run_id, &prec_set, cache, disk, fetch_cfg,
+                )
+                .map(|map| (run_id, map))
             } else {
                 fetch_one(run_id, prec_set, path, fetch_cfg)
             }
@@ -1713,12 +1874,8 @@ pub fn build_trace_tensors_from_parquet_map_cached(
 
                 let mut offset = 0usize;
                 if cfg.ms1_cmax > 0 {
-                    if ms1_series.is_empty()
-                        && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed)
-                    {
-                        log::warn!(
-                            "missing MS1 traces for at least one precursor; padding zeros"
-                        );
+                    if ms1_series.is_empty() && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed) {
+                        log::warn!("missing MS1 traces for at least one precursor; padding zeros");
                     }
                     let t_ms1 = extract_trace_tensor_centered(
                         &ms1_series,
@@ -1759,6 +1916,7 @@ pub fn build_trace_tensors_from_parquet_map_cached(
     Ok(out)
 }
 
+/// Read OSW rows through the topaz-facing compatibility wrapper.
 #[cfg(feature = "io-sqlite")]
 pub fn read_osw_features(
     path: &Path,
@@ -1768,6 +1926,8 @@ pub fn read_osw_features(
 }
 
 /// End-to-end inference: OSW + XIC -> candidate scores -> SCORE table.
+/// End-to-end convenience helper for one-shot OSW + XIC scoring into a score
+/// table.
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 pub fn infer_score_table_from_osw_xic(
     model: &impl CandidateScorerInterface,
@@ -1813,10 +1973,10 @@ pub fn infer_score_table_from_osw_xic(
 #[cfg(all(test, feature = "io-sqlite", feature = "io-parquet"))]
 mod tests {
     use super::*;
+    use crate::building_blocks::trace_input::TraceInputMode;
     use crate::infer::{build_score_table_from_rows, score_candidates, write_score_tsv};
     use crate::io::osw::{OswLevel, OswReadConfig};
     use crate::model::topaz::{TopazBagRanker, TopazConfig};
-    use crate::building_blocks::trace_input::TraceInputMode;
     use candle_core::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
     use std::fs;

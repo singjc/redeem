@@ -1,22 +1,25 @@
+//! XRUN data preparation and score-application helpers.
+
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use serde::{Deserialize, Serialize};
 
 use crate::building_blocks::bagging::make_bags_with_traces;
-use crate::infer::{rows_to_feature_matrix_preprocessed, rows_to_feature_matrix_with_cols};
-use crate::preprocess::Preprocessor;
-use crate::model_interface::BagRankerWithHiddenInterface;
-use crate::xrun::sequence::build_xrun_sequences_from_bags;
-use crate::xrun::calibrator::XrunAttentionCalibrator;
-use crate::io::osw::FeatureRow;
 #[cfg(feature = "io-sqlite")]
 use crate::infer::build_score_table_from_rows;
+use crate::infer::{rows_to_feature_matrix_preprocessed, rows_to_feature_matrix_with_cols};
+use crate::io::osw::FeatureRow;
+use crate::model_interface::BagRankerWithHiddenInterface;
+use crate::preprocess::Preprocessor;
+use crate::xrun::calibrator::XrunAttentionCalibrator;
+use crate::xrun::sequence::build_xrun_sequences_from_bags;
 
 #[cfg(feature = "io-sqlite")]
 use crate::io::osw::ScoreRow as OswScoreRow;
 #[cfg(feature = "io-sqlite")]
 use std::path::Path;
 
+/// Bag-level inputs consumed by XRUN.
 #[derive(Debug, Clone)]
 pub struct XrunBagData {
     pub bag_score: Vec<f32>,
@@ -26,6 +29,7 @@ pub struct XrunBagData {
     pub bag_pid: Vec<String>,
 }
 
+/// Prediction-time settings for applying a trained XRUN calibrator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrunPredictConfig {
     pub max_runs: usize,
@@ -35,10 +39,15 @@ pub struct XrunPredictConfig {
 
 impl Default for XrunPredictConfig {
     fn default() -> Self {
-        Self { max_runs: 64, sort_by: "run".to_string(), batch_size: 256 }
+        Self {
+            max_runs: 64,
+            sort_by: "run".to_string(),
+            batch_size: 256,
+        }
     }
 }
 
+/// Chunked helper that scores bags and also returns winner hidden vectors.
 pub fn score_bags_with_hidden_chunked(
     model: &impl BagRankerWithHiddenInterface,
     xb: &Tensor,
@@ -76,7 +85,7 @@ pub fn score_bags_with_hidden_chunked(
     Ok((scores, hidden, hidden_dim))
 }
 
-/// Build bag-level inputs and compute (bag_score, winner_hidden) for XRUN.
+/// Build bag-level inputs and compute `(bag_score, winner_hidden)` for XRUN.
 pub fn build_xrun_bag_data_from_rows(
     model: &impl BagRankerWithHiddenInterface,
     rows: &[FeatureRow],
@@ -91,19 +100,14 @@ pub fn build_xrun_bag_data_from_rows(
 ) -> Result<XrunBagData> {
     let n = rows.len();
     let x_feat = rows_to_feature_matrix_preprocessed(rows, feat_dim, pre);
-    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
     let bags = make_bags_with_traces(
-        &x_feat,
-        n,
-        feat_dim,
-        x_trace,
-        c_total,
-        l,
-        &y_rows,
-        &pid_rows,
-        k,
+        &x_feat, n, feat_dim, x_trace, c_total, l, &y_rows, &pid_rows, k,
     );
 
     let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
@@ -123,7 +127,8 @@ pub fn build_xrun_bag_data_from_rows(
     })
 }
 
-/// Build bag-level inputs and compute (bag_score, winner_hidden) with explicit feature columns.
+/// Same as [`build_xrun_bag_data_from_rows`] but with explicit feature-column
+/// projection.
 pub fn build_xrun_bag_data_from_rows_with_cols(
     model: &impl BagRankerWithHiddenInterface,
     rows: &[FeatureRow],
@@ -140,20 +145,13 @@ pub fn build_xrun_bag_data_from_rows_with_cols(
     let n = rows.len();
     let d = target_cols.len();
     let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
-    let y_rows: Vec<u8> = rows.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
 
-    let bags = make_bags_with_traces(
-        &x_feat,
-        n,
-        d,
-        x_trace,
-        c_total,
-        l,
-        &y_rows,
-        &pid_rows,
-        k,
-    );
+    let bags = make_bags_with_traces(&x_feat, n, d, x_trace, c_total, l, &y_rows, &pid_rows, k);
 
     let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
     let tb = Tensor::from_vec(bags.t_bag, (bags.b, bags.k, bags.c, bags.l), device)?;
@@ -247,7 +245,8 @@ pub fn apply_xrun_deltas(bag_score: &[f32], delta_bag: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Apply per-bag deltas to per-row (candidate) scores using group_id mapping.
+/// Apply per-bag deltas to per-row (candidate) scores using `group_id`
+/// mapping.
 pub fn apply_xrun_deltas_to_rows(
     row_scores: &[f32],
     rows: &[FeatureRow],
@@ -267,7 +266,7 @@ pub fn apply_xrun_deltas_to_rows(
     out
 }
 
-/// Write calibrated scores to OSW (uses per-row scores + delta mapped by group_id).
+/// Write XRUN-calibrated scores to an OSW score table.
 #[cfg(feature = "io-sqlite")]
 pub fn write_xrun_scores_to_osw(
     osw_path: &Path,

@@ -1,8 +1,23 @@
-// redeem-topaz/src/building_blocks/coelution.rs
+//! Differentiable coelution features computed from multi-channel trace windows.
+//!
+//! Shape notation used in this module:
+//!
+//! - `N`: number of flattened candidate rows.
+//! - `C`: number of traces/channels being compared.
+//! - `L`: fixed trace-window length.
+//! - `P`: number of unique channel pairs, `C * (C - 1) / 2`.
+//!
+//! A tensor `(N, C, L)` therefore means: for each candidate row, `C` aligned
+//! chromatograms sampled over `L` retention-time positions.
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{self as nn, VarBuilder};
 
+/// Z-score each channel independently along the time axis.
+///
+/// The input and output both have shape `(N, C, L)`. This normalization is
+/// used before cosine-similarity calculations so that the coelution features
+/// focus on shape agreement rather than absolute intensity scale.
 pub(crate) fn zscore_time(x: &Tensor, eps: f64) -> Result<Tensor> {
     let mu = x.mean_keepdim(2)?;
     let var = x.var_keepdim(2)?;
@@ -11,6 +26,10 @@ pub(crate) fn zscore_time(x: &Tensor, eps: f64) -> Result<Tensor> {
     x.broadcast_sub(&mu)?.broadcast_div(&sd)
 }
 
+/// Create a `(1, 1, L)` index tensor spanning `[0, 1]`.
+///
+/// This is used to compute soft apex positions by taking a weighted average of
+/// retention-time coordinates after a softmax over the trace intensity.
 pub(crate) fn linspace_0_1(l: usize, device: &Device) -> Result<Tensor> {
     if l <= 1 {
         return Tensor::zeros((1, 1, l), DType::F32, device);
@@ -30,7 +49,16 @@ fn upper_triangle_indices(c: usize) -> Vec<i64> {
     idx
 }
 
-/// Compute differentiable co-elution features + learned embedding from traces.
+/// Compute explicit coelution statistics plus a learned similarity embedding.
+///
+/// The head mirrors the Python coelution feature block: it summarizes how well
+/// the channels for one precursor co-elute inside the extracted RT window.
+/// Conceptually it combines:
+/// - same-window pairwise cosine similarities,
+/// - lag-tolerant cosine similarities,
+/// - soft apex alignment statistics,
+/// - entropy/peakiness summaries,
+/// - an optional learned embedding over the pairwise-similarity features.
 pub struct CoelutionHead {
     cmax: usize,
     p: usize,
@@ -45,6 +73,11 @@ pub struct CoelutionHead {
 }
 
 impl CoelutionHead {
+    /// Create a coelution head for a fixed channel count.
+    ///
+    /// `cmax` is the expected number of channels `C` for every input passed to
+    /// [`Self::forward`]. TOPAZ creates separate heads for MS2 and, when
+    /// enabled, MS1 traces.
     pub fn new(
         vb: VarBuilder,
         cmax: usize,
@@ -84,6 +117,11 @@ impl CoelutionHead {
         })
     }
 
+    /// Output dimensionality produced by [`Self::forward`].
+    ///
+    /// The output is:
+    /// - 10 scalar summary features
+    /// - plus `sim_emb_dim` learned similarity-embedding dimensions
     pub fn out_dim(&self) -> usize {
         10 + self.sim_emb_dim
     }
@@ -142,7 +180,26 @@ impl CoelutionHead {
         stacked.max(2)
     }
 
-    /// x: (N,C,L) raw traces.
+    /// Compute the coelution feature vector for each candidate row.
+    ///
+    /// # Inputs
+    /// - `x`: `(N, C, L)` raw traces with `C == cmax`.
+    ///
+    /// # Output
+    /// Returns `(N, out_dim)` where the first 10 columns are:
+    /// - mean pairwise cosine
+    /// - minimum pairwise cosine
+    /// - mean lag-tolerant pairwise cosine
+    /// - minimum lag-tolerant pairwise cosine
+    /// - apex standard deviation
+    /// - apex range
+    /// - apex mean absolute deviation
+    /// - mean channel entropy
+    /// - minimum channel entropy
+    /// - fraction of channels that look peak-like
+    ///
+    /// If `sim_emb_dim > 0`, the remaining columns are a learned embedding of
+    /// the pairwise-similarity statistics.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (n, _c, l) = x.dims3()?;
         let device = x.device();

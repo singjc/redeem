@@ -1,82 +1,77 @@
-use anyhow::{bail, Context, Result};
+//! High-level TOPAZ training, inference, and XRUN-sweep entry points.
+//!
+//! This module is the orchestration layer used by `redeem-cli`. It combines:
+//!
+//! - OSW feature loading
+//! - XIC extraction and caching
+//! - feature-column selection and preprocessing
+//! - base TOPAZ training/inference
+//! - optional XRUN training and calibrated inference
+//! - OSW/TSV writeback and diagnostics
+
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use candle_core::Device;
 
 use crate::checkpoint::{
-    load_xrun_checkpoint,
-    read_xrun_checkpoint_meta,
-    save_xrun_checkpoint,
-    xrun_checkpoint_exists,
-    CheckpointMeta,
-    XrunCheckpointMeta,
+    CheckpointMeta, XrunCheckpointMeta, load_checkpoint_partial, load_xrun_checkpoint,
+    read_xrun_checkpoint_meta, save_xrun_checkpoint, xrun_checkpoint_exists,
 };
 use crate::config::Config as TrainConfig;
 use crate::infer::{TraceBuildConfig, XicFetchConfig};
 use crate::io::osw::OswReadConfig;
 use crate::model::topaz::TopazConfig;
 use crate::train::TrainFilter;
-use crate::xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
 use crate::xrun::XrunTrainConfig;
+use crate::xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
 
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use candle_nn::{VarBuilder, VarMap};
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::checkpoint::save_checkpoint;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::infer::diagnostics::{print_trace_summary, trace_summary, warn_if_missing_ms1};
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::{
-    build_trace_tensors_from_parquet,
-    build_trace_tensors_from_parquet_cached,
-    build_trace_tensors_from_parquet_map,
-    build_trace_tensors_from_parquet_map_cached,
-    build_score_table_from_rows,
-    score_candidates,
-    score_bags_from_rows_with_cols,
-    score_bags_with_heads_from_rows_with_cols,
+    SharedXicCache, XicDiskCache, build_score_table_from_rows, build_trace_tensors_from_parquet,
+    build_trace_tensors_from_parquet_cached, build_trace_tensors_from_parquet_map,
+    build_trace_tensors_from_parquet_map_cached, rows_to_feature_matrix_with_cols,
+    score_bags_from_rows_with_cols, score_bags_with_heads_from_rows_with_cols, score_candidates,
     tdc_summary,
-    rows_to_feature_matrix_with_cols,
-    SharedXicCache,
-    XicDiskCache,
 };
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::io::osw::FeatureRow;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::io::osw::read_feature_rows;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::model::topaz::TopazBagRanker;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::{
-    bags_to_train_batches,
-    filter_training_rows,
-    fit_preprocessor_from_rows_with_cols,
-    split_rows_by_precursor,
-    subsample_train_rows_by_bag,
-    Trainer,
+    Trainer, bags_to_train_batches, filter_training_rows, fit_preprocessor_from_rows_with_cols,
+    split_rows_by_precursor, subsample_train_rows_by_bag,
 };
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use crate::infer::diagnostics::{print_trace_summary, trace_summary, warn_if_missing_ms1};
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use crate::io::osw::FeatureRow;
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::pipeline::{
-    apply_xrun_deltas,
-    apply_xrun_deltas_to_rows,
-    build_xrun_bag_data_from_rows,
+    XrunPredictConfig, apply_xrun_deltas, apply_xrun_deltas_to_rows, build_xrun_bag_data_from_rows,
     build_xrun_bag_data_from_rows_with_cols,
-    XrunPredictConfig,
 };
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::sequence::build_xrun_sequences_from_bags;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use crate::xrun::train::{split_train_val, XrunDataset, XrunTrainer, XrunPoolMode};
+use crate::xrun::train::{XrunDataset, XrunPoolMode, XrunTrainer, split_train_val};
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use candle_nn::{VarBuilder, VarMap};
 
-#[cfg(feature = "io-sqlite")]
-use crate::io::osw::ScoreRow as OswScoreRow;
 #[cfg(feature = "io-sqlite")]
 use crate::infer::write_rank1_disagreement_tsvs;
+#[cfg(feature = "io-sqlite")]
+use crate::io::osw::ScoreRow as OswScoreRow;
 
+/// Optional numeric and file-based diagnostics emitted during training and
+/// inference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiagnosticsConfig {
@@ -88,6 +83,7 @@ pub struct DiagnosticsConfig {
     pub head_embeddings_outdir: Option<PathBuf>,
 }
 
+/// XRUN runtime/training configuration embedded inside the main TOPAZ config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct XrunRunConfig {
@@ -133,6 +129,7 @@ pub const DEFAULT_LIB_COLS: &[&str] = &[
     "var_library_sangle",
 ];
 
+/// Selection policy for heuristic/library feature columns.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureMode {
@@ -149,6 +146,8 @@ impl Default for FeatureMode {
     }
 }
 
+/// Configuration describing which heuristic feature columns are exposed to the
+/// candidate scorer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FeatureSelectConfig {
@@ -165,6 +164,7 @@ impl Default for FeatureSelectConfig {
     }
 }
 
+/// Top-level training configuration consumed by [`run_training`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrainRunConfig {
@@ -236,6 +236,7 @@ impl Default for TrainRunConfig {
     }
 }
 
+/// Top-level inference configuration consumed by [`run_inference`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InferRunConfig {
@@ -246,6 +247,8 @@ pub struct InferRunConfig {
     pub output_tsv: PathBuf,
     pub output_osw: Option<PathBuf>,
     pub output_table: String,
+    pub output_table_base: Option<String>,
+    pub output_table_xrun: Option<String>,
     pub device: String,
     pub batch_size: usize,
     pub pep_bins: usize,
@@ -272,6 +275,8 @@ impl Default for InferRunConfig {
             output_tsv: PathBuf::from("score_topaz.tsv"),
             output_osw: None,
             output_table: "SCORE_TOPAZ".to_string(),
+            output_table_base: None,
+            output_table_xrun: None,
             device: "cpu".to_string(),
             batch_size: 256,
             pep_bins: 20,
@@ -295,16 +300,20 @@ impl Default for InferRunConfig {
     }
 }
 
+/// Result returned after a successful training run.
 #[derive(Debug, Clone)]
 pub struct TrainRunOutput {
     pub checkpoint_prefix: PathBuf,
 }
 
+/// Result returned after a successful inference run.
 #[derive(Debug, Clone)]
 pub struct InferRunOutput {
     pub n_rows: usize,
 }
 
+/// Configuration for evaluating multiple XRUN hyper-parameter combinations from
+/// a fixed base TOPAZ checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct XrunSweepConfig {
@@ -366,6 +375,7 @@ impl Default for XrunSweepConfig {
     }
 }
 
+/// One row of XRUN sweep output.
 #[derive(Debug, Clone)]
 pub struct XrunSweepRow {
     pub pool: String,
@@ -526,7 +536,9 @@ fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let Some(path_str) = parts.next() else { continue; };
+        let Some(path_str) = parts.next() else {
+            continue;
+        };
         let mut p = PathBuf::from(path_str);
         if p.is_relative() {
             let base_candidate = base.join(&p);
@@ -607,7 +619,11 @@ fn build_traces_for_rows(
 ) -> Result<Vec<f32>> {
     if let Some(map_path) = xic_map_path {
         let map = read_xic_map(map_path)?;
-        log::info!("Using XIC map with {} entries from {:?}", map.len(), map_path);
+        log::info!(
+            "Using XIC map with {} entries from {:?}",
+            map.len(),
+            map_path
+        );
         if let Some(cache) = cache {
             build_trace_tensors_from_parquet_map_cached(rows, &map, trace, fetch, cache, disk)
         } else {
@@ -634,7 +650,8 @@ fn build_traces_for_train_val(
     disk: Option<&XicDiskCache>,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     if rows_va.is_empty() {
-        let x_tr = build_traces_for_rows(rows_tr, xic_path, xic_map_path, trace, fetch, cache, disk)?;
+        let x_tr =
+            build_traces_for_rows(rows_tr, xic_path, xic_map_path, trace, fetch, cache, disk)?;
         return Ok((x_tr, Vec::new()));
     }
 
@@ -647,7 +664,8 @@ fn build_traces_for_train_val(
         rows_tr.len(),
         rows_va.len()
     );
-    let x_all = build_traces_for_rows(&rows_all, xic_path, xic_map_path, trace, fetch, cache, disk)?;
+    let x_all =
+        build_traces_for_rows(&rows_all, xic_path, xic_map_path, trace, fetch, cache, disk)?;
     let span = trace.total_c() * trace.l;
     let split = rows_tr.len() * span;
     let x_tr = x_all[..split].to_vec();
@@ -695,10 +713,7 @@ fn select_bag_winners(
     (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y)
 }
 
-fn write_head_embeddings_tsv(
-    path: &Path,
-    out: &crate::infer::BagHeadOutput,
-) -> Result<()> {
+fn write_head_embeddings_tsv(path: &Path, out: &crate::infer::BagHeadOutput) -> Result<()> {
     let mut header: Vec<String> = Vec::new();
     header.push("bag_pid".to_string());
     header.push("is_decoy".to_string());
@@ -736,40 +751,68 @@ fn write_head_embeddings_tsv(
     for i in 0..b {
         let mut row = Vec::with_capacity(header.len());
         row.push(out.bag_pid[i].clone());
-        row.push(if out.is_decoy.get(i).copied().unwrap_or(false) { "1".to_string() } else { "0".to_string() });
+        row.push(if out.is_decoy.get(i).copied().unwrap_or(false) {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        });
         row.push(format!("{}", out.bag_score.get(i).copied().unwrap_or(0.0)));
 
         let off = i * out.hidden_dim;
         for j in 0..out.hidden_dim {
-            row.push(format!("{}", out.winner_hidden.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.winner_hidden.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         let off = i * out.emb_ms2_dim;
         for j in 0..out.emb_ms2_dim {
-            row.push(format!("{}", out.emb_ms2.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.emb_ms2.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         let off = i * out.emb_ms1_dim;
         for j in 0..out.emb_ms1_dim {
-            row.push(format!("{}", out.emb_ms1.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.emb_ms1.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         let off = i * out.emb_all_dim;
         for j in 0..out.emb_all_dim {
-            row.push(format!("{}", out.emb_all.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.emb_all.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         let off = i * out.coe_ms2_dim;
         for j in 0..out.coe_ms2_dim {
-            row.push(format!("{}", out.coe_ms2.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.coe_ms2.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         let off = i * out.coe_ms1_dim;
         for j in 0..out.coe_ms1_dim {
-            row.push(format!("{}", out.coe_ms1.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.coe_ms1.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         let off = i * out.coe_ms12_dim;
         for j in 0..out.coe_ms12_dim {
-            row.push(format!("{}", out.coe_ms12.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.coe_ms12.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         let off = i * out.coe_all_dim;
         for j in 0..out.coe_all_dim {
-            row.push(format!("{}", out.coe_all.get(off + j).copied().unwrap_or(0.0)));
+            row.push(format!(
+                "{}",
+                out.coe_all.get(off + j).copied().unwrap_or(0.0)
+            ));
         }
         text.push_str(&row.join("\t"));
         text.push('\n');
@@ -799,6 +842,24 @@ fn log_xic_cache_stats(label: &str, stats: &crate::infer::XicCacheStats) {
     );
 }
 
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn summarize_names(names: &[String], max_show: usize) -> String {
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    let shown = names
+        .iter()
+        .take(max_show)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > max_show {
+        format!("{shown}, ... (+{} more)", names.len() - max_show)
+    } else {
+        shown
+    }
+}
+
 fn checkpoint_base(path: &Path) -> PathBuf {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
         if ext == "safetensors" || ext == "json" {
@@ -821,6 +882,20 @@ fn load_checkpoint_weights(base: &Path, varmap: &mut VarMap) -> Result<()> {
     let weights = base.with_extension("safetensors");
     varmap.load(&weights)?;
     Ok(())
+}
+
+#[cfg(feature = "io-sqlite")]
+fn score_rows_to_osw(rows: &[crate::infer::ScoreTableRow]) -> Vec<OswScoreRow> {
+    rows.iter()
+        .map(|r| OswScoreRow {
+            feature_id: r.feature_id,
+            score: r.score,
+            rank: r.rank,
+            pvalue: r.pvalue,
+            qvalue: r.qvalue,
+            pep: r.pep,
+        })
+        .collect()
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -881,7 +956,8 @@ fn apply_xrun_to_row_scores(
     base_batch_size: usize,
     pre: Option<&crate::Preprocessor>,
 ) -> Result<XrunAppliedScores> {
-    let (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y) = select_bag_winners(rows, row_scores);
+    let (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y) =
+        select_bag_winners(rows, row_scores);
     if winner_rows.is_empty() {
         return Ok(XrunAppliedScores {
             row_scores: row_scores.to_vec(),
@@ -980,6 +1056,7 @@ fn get_device(device_str: &str) -> Result<Device> {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Train the base TOPAZ model and, optionally, an XRUN calibrator sidecar.
 pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     let device = get_device(&cfg.device)?;
     let init_base: Option<PathBuf> = cfg
@@ -1062,12 +1139,8 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
 
     let (mut rows_tr, rows_va) = split_rows_by_precursor(&rows, cfg.val_frac, cfg.seed);
     if cfg.train_frac < 1.0 {
-        rows_tr = subsample_train_rows_by_bag(
-            rows_tr,
-            cfg.train_frac,
-            cfg.train_stratify_run,
-            cfg.seed,
-        );
+        rows_tr =
+            subsample_train_rows_by_bag(rows_tr, cfg.train_frac, cfg.train_stratify_run, cfg.seed);
         if rows_tr.is_empty() {
             bail!("no rows after train subsample");
         }
@@ -1081,7 +1154,11 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         );
     }
     let disk_cache = match &cfg.xic_cache_dir {
-        Some(dir) => Some(XicDiskCache::new(dir.clone(), cfg.xic_cache_max_bytes, cache_stats.clone())?),
+        Some(dir) => Some(XicDiskCache::new(
+            dir.clone(),
+            cfg.xic_cache_max_bytes,
+            cache_stats.clone(),
+        )?),
         None => None,
     };
     if let Some(dir) = &cfg.xic_cache_dir {
@@ -1114,7 +1191,9 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         (rows_tr, x_tr)
     };
     if apply_trace_filter && rows_tr.is_empty() {
-        bail!("all training rows were dropped after XIC restriction; check run_id match and xic_path");
+        bail!(
+            "all training rows were dropped after XIC restriction; check run_id match and xic_path"
+        );
     }
     let (rows_va, x_va) = if apply_trace_filter {
         filter_rows_by_trace(rows_va, x_va, cfg.trace.total_c(), cfg.trace.l)
@@ -1184,7 +1263,10 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         Vec::new()
     };
 
-    let y_rows: Vec<u8> = rows_tr.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+    let y_rows: Vec<u8> = rows_tr
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
     let pid_rows: Vec<String> = rows_tr.iter().map(|r| r.group_id.clone()).collect();
 
     let bags = crate::building_blocks::bagging::make_bags_with_traces(
@@ -1215,8 +1297,40 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
 
     let mut trainer = Trainer::new(cfg.train.clone(), &model_cfg, &device)?;
     if let Some(base) = init_base.as_ref() {
-        load_checkpoint_weights(base, &mut trainer.varmap)?;
-        log::info!("Loaded initialization checkpoint from {:?}", base);
+        let (_meta, report) = load_checkpoint_partial(base, &mut trainer.varmap)?;
+        if report.loaded == 0 {
+            bail!(
+                "init_checkpoint {:?} did not provide any compatible tensors for the current model",
+                base
+            );
+        }
+        log::info!(
+            "Loaded initialization checkpoint from {:?} (loaded={}, missing={}, shape_mismatch={}, set_errors={}, extra_in_checkpoint={})",
+            base,
+            report.loaded,
+            report.missing_in_checkpoint.len(),
+            report.shape_mismatch.len(),
+            report.set_errors.len(),
+            report.extra_in_checkpoint.len()
+        );
+        if !report.missing_in_checkpoint.is_empty() {
+            log::warn!(
+                "init_checkpoint tensors missing in checkpoint: {}",
+                summarize_names(&report.missing_in_checkpoint, 8)
+            );
+        }
+        if !report.shape_mismatch.is_empty() {
+            log::warn!(
+                "init_checkpoint tensors skipped due to shape mismatch: {}",
+                summarize_names(&report.shape_mismatch, 8)
+            );
+        }
+        if !report.set_errors.is_empty() {
+            log::warn!(
+                "init_checkpoint tensors skipped due to assignment errors: {}",
+                summarize_names(&report.set_errors, 8)
+            );
+        }
     }
     trainer.set_pos_weight(pos_weight);
     trainer.set_shuffle_seed(cfg.seed);
@@ -1227,7 +1341,10 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         n_neg
     );
     let val_batches = if !rows_va.is_empty() {
-        let y_rows_va: Vec<u8> = rows_va.iter().map(|r| if r.is_decoy { 1 } else { 0 }).collect();
+        let y_rows_va: Vec<u8> = rows_va
+            .iter()
+            .map(|r| if r.is_decoy { 1 } else { 0 })
+            .collect();
         let pid_rows_va: Vec<String> = rows_va.iter().map(|r| r.group_id.clone()).collect();
         let bags_va = crate::building_blocks::bagging::make_bags_with_traces(
             &x_feat_va,
@@ -1263,7 +1380,9 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         let summ = tdc_summary(&out.bag_score, &out.is_decoy, 0.01);
         log::info!(
             "VAL TDC summary @q=0.01: cutoff={:.4} targets={} decoys={}",
-            summ.cutoff, summ.n_targets, summ.n_decoys
+            summ.cutoff,
+            summ.n_targets,
+            summ.n_decoys
         );
     }
 
@@ -1379,6 +1498,14 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Run TOPAZ inference and optionally apply XRUN calibration before writeback.
+///
+/// TSV output always contains the final score stream:
+/// - base TOPAZ scores when `xrun.enabled == false`
+/// - XRUN-calibrated scores when `xrun.enabled == true`
+///
+/// When OSW writeback is enabled, `output_table_base` can be used to persist
+/// the uncalibrated base table in addition to the final table.
 pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     let device = get_device(&cfg.device)?;
 
@@ -1412,7 +1539,11 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         );
     }
     let disk_cache = match &cfg.xic_cache_dir {
-        Some(dir) => Some(XicDiskCache::new(dir.clone(), cfg.xic_cache_max_bytes, cache_stats.clone())?),
+        Some(dir) => Some(XicDiskCache::new(
+            dir.clone(),
+            cfg.xic_cache_max_bytes,
+            cache_stats.clone(),
+        )?),
         None => None,
     };
     if let Some(dir) = &cfg.xic_cache_dir {
@@ -1429,7 +1560,11 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     }
 
     let target_cols = meta.feature_cols.clone();
-    let feat_dim = if meta.model.use_heuristic_features { meta.model.feat_dim } else { 0 };
+    let feat_dim = if meta.model.use_heuristic_features {
+        meta.model.feat_dim
+    } else {
+        0
+    };
     let chunk_size = if cfg.trace_chunk_size == 0 {
         rows.len().max(1)
     } else {
@@ -1460,12 +1595,8 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         )?;
 
         let (chunk_rows, x_trace) = if apply_trace_filter {
-            let (rows_f, x_tr_f) = filter_rows_by_trace(
-                chunk.to_vec(),
-                x_trace,
-                cfg.trace.total_c(),
-                cfg.trace.l,
-            );
+            let (rows_f, x_tr_f) =
+                filter_rows_by_trace(chunk.to_vec(), x_trace, cfg.trace.total_c(), cfg.trace.l);
             if rows_f.is_empty() {
                 continue;
             }
@@ -1543,12 +1674,18 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         warn_if_missing_ms1(&sum, "infer");
     }
 
+    let base_scores = scores.clone();
     let xrun_applied = if cfg.xrun.enabled {
         let (_xrun_varmap, xrun_model, xrun_meta) = load_xrun_calibrator(&base, &device)?
-            .ok_or_else(|| anyhow::anyhow!("XRUN enabled but no XRUN checkpoint sidecar found for {:?}", base))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "XRUN enabled but no XRUN checkpoint sidecar found for {:?}",
+                    base
+                )
+            })?;
         let applied = apply_xrun_to_row_scores(
             &rows,
-            &scores,
+            &base_scores,
             &model,
             &table.feature_cols,
             &target_cols,
@@ -1576,8 +1713,9 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         None
     };
 
-    let table_rows = build_score_table_from_rows(&rows, &scores, cfg.pep_bins);
-    crate::infer::write_score_tsv(&cfg.output_tsv, &table_rows)?;
+    let table_rows_base = build_score_table_from_rows(&rows, &base_scores, cfg.pep_bins);
+    let table_rows_final = build_score_table_from_rows(&rows, &scores, cfg.pep_bins);
+    crate::infer::write_score_tsv(&cfg.output_tsv, &table_rows_final)?;
 
     if cfg.diagnostics.save_head_embeddings {
         let outdir = cfg
@@ -1665,18 +1803,30 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     if let Some(osw_path) = &cfg.output_osw {
         #[cfg(feature = "io-sqlite")]
         {
-            let osw_rows: Vec<OswScoreRow> = table_rows
-                .iter()
-                .map(|r| OswScoreRow {
-                    feature_id: r.feature_id,
-                    score: r.score,
-                    rank: r.rank,
-                    pvalue: r.pvalue,
-                    qvalue: r.qvalue,
-                    pep: r.pep,
-                })
-                .collect();
-            crate::io::osw::write_score_table(osw_path, &cfg.output_table, &osw_rows)?;
+            if let Some(base_name) = cfg
+                .output_table_base
+                .as_ref()
+                .filter(|name| !name.is_empty())
+            {
+                let osw_rows = score_rows_to_osw(&table_rows_base);
+                crate::io::osw::write_score_table(osw_path, base_name, &osw_rows)?;
+                log::info!("Wrote base TOPAZ scores to OSW table {:?}", base_name);
+            }
+
+            let final_table_name = if cfg.xrun.enabled {
+                cfg.output_table_xrun
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(cfg.output_table.as_str())
+            } else {
+                cfg.output_table.as_str()
+            };
+            let osw_rows = score_rows_to_osw(&table_rows_final);
+            crate::io::osw::write_score_table(osw_path, final_table_name, &osw_rows)?;
+            log::info!(
+                "Wrote final TOPAZ scores to OSW table {:?}",
+                final_table_name
+            );
 
             if cfg.diagnostics.rank1_disagreements {
                 let outdir = cfg
@@ -1684,15 +1834,13 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                     .rank1_outdir
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("rank1_disagreements"));
-                let summ = write_rank1_disagreement_tsvs(
-                    osw_path,
-                    &cfg.output_table,
-                    0.01,
-                    &outdir,
-                )?;
+                let summ =
+                    write_rank1_disagreement_tsvs(osw_path, final_table_name, 0.01, &outdir)?;
                 log::info!(
                     "Rank1 disagreement summary: rows={} cutoff_pstc={:?} cutoff_ms2={:?}",
-                    summ.rows, summ.pstc_cutoff, summ.ms2_cutoff
+                    summ.rows,
+                    summ.pstc_cutoff,
+                    summ.ms2_cutoff
                 );
             }
         }
@@ -1702,6 +1850,8 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Evaluate a grid of XRUN calibrator settings without retraining the base
+/// TOPAZ model.
 pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     let device = get_device(&cfg.device)?;
 
@@ -1736,7 +1886,11 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
         );
     }
     let disk_cache = match &cfg.xic_cache_dir {
-        Some(dir) => Some(XicDiskCache::new(dir.clone(), cfg.xic_cache_max_bytes, cache_stats.clone())?),
+        Some(dir) => Some(XicDiskCache::new(
+            dir.clone(),
+            cfg.xic_cache_max_bytes,
+            cache_stats.clone(),
+        )?),
         None => None,
     };
     if let Some(dir) = &cfg.xic_cache_dir {
@@ -1802,7 +1956,10 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
         .sweep_pools
         .clone()
         .unwrap_or_else(|| vec![format!("{:?}", cfg.train.pool).to_lowercase()]);
-    let taus: Vec<f64> = cfg.sweep_taus.clone().unwrap_or_else(|| vec![cfg.train.tau]);
+    let taus: Vec<f64> = cfg
+        .sweep_taus
+        .clone()
+        .unwrap_or_else(|| vec![cfg.train.tau]);
 
     let mut rows = Vec::new();
     for p in pools {
@@ -1837,17 +1994,251 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     Ok(rows)
 }
 
+#[cfg(all(test, feature = "io-sqlite", feature = "io-parquet"))]
+mod tests {
+    use super::*;
+    use crate::building_blocks::trace_input::TraceInputMode;
+    use crate::checkpoint::save_checkpoint;
+    use candle_core::{DType, Tensor};
+    use candle_nn::VarBuilder;
+
+    fn tmp_base(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("redeem_topaz_{name}_{stamp}"));
+        p
+    }
+
+    fn synthetic_rows() -> Vec<FeatureRow> {
+        let mut rows = Vec::new();
+        let runs = [101u64, 102, 103];
+        let precs = [1001u64, 1002, 1003, 1004];
+        let mut feature_id = 1u64;
+        for &prec in &precs {
+            for (ri, &run_id) in runs.iter().enumerate() {
+                rows.push(FeatureRow {
+                    feature_id,
+                    precursor_id: prec,
+                    run_id,
+                    group_id: format!("{run_id}_{prec}"),
+                    exp_rt: 1000.0 + prec as f32 * 0.1 + ri as f32,
+                    is_decoy: prec % 2 == 0,
+                    features: vec![
+                        prec as f32 * 0.001,
+                        run_id as f32 * 0.0001 + ri as f32 * 0.01,
+                    ],
+                });
+                feature_id += 1;
+            }
+        }
+        rows
+    }
+
+    fn synthetic_traces(rows: &[FeatureRow], c: usize, l: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(rows.len() * c * l);
+        for (i, row) in rows.iter().enumerate() {
+            for ch in 0..c {
+                for t in 0..l {
+                    let v = ((i + 1) as f32 * 0.1)
+                        + (ch as f32 * 0.2)
+                        + (t as f32 / l as f32)
+                        + (row.precursor_id % 5) as f32 * 0.05;
+                    out.push(v.max(0.0));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_xrun_sidecar_smoke_end_to_end() -> Result<()> {
+        let device = Device::Cpu;
+        let base = tmp_base("xrun_sidecar");
+
+        let model_cfg = TopazConfig {
+            feat_dim: 2,
+            ms2_cmax: 2,
+            ms1_cmax: 0,
+            l: 8,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: TraceInputMode::Single,
+            use_heuristic_features: true,
+            use_coelution_head: false,
+            ..Default::default()
+        };
+        let trace_cfg = TraceBuildConfig {
+            l: model_cfg.l,
+            ms1_cmax: model_cfg.ms1_cmax,
+            ms2_cmax: model_cfg.ms2_cmax,
+            normalize_max: false,
+        };
+        let feature_cols = vec!["f0".to_string(), "f1".to_string()];
+        let rows = synthetic_rows();
+        let x_trace = synthetic_traces(&rows, trace_cfg.total_c(), trace_cfg.l);
+
+        let train_cfg = TrainConfig {
+            learning_rate: 1e-3,
+            lambda_pair: 0.0,
+            lambda_inbag: 0.0,
+            lambda_winner_margin: 0.0,
+            ..Default::default()
+        };
+        let trainer = Trainer::new(train_cfg.clone(), &model_cfg, &device)?;
+        let meta = CheckpointMeta {
+            model: model_cfg.clone(),
+            train: Some(train_cfg),
+            trace: Some(trace_cfg.clone()),
+            feature_cols: feature_cols.clone(),
+            preprocess: None,
+            version: 1,
+        };
+        save_checkpoint(&base, &trainer.varmap, &meta)?;
+
+        let bag_data = build_xrun_bag_data_from_rows_with_cols(
+            &trainer.model,
+            &rows,
+            &x_trace,
+            &feature_cols,
+            &feature_cols,
+            trace_cfg.total_c(),
+            trace_cfg.l,
+            1,
+            &device,
+            8,
+            None,
+        )?;
+        let seq = build_xrun_sequences_from_bags(
+            &bag_data.bag_pid,
+            &bag_data.bag_score,
+            &bag_data.bag_hidden,
+            bag_data.hidden_dim,
+            &bag_data.bag_y,
+            8,
+            "run",
+        );
+        let ds = XrunDataset {
+            xseq: seq.xseq,
+            mask: seq.mask,
+            y: seq.y_prec,
+            p: seq.p,
+            r: seq.r,
+            din: seq.din,
+        };
+        let (tr_ds, va_ds) = split_train_val(&ds, 0.25, 7);
+        assert!(tr_ds.p > 0);
+        assert!(va_ds.p > 0);
+
+        let xrun_train_cfg = XrunTrainConfig {
+            d_model: 16,
+            attn_hidden: 16,
+            head_hidden: vec![8],
+            batch_size: 8,
+            max_epochs: 2,
+            patience: 1,
+            dropout: 0.0,
+            ..Default::default()
+        };
+        let mut xrun_trainer = XrunTrainer::new(xrun_train_cfg.clone(), ds.din, &device)?;
+        let xrun_meta = xrun_trainer.train(&tr_ds, &va_ds, &device)?;
+        save_xrun_checkpoint(
+            &base,
+            &xrun_trainer.varmap,
+            &XrunCheckpointMeta {
+                train: xrun_train_cfg.clone(),
+                predict: XrunPredictConfig {
+                    max_runs: 8,
+                    sort_by: "run".to_string(),
+                    batch_size: 8,
+                },
+                in_dim: ds.din,
+                best_val: Some(xrun_meta.best_val),
+                version: 1,
+            },
+        )?;
+
+        let mut loaded_varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&loaded_varmap, DType::F32, &device);
+        let loaded_model = TopazBagRanker::new(vb.pp("topaz"), &model_cfg)?;
+        load_checkpoint_weights(&base, &mut loaded_varmap)?;
+        let (_xrun_varmap, loaded_xrun, loaded_xrun_meta) =
+            load_xrun_calibrator(&base, &device)?.expect("xrun sidecar should exist");
+
+        let x_feat = rows_to_feature_matrix_with_cols(&rows, &feature_cols, &feature_cols, None);
+        let x_feat_t = Tensor::from_vec(x_feat, (rows.len(), model_cfg.feat_dim), &device)?;
+        let x_trace_t = Tensor::from_slice(
+            &x_trace,
+            (rows.len(), trace_cfg.total_c(), trace_cfg.l),
+            &device,
+        )?;
+        let base_scores =
+            score_candidates(&loaded_model, &x_feat_t, &x_trace_t, 8)?.to_vec1::<f32>()?;
+        let (winner_rows, bag_pid, bag_score, _bag_is_decoy, bag_y) =
+            select_bag_winners(&rows, &base_scores);
+        let winner_trace = synthetic_traces(&winner_rows, trace_cfg.total_c(), trace_cfg.l);
+        let head_out = score_bags_with_heads_from_rows_with_cols(
+            &loaded_model,
+            &winner_rows,
+            &winner_trace,
+            &feature_cols,
+            &feature_cols,
+            trace_cfg.total_c(),
+            trace_cfg.l,
+            1,
+            &device,
+            8,
+            None,
+        )?;
+        let loaded_bag_data = crate::xrun::XrunBagData {
+            bag_score: bag_score.clone(),
+            bag_hidden: head_out.winner_hidden.clone(),
+            hidden_dim: head_out.hidden_dim,
+            bag_y: bag_y.clone(),
+            bag_pid: bag_pid.clone(),
+        };
+        let (delta_bag, _attn_entropy) = crate::xrun::xrun_predict_deltas_for_bags(
+            &loaded_xrun,
+            &loaded_bag_data,
+            &loaded_xrun_meta.predict,
+            &device,
+        )?;
+        let calibrated_scores =
+            apply_xrun_deltas_to_rows(&base_scores, &rows, &bag_pid, &delta_bag);
+
+        assert_eq!(calibrated_scores.len(), rows.len());
+        assert_eq!(bag_pid.len(), bag_data.bag_pid.len());
+        assert_eq!(delta_bag.len(), bag_data.bag_pid.len());
+        assert!(xrun_checkpoint_exists(&base));
+
+        let _ = std::fs::remove_file(base.with_extension("safetensors"));
+        let _ = std::fs::remove_file(base.with_extension("json"));
+        let _ = std::fs::remove_file(base.with_extension("xrun.safetensors"));
+        let _ = std::fs::remove_file(base.with_extension("xrun.json"));
+        Ok(())
+    }
+}
+
 #[cfg(not(all(feature = "io-sqlite", feature = "io-parquet")))]
+/// Stub entry point used when the crate is built without the IO features
+/// required by the XRUN sweep.
 pub fn run_xrun_sweep(_cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     bail!("redeem-topaz built without io-sqlite/io-parquet features");
 }
 
 #[cfg(not(all(feature = "io-sqlite", feature = "io-parquet")))]
+/// Stub entry point used when the crate is built without the IO features
+/// required by training.
 pub fn run_training(_cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     bail!("redeem-topaz built without io-sqlite/io-parquet features");
 }
 
 #[cfg(not(all(feature = "io-sqlite", feature = "io-parquet")))]
+/// Stub entry point used when the crate is built without the IO features
+/// required by inference.
 pub fn run_inference(_cfg: &InferRunConfig) -> Result<InferRunOutput> {
     bail!("redeem-topaz built without io-sqlite/io-parquet features");
 }

@@ -1,8 +1,26 @@
+//! Chunked candidate-level scoring helpers.
+//!
+//! This module provides a thin API boundary around the model-interface trait
+//! used for candidate scoring. Keeping this wrapper separate makes it easier to
+//! share the same chunked scoring path across training diagnostics, offline
+//! inference, and future CLI/report tooling without coupling those call sites
+//! to a specific model implementation.
+
 use candle_core::{Result, Tensor};
 
 use crate::model_interface::CandidateScorerInterface;
 
-/// Scoring rows (candidates) in chunks.
+/// Score a candidate matrix in chunks and return one logit per input row.
+///
+/// # Inputs
+/// - `model`: model implementing [`CandidateScorerInterface`].
+/// - `x_feat`: heuristic feature tensor with shape `(N, D)`.
+/// - `x_trace`: trace tensor with shape `(N, C, L)`.
+/// - `batch_size`: maximum number of rows to score per chunk.
+///
+/// # Output
+/// Returns a tensor of shape `(N,)` containing the raw candidate logits before
+/// any bag-level aggregation or calibration.
 pub fn score_candidates(
     model: &impl CandidateScorerInterface,
     x_feat: &Tensor,  // (N,D)
@@ -12,6 +30,11 @@ pub fn score_candidates(
     model.score_candidates_chunked(x_feat, x_trace, batch_size)
 }
 
+/// Namespace marker for row-scoring utilities.
+///
+/// The current implementation exposes only free functions, but this marker type
+/// keeps the public surface aligned with the rest of the inference modules and
+/// leaves room for future method-based extensions.
 pub struct ScoreRows;
 
 #[cfg(test)]

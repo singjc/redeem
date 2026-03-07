@@ -1,3 +1,6 @@
+//! Loss functions used by the TOPAZ base model and its optional auxiliary
+//! objectives.
+
 use candle_core::{DType, Result, Tensor};
 
 fn softplus(x: &Tensor) -> Result<Tensor> {

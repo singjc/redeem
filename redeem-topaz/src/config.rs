@@ -1,5 +1,11 @@
+//! Training hyper-parameters for the base TOPAZ model.
+
 use serde::{Deserialize, Serialize};
 
+/// Base-model optimization and auxiliary-loss configuration.
+///
+/// This struct intentionally excludes data-loading and trace extraction
+/// settings; those belong to [`crate::run::TrainRunConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {

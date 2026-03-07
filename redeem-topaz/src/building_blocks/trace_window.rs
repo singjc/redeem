@@ -1,6 +1,17 @@
-// redeem-topaz/src/building_blocks/trace_window.rs
+//! Pure helpers for extracting fixed-width trace windows around an expected RT.
+//!
+//! Shape notation used in this module:
+//!
+//! - `L`: requested fixed output length in retention-time samples.
+//! - `Cmax`: maximum number of channels/traces kept for one precursor.
+//!
+//! A returned trace tensor with shape `(Cmax, L)` is stored as a flat
+//! row-major vector where each channel contributes one contiguous window of
+//! length `L`.
 
-/// Return index of nearest element in sorted `rt` to `center_rt`.
+/// Return the index of the RT sample nearest to `center_rt`.
+///
+/// `rt` must be sorted in ascending order.
 pub fn nearest_index_sorted(rt: &[f32], center_rt: f32) -> usize {
     if rt.is_empty() {
         return 0;
@@ -24,11 +35,18 @@ pub fn nearest_index_sorted(rt: &[f32], center_rt: f32) -> usize {
     } else {
         let a = rt[i - 1];
         let b = rt[i];
-        if (center_rt - a).abs() <= (b - center_rt).abs() { i - 1 } else { i }
+        if (center_rt - a).abs() <= (b - center_rt).abs() {
+            i - 1
+        } else {
+            i
+        }
     }
 }
 
-/// Copy a centered window of length L from `x` into a zero-padded output.
+/// Copy a centered window of length `L` from `x` into a zero-padded output.
+///
+/// The returned vector always has length `L`. If the requested window would
+/// extend past either end of `x`, the missing values are filled with zeros.
 pub fn pad_or_crop_centered(x: &[f32], center_idx: isize, l: usize) -> Vec<f32> {
     let mut out = vec![0f32; l];
     if x.is_empty() || l == 0 {
@@ -51,10 +69,20 @@ pub fn pad_or_crop_centered(x: &[f32], center_idx: isize, l: usize) -> Vec<f32> 
     out
 }
 
-/// Build (Cmax,L) trace tensor for a set of transition series.
+/// Build a fixed-size `(Cmax, L)` trace tensor for a set of traces.
 ///
-/// - `series` must be ordered by ordinal then annotation (same as Python).
-/// - normalization: "max" divides by global max over (C,L).
+/// # Inputs
+/// - `series`: traces already ordered deterministically, typically by ordinal
+///   then annotation to match the Python implementation.
+/// - `center_rt`: expected apex RT around which the window is centered.
+/// - `l`: output trace length `L`.
+/// - `cmax`: number of channels kept in the output. Missing channels are
+///   zero-padded.
+/// - `normalize_max`: when `true`, divide the full `(Cmax, L)` block by its
+///   global maximum.
+///
+/// # Output
+/// Returns a row-major flat representation of a `(Cmax, L)` tensor.
 pub fn extract_trace_tensor_centered(
     series: &[crate::io::xic::TransitionTrace],
     center_rt: f32,
@@ -134,11 +162,26 @@ mod tests {
             ordinal: 0,
             ms_level: Some(2),
             points: vec![
-                XicPoint { rt: 0.0, intensity: 0.0 },
-                XicPoint { rt: 1.0, intensity: 1.0 },
-                XicPoint { rt: 2.0, intensity: 2.0 },
-                XicPoint { rt: 3.0, intensity: 3.0 },
-                XicPoint { rt: 4.0, intensity: 4.0 },
+                XicPoint {
+                    rt: 0.0,
+                    intensity: 0.0,
+                },
+                XicPoint {
+                    rt: 1.0,
+                    intensity: 1.0,
+                },
+                XicPoint {
+                    rt: 2.0,
+                    intensity: 2.0,
+                },
+                XicPoint {
+                    rt: 3.0,
+                    intensity: 3.0,
+                },
+                XicPoint {
+                    rt: 4.0,
+                    intensity: 4.0,
+                },
             ],
         };
         let trace_b = TransitionTrace {
@@ -146,11 +189,26 @@ mod tests {
             ordinal: 1,
             ms_level: Some(2),
             points: vec![
-                XicPoint { rt: 0.0, intensity: 10.0 },
-                XicPoint { rt: 1.0, intensity: 11.0 },
-                XicPoint { rt: 2.0, intensity: 12.0 },
-                XicPoint { rt: 3.0, intensity: 13.0 },
-                XicPoint { rt: 4.0, intensity: 14.0 },
+                XicPoint {
+                    rt: 0.0,
+                    intensity: 10.0,
+                },
+                XicPoint {
+                    rt: 1.0,
+                    intensity: 11.0,
+                },
+                XicPoint {
+                    rt: 2.0,
+                    intensity: 12.0,
+                },
+                XicPoint {
+                    rt: 3.0,
+                    intensity: 13.0,
+                },
+                XicPoint {
+                    rt: 4.0,
+                    intensity: 14.0,
+                },
             ],
         };
 
