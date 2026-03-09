@@ -8,6 +8,7 @@ RUN apt-get update && \
     ca-certificates \
     curl \
     libssl-dev \
+    libsqlite3-dev \
     pkg-config \
     clang \
     libstdc++-12-dev \
@@ -35,9 +36,11 @@ COPY redeem-classifiers ./redeem-classifiers
 COPY redeem-cli ./redeem-cli
 COPY redeem-properties ./redeem-properties
 COPY redeem-properties-py ./redeem-properties-py
+COPY redeem-topaz ./redeem-topaz
+COPY redeem-io ./redeem-io
 
 # Build release binary with CUDA
-RUN cargo build --release --bin redeem --features cuda
+RUN cargo build --release --bin redeem --features cuda,io-parquet,io-sqlite,rayon
 
 # Stage 2: Runtime
 FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04 AS runtime
@@ -47,6 +50,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    libsqlite3-0 \
     libstdc++6 \
     libgomp1 \
     && update-ca-certificates && \
