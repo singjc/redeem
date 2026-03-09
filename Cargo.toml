@@ -27,6 +27,7 @@ parquet = "53.0.0"
 flate2 = "1.0"
 log = "0.4"
 filetime = "0.2"
+zip = "2.2.2"
 
 # Candle pinned once, workspace-wide
 candle-core = { version = "0.8.4", default-features = false, features = [] }
