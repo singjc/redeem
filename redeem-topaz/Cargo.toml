@@ -11,6 +11,7 @@ serde_json = { workspace = true }
 log = { workspace = true }
 rayon = { workspace = true, optional = true }
 filetime = { workspace = true }
+zip = { workspace = true }
 
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
@@ -19,6 +20,7 @@ rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
+plotly = "0.12.1"
 
 [features]
 default = ["xrun"]
