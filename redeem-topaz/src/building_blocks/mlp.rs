@@ -38,7 +38,6 @@ impl LayerBlock {
 /// - explicit coelution features `(N, Coe)`.
 pub struct CandidateScorer {
     use_features: bool,
-    feat_dim_used: usize,
     layers: Vec<LayerBlock>,
     head: nn::Linear,
     hidden_dim: usize,
@@ -76,7 +75,6 @@ impl CandidateScorer {
 
         Ok(Self {
             use_features,
-            feat_dim_used,
             layers,
             head,
             hidden_dim: d,

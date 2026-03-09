@@ -144,7 +144,10 @@ impl CoelutionHead {
     }
 
     fn lagged_pairwise_cos_max(&self, z: &Tensor) -> Result<Tensor> {
-        let (_n, _c, l) = z.dims3()?;
+        let (n, _c, l) = z.dims3()?;
+        if self.p == 0 {
+            return Tensor::zeros((n, 0), DType::F32, z.device());
+        }
         let max_lag = self.max_lag as isize;
         let mut sims_per_lag: Vec<Tensor> = Vec::new();
 

@@ -241,7 +241,6 @@ fn counts_for_table(conn: &Connection, table: &str, q: f32) -> Result<(usize, us
 #[derive(Debug)]
 struct Rank1Row {
     run_id: u64,
-    precursor_id: u64,
     pstc_score: f32,
     pstc_q: f32,
     ms2_score: f32,
@@ -298,7 +297,7 @@ fn load_rank1_join(conn: &Connection, pstc_table: &str) -> Result<Vec<Rank1Row>>
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
         let run_id: i64 = r.get(0)?;
-        let precursor_id: i64 = r.get(1)?;
+        let _precursor_id: i64 = r.get(1)?;
         let pstc_score: f32 = r.get(2)?;
         let pstc_q: f32 = r.get(3)?;
         let ms2_score: f32 = r.get(4)?;
@@ -306,7 +305,6 @@ fn load_rank1_join(conn: &Connection, pstc_table: &str) -> Result<Vec<Rank1Row>>
         let decoy: i64 = r.get(6)?;
         out.push(Rank1Row {
             run_id: run_id as u64,
-            precursor_id: precursor_id as u64,
             pstc_score,
             pstc_q,
             ms2_score,

@@ -23,7 +23,7 @@ use crate::checkpoint::{
     read_xrun_checkpoint_meta, save_xrun_checkpoint, xrun_checkpoint_exists,
 };
 use crate::config::Config as TrainConfig;
-use crate::infer::{TraceBuildConfig, XicFetchConfig};
+use crate::infer::{TraceBuildConfig, XicFetchConfig, XimFetchConfig};
 use crate::io::osw::OswReadConfig;
 use crate::model::topaz::TopazConfig;
 use crate::train::TrainFilter;
@@ -31,16 +31,19 @@ use crate::xrun::XrunTrainConfig;
 use crate::xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use crate::building_blocks::bagging::make_bags_with_traces;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::checkpoint::save_checkpoint;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::diagnostics::{print_trace_summary, trace_summary, warn_if_missing_ms1};
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::{
-    SharedXicCache, XicDiskCache, build_score_table_from_rows, build_trace_tensors_from_parquet,
-    build_trace_tensors_from_parquet_cached, build_trace_tensors_from_parquet_map,
-    build_trace_tensors_from_parquet_map_cached, rows_to_feature_matrix_with_cols,
-    score_bags_from_rows_with_cols, score_bags_with_heads_from_rows_with_cols, score_candidates,
-    tdc_summary,
+    SharedXicCache, SharedXimCache, XicDiskCache, XimDiskCache, build_score_table_from_rows,
+    build_trace_tensors_from_parquet, build_trace_tensors_from_parquet_cached,
+    build_trace_tensors_from_parquet_map, build_trace_tensors_from_parquet_map_cached,
+    build_xim_tensors_from_parquet, build_xim_tensors_from_parquet_cached,
+    build_xim_tensors_from_parquet_map, build_xim_tensors_from_parquet_map_cached,
+    rows_to_feature_matrix_with_cols, score_candidates_with_aux, tdc_summary,
 };
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::io::osw::FeatureRow;
@@ -50,14 +53,11 @@ use crate::io::osw::read_feature_rows;
 use crate::model::topaz::TopazBagRanker;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::{
-    Trainer, bags_to_train_batches, filter_training_rows, fit_preprocessor_from_rows_with_cols,
-    split_rows_by_precursor, subsample_train_rows_by_bag,
+    Trainer, bags_to_train_batches, bags_to_train_batches_with_aux, filter_training_rows,
+    fit_preprocessor_from_rows_with_cols, split_rows_by_precursor, subsample_train_rows_by_bag,
 };
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use crate::xrun::pipeline::{
-    XrunPredictConfig, apply_xrun_deltas, apply_xrun_deltas_to_rows, build_xrun_bag_data_from_rows,
-    build_xrun_bag_data_from_rows_with_cols,
-};
+use crate::xrun::pipeline::{XrunPredictConfig, apply_xrun_deltas, apply_xrun_deltas_to_rows};
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::sequence::build_xrun_sequences_from_bags;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -168,32 +168,95 @@ impl Default for FeatureSelectConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrainRunConfig {
+    /// Input OSW SQLite file containing candidate feature rows.
     pub osw_path: PathBuf,
+    /// Single XIC parquet path used when all requested runs live in one file.
+    ///
+    /// This is retained for backward compatibility with the original single-file
+    /// interface. When `xic_paths` or `xic_map_path` is provided they take
+    /// precedence.
     pub xic_path: PathBuf,
+    /// Optional list of XIC parquet files.
+    ///
+    /// This is the common case for OpenSWATH exports where each run is written
+    /// to its own parquet file. The pipeline will infer a run-to-path mapping by
+    /// inspecting the parquet metadata.
+    pub xic_paths: Option<Vec<PathBuf>>,
+    /// Optional explicit run-to-XIC mapping file.
+    ///
+    /// Each row is expected to provide `run_id` and the parquet path to use for
+    /// that run. This is the most reliable option when OSW `RUN_ID` values do
+    /// not match the parquet-internal run IDs.
     pub xic_map_path: Option<PathBuf>,
+    /// Single XIM parquet path used when all requested runs live in one file.
+    pub xim_path: Option<PathBuf>,
+    /// Optional list of XIM parquet files, typically one per run.
+    pub xim_paths: Option<Vec<PathBuf>>,
+    /// Optional explicit run-to-XIM mapping file.
+    pub xim_map_path: Option<PathBuf>,
+    /// Output prefix for the saved model checkpoint bundle.
+    ///
+    /// The base weights, metadata, and optional XRUN sidecar are written into
+    /// `topaz.model` beneath this prefix.
     pub output_prefix: PathBuf,
+    /// Optional checkpoint used to initialize the model before training.
     pub init_checkpoint: Option<PathBuf>,
+    /// Compute device string, e.g. `cpu`, `cuda`, or `cuda:0`.
     pub device: String,
+    /// Maximum padded candidate count per bag.
     pub bag_k: usize,
+    /// Number of bags per optimization step.
     pub batch_size: usize,
+    /// Upper bound on training epochs before early stopping.
     pub max_epochs: usize,
+    /// Fraction of bags held out for validation when no explicit split exists.
     pub val_frac: f32,
+    /// Optional sub-sampling fraction applied to the training bags.
     pub train_frac: f32,
+    /// Whether the train/validation split should preserve run balance.
     pub train_stratify_run: bool,
+    /// Global RNG seed used for splitting, subsampling, and shuffling.
     pub seed: u64,
+    /// Neural-network architecture and feature-fusion settings.
     pub model: TopazConfig,
+    /// Optimizer, loss, and scheduler settings for base model training.
     pub train: TrainConfig,
+    /// XIC extraction settings controlling window length and channel counts.
     pub trace: TraceBuildConfig,
+    /// Optional XIM extraction settings. Required when `model.xim` is enabled.
+    pub xim_trace: Option<TraceBuildConfig>,
+    /// XIC parquet fetch filters such as `MS_LEVEL` and decoy handling.
     pub fetch: XicFetchConfig,
+    /// XIM parquet fetch filters such as mobilogram type and decoy handling.
+    pub xim_fetch: XimFetchConfig,
+    /// OSW reader settings such as feature-table level and selected columns.
     pub osw: OswReadConfig,
+    /// Optional row-level restriction applied before bagging/training.
     pub filter: TrainFilter,
+    /// Policy for selecting scalar heuristic/library features from the OSW table.
     pub feature_select: FeatureSelectConfig,
+    /// Controls extra diagnostics such as embedding export and disagreement tables.
     pub diagnostics: DiagnosticsConfig,
+    /// If `true`, drop OSW rows whose `RUN_ID` is not represented in the XIC map.
     pub restrict_osw_to_xic_map: bool,
+    /// Maximum number of decoded precursor chromatograms stored in memory.
     pub xic_cache_max_precursors: usize,
+    /// Optional on-disk cache root for decoded XIC payloads.
     pub xic_cache_dir: Option<PathBuf>,
+    /// Optional byte budget for the XIC disk cache.
     pub xic_cache_max_bytes: Option<u64>,
+    /// Maximum number of decoded feature mobilograms stored in memory.
+    pub xim_cache_max_features: usize,
+    /// Optional on-disk cache root for decoded XIM payloads.
+    pub xim_cache_dir: Option<PathBuf>,
+    /// Optional byte budget for the XIM disk cache.
+    pub xim_cache_max_bytes: Option<u64>,
+    /// Number of candidate rows to process per inference-style trace chunk.
+    ///
+    /// Training primarily builds train/validation tensors once, but this value is
+    /// also reused in shared utility paths that may need to chunk large row sets.
     pub trace_chunk_size: usize,
+    /// Optional cross-run calibration stage trained after the base model.
     pub xrun: XrunRunConfig,
 }
 
@@ -202,7 +265,11 @@ impl Default for TrainRunConfig {
         Self {
             osw_path: PathBuf::new(),
             xic_path: PathBuf::new(),
+            xic_paths: None,
             xic_map_path: None,
+            xim_path: None,
+            xim_paths: None,
+            xim_map_path: None,
             output_prefix: PathBuf::from("topaz_checkpoint"),
             init_checkpoint: None,
             device: "cpu".to_string(),
@@ -221,7 +288,9 @@ impl Default for TrainRunConfig {
                 ms2_cmax: 6,
                 normalize_max: true,
             },
+            xim_trace: None,
             fetch: XicFetchConfig::default(),
+            xim_fetch: XimFetchConfig::default(),
             osw: OswReadConfig::default(),
             filter: TrainFilter::default(),
             feature_select: FeatureSelectConfig::default(),
@@ -230,6 +299,9 @@ impl Default for TrainRunConfig {
             xic_cache_max_precursors: 50_000,
             xic_cache_dir: None,
             xic_cache_max_bytes: None,
+            xim_cache_max_features: 50_000,
+            xim_cache_dir: None,
+            xim_cache_max_bytes: None,
             trace_chunk_size: 5000,
             xrun: XrunRunConfig::default(),
         }
@@ -240,28 +312,69 @@ impl Default for TrainRunConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InferRunConfig {
+    /// Input OSW SQLite file containing the rows to score.
     pub osw_path: PathBuf,
+    /// Single XIC parquet path used when all requested runs live in one file.
     pub xic_path: PathBuf,
+    /// Optional list of XIC parquet files, typically one per run.
+    pub xic_paths: Option<Vec<PathBuf>>,
+    /// Optional explicit run-to-XIC mapping file.
     pub xic_map_path: Option<PathBuf>,
+    /// Single XIM parquet path used when all requested runs live in one file.
+    pub xim_path: Option<PathBuf>,
+    /// Optional list of XIM parquet files, typically one per run.
+    pub xim_paths: Option<Vec<PathBuf>>,
+    /// Optional explicit run-to-XIM mapping file.
+    pub xim_map_path: Option<PathBuf>,
+    /// Trained checkpoint prefix or `topaz.model` archive to load.
     pub checkpoint: PathBuf,
+    /// TSV file written with per-row TOPAZ scores and derived statistics.
     pub output_tsv: PathBuf,
+    /// Optional OSW SQLite file that should receive score-table writeback.
     pub output_osw: Option<PathBuf>,
+    /// Default output score-table name used when writing a single table.
     pub output_table: String,
+    /// Optional score-table name for uncalibrated base TOPAZ scores.
     pub output_table_base: Option<String>,
+    /// Optional score-table name for XRUN-calibrated TOPAZ scores.
     pub output_table_xrun: Option<String>,
+    /// Compute device string, e.g. `cpu`, `cuda`, or `cuda:0`.
     pub device: String,
+    /// Number of bags scored per forward batch.
     pub batch_size: usize,
+    /// Number of bins used by the simple PEP estimator.
     pub pep_bins: usize,
+    /// Maximum padded candidate count per bag.
     pub bag_k: usize,
+    /// XIC extraction settings controlling window length and channel counts.
     pub trace: TraceBuildConfig,
+    /// Optional XIM extraction settings used when the checkpoint enables XIM.
+    pub xim_trace: Option<TraceBuildConfig>,
+    /// XIC parquet fetch filters.
     pub fetch: XicFetchConfig,
+    /// XIM parquet fetch filters.
+    pub xim_fetch: XimFetchConfig,
+    /// OSW reader settings such as feature-table level and selected columns.
     pub osw: OswReadConfig,
+    /// Controls optional report generation and diagnostic outputs.
     pub diagnostics: DiagnosticsConfig,
+    /// If `true`, drop OSW rows whose `RUN_ID` is not represented in the XIC map.
     pub restrict_osw_to_xic_map: bool,
+    /// Maximum number of decoded precursor chromatograms stored in memory.
     pub xic_cache_max_precursors: usize,
+    /// Optional on-disk cache root for decoded XIC payloads.
     pub xic_cache_dir: Option<PathBuf>,
+    /// Optional byte budget for the XIC disk cache.
     pub xic_cache_max_bytes: Option<u64>,
+    /// Maximum number of decoded feature mobilograms stored in memory.
+    pub xim_cache_max_features: usize,
+    /// Optional on-disk cache root for decoded XIM payloads.
+    pub xim_cache_dir: Option<PathBuf>,
+    /// Optional byte budget for the XIM disk cache.
+    pub xim_cache_max_bytes: Option<u64>,
+    /// Candidate-row chunk size used to keep full-dataset inference bounded in memory.
     pub trace_chunk_size: usize,
+    /// XRUN loading/application settings.
     pub xrun: XrunRunConfig,
 }
 
@@ -270,7 +383,11 @@ impl Default for InferRunConfig {
         Self {
             osw_path: PathBuf::new(),
             xic_path: PathBuf::new(),
+            xic_paths: None,
             xic_map_path: None,
+            xim_path: None,
+            xim_paths: None,
+            xim_map_path: None,
             checkpoint: PathBuf::from("topaz_checkpoint"),
             output_tsv: PathBuf::from("score_topaz.tsv"),
             output_osw: None,
@@ -287,13 +404,18 @@ impl Default for InferRunConfig {
                 ms2_cmax: 6,
                 normalize_max: true,
             },
+            xim_trace: None,
             fetch: XicFetchConfig::default(),
+            xim_fetch: XimFetchConfig::default(),
             osw: OswReadConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             restrict_osw_to_xic_map: false,
             xic_cache_max_precursors: 50_000,
             xic_cache_dir: None,
             xic_cache_max_bytes: None,
+            xim_cache_max_features: 50_000,
+            xim_cache_dir: None,
+            xim_cache_max_bytes: None,
             trace_chunk_size: 5000,
             xrun: XrunRunConfig::default(),
         }
@@ -317,28 +439,68 @@ pub struct InferRunOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct XrunSweepConfig {
+    /// Input OSW SQLite file containing rows aligned across runs.
     pub osw_path: PathBuf,
+    /// Single XIC parquet path used when all requested runs live in one file.
     pub xic_path: PathBuf,
+    /// Optional list of XIC parquet files, typically one per run.
+    pub xic_paths: Option<Vec<PathBuf>>,
+    /// Optional explicit run-to-XIC mapping file.
     pub xic_map_path: Option<PathBuf>,
+    /// Single XIM parquet path used when all requested runs live in one file.
+    pub xim_path: Option<PathBuf>,
+    /// Optional list of XIM parquet files, typically one per run.
+    pub xim_paths: Option<Vec<PathBuf>>,
+    /// Optional explicit run-to-XIM mapping file.
+    pub xim_map_path: Option<PathBuf>,
+    /// Base TOPAZ checkpoint used to generate winner embeddings and bag scores.
     pub checkpoint: PathBuf,
+    /// TSV file summarizing each XRUN hyper-parameter combination.
     pub output_tsv: PathBuf,
+    /// Compute device string, e.g. `cpu`, `cuda`, or `cuda:0`.
     pub device: String,
+    /// XIC extraction settings controlling window length and channel counts.
     pub trace: TraceBuildConfig,
+    /// Optional XIM extraction settings used when the checkpoint enables XIM.
+    pub xim_trace: Option<TraceBuildConfig>,
+    /// XIC parquet fetch filters.
     pub fetch: XicFetchConfig,
+    /// XIM parquet fetch filters.
+    pub xim_fetch: XimFetchConfig,
+    /// OSW reader settings such as feature-table level and selected columns.
     pub osw: OswReadConfig,
+    /// Maximum padded candidate count per bag.
     pub bag_k: usize,
+    /// Number of bags scored per forward batch while building XRUN sequences.
     pub batch_size: usize,
+    /// Fraction of aligned precursors held out for XRUN validation.
     pub val_frac: f32,
+    /// Global RNG seed used for XRUN splitting and training.
     pub seed: u64,
+    /// Hard cap on the number of runs per precursor sequence.
     pub max_runs: usize,
+    /// Sort mode used when constructing precursor-aligned run sequences.
     pub sort_by: String,
+    /// XRUN trainer hyper-parameters shared by every sweep point.
     pub train: XrunTrainConfig,
+    /// Optional set of pooling modes to evaluate.
     pub sweep_pools: Option<Vec<String>>,
+    /// Optional set of temperature values to evaluate.
     pub sweep_taus: Option<Vec<f64>>,
+    /// If `true`, drop OSW rows whose `RUN_ID` is not represented in the XIC map.
     pub restrict_osw_to_xic_map: bool,
+    /// Maximum number of decoded precursor chromatograms stored in memory.
     pub xic_cache_max_precursors: usize,
+    /// Optional on-disk cache root for decoded XIC payloads.
     pub xic_cache_dir: Option<PathBuf>,
+    /// Optional byte budget for the XIC disk cache.
     pub xic_cache_max_bytes: Option<u64>,
+    /// Maximum number of decoded feature mobilograms stored in memory.
+    pub xim_cache_max_features: usize,
+    /// Optional on-disk cache root for decoded XIM payloads.
+    pub xim_cache_dir: Option<PathBuf>,
+    /// Optional byte budget for the XIM disk cache.
+    pub xim_cache_max_bytes: Option<u64>,
 }
 
 impl Default for XrunSweepConfig {
@@ -346,7 +508,11 @@ impl Default for XrunSweepConfig {
         Self {
             osw_path: PathBuf::new(),
             xic_path: PathBuf::new(),
+            xic_paths: None,
             xic_map_path: None,
+            xim_path: None,
+            xim_paths: None,
+            xim_map_path: None,
             checkpoint: PathBuf::from("topaz_checkpoint"),
             output_tsv: PathBuf::from("xrun_sweep.tsv"),
             device: "cpu".to_string(),
@@ -356,7 +522,9 @@ impl Default for XrunSweepConfig {
                 ms2_cmax: 6,
                 normalize_max: true,
             },
+            xim_trace: None,
             fetch: XicFetchConfig::default(),
+            xim_fetch: XimFetchConfig::default(),
             osw: OswReadConfig::default(),
             bag_k: 5,
             batch_size: 256,
@@ -371,6 +539,9 @@ impl Default for XrunSweepConfig {
             xic_cache_max_precursors: 50_000,
             xic_cache_dir: None,
             xic_cache_max_bytes: None,
+            xim_cache_max_features: 50_000,
+            xim_cache_dir: None,
+            xim_cache_max_bytes: None,
         }
     }
 }
@@ -462,18 +633,25 @@ fn align_rows_to_cols(
     out
 }
 
-fn filter_rows_by_trace(
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn filter_rows_by_trace_with_aux(
     rows: Vec<crate::io::osw::FeatureRow>,
     x_trace: Vec<f32>,
+    x_aux: Option<Vec<f32>>,
     c_total: usize,
     l: usize,
-) -> (Vec<crate::io::osw::FeatureRow>, Vec<f32>) {
+    aux_c_total: Option<usize>,
+    aux_l: Option<usize>,
+) -> (Vec<crate::io::osw::FeatureRow>, Vec<f32>, Option<Vec<f32>>) {
     if rows.is_empty() {
-        return (rows, x_trace);
+        return (rows, x_trace, x_aux);
     }
     let mut out_rows = Vec::new();
     let mut out_trace = Vec::new();
+    let mut out_aux = x_aux.as_ref().map(|_| Vec::new());
     let span = c_total * l;
+    let aux_span = aux_c_total.zip(aux_l).map(|(c, l)| c * l);
+
     for (i, row) in rows.into_iter().enumerate() {
         let start = i * span;
         let end = start + span;
@@ -488,13 +666,34 @@ fn filter_rows_by_trace(
         if max_v > 0.0 {
             out_rows.push(row);
             out_trace.extend_from_slice(slice);
+            if let (Some(aux_src), Some(aux_dst), Some(aux_span)) =
+                (x_aux.as_ref(), out_aux.as_mut(), aux_span)
+            {
+                let aux_start = i * aux_span;
+                let aux_end = aux_start + aux_span;
+                aux_dst.extend_from_slice(&aux_src[aux_start..aux_end]);
+            }
         }
     }
-    (out_rows, out_trace)
+    (out_rows, out_trace, out_aux)
+}
+
+fn effective_xim_trace_cfg(
+    explicit: &Option<TraceBuildConfig>,
+    model_cfg: &TopazConfig,
+) -> Option<TraceBuildConfig> {
+    explicit.clone().or_else(|| {
+        model_cfg.xim.as_ref().map(|xim| TraceBuildConfig {
+            l: xim.l,
+            ms1_cmax: xim.ms1_cmax,
+            ms2_cmax: xim.ms2_cmax,
+            normalize_max: true,
+        })
+    })
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn log_run_id_summary(rows: &[FeatureRow], xic_path: &Path) {
+fn log_run_id_summary(rows: &[FeatureRow], xic_path: &Path, xic_paths: &Option<Vec<PathBuf>>) {
     if !log::log_enabled!(log::Level::Info) {
         return;
     }
@@ -503,22 +702,45 @@ fn log_run_id_summary(rows: &[FeatureRow], xic_path: &Path) {
     osw_runs.dedup();
     log::info!("OSW run_ids (n={}): {:?}", osw_runs.len(), osw_runs);
 
-    match crate::io::xic_parquet::list_run_ids(xic_path) {
-        Ok(mut runs) => {
-            runs.sort_unstable();
-            runs.dedup();
-            log::info!("XIC run_ids (n={}): {:?}", runs.len(), runs);
+    let run_ids = if let Some(paths) = xic_paths {
+        let mut set = HashSet::new();
+        for path in paths {
+            match crate::io::xic_parquet::list_run_ids(path) {
+                Ok(runs) => {
+                    for run_id in runs {
+                        set.insert(run_id);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to read XIC run_ids from {:?}: {e:#}", path);
+                }
+            }
         }
-        Err(e) => {
-            log::warn!("Failed to read XIC run_ids: {e:#}");
+        let mut runs: Vec<u64> = set.into_iter().collect();
+        runs.sort_unstable();
+        runs
+    } else {
+        match crate::io::xic_parquet::list_run_ids(xic_path) {
+            Ok(mut runs) => {
+                runs.sort_unstable();
+                runs.dedup();
+                runs
+            }
+            Err(e) => {
+                log::warn!("Failed to read XIC run_ids: {e:#}");
+                Vec::new()
+            }
         }
+    };
+    if !run_ids.is_empty() {
+        log::info!("XIC run_ids (n={}): {:?}", run_ids.len(), run_ids);
     }
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
+fn read_run_path_map(path: &Path, label: &str) -> Result<HashMap<u64, PathBuf>> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read xic_map: {path:?}"))?;
+        .with_context(|| format!("failed to read {label} map: {path:?}"))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut map: HashMap<u64, PathBuf> = HashMap::new();
@@ -573,20 +795,92 @@ fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
         map.insert(run_id, p);
     }
     if map.is_empty() {
-        bail!("xic_map has no usable entries: {path:?}");
+        bail!("{label} map has no usable entries: {path:?}");
     }
     Ok(map)
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn read_xic_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
+    read_run_path_map(path, "XIC")
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn read_xim_map(path: &Path) -> Result<HashMap<u64, PathBuf>> {
+    read_run_path_map(path, "XIM")
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn infer_run_path_map_from_paths<F>(
+    paths: &[PathBuf],
+    label: &str,
+    list_run_ids: F,
+) -> Result<HashMap<u64, PathBuf>>
+where
+    F: Fn(&Path) -> Result<Vec<u64>>,
+{
+    let mut map = HashMap::new();
+    for path in paths {
+        let run_ids = list_run_ids(path)?;
+        if run_ids.is_empty() {
+            log::warn!("{label} path {:?} reported no run_ids", path);
+            continue;
+        }
+        for run_id in run_ids {
+            if let Some(prev) = map.insert(run_id, path.clone()) {
+                bail!(
+                    "{label} paths map the same run_id {run_id} to both {:?} and {:?}",
+                    prev,
+                    path
+                );
+            }
+        }
+    }
+    if map.is_empty() {
+        bail!("no usable run_id -> path mapping could be inferred from {label} paths");
+    }
+    Ok(map)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn resolve_xic_map(
+    xic_paths: &Option<Vec<PathBuf>>,
+    xic_map_path: &Option<PathBuf>,
+) -> Result<Option<HashMap<u64, PathBuf>>> {
+    if let Some(map_path) = xic_map_path {
+        return read_xic_map(map_path).map(Some);
+    }
+    if let Some(paths) = xic_paths {
+        return infer_run_path_map_from_paths(paths, "XIC", crate::io::xic_parquet::list_run_ids)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn resolve_xim_map(
+    xim_paths: &Option<Vec<PathBuf>>,
+    xim_map_path: &Option<PathBuf>,
+) -> Result<Option<HashMap<u64, PathBuf>>> {
+    if let Some(map_path) = xim_map_path {
+        return read_xim_map(map_path).map(Some);
+    }
+    if let Some(paths) = xim_paths {
+        return infer_run_path_map_from_paths(paths, "XIM", crate::io::xim_parquet::list_run_ids)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn filter_rows_by_xic_map(
     rows: Vec<FeatureRow>,
+    xic_paths: &Option<Vec<PathBuf>>,
     xic_map_path: &Option<PathBuf>,
 ) -> Result<Vec<FeatureRow>> {
-    let Some(map_path) = xic_map_path else {
+    let Some(map) = resolve_xic_map(xic_paths, xic_map_path)? else {
         return Ok(rows);
     };
-    let map = read_xic_map(map_path)?;
     let allowed: HashSet<u64> = map.keys().copied().collect();
     let before = rows.len();
     let out: Vec<FeatureRow> = rows
@@ -611,18 +905,21 @@ fn filter_rows_by_xic_map(
 fn build_traces_for_rows(
     rows: &[FeatureRow],
     xic_path: &Path,
+    xic_paths: &Option<Vec<PathBuf>>,
     xic_map_path: &Option<PathBuf>,
     trace: &TraceBuildConfig,
     fetch: &XicFetchConfig,
     cache: Option<&SharedXicCache>,
     disk: Option<&XicDiskCache>,
 ) -> Result<Vec<f32>> {
-    if let Some(map_path) = xic_map_path {
-        let map = read_xic_map(map_path)?;
+    if let Some(map) = resolve_xic_map(xic_paths, xic_map_path)? {
         log::info!(
             "Using XIC map with {} entries from {:?}",
             map.len(),
-            map_path
+            xic_map_path
+                .as_ref()
+                .map(|p| p.as_path())
+                .unwrap_or_else(|| Path::new("<inferred from xic_paths>"))
         );
         if let Some(cache) = cache {
             build_trace_tensors_from_parquet_map_cached(rows, &map, trace, fetch, cache, disk)
@@ -639,10 +936,109 @@ fn build_traces_for_rows(
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn build_xim_for_rows(
+    rows: &[FeatureRow],
+    xim_path: &Option<PathBuf>,
+    xim_paths: &Option<Vec<PathBuf>>,
+    xim_map_path: &Option<PathBuf>,
+    xim_trace: &Option<TraceBuildConfig>,
+    xim_fetch: &XimFetchConfig,
+    cache: Option<&SharedXimCache>,
+    disk: Option<&XimDiskCache>,
+) -> Result<Option<Vec<f32>>> {
+    let Some(trace) = xim_trace.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(map) = resolve_xim_map(xim_paths, xim_map_path)? {
+        log::info!(
+            "Using XIM map with {} entries from {:?}",
+            map.len(),
+            xim_map_path
+                .as_ref()
+                .map(|p| p.as_path())
+                .unwrap_or_else(|| Path::new("<inferred from xim_paths>"))
+        );
+        return if let Some(cache) = cache {
+            build_xim_tensors_from_parquet_map_cached(rows, &map, trace, xim_fetch, cache, disk)
+                .map(Some)
+        } else {
+            build_xim_tensors_from_parquet_map(rows, &map, trace, xim_fetch).map(Some)
+        };
+    }
+    let Some(path) = xim_path.as_ref() else {
+        bail!("XIM branch enabled but neither xim_path/xim_paths nor xim_map_path was provided");
+    };
+    if let Some(cache) = cache {
+        build_xim_tensors_from_parquet_cached(rows, path, trace, xim_fetch, cache, disk).map(Some)
+    } else {
+        build_xim_tensors_from_parquet(rows, path, trace, xim_fetch).map(Some)
+    }
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn build_xim_for_train_val(
+    rows_tr: &[FeatureRow],
+    rows_va: &[FeatureRow],
+    xim_path: &Option<PathBuf>,
+    xim_paths: &Option<Vec<PathBuf>>,
+    xim_map_path: &Option<PathBuf>,
+    xim_trace: &Option<TraceBuildConfig>,
+    xim_fetch: &XimFetchConfig,
+    cache: Option<&SharedXimCache>,
+    disk: Option<&XimDiskCache>,
+) -> Result<(Option<Vec<f32>>, Option<Vec<f32>>)> {
+    let Some(trace) = xim_trace.as_ref() else {
+        return Ok((None, None));
+    };
+    if rows_va.is_empty() {
+        let trace_opt = Some(trace.clone());
+        let x_tr = build_xim_for_rows(
+            rows_tr,
+            xim_path,
+            xim_paths,
+            xim_map_path,
+            &trace_opt,
+            xim_fetch,
+            cache,
+            disk,
+        )?;
+        return Ok((x_tr, None));
+    }
+
+    let mut rows_all = Vec::with_capacity(rows_tr.len() + rows_va.len());
+    rows_all.extend(rows_tr.iter().cloned());
+    rows_all.extend(rows_va.iter().cloned());
+
+    log::info!(
+        "Building XIM mobilograms once for train+val (N={} + {} rows)",
+        rows_tr.len(),
+        rows_va.len()
+    );
+    let trace_opt = Some(trace.clone());
+    let x_all = build_xim_for_rows(
+        &rows_all,
+        xim_path,
+        xim_paths,
+        xim_map_path,
+        &trace_opt,
+        xim_fetch,
+        cache,
+        disk,
+    )?
+    .unwrap_or_default();
+    let span = trace.total_c() * trace.l;
+    let split = rows_tr.len() * span;
+    let x_tr = x_all[..split].to_vec();
+    let x_va = x_all[split..].to_vec();
+    Ok((Some(x_tr), Some(x_va)))
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn build_traces_for_train_val(
     rows_tr: &[FeatureRow],
     rows_va: &[FeatureRow],
     xic_path: &Path,
+    xic_paths: &Option<Vec<PathBuf>>,
     xic_map_path: &Option<PathBuf>,
     trace: &TraceBuildConfig,
     fetch: &XicFetchConfig,
@@ -650,8 +1046,16 @@ fn build_traces_for_train_val(
     disk: Option<&XicDiskCache>,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     if rows_va.is_empty() {
-        let x_tr =
-            build_traces_for_rows(rows_tr, xic_path, xic_map_path, trace, fetch, cache, disk)?;
+        let x_tr = build_traces_for_rows(
+            rows_tr,
+            xic_path,
+            xic_paths,
+            xic_map_path,
+            trace,
+            fetch,
+            cache,
+            disk,
+        )?;
         return Ok((x_tr, Vec::new()));
     }
 
@@ -664,8 +1068,16 @@ fn build_traces_for_train_val(
         rows_tr.len(),
         rows_va.len()
     );
-    let x_all =
-        build_traces_for_rows(&rows_all, xic_path, xic_map_path, trace, fetch, cache, disk)?;
+    let x_all = build_traces_for_rows(
+        &rows_all,
+        xic_path,
+        xic_paths,
+        xic_map_path,
+        trace,
+        fetch,
+        cache,
+        disk,
+    )?;
     let span = trace.total_c() * trace.l;
     let split = rows_tr.len() * span;
     let x_tr = x_all[..split].to_vec();
@@ -711,6 +1123,454 @@ fn select_bag_winners(
         .collect();
 
     (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+struct BagTensorPack {
+    xb: candle_core::Tensor,
+    tb: candle_core::Tensor,
+    tb_aux: Option<candle_core::Tensor>,
+    mask: candle_core::Tensor,
+    y_bag: Vec<f32>,
+    bag_pid: Vec<String>,
+    b: usize,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn build_bag_tensor_pack_with_cols(
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    x_aux: Option<(&[f32], &TraceBuildConfig)>,
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    bag_k: usize,
+    device: &Device,
+    pre: Option<&crate::Preprocessor>,
+) -> Result<BagTensorPack> {
+    let n = rows.len();
+    let d = target_cols.len();
+    let x_feat = rows_to_feature_matrix_with_cols(rows, osw_cols, target_cols, pre);
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
+    let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
+
+    let bags = make_bags_with_traces(
+        &x_feat, n, d, x_trace, c_total, l, &y_rows, &pid_rows, bag_k,
+    );
+    let xb = candle_core::Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
+    let tb = candle_core::Tensor::from_vec(bags.t_bag, (bags.b, bags.k, bags.c, bags.l), device)?;
+    let mask_u8: Vec<u8> = bags.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
+    let mask = candle_core::Tensor::from_vec(mask_u8.clone(), (bags.b, bags.k), device)?;
+
+    let tb_aux = if let Some((x_aux, aux_cfg)) = x_aux {
+        let aux_bags = make_bags_with_traces(
+            &x_feat,
+            n,
+            d,
+            x_aux,
+            aux_cfg.total_c(),
+            aux_cfg.l,
+            &y_rows,
+            &pid_rows,
+            bag_k,
+        );
+        if aux_bags.b != bags.b || aux_bags.k != bags.k || aux_bags.bag_pid != bags.bag_pid {
+            bail!("auxiliary bagging order mismatch between XIC and XIM inputs");
+        }
+        Some(candle_core::Tensor::from_vec(
+            aux_bags.t_bag,
+            (aux_bags.b, aux_bags.k, aux_bags.c, aux_bags.l),
+            device,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(BagTensorPack {
+        xb,
+        tb,
+        tb_aux,
+        mask,
+        y_bag: bags.y_bag,
+        bag_pid: bags.bag_pid,
+        b: bags.b,
+    })
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn score_bags_from_rows_with_cols_with_aux(
+    model: &TopazBagRanker,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    x_aux: Option<(&[f32], &TraceBuildConfig)>,
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    bag_k: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&crate::Preprocessor>,
+) -> Result<crate::infer::BagScoreOutput> {
+    if rows.is_empty() {
+        return Ok(crate::infer::BagScoreOutput {
+            bag_score: Vec::new(),
+            bag_y: Vec::new(),
+            is_decoy: Vec::new(),
+            bag_pid: Vec::new(),
+            winner_hidden: Vec::new(),
+            hidden_dim: 0,
+        });
+    }
+
+    let pack = build_bag_tensor_pack_with_cols(
+        rows,
+        x_trace,
+        x_aux,
+        osw_cols,
+        target_cols,
+        c_total,
+        l,
+        bag_k,
+        device,
+        pre,
+    )?;
+
+    let b = pack.b;
+    let mut bag_scores = Vec::with_capacity(b);
+    let mut hidden: Vec<f32> = Vec::new();
+    let mut hidden_dim = 0usize;
+    let bs = batch_size.max(1);
+
+    let mut i = 0usize;
+    while i < b {
+        let take = (b - i).min(bs);
+        let xb_i = pack.xb.narrow(0, i, take)?;
+        let tb_i = pack.tb.narrow(0, i, take)?;
+        let m_i = pack.mask.narrow(0, i, take)?;
+        let tb_aux_i = if let Some(tb_aux) = pack.tb_aux.as_ref() {
+            Some(tb_aux.narrow(0, i, take)?)
+        } else {
+            None
+        };
+
+        let (_cand, bag, win) =
+            model.forward_bags_with_hidden_aux(&xb_i, &tb_i, &m_i, tb_aux_i.as_ref())?;
+        bag_scores.extend(bag.to_vec1::<f32>()?);
+
+        let win_vec = win.to_vec2::<f32>()?;
+        if hidden_dim == 0 {
+            hidden_dim = win_vec.first().map(|v| v.len()).unwrap_or(0);
+        }
+        for row in win_vec {
+            hidden.extend(row);
+        }
+        i += take;
+    }
+
+    let is_decoy: Vec<bool> = pack.y_bag.iter().map(|&y| y < 0.5).collect();
+    Ok(crate::infer::BagScoreOutput {
+        bag_score: bag_scores,
+        bag_y: pack.y_bag,
+        is_decoy,
+        bag_pid: pack.bag_pid,
+        winner_hidden: hidden,
+        hidden_dim,
+    })
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn score_bags_with_heads_from_rows_with_cols_with_aux(
+    model: &TopazBagRanker,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    x_aux: Option<(&[f32], &TraceBuildConfig)>,
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    bag_k: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&crate::Preprocessor>,
+) -> Result<crate::infer::BagHeadOutput> {
+    if rows.is_empty() {
+        return Ok(crate::infer::BagHeadOutput {
+            bag_score: Vec::new(),
+            bag_y: Vec::new(),
+            is_decoy: Vec::new(),
+            bag_pid: Vec::new(),
+            winner_hidden: Vec::new(),
+            hidden_dim: 0,
+            emb_ms2: Vec::new(),
+            emb_ms2_dim: 0,
+            emb_ms1: Vec::new(),
+            emb_ms1_dim: 0,
+            emb_all: Vec::new(),
+            emb_all_dim: 0,
+            coe_ms2: Vec::new(),
+            coe_ms2_dim: 0,
+            coe_ms1: Vec::new(),
+            coe_ms1_dim: 0,
+            coe_ms12: Vec::new(),
+            coe_ms12_dim: 0,
+            coe_all: Vec::new(),
+            coe_all_dim: 0,
+        });
+    }
+
+    let pack = build_bag_tensor_pack_with_cols(
+        rows,
+        x_trace,
+        x_aux,
+        osw_cols,
+        target_cols,
+        c_total,
+        l,
+        bag_k,
+        device,
+        pre,
+    )?;
+
+    let b = pack.b;
+    let mut bag_scores = Vec::with_capacity(b);
+    let mut hidden: Vec<f32> = Vec::new();
+    let mut hidden_dim = 0usize;
+    let mut emb_ms2 = Vec::new();
+    let mut emb_ms1 = Vec::new();
+    let mut emb_all = Vec::new();
+    let mut coe_ms2 = Vec::new();
+    let mut coe_ms1 = Vec::new();
+    let mut coe_ms12 = Vec::new();
+    let mut coe_all = Vec::new();
+    let mut emb_ms2_dim = 0usize;
+    let mut emb_ms1_dim = 0usize;
+    let mut emb_all_dim = 0usize;
+    let mut coe_ms2_dim = 0usize;
+    let mut coe_ms1_dim = 0usize;
+    let mut coe_ms12_dim = 0usize;
+    let mut coe_all_dim = 0usize;
+    let bs = batch_size.max(1);
+
+    let mut i = 0usize;
+    while i < b {
+        let take = (b - i).min(bs);
+        let xb_i = pack.xb.narrow(0, i, take)?;
+        let tb_i = pack.tb.narrow(0, i, take)?;
+        let m_i = pack.mask.narrow(0, i, take)?;
+        let tb_aux_i = if let Some(tb_aux) = pack.tb_aux.as_ref() {
+            Some(tb_aux.narrow(0, i, take)?)
+        } else {
+            None
+        };
+
+        let (_cand, bag, win, comps) =
+            model.forward_bags_with_heads_aux(&xb_i, &tb_i, &m_i, tb_aux_i.as_ref())?;
+        bag_scores.extend(bag.to_vec1::<f32>()?);
+
+        let win_vec = win.to_vec2::<f32>()?;
+        if hidden_dim == 0 {
+            hidden_dim = win_vec.first().map(|v| v.len()).unwrap_or(0);
+        }
+        for row in win_vec {
+            hidden.extend(row);
+        }
+
+        let emb2 = comps.emb_ms2.to_vec2::<f32>()?;
+        let emb1 = comps.emb_ms1.to_vec2::<f32>()?;
+        let emba = comps.emb_all.to_vec2::<f32>()?;
+        let coe2 = comps.coe_ms2.to_vec2::<f32>()?;
+        let coe1 = comps.coe_ms1.to_vec2::<f32>()?;
+        let coe12b = comps.coe_ms12.to_vec2::<f32>()?;
+        let coeab = comps.coe_all.to_vec2::<f32>()?;
+
+        if emb_ms2_dim == 0 {
+            emb_ms2_dim = emb2.first().map(|v| v.len()).unwrap_or(0);
+        }
+        if emb_ms1_dim == 0 {
+            emb_ms1_dim = emb1.first().map(|v| v.len()).unwrap_or(0);
+        }
+        if emb_all_dim == 0 {
+            emb_all_dim = emba.first().map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms2_dim == 0 {
+            coe_ms2_dim = coe2.first().map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms1_dim == 0 {
+            coe_ms1_dim = coe1.first().map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_ms12_dim == 0 {
+            coe_ms12_dim = coe12b.first().map(|v| v.len()).unwrap_or(0);
+        }
+        if coe_all_dim == 0 {
+            coe_all_dim = coeab.first().map(|v| v.len()).unwrap_or(0);
+        }
+
+        for row in emb2 {
+            emb_ms2.extend(row);
+        }
+        for row in emb1 {
+            emb_ms1.extend(row);
+        }
+        for row in emba {
+            emb_all.extend(row);
+        }
+        for row in coe2 {
+            coe_ms2.extend(row);
+        }
+        for row in coe1 {
+            coe_ms1.extend(row);
+        }
+        for row in coe12b {
+            coe_ms12.extend(row);
+        }
+        for row in coeab {
+            coe_all.extend(row);
+        }
+        i += take;
+    }
+
+    let is_decoy: Vec<bool> = pack.y_bag.iter().map(|&y| y < 0.5).collect();
+    Ok(crate::infer::BagHeadOutput {
+        bag_score: bag_scores,
+        bag_y: pack.y_bag,
+        is_decoy,
+        bag_pid: pack.bag_pid,
+        winner_hidden: hidden,
+        hidden_dim,
+        emb_ms2,
+        emb_ms2_dim,
+        emb_ms1,
+        emb_ms1_dim,
+        emb_all,
+        emb_all_dim,
+        coe_ms2,
+        coe_ms2_dim,
+        coe_ms1,
+        coe_ms1_dim,
+        coe_ms12,
+        coe_ms12_dim,
+        coe_all,
+        coe_all_dim,
+    })
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn build_xrun_bag_data_from_rows_with_cols_with_aux(
+    model: &TopazBagRanker,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    x_aux: Option<(&[f32], &TraceBuildConfig)>,
+    osw_cols: &[String],
+    target_cols: &[String],
+    c_total: usize,
+    l: usize,
+    bag_k: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&crate::Preprocessor>,
+) -> Result<crate::xrun::XrunBagData> {
+    let out = score_bags_from_rows_with_cols_with_aux(
+        model,
+        rows,
+        x_trace,
+        x_aux,
+        osw_cols,
+        target_cols,
+        c_total,
+        l,
+        bag_k,
+        device,
+        batch_size,
+        pre,
+    )?;
+    Ok(crate::xrun::XrunBagData {
+        bag_score: out.bag_score,
+        bag_hidden: out.winner_hidden,
+        hidden_dim: out.hidden_dim,
+        bag_y: out.bag_y,
+        bag_pid: out.bag_pid,
+    })
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn drain_xim_decode_issues(accum: &mut Vec<crate::io::xim_parquet::XimDecodeIssue>) {
+    accum.extend(crate::io::xim_parquet::take_decode_issues());
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn diagnostic_tsv_path(path: &Path, label: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("topaz");
+    parent.join(format!("{stem}.{label}.tsv"))
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn write_xim_decode_issue_tsv(
+    path: &Path,
+    issues: &[crate::io::xim_parquet::XimDecodeIssue],
+) -> Result<()> {
+    let mut uniq = issues.to_vec();
+    uniq.sort();
+    uniq.dedup();
+
+    let mut text = String::new();
+    text.push_str("XIM_PATH\tRUN_ID\tFEATURE_ID\tANNOTATION\tFIELD\tCOMPRESSION\tERROR\n");
+    for issue in uniq {
+        let xim_path = issue.xim_path.display().to_string().replace('\t', " ");
+        let annotation = issue.annotation.replace('\t', " ");
+        let field = issue.field.replace('\t', " ");
+        let error = issue.error.replace(['\t', '\n', '\r'], " ");
+        text.push_str(&format!(
+            "{xim_path}\t{}\t{}\t{annotation}\t{field}\t{}\t{error}\n",
+            issue.run_id, issue.feature_id, issue.compression
+        ));
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn report_xim_decode_issues(
+    stage: &str,
+    issues: &[crate::io::xim_parquet::XimDecodeIssue],
+    out_path: &Path,
+) -> Result<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+
+    let mut uniq = issues.to_vec();
+    uniq.sort();
+    uniq.dedup();
+
+    let mut files = HashSet::new();
+    let mut features = HashSet::new();
+    for issue in &uniq {
+        files.insert(issue.xim_path.clone());
+        features.insert(issue.feature_id);
+    }
+
+    write_xim_decode_issue_tsv(out_path, &uniq)?;
+    log::warn!(
+        "Skipped {} malformed XIM traces during {} loading ({} unique traces across {} features from {} files). Wrote diagnostics to {:?}",
+        issues.len(),
+        stage,
+        uniq.len(),
+        features.len(),
+        files.len(),
+        out_path
+    );
+    Ok(())
 }
 
 fn write_head_embeddings_tsv(path: &Path, out: &crate::infer::BagHeadOutput) -> Result<()> {
@@ -843,6 +1703,26 @@ fn log_xic_cache_stats(label: &str, stats: &crate::infer::XicCacheStats) {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn log_xim_cache_stats(label: &str, stats: &crate::infer::XimCacheStats) {
+    let (mem_hits, disk_hits, misses, stores, evictions) = stats.snapshot();
+    let total = mem_hits + disk_hits + misses;
+    let hit_rate = if total > 0 {
+        (mem_hits + disk_hits) as f64 / (total as f64)
+    } else {
+        0.0
+    };
+    log::info!(
+        "XIM cache stats ({label}): mem_hits={} disk_hits={} misses={} stores={} evictions={} hit_rate={:.3}",
+        mem_hits,
+        disk_hits,
+        misses,
+        stores,
+        evictions,
+        hit_rate
+    );
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn summarize_names(names: &[String], max_show: usize) -> String {
     if names.is_empty() {
         return "none".to_string();
@@ -862,7 +1742,7 @@ fn summarize_names(names: &[String], max_show: usize) -> String {
 
 fn checkpoint_base(path: &Path) -> PathBuf {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        if ext == "safetensors" || ext == "json" {
+        if ext == "safetensors" || ext == "json" || ext == "model" {
             return path.with_extension("");
         }
     }
@@ -870,18 +1750,12 @@ fn checkpoint_base(path: &Path) -> PathBuf {
 }
 
 fn read_checkpoint_meta(base: &Path) -> Result<CheckpointMeta> {
-    let meta_path = base.with_extension("json");
-    let text = std::fs::read_to_string(&meta_path)
-        .with_context(|| format!("failed to read checkpoint meta: {meta_path:?}"))?;
-    let meta: CheckpointMeta = serde_json::from_str(&text)?;
-    Ok(meta)
+    crate::checkpoint::read_checkpoint_meta(base)
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn load_checkpoint_weights(base: &Path, varmap: &mut VarMap) -> Result<()> {
-    let weights = base.with_extension("safetensors");
-    varmap.load(&weights)?;
-    Ok(())
+    crate::checkpoint::load_checkpoint(base, varmap).map(|_| ())
 }
 
 #[cfg(feature = "io-sqlite")]
@@ -931,9 +1805,6 @@ struct XrunAppliedScores {
     row_scores: Vec<f32>,
     bag_pid: Vec<String>,
     bag_score: Vec<f32>,
-    bag_is_decoy: Vec<bool>,
-    bag_y: Vec<f32>,
-    delta_bag: Vec<f32>,
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -944,11 +1815,19 @@ fn apply_xrun_to_row_scores(
     table_feature_cols: &[String],
     target_cols: &[String],
     trace_cfg: &TraceBuildConfig,
+    xim_trace_cfg: Option<&TraceBuildConfig>,
     fetch_cfg: &XicFetchConfig,
+    xim_fetch_cfg: &XimFetchConfig,
     xic_path: &Path,
+    xic_paths: &Option<Vec<PathBuf>>,
     xic_map_path: &Option<PathBuf>,
+    xim_path: &Option<PathBuf>,
+    xim_paths: &Option<Vec<PathBuf>>,
+    xim_map_path: &Option<PathBuf>,
     cache_opt: Option<&SharedXicCache>,
     disk_cache: Option<&XicDiskCache>,
+    xim_cache_opt: Option<&SharedXimCache>,
+    xim_disk_cache: Option<&XimDiskCache>,
     xrun_cfg: &XrunRunConfig,
     xrun_model: &XrunAttentionCalibrator,
     xrun_meta: &XrunCheckpointMeta,
@@ -956,32 +1835,45 @@ fn apply_xrun_to_row_scores(
     base_batch_size: usize,
     pre: Option<&crate::Preprocessor>,
 ) -> Result<XrunAppliedScores> {
-    let (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y) =
+    let (winner_rows, bag_pid, bag_score, _bag_is_decoy, bag_y) =
         select_bag_winners(rows, row_scores);
     if winner_rows.is_empty() {
         return Ok(XrunAppliedScores {
             row_scores: row_scores.to_vec(),
             bag_pid,
             bag_score,
-            bag_is_decoy,
-            bag_y,
-            delta_bag: Vec::new(),
         });
     }
 
     let x_trace = build_traces_for_rows(
         &winner_rows,
         xic_path,
+        xic_paths,
         xic_map_path,
         trace_cfg,
         fetch_cfg,
         cache_opt,
         disk_cache,
     )?;
-    let head_out = score_bags_with_heads_from_rows_with_cols(
+    let xim_trace_owned = xim_trace_cfg.cloned();
+    let x_xim = build_xim_for_rows(
+        &winner_rows,
+        xim_path,
+        xim_paths,
+        xim_map_path,
+        &xim_trace_owned,
+        xim_fetch_cfg,
+        xim_cache_opt,
+        xim_disk_cache,
+    )?;
+    let head_out = score_bags_with_heads_from_rows_with_cols_with_aux(
         model,
         &winner_rows,
         &x_trace,
+        x_xim
+            .as_ref()
+            .zip(xim_trace_cfg)
+            .map(|(x, cfg)| (x.as_slice(), cfg)),
         table_feature_cols,
         target_cols,
         trace_cfg.total_c(),
@@ -1025,9 +1917,6 @@ fn apply_xrun_to_row_scores(
         row_scores,
         bag_pid,
         bag_score,
-        bag_is_decoy,
-        bag_y,
-        delta_bag,
     })
 }
 
@@ -1059,6 +1948,8 @@ fn get_device(device_str: &str) -> Result<Device> {
 /// Train the base TOPAZ model and, optionally, an XRUN calibrator sidecar.
 pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     let device = get_device(&cfg.device)?;
+    crate::io::xim_parquet::clear_decode_issues();
+    let mut xim_decode_issues = Vec::new();
     let init_base: Option<PathBuf> = cfg
         .init_checkpoint
         .as_ref()
@@ -1074,9 +1965,9 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     if rows.is_empty() {
         bail!("no rows after filtering");
     }
-    log_run_id_summary(&rows, &cfg.xic_path);
+    log_run_id_summary(&rows, &cfg.xic_path, &cfg.xic_paths);
     if cfg.restrict_osw_to_xic_map {
-        rows = filter_rows_by_xic_map(rows, &cfg.xic_map_path)?;
+        rows = filter_rows_by_xic_map(rows, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows.is_empty() {
             bail!("no rows after XIC map restriction; check run_id mapping");
         }
@@ -1136,6 +2027,17 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
             model_cfg.feat_dim = selected_cols.len();
         }
     }
+    let xim_trace_cfg = effective_xim_trace_cfg(&cfg.xim_trace, &model_cfg);
+    if model_cfg.xim.is_some() && xim_trace_cfg.is_none() {
+        bail!("model.xim is enabled but no xim_trace configuration could be inferred");
+    }
+    if model_cfg.xim.is_some()
+        && cfg.xim_path.is_none()
+        && cfg.xim_paths.is_none()
+        && cfg.xim_map_path.is_none()
+    {
+        bail!("model.xim is enabled but neither xim_path/xim_paths nor xim_map_path was provided");
+    }
 
     let (mut rows_tr, rows_va) = split_rows_by_precursor(&rows, cfg.val_frac, cfg.seed);
     if cfg.train_frac < 1.0 {
@@ -1169,36 +2071,94 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     } else {
         None
     };
+    let xim_cache = SharedXimCache::new(cfg.xim_cache_max_features);
+    let xim_cache_stats = xim_cache.stats();
+    if xim_cache.is_enabled() {
+        log::info!(
+            "Enabled XIM cache (max_features={})",
+            cfg.xim_cache_max_features
+        );
+    }
+    let xim_disk_cache = match &cfg.xim_cache_dir {
+        Some(dir) => Some(XimDiskCache::new(
+            dir.clone(),
+            cfg.xim_cache_max_bytes,
+            xim_cache_stats.clone(),
+        )?),
+        None => None,
+    };
+    if let Some(dir) = &cfg.xim_cache_dir {
+        log::info!("Enabled XIM disk cache at {:?}", dir);
+    }
+    let xim_cache_opt = if xim_cache.is_enabled() || xim_disk_cache.is_some() {
+        Some(&xim_cache)
+    } else {
+        None
+    };
     let (x_tr, x_va) = build_traces_for_train_val(
         &rows_tr,
         &rows_va,
         &cfg.xic_path,
+        &cfg.xic_paths,
         &cfg.xic_map_path,
         &cfg.trace,
         &cfg.fetch,
         cache_opt,
         disk_cache.as_ref(),
     )?;
+    let (x_tr_xim, x_va_xim) = build_xim_for_train_val(
+        &rows_tr,
+        &rows_va,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+        &cfg.xim_map_path,
+        &xim_trace_cfg,
+        &cfg.xim_fetch,
+        xim_cache_opt,
+        xim_disk_cache.as_ref(),
+    )?;
+    drain_xim_decode_issues(&mut xim_decode_issues);
     log_xic_cache_stats("train", &cache_stats);
+    log_xim_cache_stats("train", &xim_cache_stats);
 
-    let apply_trace_filter = cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_none();
-    if cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_some() {
-        log::info!("XIC map provided; skipping trace-based restriction (run_id filter only)");
+    let apply_trace_filter = cfg.restrict_osw_to_xic_map
+        && resolve_xic_map(&cfg.xic_paths, &cfg.xic_map_path)?.is_none();
+    if cfg.restrict_osw_to_xic_map && resolve_xic_map(&cfg.xic_paths, &cfg.xic_map_path)?.is_some()
+    {
+        log::info!(
+            "XIC map/path list provided; skipping trace-based restriction (run_id filter only)"
+        );
     }
-    let (rows_tr, x_tr) = if apply_trace_filter {
-        filter_rows_by_trace(rows_tr, x_tr, cfg.trace.total_c(), cfg.trace.l)
+    let (rows_tr, x_tr, x_tr_xim) = if apply_trace_filter {
+        filter_rows_by_trace_with_aux(
+            rows_tr,
+            x_tr,
+            x_tr_xim,
+            cfg.trace.total_c(),
+            cfg.trace.l,
+            xim_trace_cfg.as_ref().map(|c| c.total_c()),
+            xim_trace_cfg.as_ref().map(|c| c.l),
+        )
     } else {
-        (rows_tr, x_tr)
+        (rows_tr, x_tr, x_tr_xim)
     };
     if apply_trace_filter && rows_tr.is_empty() {
         bail!(
             "all training rows were dropped after XIC restriction; check run_id match and xic_path"
         );
     }
-    let (rows_va, x_va) = if apply_trace_filter {
-        filter_rows_by_trace(rows_va, x_va, cfg.trace.total_c(), cfg.trace.l)
+    let (rows_va, x_va, x_va_xim) = if apply_trace_filter {
+        filter_rows_by_trace_with_aux(
+            rows_va,
+            x_va,
+            x_va_xim,
+            cfg.trace.total_c(),
+            cfg.trace.l,
+            xim_trace_cfg.as_ref().map(|c| c.total_c()),
+            xim_trace_cfg.as_ref().map(|c| c.l),
+        )
     } else {
-        (rows_va, x_va)
+        (rows_va, x_va, x_va_xim)
     };
 
     let pre = if let Some(meta) = init_meta.as_ref() {
@@ -1293,7 +2253,28 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     } else {
         1.0
     };
-    let batches = bags_to_train_batches(bags, &device, cfg.batch_size)?;
+    let batches =
+        if let (Some(x_tr_xim), Some(xim_cfg)) = (x_tr_xim.as_ref(), xim_trace_cfg.as_ref()) {
+            let aux_bags = crate::building_blocks::bagging::make_bags_with_traces(
+                &x_feat,
+                rows_tr.len(),
+                model_cfg.feat_dim,
+                x_tr_xim,
+                xim_cfg.total_c(),
+                xim_cfg.l,
+                &y_rows,
+                &pid_rows,
+                cfg.bag_k,
+            );
+            bags_to_train_batches_with_aux(
+                bags,
+                Some((aux_bags.t_bag, xim_cfg.total_c(), xim_cfg.l)),
+                &device,
+                cfg.batch_size,
+            )?
+        } else {
+            bags_to_train_batches(bags, &device, cfg.batch_size)?
+        };
 
     let mut trainer = Trainer::new(cfg.train.clone(), &model_cfg, &device)?;
     if let Some(base) = init_base.as_ref() {
@@ -1357,17 +2338,41 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
             &pid_rows_va,
             cfg.bag_k,
         );
-        bags_to_train_batches(bags_va, &device, cfg.batch_size)?
+        if let (Some(x_va_xim), Some(xim_cfg)) = (x_va_xim.as_ref(), xim_trace_cfg.as_ref()) {
+            let aux_bags_va = crate::building_blocks::bagging::make_bags_with_traces(
+                &x_feat_va,
+                rows_va.len(),
+                model_cfg.feat_dim,
+                x_va_xim,
+                xim_cfg.total_c(),
+                xim_cfg.l,
+                &y_rows_va,
+                &pid_rows_va,
+                cfg.bag_k,
+            );
+            bags_to_train_batches_with_aux(
+                bags_va,
+                Some((aux_bags_va.t_bag, xim_cfg.total_c(), xim_cfg.l)),
+                &device,
+                cfg.batch_size,
+            )?
+        } else {
+            bags_to_train_batches(bags_va, &device, cfg.batch_size)?
+        }
     } else {
         Vec::new()
     };
     let _history = trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
 
     if !rows_va.is_empty() {
-        let out = score_bags_from_rows_with_cols(
+        let out = score_bags_from_rows_with_cols_with_aux(
             &trainer.model,
             &rows_va,
             &x_va,
+            x_va_xim
+                .as_ref()
+                .zip(xim_trace_cfg.as_ref())
+                .map(|(x, cfg)| (x.as_slice(), cfg)),
             &table.feature_cols,
             &selected_cols,
             cfg.trace.total_c(),
@@ -1401,10 +2406,22 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         if !x_va.is_empty() {
             x_all.extend_from_slice(&x_va);
         }
-        let out = score_bags_with_heads_from_rows_with_cols(
+        let mut x_all_xim = None;
+        if let Some(x_tr_xim) = x_tr_xim.as_ref() {
+            let mut buf = x_tr_xim.clone();
+            if let Some(x_va_xim) = x_va_xim.as_ref() {
+                buf.extend_from_slice(x_va_xim);
+            }
+            x_all_xim = Some(buf);
+        }
+        let out = score_bags_with_heads_from_rows_with_cols_with_aux(
             &trainer.model,
             &rows_all,
             &x_all,
+            x_all_xim
+                .as_ref()
+                .zip(xim_trace_cfg.as_ref())
+                .map(|(x, cfg)| (x.as_slice(), cfg)),
             &table.feature_cols,
             &selected_cols,
             cfg.trace.total_c(),
@@ -1433,10 +2450,22 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         rows_all.extend(rows_va.iter().cloned());
         let mut x_all = x_tr.clone();
         x_all.extend_from_slice(&x_va);
-        let bag_data = build_xrun_bag_data_from_rows_with_cols(
+        let mut x_all_xim = None;
+        if let Some(x_tr_xim) = x_tr_xim.as_ref() {
+            let mut buf = x_tr_xim.clone();
+            if let Some(x_va_xim) = x_va_xim.as_ref() {
+                buf.extend_from_slice(x_va_xim);
+            }
+            x_all_xim = Some(buf);
+        }
+        let bag_data = build_xrun_bag_data_from_rows_with_cols_with_aux(
             &trainer.model,
             &rows_all,
             &x_all,
+            x_all_xim
+                .as_ref()
+                .zip(xim_trace_cfg.as_ref())
+                .map(|(x, cfg)| (x.as_slice(), cfg)),
             &table.feature_cols,
             &meta.feature_cols,
             cfg.trace.total_c(),
@@ -1492,6 +2521,12 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         }
     }
 
+    report_xim_decode_issues(
+        "train",
+        &xim_decode_issues,
+        &diagnostic_tsv_path(&cfg.output_prefix, "xim_skipped"),
+    )?;
+
     Ok(TrainRunOutput {
         checkpoint_prefix: cfg.output_prefix.clone(),
     })
@@ -1508,6 +2543,8 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
 /// the uncalibrated base table in addition to the final table.
 pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     let device = get_device(&cfg.device)?;
+    crate::io::xim_parquet::clear_decode_issues();
+    let mut xim_decode_issues = Vec::new();
 
     let base = checkpoint_base(&cfg.checkpoint);
     let meta = read_checkpoint_meta(&base)?;
@@ -1522,9 +2559,9 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     if rows.is_empty() {
         bail!("no rows in OSW");
     }
-    log_run_id_summary(&rows, &cfg.xic_path);
+    log_run_id_summary(&rows, &cfg.xic_path, &cfg.xic_paths);
     if cfg.restrict_osw_to_xic_map {
-        rows = filter_rows_by_xic_map(rows, &cfg.xic_map_path)?;
+        rows = filter_rows_by_xic_map(rows, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows.is_empty() {
             bail!("no rows after XIC map restriction; check run_id mapping");
         }
@@ -1554,17 +2591,57 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     } else {
         None
     };
-    let apply_trace_filter = cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_none();
-    if cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_some() {
-        log::info!("XIC map provided; skipping trace-based restriction (run_id filter only)");
-    }
-
     let target_cols = meta.feature_cols.clone();
     let feat_dim = if meta.model.use_heuristic_features {
         meta.model.feat_dim
     } else {
         0
     };
+    let xim_trace_cfg = effective_xim_trace_cfg(&cfg.xim_trace, &meta.model);
+    if meta.model.xim.is_some() && xim_trace_cfg.is_none() {
+        bail!("checkpoint enables model.xim but no xim_trace configuration could be inferred");
+    }
+    if meta.model.xim.is_some()
+        && cfg.xim_path.is_none()
+        && cfg.xim_paths.is_none()
+        && cfg.xim_map_path.is_none()
+    {
+        bail!(
+            "checkpoint enables model.xim but neither xim_path/xim_paths nor xim_map_path was provided"
+        );
+    }
+    let xim_cache = SharedXimCache::new(cfg.xim_cache_max_features);
+    let xim_cache_stats = xim_cache.stats();
+    if xim_cache.is_enabled() {
+        log::info!(
+            "Enabled XIM cache (max_features={})",
+            cfg.xim_cache_max_features
+        );
+    }
+    let xim_disk_cache = match &cfg.xim_cache_dir {
+        Some(dir) => Some(XimDiskCache::new(
+            dir.clone(),
+            cfg.xim_cache_max_bytes,
+            xim_cache_stats.clone(),
+        )?),
+        None => None,
+    };
+    if let Some(dir) = &cfg.xim_cache_dir {
+        log::info!("Enabled XIM disk cache at {:?}", dir);
+    }
+    let xim_cache_opt = if xim_cache.is_enabled() || xim_disk_cache.is_some() {
+        Some(&xim_cache)
+    } else {
+        None
+    };
+    let apply_trace_filter = cfg.restrict_osw_to_xic_map
+        && resolve_xic_map(&cfg.xic_paths, &cfg.xic_map_path)?.is_none();
+    if cfg.restrict_osw_to_xic_map && resolve_xic_map(&cfg.xic_paths, &cfg.xic_map_path)?.is_some()
+    {
+        log::info!(
+            "XIC map/path list provided; skipping trace-based restriction (run_id filter only)"
+        );
+    }
     let chunk_size = if cfg.trace_chunk_size == 0 {
         rows.len().max(1)
     } else {
@@ -1587,22 +2664,41 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         let x_trace = build_traces_for_rows(
             chunk,
             &cfg.xic_path,
+            &cfg.xic_paths,
             &cfg.xic_map_path,
             &cfg.trace,
             &cfg.fetch,
             cache_opt,
             disk_cache.as_ref(),
         )?;
+        let x_xim = build_xim_for_rows(
+            chunk,
+            &cfg.xim_path,
+            &cfg.xim_paths,
+            &cfg.xim_map_path,
+            &xim_trace_cfg,
+            &cfg.xim_fetch,
+            xim_cache_opt,
+            xim_disk_cache.as_ref(),
+        )?;
+        drain_xim_decode_issues(&mut xim_decode_issues);
 
-        let (chunk_rows, x_trace) = if apply_trace_filter {
-            let (rows_f, x_tr_f) =
-                filter_rows_by_trace(chunk.to_vec(), x_trace, cfg.trace.total_c(), cfg.trace.l);
+        let (chunk_rows, x_trace, x_xim) = if apply_trace_filter {
+            let (rows_f, x_tr_f, x_xim_f) = filter_rows_by_trace_with_aux(
+                chunk.to_vec(),
+                x_trace,
+                x_xim,
+                cfg.trace.total_c(),
+                cfg.trace.l,
+                xim_trace_cfg.as_ref().map(|c| c.total_c()),
+                xim_trace_cfg.as_ref().map(|c| c.l),
+            );
             if rows_f.is_empty() {
                 continue;
             }
-            (rows_f, x_tr_f)
+            (rows_f, x_tr_f, x_xim_f)
         } else {
-            (Vec::new(), x_trace)
+            (Vec::new(), x_trace, x_xim)
         };
 
         let row_slice: &[FeatureRow] = if apply_trace_filter {
@@ -1645,7 +2741,23 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             (n_chunk, cfg.trace.total_c(), cfg.trace.l),
             &device,
         )?;
-        let scores_t = score_candidates(&model, &x_feat_t, &x_trace_t, cfg.batch_size.max(1))?;
+        let x_xim_t = if let (Some(x_xim), Some(xim_cfg)) = (x_xim.as_ref(), xim_trace_cfg.as_ref())
+        {
+            Some(candle_core::Tensor::from_slice(
+                x_xim,
+                (n_chunk, xim_cfg.total_c(), xim_cfg.l),
+                &device,
+            )?)
+        } else {
+            None
+        };
+        let scores_t = score_candidates_with_aux(
+            &model,
+            &x_feat_t,
+            &x_trace_t,
+            x_xim_t.as_ref(),
+            cfg.batch_size.max(1),
+        )?;
         let scores_chunk = scores_t.to_vec1::<f32>()?;
 
         if apply_trace_filter {
@@ -1658,6 +2770,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     }
 
     log_xic_cache_stats("infer", &cache_stats);
+    log_xim_cache_stats("infer", &xim_cache_stats);
     if apply_trace_filter {
         rows = rows_scored;
     }
@@ -1690,11 +2803,19 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             &table.feature_cols,
             &target_cols,
             &cfg.trace,
+            xim_trace_cfg.as_ref(),
             &cfg.fetch,
+            &cfg.xim_fetch,
             &cfg.xic_path,
+            &cfg.xic_paths,
             &cfg.xic_map_path,
+            &cfg.xim_path,
+            &cfg.xim_paths,
+            &cfg.xim_map_path,
             cache_opt,
             disk_cache.as_ref(),
+            xim_cache_opt,
+            xim_disk_cache.as_ref(),
             &cfg.xrun,
             &xrun_model,
             &xrun_meta,
@@ -1702,6 +2823,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             cfg.batch_size.max(1),
             meta.preprocess.as_ref(),
         )?;
+        drain_xim_decode_issues(&mut xim_decode_issues);
         log::info!(
             "Applied XRUN calibration to {} bags using {:?} pooling",
             applied.bag_pid.len(),
@@ -1734,16 +2856,32 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 let x_trace = build_traces_for_rows(
                     &winner_rows,
                     &cfg.xic_path,
+                    &cfg.xic_paths,
                     &cfg.xic_map_path,
                     &cfg.trace,
                     &cfg.fetch,
                     cache_opt,
                     disk_cache.as_ref(),
                 )?;
-                let mut out = score_bags_with_heads_from_rows_with_cols(
+                let x_xim = build_xim_for_rows(
+                    &winner_rows,
+                    &cfg.xim_path,
+                    &cfg.xim_paths,
+                    &cfg.xim_map_path,
+                    &xim_trace_cfg,
+                    &cfg.xim_fetch,
+                    xim_cache_opt,
+                    xim_disk_cache.as_ref(),
+                )?;
+                drain_xim_decode_issues(&mut xim_decode_issues);
+                let mut out = score_bags_with_heads_from_rows_with_cols_with_aux(
                     &model,
                     &winner_rows,
                     &x_trace,
+                    x_xim
+                        .as_ref()
+                        .zip(xim_trace_cfg.as_ref())
+                        .map(|(x, cfg)| (x.as_slice(), cfg)),
                     &table.feature_cols,
                     &meta.feature_cols,
                     cfg.trace.total_c(),
@@ -1765,16 +2903,32 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             let x_trace = build_traces_for_rows(
                 &rows,
                 &cfg.xic_path,
+                &cfg.xic_paths,
                 &cfg.xic_map_path,
                 &cfg.trace,
                 &cfg.fetch,
                 cache_opt,
                 disk_cache.as_ref(),
             )?;
-            let mut out = score_bags_with_heads_from_rows_with_cols(
+            let x_xim = build_xim_for_rows(
+                &rows,
+                &cfg.xim_path,
+                &cfg.xim_paths,
+                &cfg.xim_map_path,
+                &xim_trace_cfg,
+                &cfg.xim_fetch,
+                xim_cache_opt,
+                xim_disk_cache.as_ref(),
+            )?;
+            drain_xim_decode_issues(&mut xim_decode_issues);
+            let mut out = score_bags_with_heads_from_rows_with_cols_with_aux(
                 &model,
                 &rows,
                 &x_trace,
+                x_xim
+                    .as_ref()
+                    .zip(xim_trace_cfg.as_ref())
+                    .map(|(x, cfg)| (x.as_slice(), cfg)),
                 &table.feature_cols,
                 &meta.feature_cols,
                 cfg.trace.total_c(),
@@ -1846,6 +3000,12 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         }
     }
 
+    report_xim_decode_issues(
+        "infer",
+        &xim_decode_issues,
+        &diagnostic_tsv_path(&cfg.output_tsv, "xim_skipped"),
+    )?;
+
     Ok(InferRunOutput { n_rows: rows.len() })
 }
 
@@ -1854,6 +3014,8 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
 /// TOPAZ model.
 pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     let device = get_device(&cfg.device)?;
+    crate::io::xim_parquet::clear_decode_issues();
+    let mut xim_decode_issues = Vec::new();
 
     let base = checkpoint_base(&cfg.checkpoint);
     let meta = read_checkpoint_meta(&base)?;
@@ -1869,9 +3031,9 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     } else {
         table.rows
     };
-    log_run_id_summary(&rows_aligned, &cfg.xic_path);
+    log_run_id_summary(&rows_aligned, &cfg.xic_path, &cfg.xic_paths);
     if cfg.restrict_osw_to_xic_map {
-        rows_aligned = filter_rows_by_xic_map(rows_aligned, &cfg.xic_map_path)?;
+        rows_aligned = filter_rows_by_xic_map(rows_aligned, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows_aligned.is_empty() {
             bail!("no rows after XIC map restriction; check run_id mapping");
         }
@@ -1901,30 +3063,97 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
     } else {
         None
     };
+    let xim_trace_cfg = effective_xim_trace_cfg(&cfg.xim_trace, &meta.model);
+    if meta.model.xim.is_some() && xim_trace_cfg.is_none() {
+        bail!("checkpoint enables model.xim but no xim_trace configuration could be inferred");
+    }
+    if meta.model.xim.is_some()
+        && cfg.xim_path.is_none()
+        && cfg.xim_paths.is_none()
+        && cfg.xim_map_path.is_none()
+    {
+        bail!(
+            "checkpoint enables model.xim but neither xim_path/xim_paths nor xim_map_path was provided"
+        );
+    }
+    let xim_cache = SharedXimCache::new(cfg.xim_cache_max_features);
+    let xim_cache_stats = xim_cache.stats();
+    if xim_cache.is_enabled() {
+        log::info!(
+            "Enabled XIM cache (max_features={})",
+            cfg.xim_cache_max_features
+        );
+    }
+    let xim_disk_cache = match &cfg.xim_cache_dir {
+        Some(dir) => Some(XimDiskCache::new(
+            dir.clone(),
+            cfg.xim_cache_max_bytes,
+            xim_cache_stats.clone(),
+        )?),
+        None => None,
+    };
+    if let Some(dir) = &cfg.xim_cache_dir {
+        log::info!("Enabled XIM disk cache at {:?}", dir);
+    }
+    let xim_cache_opt = if xim_cache.is_enabled() || xim_disk_cache.is_some() {
+        Some(&xim_cache)
+    } else {
+        None
+    };
     let x_trace = build_traces_for_rows(
         &rows_aligned,
         &cfg.xic_path,
+        &cfg.xic_paths,
         &cfg.xic_map_path,
         &cfg.trace,
         &cfg.fetch,
         cache_opt,
         disk_cache.as_ref(),
     )?;
+    let x_xim = build_xim_for_rows(
+        &rows_aligned,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+        &cfg.xim_map_path,
+        &xim_trace_cfg,
+        &cfg.xim_fetch,
+        xim_cache_opt,
+        xim_disk_cache.as_ref(),
+    )?;
+    drain_xim_decode_issues(&mut xim_decode_issues);
     log_xic_cache_stats("xrun", &cache_stats);
-    let apply_trace_filter = cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_none();
-    if cfg.restrict_osw_to_xic_map && cfg.xic_map_path.is_some() {
-        log::info!("XIC map provided; skipping trace-based restriction (run_id filter only)");
+    log_xim_cache_stats("xrun", &xim_cache_stats);
+    let apply_trace_filter = cfg.restrict_osw_to_xic_map
+        && resolve_xic_map(&cfg.xic_paths, &cfg.xic_map_path)?.is_none();
+    if cfg.restrict_osw_to_xic_map && resolve_xic_map(&cfg.xic_paths, &cfg.xic_map_path)?.is_some()
+    {
+        log::info!(
+            "XIC map/path list provided; skipping trace-based restriction (run_id filter only)"
+        );
     }
-    let (rows_aligned, x_trace) = if apply_trace_filter {
-        filter_rows_by_trace(rows_aligned, x_trace, cfg.trace.total_c(), cfg.trace.l)
+    let (rows_aligned, x_trace, x_xim) = if apply_trace_filter {
+        filter_rows_by_trace_with_aux(
+            rows_aligned,
+            x_trace,
+            x_xim,
+            cfg.trace.total_c(),
+            cfg.trace.l,
+            xim_trace_cfg.as_ref().map(|c| c.total_c()),
+            xim_trace_cfg.as_ref().map(|c| c.l),
+        )
     } else {
-        (rows_aligned, x_trace)
+        (rows_aligned, x_trace, x_xim)
     };
-    let bag_data = build_xrun_bag_data_from_rows(
+    let bag_data = build_xrun_bag_data_from_rows_with_cols_with_aux(
         &model,
         &rows_aligned,
         &x_trace,
-        meta.model.feat_dim,
+        x_xim
+            .as_ref()
+            .zip(xim_trace_cfg.as_ref())
+            .map(|(x, cfg)| (x.as_slice(), cfg)),
+        &table.feature_cols,
+        &meta.feature_cols,
         cfg.trace.total_c(),
         cfg.trace.l,
         cfg.bag_k,
@@ -1991,6 +3220,11 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
         text.push_str(&format!("{}\t{}\t{}\n", r.pool, r.tau, r.best_val));
     }
     std::fs::write(&cfg.output_tsv, text)?;
+    report_xim_decode_issues(
+        "xrun",
+        &xim_decode_issues,
+        &diagnostic_tsv_path(&cfg.output_tsv, "xim_skipped"),
+    )?;
     Ok(rows)
 }
 
@@ -1999,6 +3233,7 @@ mod tests {
     use super::*;
     use crate::building_blocks::trace_input::TraceInputMode;
     use crate::checkpoint::save_checkpoint;
+    use crate::io::xim_parquet::XimDecodeIssue;
     use candle_core::{DType, Tensor};
     use candle_nn::VarBuilder;
 
@@ -2010,6 +3245,40 @@ mod tests {
             .as_nanos();
         p.push(format!("redeem_topaz_{name}_{stamp}"));
         p
+    }
+
+    #[test]
+    fn test_diagnostic_tsv_path_uses_input_stem() {
+        let p = diagnostic_tsv_path(Path::new("scores/output.tsv"), "xim_skipped");
+        assert_eq!(p, PathBuf::from("scores/output.xim_skipped.tsv"));
+
+        let p = diagnostic_tsv_path(Path::new("checkpoints/topaz_v1"), "xim_skipped");
+        assert_eq!(p, PathBuf::from("checkpoints/topaz_v1.xim_skipped.tsv"));
+    }
+
+    #[test]
+    fn test_write_xim_decode_issue_tsv_dedups_rows() -> Result<()> {
+        let path = tmp_base("xim_decode_issue").with_extension("tsv");
+        let issue = XimDecodeIssue {
+            xim_path: PathBuf::from("run1.xim"),
+            run_id: 7,
+            feature_id: 42,
+            annotation: "y7".to_string(),
+            field: "MOBILITY_DATA".to_string(),
+            compression: 5,
+            error: "data too small".to_string(),
+        };
+        write_xim_decode_issue_tsv(&path, &[issue.clone(), issue])?;
+        let text = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "XIM_PATH\tRUN_ID\tFEATURE_ID\tANNOTATION\tFIELD\tCOMPRESSION\tERROR"
+        );
+        assert!(lines[1].contains("run1.xim\t7\t42\ty7\tMOBILITY_DATA\t5\tdata too small"));
+        Ok(())
     }
 
     fn synthetic_rows() -> Vec<FeatureRow> {
@@ -2025,6 +3294,11 @@ mod tests {
                     run_id,
                     group_id: format!("{run_id}_{prec}"),
                     exp_rt: 1000.0 + prec as f32 * 0.1 + ri as f32,
+                    rt_left_width: None,
+                    rt_right_width: None,
+                    exp_im: Some(1.0 + ri as f32 * 0.01),
+                    exp_im_left_width: Some(0.95),
+                    exp_im_right_width: Some(1.05),
                     is_decoy: prec % 2 == 0,
                     features: vec![
                         prec as f32 * 0.001,
@@ -2099,10 +3373,11 @@ mod tests {
         };
         save_checkpoint(&base, &trainer.varmap, &meta)?;
 
-        let bag_data = build_xrun_bag_data_from_rows_with_cols(
+        let bag_data = build_xrun_bag_data_from_rows_with_cols_with_aux(
             &trainer.model,
             &rows,
             &x_trace,
+            None,
             &feature_cols,
             &feature_cols,
             trace_cfg.total_c(),
@@ -2175,15 +3450,16 @@ mod tests {
             (rows.len(), trace_cfg.total_c(), trace_cfg.l),
             &device,
         )?;
-        let base_scores =
-            score_candidates(&loaded_model, &x_feat_t, &x_trace_t, 8)?.to_vec1::<f32>()?;
+        let base_scores = crate::infer::score_candidates(&loaded_model, &x_feat_t, &x_trace_t, 8)?
+            .to_vec1::<f32>()?;
         let (winner_rows, bag_pid, bag_score, _bag_is_decoy, bag_y) =
             select_bag_winners(&rows, &base_scores);
         let winner_trace = synthetic_traces(&winner_rows, trace_cfg.total_c(), trace_cfg.l);
-        let head_out = score_bags_with_heads_from_rows_with_cols(
+        let head_out = score_bags_with_heads_from_rows_with_cols_with_aux(
             &loaded_model,
             &winner_rows,
             &winner_trace,
+            None,
             &feature_cols,
             &feature_cols,
             trace_cfg.total_c(),
@@ -2214,10 +3490,112 @@ mod tests {
         assert_eq!(delta_bag.len(), bag_data.bag_pid.len());
         assert!(xrun_checkpoint_exists(&base));
 
-        let _ = std::fs::remove_file(base.with_extension("safetensors"));
-        let _ = std::fs::remove_file(base.with_extension("json"));
-        let _ = std::fs::remove_file(base.with_extension("xrun.safetensors"));
-        let _ = std::fs::remove_file(base.with_extension("xrun.json"));
+        let _ = std::fs::remove_file(base.with_extension("model"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_xim_branch_smoke_end_to_end() -> Result<()> {
+        let device = Device::Cpu;
+        let rows = synthetic_rows();
+        let feature_cols = vec!["f0".to_string(), "f1".to_string()];
+
+        let model_cfg = TopazConfig {
+            feat_dim: 2,
+            ms2_cmax: 2,
+            ms1_cmax: 0,
+            l: 8,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: TraceInputMode::Single,
+            use_heuristic_features: true,
+            use_coelution_head: false,
+            xim: Some(crate::model::topaz::TopazXimConfig {
+                ms2_cmax: 3,
+                ms1_cmax: 1,
+                l: 12,
+                trace_emb_dim: 6,
+                trace_input_mode: TraceInputMode::Single,
+                use_coelution_head: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let trace_cfg = TraceBuildConfig {
+            l: model_cfg.l,
+            ms1_cmax: model_cfg.ms1_cmax,
+            ms2_cmax: model_cfg.ms2_cmax,
+            normalize_max: false,
+        };
+        let xim_cfg = effective_xim_trace_cfg(&None, &model_cfg).expect("xim config should exist");
+
+        let train_cfg = TrainConfig {
+            learning_rate: 1e-3,
+            lambda_pair: 0.0,
+            lambda_inbag: 0.0,
+            lambda_winner_margin: 0.0,
+            ..Default::default()
+        };
+        let trainer = Trainer::new(train_cfg, &model_cfg, &device)?;
+
+        let x_trace = synthetic_traces(&rows, trace_cfg.total_c(), trace_cfg.l);
+        let x_xim = synthetic_traces(&rows, xim_cfg.total_c(), xim_cfg.l);
+        let x_feat = rows_to_feature_matrix_with_cols(&rows, &feature_cols, &feature_cols, None);
+        let x_feat_t = Tensor::from_vec(x_feat, (rows.len(), model_cfg.feat_dim), &device)?;
+        let x_trace_t = Tensor::from_slice(
+            &x_trace,
+            (rows.len(), trace_cfg.total_c(), trace_cfg.l),
+            &device,
+        )?;
+        let x_xim_t =
+            Tensor::from_slice(&x_xim, (rows.len(), xim_cfg.total_c(), xim_cfg.l), &device)?;
+
+        let scores = crate::infer::score_candidates_with_aux(
+            &trainer.model,
+            &x_feat_t,
+            &x_trace_t,
+            Some(&x_xim_t),
+            8,
+        )?
+        .to_vec1::<f32>()?;
+        assert_eq!(scores.len(), rows.len());
+
+        let head_out = score_bags_with_heads_from_rows_with_cols_with_aux(
+            &trainer.model,
+            &rows,
+            &x_trace,
+            Some((x_xim.as_slice(), &xim_cfg)),
+            &feature_cols,
+            &feature_cols,
+            trace_cfg.total_c(),
+            trace_cfg.l,
+            1,
+            &device,
+            8,
+            None,
+        )?;
+        assert_eq!(head_out.bag_pid.len(), rows.len());
+        assert!(head_out.hidden_dim > 0);
+        assert!(head_out.emb_all_dim >= head_out.emb_ms2_dim);
+        assert!(head_out.coe_all_dim >= head_out.coe_ms2_dim);
+
+        let bag_data = build_xrun_bag_data_from_rows_with_cols_with_aux(
+            &trainer.model,
+            &rows,
+            &x_trace,
+            Some((x_xim.as_slice(), &xim_cfg)),
+            &feature_cols,
+            &feature_cols,
+            trace_cfg.total_c(),
+            trace_cfg.l,
+            1,
+            &device,
+            8,
+            None,
+        )?;
+        assert_eq!(bag_data.bag_pid.len(), rows.len());
+        assert!(bag_data.hidden_dim > 0);
         Ok(())
     }
 }

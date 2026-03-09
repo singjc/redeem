@@ -259,9 +259,30 @@ pub fn bags_to_train_batches(
     device: &Device,
     batch_size: usize,
 ) -> Result<Vec<TrainBatch>> {
+    bags_to_train_batches_with_aux(bags, None, device, batch_size)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Convert flattened bag buffers plus an optional auxiliary signal tensor into
+/// a vector of tensor mini-batches.
+pub fn bags_to_train_batches_with_aux(
+    bags: Bags,
+    aux: Option<(Vec<f32>, usize, usize)>,
+    device: &Device,
+    batch_size: usize,
+) -> Result<Vec<TrainBatch>> {
     let b = bags.b;
     let xb = Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
     let tb = Tensor::from_vec(bags.t_bag, (bags.b, bags.k, bags.c, bags.l), device)?;
+    let tb_aux = if let Some((data, c_aux, l_aux)) = aux {
+        Some(Tensor::from_vec(
+            data,
+            (bags.b, bags.k, c_aux, l_aux),
+            device,
+        )?)
+    } else {
+        None
+    };
     let mask_u8: Vec<u8> = bags.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
     let mask = Tensor::from_vec(mask_u8, (bags.b, bags.k), device)?;
     let yb = Tensor::from_vec(bags.y_bag, (bags.b,), device)?;
@@ -273,11 +294,17 @@ pub fn bags_to_train_batches(
         let take = (b - i).min(bs);
         let xb_i = xb.narrow(0, i, take)?;
         let tb_i = tb.narrow(0, i, take)?;
+        let tb_aux_i = if let Some(tb_aux) = tb_aux.as_ref() {
+            Some(tb_aux.narrow(0, i, take)?)
+        } else {
+            None
+        };
         let m_i = mask.narrow(0, i, take)?;
         let yb_i = yb.narrow(0, i, take)?;
         out.push(TrainBatch {
             xb: xb_i,
             tb: tb_i,
+            tb_aux: tb_aux_i,
             mask: m_i,
             yb: yb_i,
         });

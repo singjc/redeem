@@ -52,9 +52,10 @@ pub mod xrun;
 
 pub mod checkpoint;
 pub mod config;
+pub mod inspect;
 pub mod model_interface;
 
-pub use model::topaz::{TopazBagRanker, TopazConfig};
+pub use model::topaz::{TopazBagRanker, TopazConfig, TopazXimConfig};
 pub use model_interface::{
     BagRankerInterface, BagRankerWithHiddenInterface, CandidateScorerInterface, ModelInterface,
 };

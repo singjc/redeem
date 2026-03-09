@@ -30,6 +30,20 @@ pub fn score_candidates(
     model.score_candidates_chunked(x_feat, x_trace, batch_size)
 }
 
+/// Score a candidate matrix in chunks with an optional auxiliary signal tensor.
+///
+/// `x_aux`, when present, is aligned row-for-row with `x_trace` and is used by
+/// models that consume a secondary signal modality such as ion-mobilograms.
+pub fn score_candidates_with_aux(
+    model: &impl CandidateScorerInterface,
+    x_feat: &Tensor,
+    x_trace: &Tensor,
+    x_aux: Option<&Tensor>,
+    batch_size: usize,
+) -> Result<Tensor> {
+    model.score_candidates_chunked_aux(x_feat, x_trace, x_aux, batch_size)
+}
+
 /// Namespace marker for row-scoring utilities.
 ///
 /// The current implementation exposes only free functions, but this marker type

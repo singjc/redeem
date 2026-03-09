@@ -29,12 +29,20 @@ pub use pipeline::build_trace_tensors_from_parquet_cached;
 pub use pipeline::build_trace_tensors_from_parquet_map;
 #[cfg(feature = "io-parquet")]
 pub use pipeline::build_trace_tensors_from_parquet_map_cached;
+#[cfg(feature = "io-parquet")]
+pub use pipeline::build_xim_tensors_from_parquet;
+#[cfg(feature = "io-parquet")]
+pub use pipeline::build_xim_tensors_from_parquet_cached;
+#[cfg(feature = "io-parquet")]
+pub use pipeline::build_xim_tensors_from_parquet_map;
+#[cfg(feature = "io-parquet")]
+pub use pipeline::build_xim_tensors_from_parquet_map_cached;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 pub use pipeline::infer_score_table_from_osw_xic;
 #[cfg(feature = "io-sqlite")]
 pub use pipeline::read_osw_features;
 pub use pipeline::{
-    BagHeadOutput, BagScoreOutput, TraceBuildConfig, XicFetchConfig,
+    BagHeadOutput, BagScoreOutput, TraceBuildConfig, XicFetchConfig, XimFetchConfig,
     build_trace_tensors_from_source, rows_to_feature_matrix, rows_to_feature_matrix_preprocessed,
     rows_to_feature_matrix_with_cols, score_bags_from_rows, score_bags_from_rows_with_cols,
     score_bags_with_heads_from_rows, score_bags_with_heads_from_rows_with_cols,
@@ -42,8 +50,10 @@ pub use pipeline::{
 };
 #[cfg(feature = "io-parquet")]
 pub use pipeline::{SharedXicCache, XicCacheStats, XicDiskCache};
-pub use score_bags::{ScoreBags, score_bags};
-pub use score_rows::{ScoreRows, score_candidates};
+#[cfg(feature = "io-parquet")]
+pub use pipeline::{SharedXimCache, XimCacheStats, XimDiskCache};
+pub use score_bags::{ScoreBags, score_bags, score_bags_with_aux};
+pub use score_rows::{ScoreRows, score_candidates, score_candidates_with_aux};
 pub use score_table::{
     ScoreTableRow, build_score_table, build_score_table_from_rows, write_score_tsv,
 };

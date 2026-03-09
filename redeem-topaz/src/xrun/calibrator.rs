@@ -101,9 +101,15 @@ impl XrunAttentionCalibrator {
     /// - `delta`: additive correction to apply to each run's bag score
     /// - `attn`: precursor-specific attention distribution over runs
     pub fn forward_masked(&self, x: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
+        // XRUN batches are typically built with `narrow(0, ...)` over a large
+        // `(P, R, D_in)` tensor. Candle's linear/matmul path requires
+        // contiguous input layouts, so normalize the batch layout at the
+        // boundary here instead of relying on every call site to do it.
+        let x = x.contiguous()?;
+        let mask = mask.contiguous()?;
         let (b, r, _d) = x.dims3()?;
 
-        let r_proj = x.apply(&self.proj)?; // (B,R,dm)
+        let r_proj = x.apply(&self.proj)?.contiguous()?; // (B,R,dm)
 
         // attn logits
         let a_logits = r_proj.apply(&self.attn)?.squeeze(2)?; // (B,R)
@@ -119,10 +125,10 @@ impl XrunAttentionCalibrator {
         // context = sum(r_proj * a)
         let a3 = a.unsqueeze(2)?; // (B,R,1)
         let context = r_proj.broadcast_mul(&a3)?.sum_keepdim(1)?; // (B,1,dm)
-        let ctx = context.broadcast_as(r_proj.dims())?;
+        let ctx = context.broadcast_as(r_proj.dims())?.contiguous()?;
 
         // delta head on concat([r_proj, ctx])
-        let cat = Tensor::cat(&[r_proj, ctx], 2)?; // (B,R,2dm)
+        let cat = Tensor::cat(&[r_proj, ctx], 2)?.contiguous()?; // (B,R,2dm)
         let mut dlt = cat.apply(&self.delta)?.squeeze(2)?; // (B,R)
         dlt = (&dlt * &m)?;
 
@@ -148,5 +154,46 @@ impl XrunAttentionCalibrator {
         }
 
         Ok((dlt, a))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+    use candle_nn::{VarBuilder, VarMap};
+
+    #[test]
+    fn test_forward_masked_accepts_narrowed_batch() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = XrunConfig {
+            in_dim: 128,
+            d_model: 64,
+            attn_hidden: 32,
+            head_hidden: vec![32],
+            dropout: 0.0,
+            center_delta: true,
+            delta_clip: Some(5.0),
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = XrunAttentionCalibrator::new(vb.pp("xrun"), cfg)?;
+
+        let p = 256usize;
+        let r = 64usize;
+        let din = 128usize;
+        let xseq: Vec<f32> = (0..p * r * din)
+            .map(|i| ((i % 37) as f32) * 0.01)
+            .collect();
+        let mask_u8 = vec![1u8; p * r];
+        let x = Tensor::from_vec(xseq, (p, r, din), &device)?;
+        let m = Tensor::from_vec(mask_u8, (p, r), &device)?;
+
+        let xb = x.narrow(0, 64, 128)?;
+        let mb = m.narrow(0, 64, 128)?;
+        let (delta, attn) = model.forward_masked(&xb, &mb)?;
+        assert_eq!(delta.dims2()?, (128, 64));
+        assert_eq!(attn.dims2()?, (128, 64));
+        Ok(())
     }
 }

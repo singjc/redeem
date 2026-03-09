@@ -42,6 +42,20 @@ pub trait ModelInterface: Sized {
 /// returns one raw logit per row. No bagging or cross-run calibration happens
 /// at this stage.
 pub trait CandidateScorerInterface {
+    /// Score a flat batch of candidate rows with an optional auxiliary signal
+    /// tensor.
+    ///
+    /// `x_aux`, when present, is a second `(N, C_aux, L_aux)` tensor aligned
+    /// row-for-row with `x_trace`. TOPAZ uses this for optional ion-mobilogram
+    /// inputs (`XIM`) while keeping the base XIC-only API available for older
+    /// call sites.
+    fn forward_candidates_aux(
+        &self,
+        x_feat: &Tensor,
+        x_trace: &Tensor,
+        x_aux: Option<&Tensor>,
+    ) -> Result<Tensor>;
+
     /// Score a flat batch of candidate rows.
     ///
     /// # Inputs
@@ -54,7 +68,43 @@ pub trait CandidateScorerInterface {
     ///
     /// # Output
     /// Returns `(N,)` logits, one per candidate row.
-    fn forward_candidates(&self, x_feat: &Tensor, x_trace: &Tensor) -> Result<Tensor>; // (N,)
+    fn forward_candidates(&self, x_feat: &Tensor, x_trace: &Tensor) -> Result<Tensor> {
+        self.forward_candidates_aux(x_feat, x_trace, None)
+    } // (N,)
+
+    /// Default chunked candidate scoring with an optional auxiliary tensor.
+    fn score_candidates_chunked_aux(
+        &self,
+        x_feat: &Tensor,
+        x_trace: &Tensor,
+        x_aux: Option<&Tensor>,
+        batch_size: usize,
+    ) -> Result<Tensor> {
+        let (n, _d) = x_feat.dims2()?;
+        let mut out: Vec<Tensor> = Vec::new();
+        let bs = batch_size.max(1);
+
+        let mut i = 0usize;
+        while i < n {
+            let take = (n - i).min(bs);
+            let xf = x_feat.narrow(0, i, take)?;
+            let tf = x_trace.narrow(0, i, take)?;
+            let ta = if let Some(xa) = x_aux {
+                Some(xa.narrow(0, i, take)?)
+            } else {
+                None
+            };
+            let logits = self.forward_candidates_aux(&xf, &tf, ta.as_ref())?;
+            out.push(logits);
+            i += take;
+        }
+
+        if out.is_empty() {
+            Tensor::zeros((0usize,), DType::F32, x_feat.device())
+        } else {
+            Tensor::cat(&out, 0)
+        }
+    }
 
     /// Default chunked candidate scoring (shared by all models that implement
     /// [`Self::forward_candidates`].
@@ -67,25 +117,7 @@ pub trait CandidateScorerInterface {
         x_trace: &Tensor, // (N,C,L)
         batch_size: usize,
     ) -> Result<Tensor> {
-        let (n, _d) = x_feat.dims2()?;
-        let mut out: Vec<Tensor> = Vec::new();
-        let bs = batch_size.max(1);
-
-        let mut i = 0usize;
-        while i < n {
-            let take = (n - i).min(bs);
-            let xf = x_feat.narrow(0, i, take)?;
-            let tf = x_trace.narrow(0, i, take)?;
-            let logits = self.forward_candidates(&xf, &tf)?;
-            out.push(logits);
-            i += take;
-        }
-
-        if out.is_empty() {
-            Tensor::zeros((0usize,), DType::F32, x_feat.device())
-        } else {
-            Tensor::cat(&out, 0)
-        }
+        self.score_candidates_chunked_aux(x_feat, x_trace, None, batch_size)
     }
 }
 
@@ -96,6 +128,18 @@ pub trait CandidateScorerInterface {
 /// bag logit is produced by masked max pooling over candidate logits, matching
 /// the Python PSTC implementation.
 pub trait BagRankerInterface {
+    /// Score a batch of bags with an optional auxiliary signal tensor aligned
+    /// to `tb`.
+    ///
+    /// `tb_aux`, when present, has shape `(B, K, C_aux, L_aux)`.
+    fn forward_bags_aux(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        tb_aux: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)>;
+
     /// Score a batch of bags.
     ///
     /// # Inputs
@@ -110,17 +154,17 @@ pub trait BagRankerInterface {
     /// Returns:
     /// - candidate logits `(B, K)`
     /// - bag logits `(B,)`, usually computed by masked max MIL pooling.
-    fn forward_bags(&self, xb: &Tensor, tb: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)>;
+    fn forward_bags(&self, xb: &Tensor, tb: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.forward_bags_aux(xb, tb, mask, None)
+    }
 
-    /// Default chunked bag scoring.
-    ///
-    /// This preserves bag order and concatenates the per-chunk results back
-    /// into the full `(B, K)` / `(B,)` outputs.
-    fn score_bags_chunked(
+    /// Default chunked bag scoring with an optional auxiliary signal tensor.
+    fn score_bags_chunked_aux(
         &self,
-        xb: &Tensor,   // (B,K,D)
-        tb: &Tensor,   // (B,K,C,L)
-        mask: &Tensor, // (B,K)
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        tb_aux: Option<&Tensor>,
         batch_size: usize,
     ) -> Result<(Tensor, Tensor)> {
         let (b, k, _d) = xb.dims3()?;
@@ -134,7 +178,12 @@ pub trait BagRankerInterface {
             let xb_i = xb.narrow(0, i, take)?;
             let tb_i = tb.narrow(0, i, take)?;
             let m_i = mask.narrow(0, i, take)?;
-            let (cand, bag) = self.forward_bags(&xb_i, &tb_i, &m_i)?;
+            let ta_i = if let Some(aux) = tb_aux {
+                Some(aux.narrow(0, i, take)?)
+            } else {
+                None
+            };
+            let (cand, bag) = self.forward_bags_aux(&xb_i, &tb_i, &m_i, ta_i.as_ref())?;
             cand_chunks.push(cand);
             bag_chunks.push(bag);
             i += take;
@@ -153,6 +202,20 @@ pub trait BagRankerInterface {
 
         Ok((cand, bag))
     }
+
+    /// Default chunked bag scoring.
+    ///
+    /// This preserves bag order and concatenates the per-chunk results back
+    /// into the full `(B, K)` / `(B,)` outputs.
+    fn score_bags_chunked(
+        &self,
+        xb: &Tensor,   // (B,K,D)
+        tb: &Tensor,   // (B,K,C,L)
+        mask: &Tensor, // (B,K)
+        batch_size: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        self.score_bags_chunked_aux(xb, tb, mask, None, batch_size)
+    }
 }
 
 /// Extension of [`BagRankerInterface`] for models that expose winner embeddings.
@@ -162,6 +225,16 @@ pub trait BagRankerInterface {
 /// for XRUN calibration, where the calibrator consumes `(bag_score,
 /// winner_hidden)` sequences across runs.
 pub trait BagRankerWithHiddenInterface: BagRankerInterface {
+    /// Score bags with an optional auxiliary signal tensor and return the
+    /// hidden representation of the winning candidate in every bag.
+    fn forward_bags_with_hidden_aux(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        tb_aux: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)>;
+
     /// Score bags and return the hidden representation of the winning candidate
     /// in every bag.
     ///
@@ -173,17 +246,18 @@ pub trait BagRankerWithHiddenInterface: BagRankerInterface {
         xb: &Tensor,
         tb: &Tensor,
         mask: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor)>;
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.forward_bags_with_hidden_aux(xb, tb, mask, None)
+    }
 
-    /// Default chunked bag scoring with winner hidden.
-    ///
-    /// As with the other chunked helpers, this exists so callers can reuse the
-    /// same memory-safe scoring path across different model implementations.
-    fn score_bags_with_hidden_chunked(
+    /// Default chunked bag scoring with winner hidden and an optional
+    /// auxiliary signal tensor.
+    fn score_bags_with_hidden_chunked_aux(
         &self,
         xb: &Tensor,
         tb: &Tensor,
         mask: &Tensor,
+        tb_aux: Option<&Tensor>,
         batch_size: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, k, _d) = xb.dims3()?;
@@ -198,7 +272,13 @@ pub trait BagRankerWithHiddenInterface: BagRankerInterface {
             let xb_i = xb.narrow(0, i, take)?;
             let tb_i = tb.narrow(0, i, take)?;
             let m_i = mask.narrow(0, i, take)?;
-            let (cand, bag, hid) = self.forward_bags_with_hidden(&xb_i, &tb_i, &m_i)?;
+            let ta_i = if let Some(aux) = tb_aux {
+                Some(aux.narrow(0, i, take)?)
+            } else {
+                None
+            };
+            let (cand, bag, hid) =
+                self.forward_bags_with_hidden_aux(&xb_i, &tb_i, &m_i, ta_i.as_ref())?;
             cand_chunks.push(cand);
             bag_chunks.push(bag);
             hid_chunks.push(hid);
@@ -222,5 +302,19 @@ pub trait BagRankerWithHiddenInterface: BagRankerInterface {
         };
 
         Ok((cand, bag, hid))
+    }
+
+    /// Default chunked bag scoring with winner hidden.
+    ///
+    /// As with the other chunked helpers, this exists so callers can reuse the
+    /// same memory-safe scoring path across different model implementations.
+    fn score_bags_with_hidden_chunked(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        batch_size: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.score_bags_with_hidden_chunked_aux(xb, tb, mask, None, batch_size)
     }
 }

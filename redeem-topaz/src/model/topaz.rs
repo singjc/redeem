@@ -29,6 +29,52 @@ use crate::model_interface::{
     BagRankerInterface, BagRankerWithHiddenInterface, CandidateScorerInterface, ModelInterface,
 };
 
+/// Configuration for the optional ion-mobilogram (`XIM`) branch.
+///
+/// This branch mirrors the main chromatogram encoder but operates on
+/// candidate-specific mobilograms keyed by `FEATURE_ID` rather than on
+/// precursor chromatograms keyed by `PRECURSOR_ID`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TopazXimConfig {
+    /// Maximum number of MS2 mobilogram channels kept per candidate.
+    pub ms2_cmax: usize,
+    /// Maximum number of MS1 mobilogram channels kept per candidate.
+    pub ms1_cmax: usize,
+    /// Fixed mobilogram length after cropping/padding along the mobility axis.
+    pub l: usize,
+    /// Embedding width produced by the mobilogram encoder before fusion.
+    pub trace_emb_dim: usize,
+    /// Input transform applied before the mobilogram convolutions.
+    pub trace_input_mode: TraceInputMode,
+    /// Whether explicit mobilogram coelution/shape features are enabled.
+    #[serde(alias = "use_coelution")]
+    pub use_coelution_head: bool,
+    /// Temperature-like scaling used by soft apex calculations.
+    pub coelution_beta: f64,
+    /// Maximum lag searched by lag-tolerant cosine features.
+    pub coelution_max_lag: usize,
+    /// Width of the learned similarity embedding inside the coelution head.
+    #[serde(alias = "coelution_emb_dim")]
+    pub coelution_sim_emb_dim: usize,
+}
+
+impl Default for TopazXimConfig {
+    fn default() -> Self {
+        Self {
+            ms2_cmax: 6,
+            ms1_cmax: 0,
+            l: 258,
+            trace_emb_dim: 64,
+            trace_input_mode: TraceInputMode::Single,
+            use_coelution_head: true,
+            coelution_beta: 10.0,
+            coelution_max_lag: 2,
+            coelution_sim_emb_dim: 8,
+        }
+    }
+}
+
 /// Configuration for the base TOPAZ model.
 ///
 /// The model sees:
@@ -40,6 +86,7 @@ use crate::model_interface::{
 /// That means a trace tensor `(N, C_total, L)` is interpreted as
 /// `[MS1 channels | MS2 channels]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TopazConfig {
     /// Number of scalar heuristic/library features per candidate row.
     pub feat_dim: usize,
@@ -70,6 +117,8 @@ pub struct TopazConfig {
     pub coelution_max_lag: usize,
     /// Width of the learned similarity embedding inside the coelution head.
     pub coelution_sim_emb_dim: usize,
+    /// Optional ion-mobilogram encoder branch used for diaPASEF-style inputs.
+    pub xim: Option<TopazXimConfig>,
 }
 
 impl Default for TopazConfig {
@@ -88,6 +137,7 @@ impl Default for TopazConfig {
             coelution_beta: 10.0,
             coelution_max_lag: 2,
             coelution_sim_emb_dim: 8,
+            xim: None,
         }
     }
 }
@@ -101,6 +151,11 @@ pub struct TopazBagRanker {
     /// Convolutional trace encoder producing learned embeddings and optional
     /// coelution features.
     pub trace_enc: crate::building_blocks::conv_encoder::TraceEncoder,
+    /// Optional mobilogram encoder branch used for diaPASEF-style XIM inputs.
+    pub xim_enc: Option<crate::building_blocks::conv_encoder::TraceEncoder>,
+    /// Configuration for the optional mobilogram branch, retained so the model
+    /// can create aligned zero tensors when XIM input is absent.
+    pub xim_cfg: Option<TopazXimConfig>,
     /// Candidate-level MLP scorer operating on heuristic features plus trace
     /// embeddings.
     pub scorer: crate::building_blocks::mlp::CandidateScorer,
@@ -122,6 +177,60 @@ pub struct BagHeadComponents {
 }
 
 impl TopazBagRanker {
+    fn encoder_cfg_from_xim(cfg: &TopazXimConfig) -> TopazConfig {
+        TopazConfig {
+            feat_dim: 0,
+            ms2_cmax: cfg.ms2_cmax,
+            ms1_cmax: cfg.ms1_cmax,
+            l: cfg.l,
+            trace_emb_dim: cfg.trace_emb_dim,
+            mlp_hidden: Vec::new(),
+            dropout: 0.0,
+            trace_input_mode: cfg.trace_input_mode,
+            use_heuristic_features: false,
+            use_coelution_head: cfg.use_coelution_head,
+            coelution_beta: cfg.coelution_beta,
+            coelution_max_lag: cfg.coelution_max_lag,
+            coelution_sim_emb_dim: cfg.coelution_sim_emb_dim,
+            xim: None,
+        }
+    }
+
+    fn zero_xim_input(
+        &self,
+        n: usize,
+        device: &candle_core::Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let Some(cfg) = &self.xim_cfg else {
+            candle_core::bail!("missing XIM config for XIM-enabled model");
+        };
+        let c_total = cfg.ms1_cmax + cfg.ms2_cmax;
+        Tensor::zeros((n, c_total, cfg.l), dtype, device)
+    }
+
+    pub(crate) fn encode_inputs(
+        &self,
+        x_trace: &Tensor,
+        x_xim: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (emb_xic, coe_xic, coe_ms12_xic) = self.trace_enc.forward_components(x_trace)?;
+        if let Some(xim_enc) = &self.xim_enc {
+            let (n, _, _) = x_trace.dims3()?;
+            let xim_tensor = if let Some(xim) = x_xim {
+                xim.clone()
+            } else {
+                self.zero_xim_input(n, x_trace.device(), x_trace.dtype())?
+            };
+            let (emb_xim, coe_xim, _coe_ms12_xim) = xim_enc.forward_components(&xim_tensor)?;
+            let emb = Tensor::cat(&[emb_xic, emb_xim], 1)?;
+            let coe = Tensor::cat(&[coe_xic, coe_xim], 1)?;
+            Ok((emb, coe, coe_ms12_xic))
+        } else {
+            Ok((emb_xic, coe_xic, coe_ms12_xic))
+        }
+    }
+
     /// Construct a TOPAZ scorer under the provided variable scope.
     ///
     /// All parameters are created beneath the supplied `vb` subtree so they can
@@ -129,13 +238,31 @@ impl TopazBagRanker {
     pub fn new(vb: VarBuilder, cfg: &TopazConfig) -> Result<Self> {
         let trace_enc =
             crate::building_blocks::conv_encoder::TraceEncoder::new(vb.pp("trace_enc"), cfg)?;
+        let xim_enc = if let Some(xim_cfg) = &cfg.xim {
+            let enc_cfg = Self::encoder_cfg_from_xim(xim_cfg);
+            Some(crate::building_blocks::conv_encoder::TraceEncoder::new(
+                vb.pp("xim_enc"),
+                &enc_cfg,
+            )?)
+        } else {
+            None
+        };
+        let total_emb_dim =
+            trace_enc.emb_out_dim() + xim_enc.as_ref().map(|enc| enc.emb_out_dim()).unwrap_or(0);
+        let total_coe_dim = trace_enc.coelution_dim()
+            + xim_enc.as_ref().map(|enc| enc.coelution_dim()).unwrap_or(0);
         let scorer = crate::building_blocks::mlp::CandidateScorer::new(
             vb.pp("candidate_scorer"),
             cfg,
-            trace_enc.emb_out_dim(),
-            trace_enc.coelution_dim(),
+            total_emb_dim,
+            total_coe_dim,
         )?;
-        Ok(Self { trace_enc, scorer })
+        Ok(Self {
+            trace_enc,
+            xim_enc,
+            xim_cfg: cfg.xim.clone(),
+            scorer,
+        })
     }
 
     /// Score a batch of bags with masked-max MIL pooling.
@@ -155,13 +282,30 @@ impl TopazBagRanker {
         tb: &Tensor,
         mask: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_bags_aux(xb, tb, mask, None)
+    }
+
+    /// Score a batch of bags with an optional aligned XIM tensor.
+    pub fn forward_bags_aux(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        tb_aux: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         let (b, k, d) = xb.dims3()?;
         let (_, _, c, l) = tb.dims4()?;
 
         let xf = xb.reshape((b * k, d))?;
         let tf = tb.reshape((b * k, c, l))?;
+        let tf_aux = if let Some(tb_aux) = tb_aux {
+            let (_, _, c_aux, l_aux) = tb_aux.dims4()?;
+            Some(tb_aux.reshape((b * k, c_aux, l_aux))?)
+        } else {
+            None
+        };
 
-        let (emb, coe) = self.trace_enc.forward(&tf)?; // (B*K, E), (B*K, Coe)
+        let (emb, coe, _coe_ms12) = self.encode_inputs(&tf, tf_aux.as_ref())?;
         let logits = self.scorer.forward_eval(&xf, &emb, &coe)?; // (B*K,)
         let cand = logits.reshape((b, k))?;
 
@@ -186,13 +330,31 @@ impl TopazBagRanker {
         tb: &Tensor,
         mask: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.forward_bags_with_hidden_aux(xb, tb, mask, None)
+    }
+
+    /// Score bags and return winner hidden vectors with an optional aligned
+    /// XIM tensor.
+    pub fn forward_bags_with_hidden_aux(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        tb_aux: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, k, d) = xb.dims3()?;
         let (_, _, c, l) = tb.dims4()?;
 
         let xf = xb.reshape((b * k, d))?;
         let tf = tb.reshape((b * k, c, l))?;
+        let tf_aux = if let Some(tb_aux) = tb_aux {
+            let (_, _, c_aux, l_aux) = tb_aux.dims4()?;
+            Some(tb_aux.reshape((b * k, c_aux, l_aux))?)
+        } else {
+            None
+        };
 
-        let (emb, coe) = self.trace_enc.forward(&tf)?;
+        let (emb, coe, _coe_ms12) = self.encode_inputs(&tf, tf_aux.as_ref())?;
         let (logits, hidden) = self.scorer.forward_with_hidden_eval(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
         let hidden = hidden.reshape((b, k, self.scorer.hidden_dim()))?;
@@ -229,13 +391,38 @@ impl TopazBagRanker {
         tb: &Tensor,
         mask: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, BagHeadComponents)> {
+        self.forward_bags_with_heads_aux(xb, tb, mask, None)
+    }
+
+    /// Score bags, export winner-side components, and optionally fuse an
+    /// aligned XIM tensor into the candidate representation.
+    pub fn forward_bags_with_heads_aux(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        tb_aux: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor, BagHeadComponents)> {
         let (b, k, d) = xb.dims3()?;
         let (_, _, c, l) = tb.dims4()?;
 
         let xf = xb.reshape((b * k, d))?;
         let tf = tb.reshape((b * k, c, l))?;
 
-        let (emb_all, coe_all, comps) = self.trace_enc.forward_with_heads(&tf)?;
+        let (mut emb_all, mut coe_all, mut comps) = self.trace_enc.forward_with_heads(&tf)?;
+        if let Some(xim_enc) = &self.xim_enc {
+            let tf_aux = if let Some(tb_aux) = tb_aux {
+                let (_, _, c_aux, l_aux) = tb_aux.dims4()?;
+                tb_aux.reshape((b * k, c_aux, l_aux))?
+            } else {
+                self.zero_xim_input(b * k, tf.device(), tf.dtype())?
+            };
+            let (xim_emb_all, xim_coe_all, _xim_comps) = xim_enc.forward_with_heads(&tf_aux)?;
+            emb_all = Tensor::cat(&[emb_all, xim_emb_all], 1)?;
+            coe_all = Tensor::cat(&[coe_all, xim_coe_all], 1)?;
+            comps.emb_all = emb_all.clone();
+            comps.coe_all = coe_all.clone();
+        }
         let (logits, hidden) = self
             .scorer
             .forward_with_hidden_eval(&xf, &emb_all, &coe_all)?;
@@ -309,26 +496,38 @@ impl ModelInterface for TopazBagRanker {
 }
 
 impl CandidateScorerInterface for TopazBagRanker {
-    fn forward_candidates(&self, x_feat: &Tensor, x_trace: &Tensor) -> Result<Tensor> {
-        let (emb, coe) = self.trace_enc.forward(x_trace)?;
+    fn forward_candidates_aux(
+        &self,
+        x_feat: &Tensor,
+        x_trace: &Tensor,
+        x_aux: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (emb, coe, _coe_ms12) = self.encode_inputs(x_trace, x_aux)?;
         self.scorer.forward_eval(x_feat, &emb, &coe)
     }
 }
 
 impl BagRankerInterface for TopazBagRanker {
-    fn forward_bags(&self, xb: &Tensor, tb: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
-        TopazBagRanker::forward_bags(self, xb, tb, mask)
-    }
-}
-
-impl BagRankerWithHiddenInterface for TopazBagRanker {
-    fn forward_bags_with_hidden(
+    fn forward_bags_aux(
         &self,
         xb: &Tensor,
         tb: &Tensor,
         mask: &Tensor,
+        tb_aux: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        TopazBagRanker::forward_bags_aux(self, xb, tb, mask, tb_aux)
+    }
+}
+
+impl BagRankerWithHiddenInterface for TopazBagRanker {
+    fn forward_bags_with_hidden_aux(
+        &self,
+        xb: &Tensor,
+        tb: &Tensor,
+        mask: &Tensor,
+        tb_aux: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        TopazBagRanker::forward_bags_with_hidden(self, xb, tb, mask)
+        TopazBagRanker::forward_bags_with_hidden_aux(self, xb, tb, mask, tb_aux)
     }
 }
 
@@ -337,6 +536,7 @@ mod tests {
     use super::*;
     use candle_core::{Device, Tensor};
     use candle_nn::VarBuilder;
+    use serde_json::json;
 
     #[test]
     fn test_forward_bags_ms2_only_shapes() -> Result<()> {
@@ -373,5 +573,71 @@ mod tests {
         assert_eq!(bb, b);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_forward_bags_with_xim_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TopazConfig {
+            feat_dim: 3,
+            ms2_cmax: 2,
+            ms1_cmax: 0,
+            l: 8,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: TraceInputMode::Single,
+            use_heuristic_features: true,
+            use_coelution_head: false,
+            xim: Some(TopazXimConfig {
+                ms2_cmax: 3,
+                ms1_cmax: 1,
+                l: 12,
+                trace_emb_dim: 6,
+                trace_input_mode: TraceInputMode::Single,
+                use_coelution_head: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = TopazBagRanker::new(vb.pp("topaz"), &cfg)?;
+
+        let (b, k, d) = (2usize, 2usize, cfg.feat_dim);
+        let xb = Tensor::zeros((b, k, d), DType::F32, &device)?;
+        let tb = Tensor::zeros((b, k, cfg.ms2_cmax, cfg.l), DType::F32, &device)?;
+        let xim = Tensor::zeros((b, k, 4usize, 12usize), DType::F32, &device)?;
+        let mask = Tensor::ones((b, k), DType::U8, &device)?;
+
+        let (cand, bag, win) = model.forward_bags_with_hidden_aux(&xb, &tb, &mask, Some(&xim))?;
+        assert_eq!(cand.dims2()?, (b, k));
+        assert_eq!(bag.dims1()?, b);
+        assert_eq!(win.dims2()?.0, b);
+        Ok(())
+    }
+
+    #[test]
+    fn test_xim_config_deserializes_legacy_field_names() {
+        let cfg: TopazConfig = serde_json::from_value(json!({
+            "feat_dim": 7,
+            "xim": {
+                "ms2_cmax": 6,
+                "ms1_cmax": 4,
+                "l": 100,
+                "trace_emb_dim": 32,
+                "trace_input_mode": "Dual",
+                "use_coelution": true,
+                "coelution_emb_dim": 16,
+                "coelution_max_lag": 3
+            }
+        }))
+        .expect("legacy xim config should deserialize");
+
+        let xim = cfg.xim.expect("xim branch should be present");
+        assert!(xim.use_coelution_head);
+        assert_eq!(xim.coelution_sim_emb_dim, 16);
+        assert_eq!(xim.trace_input_mode, TraceInputMode::Dual);
+        assert_eq!(xim.coelution_beta, TopazXimConfig::default().coelution_beta);
     }
 }

@@ -47,6 +47,7 @@ use crate::io::osw::FeatureRow;
 #[cfg(feature = "io-sqlite")]
 use crate::io::osw::OswFeatureTable;
 use crate::io::xic::{PrecursorXic, TransitionTrace, XicSource};
+use crate::io::xim::{FeatureXim, MobilogramTrace, XimSource};
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::model::topaz::TopazConfig;
 use crate::model_interface::{BagRankerWithHiddenInterface, CandidateScorerInterface};
@@ -142,6 +143,26 @@ impl Default for XicFetchConfig {
     fn default() -> Self {
         Self {
             ms_levels: None,
+            detecting_transition: Some(1),
+            decoy: None,
+        }
+    }
+}
+
+/// Filters used when reading XIM parquet data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XimFetchConfig {
+    pub ms_levels: Option<Vec<i64>>,
+    pub mobilogram_types: Option<Vec<String>>,
+    pub detecting_transition: Option<i64>,
+    pub decoy: Option<i64>,
+}
+
+impl Default for XimFetchConfig {
+    fn default() -> Self {
+        Self {
+            ms_levels: None,
+            mobilogram_types: Some(vec!["ms1".to_string(), "ms2".to_string()]),
             detecting_transition: Some(1),
             decoy: None,
         }
@@ -492,6 +513,279 @@ struct DiskEntry {
     modified: u64,
 }
 
+/// XIM caches reuse the same counter structure as XIC caches.
+#[cfg(feature = "io-parquet")]
+pub type XimCacheStats = XicCacheStats;
+
+#[cfg(feature = "io-parquet")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct XimCacheKey {
+    run_id: u64,
+    feature_id: u64,
+}
+
+/// In-memory LRU cache for decoded feature-level mobilograms.
+#[cfg(feature = "io-parquet")]
+#[derive(Debug, Default)]
+pub struct XimCache {
+    capacity: usize,
+    size: usize,
+    data: HashMap<std::path::PathBuf, HashMap<XimCacheKey, FeatureXim>>,
+    order: VecDeque<(std::path::PathBuf, XimCacheKey)>,
+}
+
+#[cfg(feature = "io-parquet")]
+impl XimCache {
+    /// Create an in-memory LRU cache for decoded mobilograms.
+    ///
+    /// `capacity` counts feature entries, not bytes. A capacity of `0`
+    /// disables the cache.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            size: 0,
+            data: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Return `true` when the cache is allowed to store entries.
+    pub fn is_enabled(&self) -> bool {
+        self.capacity > 0
+    }
+
+    fn get(&mut self, path: &Path, key: XimCacheKey) -> Option<FeatureXim> {
+        let map = self.data.get(path)?;
+        let hit = map.get(&key)?.clone();
+        self.order.push_back((path.to_path_buf(), key));
+        Some(hit)
+    }
+
+    fn insert(&mut self, path: &Path, key: XimCacheKey, xim: FeatureXim) {
+        if !self.is_enabled() {
+            return;
+        }
+        let entry = self.data.entry(path.to_path_buf()).or_default();
+        let existed = entry.insert(key, xim).is_some();
+        if !existed {
+            self.size += 1;
+        }
+        self.order.push_back((path.to_path_buf(), key));
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.size > self.capacity {
+            let Some((path, key)) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(map) = self.data.get_mut(&path) {
+                if map.remove(&key).is_some() {
+                    self.size = self.size.saturating_sub(1);
+                }
+                if map.is_empty() {
+                    self.data.remove(&path);
+                }
+            }
+        }
+    }
+}
+
+/// Thread-safe wrapper around [`XimCache`].
+#[cfg(feature = "io-parquet")]
+#[derive(Clone)]
+pub struct SharedXimCache {
+    cache: Arc<Mutex<XimCache>>,
+    stats: XimCacheStats,
+}
+
+#[cfg(feature = "io-parquet")]
+impl Default for SharedXimCache {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+#[cfg(feature = "io-parquet")]
+impl SharedXimCache {
+    /// Create a thread-safe shared cache wrapper.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(XimCache::new(capacity))),
+            stats: XimCacheStats::new(),
+        }
+    }
+
+    /// Return a cloneable handle to the shared statistics object.
+    pub fn stats(&self) -> XimCacheStats {
+        self.stats.clone()
+    }
+
+    /// Return `true` when the underlying cache capacity is non-zero.
+    pub fn is_enabled(&self) -> bool {
+        self.cache.lock().map(|c| c.is_enabled()).unwrap_or(false)
+    }
+
+    pub(crate) fn get(&self, path: &Path, key: XimCacheKey) -> Option<FeatureXim> {
+        let mut guard = self.cache.lock().ok()?;
+        guard.get(path, key)
+    }
+
+    pub(crate) fn insert(&self, path: &Path, key: XimCacheKey, xim: FeatureXim) {
+        if let Ok(mut guard) = self.cache.lock() {
+            guard.insert(path, key, xim);
+        }
+    }
+}
+
+/// Optional on-disk cache for decoded feature-level mobilograms.
+#[cfg(feature = "io-parquet")]
+#[derive(Debug, Clone)]
+pub struct XimDiskCache {
+    root: std::path::PathBuf,
+    max_bytes: Option<u64>,
+    stats: XimCacheStats,
+}
+
+#[cfg(feature = "io-parquet")]
+impl XimDiskCache {
+    /// Create an optional on-disk cache rooted at `root`.
+    ///
+    /// When `max_bytes` is set, old cache files are evicted to keep the cache
+    /// under that size budget.
+    pub fn new(
+        root: std::path::PathBuf,
+        max_bytes: Option<u64>,
+        stats: XimCacheStats,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(&root)?;
+        Ok(Self {
+            root,
+            max_bytes,
+            stats,
+        })
+    }
+
+    fn hash_path(path: &Path) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.to_string_lossy().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn dir_for(&self, xim_path: &Path) -> std::path::PathBuf {
+        let h = Self::hash_path(xim_path);
+        self.root.join(format!("{:016x}", h))
+    }
+
+    fn file_for(&self, xim_path: &Path, run_id: u64, feature_id: u64) -> std::path::PathBuf {
+        let dir = self.dir_for(xim_path);
+        dir.join(format!("run{}_feat{}.bin", run_id, feature_id))
+    }
+
+    /// Load one cached feature mobilogram if present.
+    pub fn load(
+        &self,
+        xim_path: &Path,
+        run_id: u64,
+        feature_id: u64,
+    ) -> Result<Option<FeatureXim>> {
+        let path = self.file_for(xim_path, run_id, feature_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read(&path)?;
+        let (got_run, xim) = decode_feature_xim(&data)?;
+        if got_run != run_id || xim.feature_id != feature_id {
+            return Ok(None);
+        }
+        let _ = set_file_mtime(&path, FileTime::now());
+        Ok(Some(xim))
+    }
+
+    /// Store one decoded feature mobilogram on disk.
+    pub fn store(&self, xim_path: &Path, run_id: u64, xim: &FeatureXim) -> Result<()> {
+        let path = self.file_for(xim_path, run_id, xim.feature_id);
+        if path.exists() {
+            return Ok(());
+        }
+        let dir = path.parent().unwrap_or(&self.root);
+        std::fs::create_dir_all(dir)?;
+        let bytes = encode_feature_xim(run_id, xim);
+        let tmp = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        let _ = set_file_mtime(&path, FileTime::now());
+        self.stats.inc_store(1);
+        self.enforce_capacity()?;
+        Ok(())
+    }
+
+    fn enforce_capacity(&self) -> Result<()> {
+        let Some(max_bytes) = self.max_bytes else {
+            return Ok(());
+        };
+        if max_bytes == 0 {
+            return Ok(());
+        }
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        self.collect_files(&self.root, &mut files, &mut total)?;
+        if total <= max_bytes {
+            return Ok(());
+        }
+        files.sort_by_key(|e| e.modified);
+        for entry in files {
+            if total <= max_bytes {
+                break;
+            }
+            if std::fs::remove_file(&entry.path).is_ok() {
+                total = total.saturating_sub(entry.size);
+                self.stats.inc_eviction(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_files(&self, dir: &Path, files: &mut Vec<DiskEntry>, total: &mut u64) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                self.collect_files(&path, files, total)?;
+            } else if meta.is_file() {
+                let size = meta.len();
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                *total += size;
+                files.push(DiskEntry {
+                    path,
+                    size,
+                    modified,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "io-parquet")]
 fn encode_precursor_xic(run_id: u64, xic: &PrecursorXic) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -559,6 +853,111 @@ fn decode_precursor_xic(data: &[u8]) -> Result<(u64, PrecursorXic)> {
         PrecursorXic {
             precursor_id,
             transitions,
+        },
+    ))
+}
+
+#[cfg(feature = "io-parquet")]
+fn encode_feature_xim(run_id: u64, xim: &FeatureXim) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RDXM");
+    buf.push(1u8);
+    buf.extend_from_slice(&run_id.to_le_bytes());
+    buf.extend_from_slice(&xim.feature_id.to_le_bytes());
+    buf.extend_from_slice(&xim.precursor_id.to_le_bytes());
+    buf.extend_from_slice(&xim.feature_rt.to_le_bytes());
+    let n_tr = xim.traces.len() as u32;
+    buf.extend_from_slice(&n_tr.to_le_bytes());
+    for t in &xim.traces {
+        let ann = t.annotation.as_bytes();
+        buf.extend_from_slice(&(ann.len() as u32).to_le_bytes());
+        buf.extend_from_slice(ann);
+        buf.extend_from_slice(&t.ordinal.to_le_bytes());
+        buf.push(t.ms_level.unwrap_or(255));
+        match &t.mobilogram_type {
+            Some(ty) => {
+                buf.push(1u8);
+                let bytes = ty.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            None => buf.push(0u8),
+        }
+        let n_pt = t.points.len() as u32;
+        buf.extend_from_slice(&n_pt.to_le_bytes());
+        for p in &t.points {
+            buf.extend_from_slice(&p.mobility.to_le_bytes());
+            buf.extend_from_slice(&p.intensity.to_le_bytes());
+        }
+    }
+    buf
+}
+
+#[cfg(feature = "io-parquet")]
+fn decode_feature_xim(data: &[u8]) -> Result<(u64, FeatureXim)> {
+    let mut i = 0usize;
+    if data.len() < 5 || &data[..4] != b"RDXM" {
+        anyhow::bail!("invalid xim cache header");
+    }
+    i += 4;
+    let _ver = data[i];
+    i += 1;
+    let run_id = read_u64(data, &mut i)?;
+    let feature_id = read_u64(data, &mut i)?;
+    let precursor_id = read_u64(data, &mut i)?;
+    let feature_rt = read_f32(data, &mut i)?;
+    let n_tr = read_u32(data, &mut i)? as usize;
+    let mut traces = Vec::with_capacity(n_tr);
+    for _ in 0..n_tr {
+        let ann_len = read_u32(data, &mut i)? as usize;
+        if i + ann_len > data.len() {
+            anyhow::bail!("invalid xim cache (annotation)");
+        }
+        let ann = std::str::from_utf8(&data[i..i + ann_len])?.to_string();
+        i += ann_len;
+        let ordinal = read_i32(data, &mut i)?;
+        let ms = data.get(i).copied().unwrap_or(255);
+        i += 1;
+        let has_type = *data
+            .get(i)
+            .ok_or_else(|| anyhow::anyhow!("invalid xim cache (mobilogram_type flag)"))?;
+        i += 1;
+        let mobilogram_type = if has_type == 1 {
+            let ty_len = read_u32(data, &mut i)? as usize;
+            if i + ty_len > data.len() {
+                anyhow::bail!("invalid xim cache (mobilogram_type)");
+            }
+            let ty = std::str::from_utf8(&data[i..i + ty_len])?.to_string();
+            i += ty_len;
+            Some(ty)
+        } else {
+            None
+        };
+        let n_pt = read_u32(data, &mut i)? as usize;
+        let mut points = Vec::with_capacity(n_pt);
+        for _ in 0..n_pt {
+            let mobility = read_f32(data, &mut i)?;
+            let intensity = read_f32(data, &mut i)?;
+            points.push(crate::io::xim::XimPoint {
+                mobility,
+                intensity,
+            });
+        }
+        traces.push(MobilogramTrace {
+            annotation: ann,
+            ordinal,
+            ms_level: if ms == 255 { None } else { Some(ms) },
+            mobilogram_type,
+            points,
+        });
+    }
+    Ok((
+        run_id,
+        FeatureXim {
+            feature_id,
+            precursor_id,
+            feature_rt,
+            traces,
         },
     ))
 }
@@ -702,6 +1101,160 @@ fn split_ms1_ms2(xic: &PrecursorXic) -> (Vec<TransitionTrace>, Vec<TransitionTra
     sort_series(&mut ms1);
     sort_series(&mut ms2);
     (ms1, ms2)
+}
+
+fn sort_mobilogram_series(series: &mut [MobilogramTrace]) {
+    series.sort_by(|a, b| {
+        a.ordinal
+            .cmp(&b.ordinal)
+            .then_with(|| a.annotation.cmp(&b.annotation))
+    });
+}
+
+fn split_xim_ms1_ms2(xim: &FeatureXim) -> (Vec<MobilogramTrace>, Vec<MobilogramTrace>) {
+    let mut ms1 = Vec::new();
+    let mut ms2 = Vec::new();
+    for t in &xim.traces {
+        let ty = t
+            .mobilogram_type
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        match (t.ms_level.unwrap_or(2), ty.as_str()) {
+            (1, "ms1") | (1, "") => ms1.push(t.clone()),
+            (_, "ms2") | (2, _) => ms2.push(t.clone()),
+            _ => {}
+        }
+    }
+    sort_mobilogram_series(&mut ms1);
+    sort_mobilogram_series(&mut ms2);
+    (ms1, ms2)
+}
+
+/// Return validated mobilogram peak boundaries for one OSW feature row.
+///
+/// OpenSWATH may encode unusable IM boundaries as negative values or inverted
+/// intervals. In those cases TOPAZ falls back to keeping the full centered
+/// mobilogram window.
+fn valid_im_bounds(row: &FeatureRow) -> Option<(f32, f32)> {
+    let left = row.exp_im_left_width?;
+    let right = row.exp_im_right_width?;
+    if !left.is_finite() || !right.is_finite() {
+        return None;
+    }
+    if left < 0.0 || right < 0.0 || left >= right {
+        return None;
+    }
+    Some((left, right))
+}
+
+/// Build a fixed-size mobilogram tensor for one set of XIM channels.
+///
+/// The output follows the same row-major `(Cmax, L)` layout used by XIC trace
+/// extraction, but the sample axis is ion mobility rather than retention time.
+///
+/// Centering rules:
+/// - when `center_im` is present, the window is centered on the nearest
+///   mobility sample to that OpenSWATH feature apex;
+/// - otherwise the mobilogram midpoint is used.
+///
+/// Boundary rules:
+/// - when `im_bounds` is `Some((left, right))`, samples outside that mobility
+///   interval are zeroed after window extraction;
+/// - otherwise the full centered window is kept.
+fn extract_mobilogram_tensor_centered(
+    series: &[MobilogramTrace],
+    center_im: Option<f32>,
+    im_bounds: Option<(f32, f32)>,
+    l: usize,
+    cmax: usize,
+    normalize_max: bool,
+) -> Vec<f32> {
+    use crate::building_blocks::trace_window::nearest_index_sorted;
+
+    let mut out = vec![0f32; cmax * l];
+    let take = cmax.min(series.len());
+    for c in 0..take {
+        let pts = &series[c].points;
+        if pts.is_empty() {
+            continue;
+        }
+        let mobility: Vec<f32> = pts.iter().map(|p| p.mobility).collect();
+        let intensity: Vec<f32> = pts.iter().map(|p| p.intensity).collect();
+        let center_idx = center_im
+            .filter(|v| v.is_finite())
+            .map(|center| nearest_index_sorted(&mobility, center) as isize)
+            .unwrap_or((intensity.len() / 2) as isize);
+        let half = (l as isize) / 2;
+        let start = center_idx - half;
+
+        for dst_idx in 0..l {
+            let src_idx = start + dst_idx as isize;
+            if src_idx < 0 || src_idx >= intensity.len() as isize {
+                continue;
+            }
+            let src_idx = src_idx as usize;
+            let keep = if let Some((left, right)) = im_bounds {
+                let im = mobility[src_idx];
+                im >= left && im <= right
+            } else {
+                true
+            };
+            if keep {
+                out[c * l + dst_idx] = intensity[src_idx];
+            }
+        }
+    }
+
+    if normalize_max {
+        let mut m = 0f32;
+        for v in &out {
+            if *v > m {
+                m = *v;
+            }
+        }
+        if m > 0.0 {
+            for v in &mut out {
+                *v /= m;
+            }
+        }
+    }
+
+    out
+}
+
+/// Fill one output `(C_total, L)` buffer from a candidate-specific mobilogram.
+fn fill_xim_row_from_feature(
+    row: &FeatureRow,
+    xim: &FeatureXim,
+    cfg: &TraceBuildConfig,
+    dst: &mut [f32],
+) {
+    let (ms1_series, ms2_series) = split_xim_ms1_ms2(xim);
+    let im_bounds = valid_im_bounds(row);
+
+    let mut offset = 0usize;
+    if cfg.ms1_cmax > 0 {
+        let t_ms1 = extract_mobilogram_tensor_centered(
+            &ms1_series,
+            row.exp_im,
+            im_bounds,
+            cfg.l,
+            cfg.ms1_cmax,
+            cfg.normalize_max,
+        );
+        dst[offset..offset + cfg.ms1_cmax * cfg.l].copy_from_slice(&t_ms1);
+        offset += cfg.ms1_cmax * cfg.l;
+    }
+    let t_ms2 = extract_mobilogram_tensor_centered(
+        &ms2_series,
+        row.exp_im,
+        im_bounds,
+        cfg.l,
+        cfg.ms2_cmax,
+        cfg.normalize_max,
+    );
+    dst[offset..offset + cfg.ms2_cmax * cfg.l].copy_from_slice(&t_ms2);
 }
 
 #[cfg(feature = "io-parquet")]
@@ -860,6 +1413,151 @@ fn fetch_precursors_cached_with_fallback(
     Ok(map)
 }
 
+#[cfg(feature = "io-parquet")]
+fn fetch_features_cached(
+    path: &Path,
+    run_id: u64,
+    feature_set: &HashSet<u64>,
+    cache: &SharedXimCache,
+    disk: Option<&XimDiskCache>,
+    fetch_cfg: &XimFetchConfig,
+) -> Result<HashMap<u64, FeatureXim>> {
+    let mut out: HashMap<u64, FeatureXim> = HashMap::new();
+    let mut missing: Vec<u64> = Vec::new();
+    let stats = cache.stats();
+
+    for &feature_id in feature_set {
+        let key = XimCacheKey { run_id, feature_id };
+        if let Some(xim) = cache.get(path, key) {
+            stats.inc_mem_hit(1);
+            out.insert(feature_id, xim);
+            continue;
+        }
+        if let Some(disk_cache) = disk {
+            if let Ok(Some(xim)) = disk_cache.load(path, run_id, feature_id) {
+                cache.insert(path, key, xim.clone());
+                stats.inc_disk_hit(1);
+                out.insert(feature_id, xim);
+                continue;
+            }
+        }
+        missing.push(feature_id);
+    }
+
+    if !missing.is_empty() {
+        stats.inc_miss(missing.len() as u64);
+        let mut reader = crate::io::xim_parquet::XimParquetReader::new(path);
+        reader.filter_run_id(run_id);
+        if let Some(levels) = &fetch_cfg.ms_levels {
+            reader.filter_ms_level(levels.clone());
+        }
+        if let Some(types) = &fetch_cfg.mobilogram_types {
+            reader.filter_mobilogram_type(types.iter().map(|s| s.as_str()));
+        }
+        if let Some(flag) = fetch_cfg.detecting_transition {
+            reader.filter_detecting_transition(flag);
+        }
+        if let Some(flag) = fetch_cfg.decoy {
+            reader.filter_decoy(flag);
+        }
+        reader.filter_feature_id(missing.iter().copied());
+        let fetched = reader.fetch()?;
+        let requested = missing.len();
+        let fetched_count = fetched.len();
+        if fetched_count == 0 {
+            log::warn!(
+                "XIM cache path {:?}: fetched 0 of {} features (run_id={})",
+                path,
+                requested,
+                run_id
+            );
+        } else {
+            log::info!(
+                "XIM cache path {:?}: fetched {} of {} features (run_id={})",
+                path,
+                fetched_count,
+                requested,
+                run_id
+            );
+        }
+        for xim in fetched {
+            let feature_id = xim.feature_id;
+            cache.insert(path, XimCacheKey { run_id, feature_id }, xim.clone());
+            if let Some(disk_cache) = disk {
+                let _ = disk_cache.store(path, run_id, &xim);
+            }
+            out.insert(feature_id, xim);
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(feature = "io-parquet")]
+fn fetch_features_cached_with_fallback(
+    path: &Path,
+    run_id: u64,
+    feature_set: &HashSet<u64>,
+    cache: &SharedXimCache,
+    disk: Option<&XimDiskCache>,
+    fetch_cfg: &XimFetchConfig,
+) -> Result<HashMap<u64, FeatureXim>> {
+    let out = fetch_features_cached(path, run_id, feature_set, cache, disk, fetch_cfg)?;
+    if !out.is_empty() || feature_set.is_empty() {
+        return Ok(out);
+    }
+
+    log::warn!(
+        "XIM map path {:?}: fetched 0 of {} features (run_id={}); retrying without RUN_ID filter",
+        path,
+        feature_set.len(),
+        run_id
+    );
+
+    let mut reader = crate::io::xim_parquet::XimParquetReader::new(path);
+    if let Some(levels) = &fetch_cfg.ms_levels {
+        reader.filter_ms_level(levels.clone());
+    }
+    if let Some(types) = &fetch_cfg.mobilogram_types {
+        reader.filter_mobilogram_type(types.iter().map(|s| s.as_str()));
+    }
+    if let Some(flag) = fetch_cfg.detecting_transition {
+        reader.filter_detecting_transition(flag);
+    }
+    if let Some(flag) = fetch_cfg.decoy {
+        reader.filter_decoy(flag);
+    }
+    reader.filter_feature_id(feature_set.iter().copied());
+
+    let fetched = reader.fetch()?;
+    let fetched_count = fetched.len();
+    if fetched_count == 0 {
+        log::warn!(
+            "XIM map path {:?}: fallback fetched 0 of {} features (ignoring RUN_ID)",
+            path,
+            feature_set.len()
+        );
+        return Ok(out);
+    }
+    log::info!(
+        "XIM map path {:?}: fallback fetched {} of {} features (ignoring RUN_ID)",
+        path,
+        fetched_count,
+        feature_set.len()
+    );
+
+    let mut map = HashMap::new();
+    for xim in fetched {
+        let feature_id = xim.feature_id;
+        cache.insert(path, XimCacheKey { run_id, feature_id }, xim.clone());
+        if let Some(disk_cache) = disk {
+            let _ = disk_cache.store(path, run_id, &xim);
+        }
+        map.insert(feature_id, xim);
+    }
+    Ok(map)
+}
+
 /// Build trace tensors for rows using an arbitrary XIC source.
 ///
 /// Output layout: (N, C_total, L) flattened row-major.
@@ -927,6 +1625,298 @@ pub fn build_trace_tensors_from_source(
                     cfg.normalize_max,
                 );
                 dst[offset..offset + cfg.ms2_cmax * cfg.l].copy_from_slice(&t_ms2);
+            }
+        }
+    };
+
+    #[cfg(feature = "rayon")]
+    {
+        out.par_chunks_mut(row_len)
+            .zip(rows.par_iter())
+            .for_each(|(dst, row)| fill_row(row, dst));
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        for (i, row) in rows.iter().enumerate() {
+            let dst = &mut out[i * row_len..(i + 1) * row_len];
+            fill_row(row, dst);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Build mobilogram tensors for rows using an arbitrary XIM source.
+///
+/// Output layout: flattened row-major `(N, C_total, L)`, where `C_total` is
+/// `cfg.ms1_cmax + cfg.ms2_cmax`.
+pub fn build_xim_tensors_from_source(
+    rows: &[FeatureRow],
+    xim_source: &mut impl XimSource,
+    cfg: &TraceBuildConfig,
+) -> Result<Vec<f32>> {
+    let n = rows.len();
+    let c_total = cfg.total_c();
+    let mut out = vec![0f32; n * c_total * cfg.l];
+    if n == 0 || c_total == 0 || cfg.l == 0 {
+        return Ok(out);
+    }
+
+    let mut by_run: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for row in rows {
+        by_run.entry(row.run_id).or_default().insert(row.feature_id);
+    }
+
+    let mut xim_by_run: HashMap<u64, HashMap<u64, FeatureXim>> = HashMap::new();
+    for (run_id, feature_set) in by_run {
+        let feature_ids: Vec<u64> = feature_set.into_iter().collect();
+        if feature_ids.is_empty() {
+            continue;
+        }
+        let fetched = xim_source.fetch_features(run_id, &feature_ids)?;
+        let mut map = HashMap::new();
+        for xim in fetched {
+            map.insert(xim.feature_id, xim);
+        }
+        xim_by_run.insert(run_id, map);
+    }
+
+    let row_len = c_total * cfg.l;
+    let fill_row = |row: &FeatureRow, dst: &mut [f32]| {
+        if let Some(run_map) = xim_by_run.get(&row.run_id) {
+            if let Some(xim) = run_map.get(&row.feature_id) {
+                fill_xim_row_from_feature(row, xim, cfg, dst);
+            }
+        }
+    };
+
+    #[cfg(feature = "rayon")]
+    {
+        out.par_chunks_mut(row_len)
+            .zip(rows.par_iter())
+            .for_each(|(dst, row)| fill_row(row, dst));
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        for (i, row) in rows.iter().enumerate() {
+            let dst = &mut out[i * row_len..(i + 1) * row_len];
+            fill_row(row, dst);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Build mobilogram tensors by loading candidate-specific mobilograms from one
+/// parquet XIM file.
+#[cfg(feature = "io-parquet")]
+pub fn build_xim_tensors_from_parquet(
+    rows: &[FeatureRow],
+    xim_path: &Path,
+    cfg: &TraceBuildConfig,
+    fetch_cfg: &XimFetchConfig,
+) -> Result<Vec<f32>> {
+    let cache = SharedXimCache::new(0);
+    build_xim_tensors_from_parquet_cached(rows, xim_path, cfg, fetch_cfg, &cache, None)
+}
+
+/// Build mobilogram tensors for rows using a run-id to parquet-path mapping.
+#[cfg(feature = "io-parquet")]
+pub fn build_xim_tensors_from_parquet_map(
+    rows: &[FeatureRow],
+    xim_map: &HashMap<u64, std::path::PathBuf>,
+    cfg: &TraceBuildConfig,
+    fetch_cfg: &XimFetchConfig,
+) -> Result<Vec<f32>> {
+    let cache = SharedXimCache::new(0);
+    build_xim_tensors_from_parquet_map_cached(rows, xim_map, cfg, fetch_cfg, &cache, None)
+}
+
+/// Parquet-backed mobilogram extraction with shared in-memory and optional
+/// on-disk caching.
+#[cfg(feature = "io-parquet")]
+pub fn build_xim_tensors_from_parquet_cached(
+    rows: &[FeatureRow],
+    xim_path: &Path,
+    cfg: &TraceBuildConfig,
+    fetch_cfg: &XimFetchConfig,
+    cache: &SharedXimCache,
+    disk: Option<&XimDiskCache>,
+) -> Result<Vec<f32>> {
+    let n = rows.len();
+    let c_total = cfg.total_c();
+    let mut out = vec![0f32; n * c_total * cfg.l];
+    if n == 0 || c_total == 0 || cfg.l == 0 {
+        return Ok(out);
+    }
+    if !cache.is_enabled() && disk.is_none() {
+        let mut reader = crate::io::xim_parquet::XimParquetReader::new(xim_path);
+        if let Some(levels) = &fetch_cfg.ms_levels {
+            reader.filter_ms_level(levels.clone());
+        }
+        if let Some(types) = &fetch_cfg.mobilogram_types {
+            reader.filter_mobilogram_type(types.iter().map(|s| s.as_str()));
+        }
+        if let Some(flag) = fetch_cfg.detecting_transition {
+            reader.filter_detecting_transition(flag);
+        }
+        if let Some(flag) = fetch_cfg.decoy {
+            reader.filter_decoy(flag);
+        }
+        return build_xim_tensors_from_source(rows, &mut reader, cfg);
+    }
+
+    let mut by_run: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for row in rows {
+        by_run.entry(row.run_id).or_default().insert(row.feature_id);
+    }
+
+    let items: Vec<(u64, HashSet<u64>)> = by_run.into_iter().collect();
+
+    #[cfg(feature = "rayon")]
+    let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
+        .into_par_iter()
+        .map(|(run_id, feature_ids)| {
+            let fetched =
+                fetch_features_cached(xim_path, run_id, &feature_ids, cache, disk, fetch_cfg)?;
+            Ok((run_id, fetched))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(feature = "rayon"))]
+    let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
+        .into_iter()
+        .map(|(run_id, feature_ids)| {
+            let fetched =
+                fetch_features_cached(xim_path, run_id, &feature_ids, cache, disk, fetch_cfg)?;
+            Ok((run_id, fetched))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut xim_by_run: HashMap<u64, HashMap<u64, FeatureXim>> = HashMap::new();
+    for (run_id, map) in fetched_all {
+        xim_by_run.insert(run_id, map);
+    }
+
+    let row_len = c_total * cfg.l;
+    let fill_row = |row: &FeatureRow, dst: &mut [f32]| {
+        if let Some(run_map) = xim_by_run.get(&row.run_id) {
+            if let Some(xim) = run_map.get(&row.feature_id) {
+                fill_xim_row_from_feature(row, xim, cfg, dst);
+            }
+        }
+    };
+
+    #[cfg(feature = "rayon")]
+    {
+        out.par_chunks_mut(row_len)
+            .zip(rows.par_iter())
+            .for_each(|(dst, row)| fill_row(row, dst));
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        for (i, row) in rows.iter().enumerate() {
+            let dst = &mut out[i * row_len..(i + 1) * row_len];
+            fill_row(row, dst);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Cached version of [`build_xim_tensors_from_parquet_map`].
+#[cfg(feature = "io-parquet")]
+pub fn build_xim_tensors_from_parquet_map_cached(
+    rows: &[FeatureRow],
+    xim_map: &HashMap<u64, std::path::PathBuf>,
+    cfg: &TraceBuildConfig,
+    fetch_cfg: &XimFetchConfig,
+    cache: &SharedXimCache,
+    disk: Option<&XimDiskCache>,
+) -> Result<Vec<f32>> {
+    let n = rows.len();
+    let c_total = cfg.total_c();
+    let mut out = vec![0f32; n * c_total * cfg.l];
+    if n == 0 || c_total == 0 || cfg.l == 0 {
+        return Ok(out);
+    }
+
+    let mut by_run: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for row in rows {
+        by_run.entry(row.run_id).or_default().insert(row.feature_id);
+    }
+
+    let mut run_to_path: HashMap<u64, std::path::PathBuf> = HashMap::new();
+    let mut filtered_by_run: HashMap<u64, HashSet<u64>> = HashMap::new();
+    let mut missing_runs = Vec::new();
+    for (run_id, feature_ids) in by_run {
+        if let Some(path) = xim_map.get(&run_id) {
+            run_to_path.insert(run_id, path.clone());
+            filtered_by_run.insert(run_id, feature_ids);
+        } else {
+            missing_runs.push(run_id);
+        }
+    }
+    if !missing_runs.is_empty() {
+        missing_runs.sort_unstable();
+        missing_runs.dedup();
+        log::warn!(
+            "XIM map is missing {} run_ids (will leave mobilograms zeroed): {:?}",
+            missing_runs.len(),
+            missing_runs
+        );
+    }
+
+    let items: Vec<(u64, HashSet<u64>, std::path::PathBuf)> = filtered_by_run
+        .into_iter()
+        .filter_map(|(run_id, feature_ids)| {
+            run_to_path
+                .get(&run_id)
+                .cloned()
+                .map(|path| (run_id, feature_ids, path))
+        })
+        .collect();
+
+    #[cfg(feature = "rayon")]
+    let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
+        .into_par_iter()
+        .map(|(run_id, feature_ids, path)| {
+            let fetched = fetch_features_cached_with_fallback(
+                &path,
+                run_id,
+                &feature_ids,
+                cache,
+                disk,
+                fetch_cfg,
+            )?;
+            Ok((run_id, fetched))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(feature = "rayon"))]
+    let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
+        .into_iter()
+        .map(|(run_id, feature_ids, path)| {
+            let fetched = fetch_features_cached_with_fallback(
+                &path,
+                run_id,
+                &feature_ids,
+                cache,
+                disk,
+                fetch_cfg,
+            )?;
+            Ok((run_id, fetched))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut xim_by_run: HashMap<u64, HashMap<u64, FeatureXim>> = HashMap::new();
+    for (run_id, map) in fetched_all {
+        xim_by_run.insert(run_id, map);
+    }
+
+    let row_len = c_total * cfg.l;
+    let fill_row = |row: &FeatureRow, dst: &mut [f32]| {
+        if let Some(run_map) = xim_by_run.get(&row.run_id) {
+            if let Some(xim) = run_map.get(&row.feature_id) {
+                fill_xim_row_from_feature(row, xim, cfg, dst);
             }
         }
     };
@@ -1526,17 +2516,8 @@ pub fn build_trace_tensors_from_parquet(
     cfg: &TraceBuildConfig,
     fetch_cfg: &XicFetchConfig,
 ) -> Result<Vec<f32>> {
-    let mut reader = crate::io::xic_parquet::XicParquetReader::new(xic_path);
-    if let Some(levels) = &fetch_cfg.ms_levels {
-        reader.filter_ms_level(levels.clone());
-    }
-    if let Some(flag) = fetch_cfg.detecting_transition {
-        reader.filter_detecting_transition(flag);
-    }
-    if let Some(flag) = fetch_cfg.decoy {
-        reader.filter_decoy(flag);
-    }
-    build_trace_tensors_from_source(rows, &mut reader, cfg)
+    let cache = SharedXicCache::new(0);
+    build_trace_tensors_from_parquet_cached(rows, xic_path, cfg, fetch_cfg, &cache, None)
 }
 
 /// Parquet-backed trace extraction with shared in-memory and optional on-disk
@@ -1556,9 +2537,6 @@ pub fn build_trace_tensors_from_parquet_cached(
     if n == 0 || c_total == 0 || cfg.l == 0 {
         return Ok(out);
     }
-    if !cache.is_enabled() && disk.is_none() {
-        return build_trace_tensors_from_parquet(rows, xic_path, cfg, fetch_cfg);
-    }
 
     let mut by_run: HashMap<u64, HashSet<u64>> = HashMap::new();
     for row in rows {
@@ -1570,7 +2548,9 @@ pub fn build_trace_tensors_from_parquet_cached(
 
     let mut xic_by_run: HashMap<u64, HashMap<u64, PrecursorXic>> = HashMap::new();
     for (run_id, prec_set) in by_run {
-        let fetched = fetch_precursors_cached(xic_path, run_id, &prec_set, cache, disk, fetch_cfg)?;
+        let fetched = fetch_precursors_cached_with_fallback(
+            xic_path, run_id, &prec_set, cache, disk, fetch_cfg,
+        )?;
         xic_by_run.insert(run_id, fetched);
     }
 
@@ -1771,7 +2751,9 @@ pub fn build_trace_tensors_from_parquet_map_cached(
     };
 
     let use_cache = cache.is_enabled() || disk.is_some();
+    #[cfg(feature = "rayon")]
     let disk_owned = disk.cloned();
+    #[cfg(feature = "rayon")]
     let cache_owned = cache.clone();
 
     #[cfg(feature = "rayon")]
@@ -1801,7 +2783,7 @@ pub fn build_trace_tensors_from_parquet_map_cached(
         .map(|(run_id, prec_set, path)| {
             if use_cache {
                 fetch_precursors_cached_with_fallback(
-                    path, run_id, &prec_set, cache, disk, fetch_cfg,
+                    &path, run_id, &prec_set, cache, disk, fetch_cfg,
                 )
                 .map(|map| (run_id, map))
             } else {
@@ -1976,10 +2958,31 @@ mod tests {
     use crate::building_blocks::trace_input::TraceInputMode;
     use crate::infer::{build_score_table_from_rows, score_candidates, write_score_tsv};
     use crate::io::osw::{OswLevel, OswReadConfig};
+    use crate::io::xim::XimPoint;
     use crate::model::topaz::{TopazBagRanker, TopazConfig};
     use candle_core::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
+
+    #[derive(Default)]
+    struct MockXimSource {
+        by_run: HashMap<u64, Vec<FeatureXim>>,
+    }
+
+    impl XimSource for MockXimSource {
+        fn fetch_features(&mut self, run_id: u64, feature_ids: &[u64]) -> Result<Vec<FeatureXim>> {
+            let Some(items) = self.by_run.get(&run_id) else {
+                return Ok(Vec::new());
+            };
+            let wanted: HashSet<u64> = feature_ids.iter().copied().collect();
+            Ok(items
+                .iter()
+                .filter(|xim| wanted.contains(&xim.feature_id))
+                .cloned()
+                .collect())
+        }
+    }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -2080,6 +3083,89 @@ mod tests {
         assert_eq!(lines[0], "FEATURE_ID\tSCORE\tRANK\tPVALUE\tQVALUE\tPEP");
 
         let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_xim_tensors_from_source_shape() -> Result<()> {
+        let rows = vec![
+            FeatureRow {
+                feature_id: 10,
+                precursor_id: 100,
+                run_id: 7,
+                group_id: "7_100".to_string(),
+                exp_rt: 100.0,
+                rt_left_width: None,
+                rt_right_width: None,
+                exp_im: Some(0.05),
+                exp_im_left_width: Some(0.03),
+                exp_im_right_width: Some(0.07),
+                is_decoy: false,
+                features: vec![],
+            },
+            FeatureRow {
+                feature_id: 11,
+                precursor_id: 101,
+                run_id: 7,
+                group_id: "7_101".to_string(),
+                exp_rt: 101.0,
+                rt_left_width: None,
+                rt_right_width: None,
+                exp_im: Some(0.05),
+                exp_im_left_width: None,
+                exp_im_right_width: None,
+                is_decoy: true,
+                features: vec![],
+            },
+        ];
+        let mut source = MockXimSource::default();
+        source.by_run.insert(
+            7,
+            vec![FeatureXim {
+                feature_id: 10,
+                precursor_id: 100,
+                feature_rt: 100.0,
+                traces: vec![
+                    MobilogramTrace {
+                        annotation: "ms1".to_string(),
+                        ordinal: 0,
+                        ms_level: Some(1),
+                        mobilogram_type: Some("ms1".to_string()),
+                        points: (0..10)
+                            .map(|i| XimPoint {
+                                mobility: i as f32 * 0.01,
+                                intensity: if i == 5 { 2.0 } else { 1.0 },
+                            })
+                            .collect(),
+                    },
+                    MobilogramTrace {
+                        annotation: "y7".to_string(),
+                        ordinal: 1,
+                        ms_level: Some(2),
+                        mobilogram_type: Some("ms2".to_string()),
+                        points: (0..10)
+                            .map(|i| XimPoint {
+                                mobility: i as f32 * 0.01,
+                                intensity: if i == 4 { 3.0 } else { 0.5 },
+                            })
+                            .collect(),
+                    },
+                ],
+            }],
+        );
+
+        let cfg = TraceBuildConfig {
+            l: 8,
+            ms1_cmax: 1,
+            ms2_cmax: 1,
+            normalize_max: false,
+        };
+        let x = build_xim_tensors_from_source(&rows, &mut source, &cfg)?;
+        assert_eq!(x.len(), rows.len() * cfg.total_c() * cfg.l);
+        let row0 = &x[..cfg.total_c() * cfg.l];
+        assert!(row0.iter().any(|&v| v != 0.0));
+        let row1 = &x[cfg.total_c() * cfg.l..];
+        assert!(row1.iter().all(|&v| v == 0.0));
         Ok(())
     }
 }

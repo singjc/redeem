@@ -14,6 +14,9 @@ pub struct TrainBatch {
     pub xb: Tensor,
     /// (B,K,C,L)
     pub tb: Tensor,
+    /// Optional auxiliary signal tensor, e.g. mobilograms, with shape
+    /// `(B, K, C_aux, L_aux)`.
+    pub tb_aux: Option<Tensor>,
     /// (B,K) bool
     pub mask: Tensor,
     /// (B,)
@@ -178,8 +181,14 @@ impl Trainer {
 
         let xf = batch.xb.reshape((b * k, d))?;
         let tf = batch.tb.reshape((b * k, c, l))?;
+        let tf_aux = if let Some(tb_aux) = batch.tb_aux.as_ref() {
+            let (_, _, c_aux, l_aux) = tb_aux.dims4()?;
+            Some(tb_aux.reshape((b * k, c_aux, l_aux))?)
+        } else {
+            None
+        };
 
-        let (emb, coe, coe_ms12) = self.model.trace_enc.forward_components(&tf)?;
+        let (emb, coe, coe_ms12) = self.model.encode_inputs(&tf, tf_aux.as_ref())?;
         let logits = self.model.scorer.forward(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
 
@@ -262,8 +271,14 @@ impl Trainer {
 
         let xf = batch.xb.reshape((b * k, d))?;
         let tf = batch.tb.reshape((b * k, c, l))?;
+        let tf_aux = if let Some(tb_aux) = batch.tb_aux.as_ref() {
+            let (_, _, c_aux, l_aux) = tb_aux.dims4()?;
+            Some(tb_aux.reshape((b * k, c_aux, l_aux))?)
+        } else {
+            None
+        };
 
-        let (emb, coe, _coe_ms12) = self.model.trace_enc.forward_components(&tf)?;
+        let (emb, coe, _coe_ms12) = self.model.encode_inputs(&tf, tf_aux.as_ref())?;
         let logits = self.model.scorer.forward_eval(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
 
@@ -529,7 +544,13 @@ mod tests {
         let mask = Tensor::ones((b, k), DType::U8, &device)?;
         let yb = Tensor::new(vec![1f32, 0.0, 1.0, 0.0], &device)?;
 
-        let batch = TrainBatch { xb, tb, mask, yb };
+        let batch = TrainBatch {
+            xb,
+            tb,
+            tb_aux: None,
+            mask,
+            yb,
+        };
 
         let m1 = trainer.train_step(&batch)?;
         let m2 = trainer.train_step(&batch)?;

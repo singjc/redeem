@@ -33,5 +33,18 @@ pub fn score_bags(
     model.score_bags_chunked(xb, tb, mask, batch_size)
 }
 
+/// Score bags in chunks with an optional auxiliary signal tensor aligned to
+/// `tb`.
+pub fn score_bags_with_aux(
+    model: &impl BagRankerInterface,
+    xb: &Tensor,
+    tb: &Tensor,
+    mask: &Tensor,
+    tb_aux: Option<&Tensor>,
+    batch_size: usize,
+) -> Result<(Tensor, Tensor)> {
+    model.score_bags_chunked_aux(xb, tb, mask, tb_aux, batch_size)
+}
+
 /// Namespace marker for bag-scoring utilities.
 pub struct ScoreBags;
