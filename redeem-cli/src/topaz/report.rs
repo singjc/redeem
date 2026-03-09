@@ -1,42 +1,70 @@
-use anyhow::{Result, bail};
-use plotly::common::{DashType, HoverInfo, Line, Marker, Mode, Orientation, Pattern, PatternShape};
+use anyhow::{Context, Result, bail};
+use plotly::common::{
+    DashType, HoverInfo, Line, Marker, Mode, Orientation, Pattern, PatternShape, Position,
+};
 use plotly::layout::{Axis, BarMode};
 use plotly::{Bar, Histogram, Layout, Plot, Scatter};
 use rand::prelude::*;
+use redeem_topaz::building_blocks::trace_window::nearest_index_sorted;
 use redeem_topaz::infer::stats::tdc_summary;
+use redeem_topaz::infer::{XicFetchConfig, XimFetchConfig};
+use redeem_topaz::inspect::{
+    fetch_xic_for_row, fetch_xims_for_rows, read_run_path_map, resolve_run_path,
+    valid_im_bounds, valid_rt_bounds,
+};
+use redeem_topaz::io::osw::FeatureRow;
+use redeem_topaz::io::xic::PrecursorXic;
+use redeem_topaz::io::xim::FeatureXim;
 use report_builder::{Report, ReportSection};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_PCA_MAX_ROWS: usize = 50_000;
 const POWER_ITERS: usize = 50;
 
-pub fn write_topaz_report(
-    head_embeddings_path: &Path,
-    report_path: &Path,
-    seed: u64,
-    osw_path: Option<&Path>,
-    score_tsv_path: Option<&Path>,
-) -> Result<()> {
-    let emb = load_head_embeddings_tsv(head_embeddings_path)?;
+pub struct TopazReportInputs<'a> {
+    pub head_embeddings_path: &'a Path,
+    pub report_path: &'a Path,
+    pub seed: u64,
+    pub osw_path: Option<&'a Path>,
+    pub score_tsv_path: Option<&'a Path>,
+    pub xic_path: Option<&'a Path>,
+    pub xic_paths: Option<&'a [PathBuf]>,
+    pub xic_map_path: Option<&'a Path>,
+    pub xim_path: Option<&'a Path>,
+    pub xim_paths: Option<&'a [PathBuf]>,
+    pub xim_map_path: Option<&'a Path>,
+    pub xic_fetch: &'a XicFetchConfig,
+    pub xim_fetch: &'a XimFetchConfig,
+    pub example_bags: usize,
+}
+
+pub fn write_topaz_report(inputs: &TopazReportInputs<'_>) -> Result<()> {
+    let emb = load_head_embeddings_tsv(inputs.head_embeddings_path)?;
     if emb.hidden_dim == 0 || emb.n == 0 {
-        bail!("head embeddings are empty: {:?}", head_embeddings_path);
+        bail!(
+            "head embeddings are empty: {:?}",
+            inputs.head_embeddings_path
+        );
     }
 
-    let precursor_meta = if let Some(path) = osw_path {
+    let precursor_meta = if let Some(path) = inputs.osw_path {
         redeem_topaz::io::osw::read_precursor_meta(path).ok()
     } else {
         None
     };
-    let feature_meta = if let Some(path) = osw_path {
+    let feature_meta = if let Some(path) = inputs.osw_path {
         redeem_topaz::io::osw::read_feature_meta(path).ok()
     } else {
         None
     };
 
-    let topaz_scores = score_tsv_path
+    let topaz_scores = inputs
+        .score_tsv_path
         .and_then(|p| load_score_tsv(p).ok())
         .filter(|rows| !rows.is_empty());
-    let ms2_scores = osw_path
+    let ms2_scores = inputs
+        .osw_path
         .and_then(|p| redeem_topaz::io::osw::read_score_table(p, "SCORE_MS2").ok())
         .filter(|rows| !rows.is_empty())
         .map(|rows| {
@@ -50,7 +78,7 @@ pub fn write_topaz_report(
         emb.n,
         emb.hidden_dim,
         DEFAULT_PCA_MAX_ROWS,
-        seed,
+        inputs.seed,
     );
     let bag_scores_f32: Vec<f32> = emb.bag_score.iter().map(|&v| v as f32).collect();
     let tdc = tdc_summary(&bag_scores_f32, &emb.is_decoy, 0.01);
@@ -108,7 +136,30 @@ pub fn write_topaz_report(
         }
     }
 
-    report.save_to_file(&report_path.to_string_lossy().to_string())?;
+    if let (Some(osw_path), Some(scores)) = (inputs.osw_path, topaz_scores.as_ref()) {
+        match build_example_plots(
+            osw_path,
+            &emb,
+            scores,
+            ms2_scores.as_ref(),
+            inputs,
+            precursor_meta.as_ref(),
+        ) {
+            Ok(examples) if !examples.is_empty() => {
+                let mut sec = ReportSection::new("Raw Traces");
+                for plot in examples {
+                    sec.add_plot(plot);
+                }
+                report.add_section(sec);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log::warn!("Skipping raw trace report section: {err:#}");
+            }
+        }
+    }
+
+    report.save_to_file(&inputs.report_path.to_string_lossy().to_string())?;
     Ok(())
 }
 
@@ -914,4 +965,437 @@ fn parse_bag_pid(pid: &str) -> (Option<u64>, Option<u64>) {
         return (None, None);
     }
     (run, prec)
+}
+
+#[derive(Debug, Clone)]
+struct ExampleCandidate {
+    row: FeatureRow,
+    topaz: ScoreLite,
+    ms2: Option<ScoreLite>,
+}
+
+#[derive(Debug, Clone)]
+struct ExampleBag {
+    bag_pid: String,
+    bag_score: f64,
+    is_decoy: bool,
+    title: String,
+    candidates: Vec<ExampleCandidate>,
+    raw_xic: Option<PrecursorXic>,
+    raw_xims: HashMap<u64, FeatureXim>,
+}
+
+fn infer_run_map_from_paths(
+    paths: &[PathBuf],
+    list_run_ids: fn(&Path) -> Result<Vec<u64>>,
+) -> Result<HashMap<u64, PathBuf>> {
+    let mut out = HashMap::new();
+    for path in paths {
+        for run_id in list_run_ids(path)? {
+            out.insert(run_id, path.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_xic_run_map(inputs: &TopazReportInputs<'_>) -> Result<Option<HashMap<u64, PathBuf>>> {
+    if let Some(map_path) = inputs.xic_map_path {
+        return read_run_path_map(map_path).map(Some);
+    }
+    if let Some(paths) = inputs.xic_paths {
+        return infer_run_map_from_paths(paths, redeem_topaz::io::xic_parquet::list_run_ids)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+fn resolve_xim_run_map(inputs: &TopazReportInputs<'_>) -> Result<Option<HashMap<u64, PathBuf>>> {
+    if let Some(map_path) = inputs.xim_map_path {
+        return read_run_path_map(map_path).map(Some);
+    }
+    if let Some(paths) = inputs.xim_paths {
+        return infer_run_map_from_paths(paths, redeem_topaz::io::xim_parquet::list_run_ids)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+fn bag_selection_order(emb: &HeadEmbeddings, limit: usize) -> Vec<usize> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut idx: Vec<usize> = (0..emb.n).collect();
+    idx.sort_by(|&a, &b| {
+        emb.bag_score[b]
+            .partial_cmp(&emb.bag_score[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut out = Vec::new();
+    for want_decoy in [false, true] {
+        for &i in &idx {
+            if emb.is_decoy[i] == want_decoy {
+                out.push(i);
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn score_rank_label(score: &ScoreLite) -> String {
+    match score.rank {
+        Some(1) => "top".to_string(),
+        Some(rank) => format!("r{rank}"),
+        None => "cand".to_string(),
+    }
+}
+
+fn score_hover_html(candidate: &ExampleCandidate) -> String {
+    let mut out = format!(
+        "feature_id={}<br>topaz_score={:.3}<br>topaz_rank={:?}<br>topaz_q={:?}",
+        candidate.row.feature_id,
+        candidate.topaz.score,
+        candidate.topaz.rank,
+        candidate.topaz.qvalue
+    );
+    if let Some(ms2) = candidate.ms2.as_ref() {
+        out.push_str(&format!(
+            "<br>ms2_score={:.3}<br>ms2_rank={:?}<br>ms2_q={:?}",
+            ms2.score, ms2.rank, ms2.qvalue
+        ));
+    }
+    out
+}
+
+fn summed_xic_trace(xic: &PrecursorXic) -> Option<(Vec<f64>, Vec<f64>)> {
+    let first = xic.transitions.iter().find(|t| !t.points.is_empty())?;
+    let coords: Vec<f64> = first.points.iter().map(|p| p.rt as f64).collect();
+    let mut sum = vec![0.0f64; coords.len()];
+    for trace in &xic.transitions {
+        for (i, point) in trace.points.iter().take(sum.len()).enumerate() {
+            sum[i] += point.intensity as f64;
+        }
+    }
+    Some((coords, sum))
+}
+
+fn summed_xim_trace(xim: &FeatureXim) -> Option<(Vec<f64>, Vec<f64>)> {
+    let first = xim.traces.iter().find(|t| !t.points.is_empty())?;
+    let coords: Vec<f64> = first.points.iter().map(|p| p.mobility as f64).collect();
+    let mut sum = vec![0.0f64; coords.len()];
+    for trace in &xim.traces {
+        for (i, point) in trace.points.iter().take(sum.len()).enumerate() {
+            sum[i] += point.intensity as f64;
+        }
+    }
+    Some((coords, sum))
+}
+
+fn nearest_signal(coords: &[f64], signal: &[f64], x: f64) -> f64 {
+    if coords.is_empty() || signal.is_empty() {
+        return 0.0;
+    }
+    let coords32: Vec<f32> = coords.iter().map(|&v| v as f32).collect();
+    let idx = nearest_index_sorted(&coords32, x as f32).min(signal.len().saturating_sub(1));
+    signal[idx]
+}
+
+fn palette_color(idx: usize) -> &'static str {
+    const COLORS: &[&str] = &[
+        "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2",
+    ];
+    COLORS[idx % COLORS.len()]
+}
+
+fn build_example_plots(
+    osw_path: &Path,
+    emb: &HeadEmbeddings,
+    topaz_scores: &[ScoreLite],
+    ms2_scores: Option<&Vec<ScoreLite>>,
+    inputs: &TopazReportInputs<'_>,
+    precursor_meta: Option<&HashMap<u64, redeem_topaz::io::osw::PrecursorMeta>>,
+) -> Result<Vec<Plot>> {
+    if inputs.example_bags == 0 {
+        return Ok(Vec::new());
+    }
+    if inputs.xic_path.is_none() && inputs.xic_paths.is_none() && inputs.xic_map_path.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let selected_indices = bag_selection_order(emb, inputs.example_bags);
+    let selected_bags: Vec<(u64, u64)> = selected_indices
+        .iter()
+        .filter_map(|&idx| {
+            let (run_id, precursor_id) = parse_bag_pid(&emb.bag_pid[idx]);
+            Some((run_id?, precursor_id?))
+        })
+        .collect();
+    if selected_bags.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let feature_rows = redeem_topaz::io::osw::read_feature_rows_for_bags(osw_path, &selected_bags)
+        .with_context(|| format!("reading OSW feature rows from {:?}", osw_path))?;
+
+    let mut rows_by_pid: HashMap<String, Vec<FeatureRow>> = HashMap::new();
+    for row in feature_rows {
+        rows_by_pid
+            .entry(row.group_id.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let topaz_by_feature: HashMap<u64, ScoreLite> = topaz_scores
+        .iter()
+        .cloned()
+        .map(|row| (row.feature_id, row))
+        .collect();
+    let ms2_by_feature: HashMap<u64, ScoreLite> = ms2_scores
+        .map(|rows| {
+            rows.iter()
+                .cloned()
+                .map(|row| (row.feature_id, row))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let xic_run_map =
+        resolve_xic_run_map(inputs).context("resolving XIC path inputs for raw report traces")?;
+    let xim_run_map =
+        resolve_xim_run_map(inputs).context("resolving XIM path inputs for raw report traces")?;
+
+    let mut plots = Vec::new();
+    for idx in selected_indices {
+        let bag_pid = emb.bag_pid[idx].clone();
+        let bag_rows = match rows_by_pid.get(&bag_pid) {
+            Some(rows) => rows.clone(),
+            None => continue,
+        };
+        let mut candidates = Vec::new();
+        for row in bag_rows {
+            let Some(topaz) = topaz_by_feature.get(&row.feature_id).cloned() else {
+                continue;
+            };
+            candidates.push(ExampleCandidate {
+                ms2: ms2_by_feature.get(&row.feature_id).cloned(),
+                row,
+                topaz,
+            });
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_by(|a, b| {
+            a.topaz
+                .rank
+                .unwrap_or(i32::MAX)
+                .cmp(&b.topaz.rank.unwrap_or(i32::MAX))
+                .then_with(|| {
+                    b.topaz
+                        .score
+                        .partial_cmp(&a.topaz.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+
+        let first = &candidates[0].row;
+        let run_id = first.run_id;
+        let precursor_id = first.precursor_id;
+        let peptide = precursor_meta
+            .and_then(|m| m.get(&precursor_id))
+            .map(|m| format!("{} / z={}", m.modified_sequence, m.charge))
+            .unwrap_or_else(|| format!("precursor_id={precursor_id}"));
+
+        let raw_xic = match resolve_run_path(run_id, inputs.xic_path, xic_run_map.as_ref()) {
+            Some(path) => match fetch_xic_for_row(first, &path, inputs.xic_fetch) {
+                Ok(xic) => xic,
+                Err(err) => {
+                    log::warn!(
+                        "Skipping raw XIC example fetch for feature_id={} from {:?}: {err:#}",
+                        first.feature_id,
+                        path
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let mut raw_xims = HashMap::new();
+        if let Some(path) = resolve_run_path(run_id, inputs.xim_path, xim_run_map.as_ref()) {
+            let candidate_rows: Vec<FeatureRow> =
+                candidates.iter().map(|candidate| candidate.row.clone()).collect();
+            match fetch_xims_for_rows(&candidate_rows, &path, inputs.xim_fetch) {
+                Ok(xims) => {
+                    raw_xims = xims;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Skipping raw XIM example fetch for bag_pid={} from {:?}: {err:#}",
+                        bag_pid,
+                        path
+                    );
+                }
+            }
+        }
+
+        let example = ExampleBag {
+            bag_pid,
+            bag_score: emb.bag_score[idx],
+            is_decoy: emb.is_decoy[idx],
+            title: format!(
+                "{} | run_id={} | bag_score={:.3} | {}",
+                peptide,
+                run_id,
+                emb.bag_score[idx],
+                if emb.is_decoy[idx] { "decoy" } else { "target" }
+            ),
+            candidates,
+            raw_xic,
+            raw_xims,
+        };
+        plots.push(plot_example_bag(&example));
+    }
+    Ok(plots)
+}
+
+fn plot_example_bag(example: &ExampleBag) -> Plot {
+    let mut plot = Plot::new();
+    let mut xic_y_max = 1.0f64;
+    let mut xim_y_max = 1.0f64;
+
+    if let Some(raw_xic) = example.raw_xic.as_ref() {
+        for trace in &raw_xic.transitions {
+            let x: Vec<f64> = trace.points.iter().map(|p| p.rt as f64).collect();
+            let y: Vec<f64> = trace.points.iter().map(|p| p.intensity as f64).collect();
+            xic_y_max = xic_y_max.max(y.iter().copied().fold(0.0, f64::max));
+            plot.add_trace(
+                Scatter::new(x, y)
+                    .name(format!("XIC {}", trace.annotation))
+                    .mode(Mode::Lines)
+                    .line(Line::new().color("rgba(31,119,180,0.28)").width(1.0)),
+            );
+        }
+        if let Some((coords, signal)) = summed_xic_trace(raw_xic) {
+            xic_y_max = xic_y_max.max(signal.iter().copied().fold(0.0, f64::max));
+            plot.add_trace(
+                Scatter::new(coords.clone(), signal.clone())
+                    .name("XIC sum")
+                    .mode(Mode::Lines)
+                    .line(Line::new().color("#111111").width(2.5)),
+            );
+            for (i, candidate) in example.candidates.iter().enumerate() {
+                let color = palette_color(i);
+                let apex_x = candidate.row.exp_rt as f64;
+                let apex_y = nearest_signal(&coords, &signal, apex_x).max(0.0);
+                plot.add_trace(
+                    Scatter::new(vec![apex_x], vec![apex_y])
+                        .name(format!(
+                            "{} {}",
+                            score_rank_label(&candidate.topaz),
+                            candidate.row.feature_id
+                        ))
+                        .mode(Mode::MarkersText)
+                        .text_array(vec![score_rank_label(&candidate.topaz)])
+                        .text_position(Position::TopCenter)
+                        .marker(Marker::new().color(color).size(9))
+                        .hover_info(HoverInfo::Text)
+                        .hover_text_array(vec![score_hover_html(candidate)]),
+                );
+                if let Some((left, right)) = valid_rt_bounds(&candidate.row) {
+                    plot.add_trace(
+                        Scatter::new(vec![left as f64, left as f64], vec![0.0, xic_y_max])
+                            .name(format!("rt_left {}", candidate.row.feature_id))
+                            .mode(Mode::Lines)
+                            .line(Line::new().color(color).dash(DashType::Dash)),
+                    );
+                    plot.add_trace(
+                        Scatter::new(vec![right as f64, right as f64], vec![0.0, xic_y_max])
+                            .name(format!("rt_right {}", candidate.row.feature_id))
+                            .mode(Mode::Lines)
+                            .line(Line::new().color(color).dash(DashType::Dash)),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut first_xim = true;
+    for (i, candidate) in example.candidates.iter().enumerate() {
+        let Some(raw_xim) = example.raw_xims.get(&candidate.row.feature_id) else {
+            continue;
+        };
+        let Some((coords, signal)) = summed_xim_trace(raw_xim) else {
+            continue;
+        };
+        xim_y_max = xim_y_max.max(signal.iter().copied().fold(0.0, f64::max));
+        let color = palette_color(i);
+        plot.add_trace(
+            Scatter::new(coords.clone(), signal.clone())
+                .name(format!(
+                    "XIM {} {}",
+                    score_rank_label(&candidate.topaz),
+                    candidate.row.feature_id
+                ))
+                .mode(Mode::Lines)
+                .x_axis("x2")
+                .y_axis("y2")
+                .line(
+                    Line::new()
+                        .color(color)
+                        .width(if first_xim { 2.5 } else { 1.8 }),
+                ),
+        );
+        first_xim = false;
+        let apex_x = candidate.row.exp_im.unwrap_or(0.0) as f64;
+        let apex_y = nearest_signal(&coords, &signal, apex_x).max(0.0);
+        plot.add_trace(
+            Scatter::new(vec![apex_x], vec![apex_y])
+                .name(format!("xim {}", candidate.row.feature_id))
+                .mode(Mode::MarkersText)
+                .x_axis("x2")
+                .y_axis("y2")
+                .text_array(vec![score_rank_label(&candidate.topaz)])
+                .text_position(Position::TopCenter)
+                .marker(Marker::new().color(color).size(9))
+                .hover_info(HoverInfo::Text)
+                .hover_text_array(vec![score_hover_html(candidate)]),
+        );
+        if let Some((left, right)) = valid_im_bounds(&candidate.row) {
+            plot.add_trace(
+                Scatter::new(vec![left as f64, left as f64], vec![0.0, xim_y_max])
+                    .name(format!("im_left {}", candidate.row.feature_id))
+                    .mode(Mode::Lines)
+                    .x_axis("x2")
+                    .y_axis("y2")
+                    .line(Line::new().color(color).dash(DashType::Dash)),
+            );
+            plot.add_trace(
+                Scatter::new(vec![right as f64, right as f64], vec![0.0, xim_y_max])
+                    .name(format!("im_right {}", candidate.row.feature_id))
+                    .mode(Mode::Lines)
+                    .x_axis("x2")
+                    .y_axis("y2")
+                    .line(Line::new().color(color).dash(DashType::Dash)),
+            );
+        }
+    }
+
+    plot.set_layout(
+        Layout::new()
+            .title(format!("{} | {}", example.title, example.bag_pid))
+            .x_axis(Axis::new().title("Retention time").domain(&[0.0, 0.46]))
+            .y_axis(Axis::new().title("XIC intensity").domain(&[0.0, 1.0]))
+            .x_axis2(Axis::new().title("Ion mobility").domain(&[0.54, 1.0]))
+            .y_axis2(
+                Axis::new()
+                    .title("XIM intensity")
+                    .domain(&[0.0, 1.0])
+                    .anchor("x2"),
+            )
+            .bar_mode(BarMode::Overlay),
+    );
+    plot
 }

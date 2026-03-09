@@ -31,14 +31,32 @@ impl TopazTrainConfig {
         if let Some(p) = matches.get_one::<PathBuf>("xic_path") {
             cfg.inner.xic_path = p.clone();
         }
+        if let Some(values) = matches.get_many::<PathBuf>("xic_paths") {
+            cfg.inner.xic_paths = Some(values.cloned().collect());
+        }
         if let Some(p) = matches.get_one::<PathBuf>("xic_map_path") {
             cfg.inner.xic_map_path = Some(p.clone());
+        }
+        if let Some(p) = matches.get_one::<PathBuf>("xim_path") {
+            cfg.inner.xim_path = Some(p.clone());
+        }
+        if let Some(values) = matches.get_many::<PathBuf>("xim_paths") {
+            cfg.inner.xim_paths = Some(values.cloned().collect());
+        }
+        if let Some(p) = matches.get_one::<PathBuf>("xim_map_path") {
+            cfg.inner.xim_map_path = Some(p.clone());
         }
         if let Some(p) = matches.get_one::<PathBuf>("xic_cache_dir") {
             cfg.inner.xic_cache_dir = Some(p.clone());
         }
         if let Some(v) = matches.get_one::<u64>("xic_cache_max_bytes") {
             cfg.inner.xic_cache_max_bytes = Some(*v);
+        }
+        if let Some(p) = matches.get_one::<PathBuf>("xim_cache_dir") {
+            cfg.inner.xim_cache_dir = Some(p.clone());
+        }
+        if let Some(v) = matches.get_one::<u64>("xim_cache_max_bytes") {
+            cfg.inner.xim_cache_max_bytes = Some(*v);
         }
         if let Some(p) = matches.get_one::<PathBuf>("init_checkpoint") {
             cfg.inner.init_checkpoint = Some(p.clone());
