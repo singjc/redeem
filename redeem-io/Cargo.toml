@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+log = { workspace = true }
 
 rusqlite = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }

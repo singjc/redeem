@@ -29,6 +29,29 @@ pub struct FeatureRow {
     pub group_id: String,
     /// Experimental apex retention time reported by OpenSWATH.
     pub exp_rt: f32,
+    /// Left retention-time boundary reported by peak picking, when present.
+    ///
+    /// In OpenSWATH this is usually `FEATURE.LEFT_WIDTH`. When available and
+    /// valid it describes the left edge of the chromatographic peak group.
+    pub rt_left_width: Option<f32>,
+    /// Right retention-time boundary reported by peak picking, when present.
+    ///
+    /// In OpenSWATH this is usually `FEATURE.RIGHT_WIDTH`. When available and
+    /// valid it describes the right edge of the chromatographic peak group.
+    pub rt_right_width: Option<f32>,
+    /// Experimental apex ion mobility reported by OpenSWATH, when present.
+    ///
+    /// This is typically populated for diaPASEF-style workflows and corresponds
+    /// to `FEATURE.EXP_IM`.
+    pub exp_im: Option<f32>,
+    /// Left mobility boundary reported by the ion-mobility peak picker.
+    ///
+    /// `None` means the column was absent or SQL `NULL`. Some OpenSWATH runs
+    /// may also encode invalid boundaries as negative values; TOPAZ interprets
+    /// those later when constructing fixed-width XIM tensors.
+    pub exp_im_left_width: Option<f32>,
+    /// Right mobility boundary reported by the ion-mobility peak picker.
+    pub exp_im_right_width: Option<f32>,
     /// `true` for decoy rows, `false` for targets.
     pub is_decoy: bool,
     /// Selected scalar features in the same order as `OswFeatureTable.feature_cols`.
@@ -142,6 +165,111 @@ pub struct OswFeatureTable {
     pub feature_cols: Vec<String>,
 }
 
+/// Read only the OSW feature rows needed for a small set of bags.
+///
+/// This helper is intended for diagnostics/reporting paths that need the raw
+/// candidate metadata for a handful of `(RUN_ID, PRECURSOR_ID)` bags without
+/// loading the full feature matrix. The returned rows contain the same
+/// candidate-identifying fields as [`read_feature_rows`], but `features` is
+/// empty because scalar heuristic columns are not needed for raw trace plots.
+///
+/// The query intentionally reads from `FEATURE` and `PRECURSOR` only. That
+/// keeps the path lightweight and avoids scanning the large `FEATURE_MS2` /
+/// `FEATURE_MS1` tables when the caller only needs feature IDs, apexes, peak
+/// boundaries, and decoy labels.
+#[cfg(feature = "sqlite")]
+pub fn read_feature_rows_for_bags(
+    path: &std::path::Path,
+    bag_keys: &[(u64, u64)],
+) -> Result<Vec<FeatureRow>> {
+    use rusqlite::{Connection, params_from_iter};
+    use std::collections::HashSet;
+
+    if bag_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let feature_table_cols: std::collections::HashSet<String> =
+        list_columns(&conn, "FEATURE")?.into_iter().collect();
+
+    let run_ids: HashSet<u64> = bag_keys.iter().map(|(run_id, _)| *run_id).collect();
+    let precursor_ids: HashSet<u64> = bag_keys.iter().map(|(_, precursor_id)| *precursor_id).collect();
+    let bag_set: HashSet<(u64, u64)> = bag_keys.iter().copied().collect();
+
+    let run_placeholders = vec!["?"; run_ids.len()].join(", ");
+    let precursor_placeholders = vec!["?"; precursor_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT
+            f.ID,
+            f.RUN_ID,
+            f.PRECURSOR_ID,
+            f.EXP_RT,
+            {},
+            {},
+            {},
+            {},
+            {},
+            p.DECOY
+         FROM FEATURE f
+         INNER JOIN PRECURSOR p ON f.PRECURSOR_ID = p.ID
+         WHERE f.RUN_ID IN ({run_placeholders})
+           AND f.PRECURSOR_ID IN ({precursor_placeholders})
+         ORDER BY f.RUN_ID, f.PRECURSOR_ID, f.EXP_RT",
+        feature_optional_projection(&feature_table_cols, "LEFT_WIDTH"),
+        feature_optional_projection(&feature_table_cols, "RIGHT_WIDTH"),
+        feature_optional_projection(&feature_table_cols, "EXP_IM"),
+        feature_optional_projection(&feature_table_cols, "EXP_IM_LEFTWIDTH"),
+        feature_optional_projection(&feature_table_cols, "EXP_IM_RIGHTWIDTH"),
+    );
+
+    let mut params: Vec<i64> = Vec::with_capacity(run_ids.len() + precursor_ids.len());
+    let mut run_ids_sorted: Vec<u64> = run_ids.into_iter().collect();
+    run_ids_sorted.sort_unstable();
+    params.extend(run_ids_sorted.into_iter().map(|v| v as i64));
+    let mut precursor_ids_sorted: Vec<u64> = precursor_ids.into_iter().collect();
+    precursor_ids_sorted.sort_unstable();
+    params.extend(precursor_ids_sorted.into_iter().map(|v| v as i64));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+        let feature_id: i64 = row.get(0)?;
+        let run_id: i64 = row.get(1)?;
+        let precursor_id: i64 = row.get(2)?;
+        let exp_rt: f32 = row.get(3)?;
+        let rt_left_width: Option<f32> = row.get(4)?;
+        let rt_right_width: Option<f32> = row.get(5)?;
+        let exp_im: Option<f32> = row.get(6)?;
+        let exp_im_left_width: Option<f32> = row.get(7)?;
+        let exp_im_right_width: Option<f32> = row.get(8)?;
+        let decoy: i32 = row.get(9)?;
+
+        Ok(FeatureRow {
+            feature_id: feature_id as u64,
+            precursor_id: precursor_id as u64,
+            run_id: run_id as u64,
+            group_id: format!("{run_id}_{precursor_id}"),
+            exp_rt,
+            rt_left_width,
+            rt_right_width,
+            exp_im,
+            exp_im_left_width,
+            exp_im_right_width,
+            is_decoy: decoy != 0,
+            features: Vec::new(),
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let row = row?;
+        if bag_set.contains(&(row.run_id, row.precursor_id)) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 /// Read feature rows from an OSW SQLite file.
 ///
 /// The selected SQL feature table depends on `cfg.level`. The resulting rows
@@ -217,6 +345,37 @@ fn list_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>>
     Ok(cols)
 }
 
+#[cfg(feature = "sqlite")]
+fn row_get_f32_like(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<f32>> {
+    use rusqlite::types::ValueRef;
+
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Integer(v) => Ok(Some(v as f32)),
+        ValueRef::Real(v) => Ok(Some(v as f32)),
+        ValueRef::Text(v) => Ok(std::str::from_utf8(v)
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())),
+        ValueRef::Blob(_) => Ok(None),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn row_get_i32_like(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<i32>> {
+    use rusqlite::types::ValueRef;
+
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Integer(v) => Ok(Some(v as i32)),
+        ValueRef::Real(v) => Ok(Some(v.round() as i32)),
+        ValueRef::Text(v) => Ok(std::str::from_utf8(v)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| v.round() as i32)),
+        ValueRef::Blob(_) => Ok(None),
+    }
+}
+
 /// Read feature metadata keyed by `FEATURE_ID`.
 ///
 /// This is the lightest-weight way to recover run/precursor/decoy context for
@@ -280,13 +439,13 @@ pub fn read_score_table(path: &std::path::Path, table: &str) -> Result<Vec<Score
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         let feature_id: i64 = row.get(0)?;
-        let score: Option<f32> = row.get(1)?;
-        let rank: Option<i64> = row.get(2)?;
-        let qvalue: Option<f32> = row.get(3)?;
+        let score = row_get_f32_like(row, 1)?;
+        let rank = row_get_i32_like(row, 2)?;
+        let qvalue = row_get_f32_like(row, 3)?;
         Ok(ScoreTableEntry {
             feature_id: feature_id as u64,
             score: score.unwrap_or(0.0),
-            rank: rank.map(|r| r as i32),
+            rank,
             qvalue,
         })
     })?;
@@ -408,6 +567,18 @@ fn filter_all_null_columns(
 }
 
 #[cfg(feature = "sqlite")]
+fn feature_optional_projection(
+    feature_cols: &std::collections::HashSet<String>,
+    column: &str,
+) -> String {
+    if feature_cols.contains(column) {
+        format!("f.{column}")
+    } else {
+        format!("NULL AS {column}")
+    }
+}
+
+#[cfg(feature = "sqlite")]
 fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result<OswFeatureTable> {
     use rusqlite::Row;
 
@@ -435,11 +606,31 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
         ms1_cols = kept;
     }
 
+    let feature_table_cols: std::collections::HashSet<String> =
+        list_columns(conn, "FEATURE")?.into_iter().collect();
+
     let mut select_cols: Vec<String> = Vec::new();
     select_cols.push("fm.FEATURE_ID".to_string());
     select_cols.push("f.RUN_ID".to_string());
     select_cols.push("f.PRECURSOR_ID".to_string());
     select_cols.push("f.EXP_RT".to_string());
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "LEFT_WIDTH",
+    ));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "RIGHT_WIDTH",
+    ));
+    select_cols.push(feature_optional_projection(&feature_table_cols, "EXP_IM"));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "EXP_IM_LEFTWIDTH",
+    ));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "EXP_IM_RIGHTWIDTH",
+    ));
     select_cols.push("p.DECOY".to_string());
 
     for c in &feature_cols {
@@ -472,9 +663,14 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
         let run_id: i64 = row.get(1)?;
         let precursor_id: i64 = row.get(2)?;
         let exp_rt: f32 = row.get(3)?;
-        let decoy: i32 = row.get(4)?;
+        let rt_left_width: Option<f32> = row.get(4)?;
+        let rt_right_width: Option<f32> = row.get(5)?;
+        let exp_im: Option<f32> = row.get(6)?;
+        let exp_im_left_width: Option<f32> = row.get(7)?;
+        let exp_im_right_width: Option<f32> = row.get(8)?;
+        let decoy: i32 = row.get(9)?;
 
-        let mut idx = 5usize;
+        let mut idx = 10usize;
         let mut feats = Vec::new();
 
         for _ in 0..feature_cols.len() {
@@ -495,6 +691,11 @@ fn read_ms2_features(conn: &rusqlite::Connection, cfg: &OswReadConfig) -> Result
             run_id: run_id as u64,
             group_id: format!("{run_id}_{precursor_id}"),
             exp_rt,
+            rt_left_width,
+            rt_right_width,
+            exp_im,
+            exp_im_left_width,
+            exp_im_right_width,
             is_decoy: decoy != 0,
             features: feats,
         })
@@ -535,11 +736,31 @@ fn read_ms1_features(conn: &rusqlite::Connection, _cfg: &OswReadConfig) -> Resul
         );
     }
 
+    let feature_table_cols: std::collections::HashSet<String> =
+        list_columns(conn, "FEATURE")?.into_iter().collect();
+
     let mut select_cols: Vec<String> = Vec::new();
     select_cols.push("fm.FEATURE_ID".to_string());
     select_cols.push("f.RUN_ID".to_string());
     select_cols.push("f.PRECURSOR_ID".to_string());
     select_cols.push("f.EXP_RT".to_string());
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "LEFT_WIDTH",
+    ));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "RIGHT_WIDTH",
+    ));
+    select_cols.push(feature_optional_projection(&feature_table_cols, "EXP_IM"));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "EXP_IM_LEFTWIDTH",
+    ));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "EXP_IM_RIGHTWIDTH",
+    ));
     select_cols.push("p.DECOY".to_string());
     for c in &feature_cols {
         select_cols.push(format!("fm.{c}"));
@@ -560,9 +781,14 @@ fn read_ms1_features(conn: &rusqlite::Connection, _cfg: &OswReadConfig) -> Resul
         let run_id: i64 = row.get(1)?;
         let precursor_id: i64 = row.get(2)?;
         let exp_rt: f32 = row.get(3)?;
-        let decoy: i32 = row.get(4)?;
+        let rt_left_width: Option<f32> = row.get(4)?;
+        let rt_right_width: Option<f32> = row.get(5)?;
+        let exp_im: Option<f32> = row.get(6)?;
+        let exp_im_left_width: Option<f32> = row.get(7)?;
+        let exp_im_right_width: Option<f32> = row.get(8)?;
+        let decoy: i32 = row.get(9)?;
 
-        let mut idx = 5usize;
+        let mut idx = 10usize;
         let mut feats = Vec::new();
         for _ in 0..feature_cols.len() {
             let v = get_f32_or_nan(row, idx)?;
@@ -576,6 +802,11 @@ fn read_ms1_features(conn: &rusqlite::Connection, _cfg: &OswReadConfig) -> Resul
             run_id: run_id as u64,
             group_id: format!("{run_id}_{precursor_id}"),
             exp_rt,
+            rt_left_width,
+            rt_right_width,
+            exp_im,
+            exp_im_left_width,
+            exp_im_right_width,
             is_decoy: decoy != 0,
             features: feats,
         })
@@ -612,12 +843,32 @@ fn read_transition_features(
         );
     }
 
+    let feature_table_cols: std::collections::HashSet<String> =
+        list_columns(conn, "FEATURE")?.into_iter().collect();
+
     let mut select_cols: Vec<String> = Vec::new();
     select_cols.push("ft.FEATURE_ID".to_string());
     select_cols.push("ft.TRANSITION_ID".to_string());
     select_cols.push("f.RUN_ID".to_string());
     select_cols.push("f.PRECURSOR_ID".to_string());
     select_cols.push("f.EXP_RT".to_string());
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "LEFT_WIDTH",
+    ));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "RIGHT_WIDTH",
+    ));
+    select_cols.push(feature_optional_projection(&feature_table_cols, "EXP_IM"));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "EXP_IM_LEFTWIDTH",
+    ));
+    select_cols.push(feature_optional_projection(
+        &feature_table_cols,
+        "EXP_IM_RIGHTWIDTH",
+    ));
     select_cols.push("t.DECOY".to_string());
     for c in &feature_cols {
         select_cols.push(format!("ft.{c}"));
@@ -650,9 +901,14 @@ fn read_transition_features(
         let run_id: i64 = row.get(2)?;
         let precursor_id: i64 = row.get(3)?;
         let exp_rt: f32 = row.get(4)?;
-        let decoy: i32 = row.get(5)?;
+        let rt_left_width: Option<f32> = row.get(5)?;
+        let rt_right_width: Option<f32> = row.get(6)?;
+        let exp_im: Option<f32> = row.get(7)?;
+        let exp_im_left_width: Option<f32> = row.get(8)?;
+        let exp_im_right_width: Option<f32> = row.get(9)?;
+        let decoy: i32 = row.get(10)?;
 
-        let mut idx = 6usize;
+        let mut idx = 11usize;
         let mut feats = Vec::new();
         for _ in 0..feature_cols.len() {
             let v = get_f32_or_nan(row, idx)?;
@@ -666,6 +922,11 @@ fn read_transition_features(
             run_id: run_id as u64,
             group_id: format!("{run_id}_{feature_id}_{precursor_id}_{transition_id}"),
             exp_rt,
+            rt_left_width,
+            rt_right_width,
+            exp_im,
+            exp_im_left_width,
+            exp_im_right_width,
             is_decoy: decoy != 0,
             features: feats,
         })

@@ -14,7 +14,11 @@ pub mod msnumpress;
 pub mod osw;
 pub mod xic;
 pub mod xic_parquet;
+pub mod xim;
+pub mod xim_parquet;
 
 pub use osw::{FeatureRow, OswFeatureTable, OswLevel, OswReadConfig, ScoreRow};
 pub use xic::{PrecursorXic, TransitionTrace, XicPoint, XicSource};
 pub use xic_parquet::XicParquetReader;
+pub use xim::{FeatureXim, MobilogramTrace, XimPoint, XimSource};
+pub use xim_parquet::XimParquetReader;
