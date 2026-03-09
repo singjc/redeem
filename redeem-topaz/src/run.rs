@@ -554,6 +554,14 @@ pub struct XrunSweepRow {
     pub best_val: f32,
 }
 
+/// Result returned after training an XRUN calibrator from a saved base
+/// checkpoint without re-running base TOPAZ training.
+#[derive(Debug, Clone)]
+pub struct XrunTrainOnlyOutput {
+    pub checkpoint_prefix: PathBuf,
+    pub best_val: f32,
+}
+
 fn resolve_feature_cols(osw_cols: &[String], cfg: &FeatureSelectConfig) -> Vec<String> {
     match cfg.mode {
         FeatureMode::All => return osw_cols.iter().map(|c| c.to_lowercase()).collect(),
@@ -3010,10 +3018,21 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-/// Evaluate a grid of XRUN calibrator settings without retraining the base
-/// TOPAZ model.
-pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
-    let device = get_device(&cfg.device)?;
+fn write_xrun_summary_tsv(path: &Path, rows: &[XrunSweepRow]) -> Result<()> {
+    let mut text = String::new();
+    text.push_str("pool\ttau\tbest_val\n");
+    for r in rows {
+        text.push_str(&format!("{}\t{}\t{}\n", r.pool, r.tau, r.best_val));
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn prepare_xrun_dataset_from_checkpoint(
+    cfg: &XrunSweepConfig,
+    device: &Device,
+) -> Result<(XrunDataset, Vec<crate::io::xim_parquet::XimDecodeIssue>)> {
     crate::io::xim_parquet::clear_decode_issues();
     let mut xim_decode_issues = Vec::new();
 
@@ -3179,6 +3198,76 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
         r: seq.r,
         din: seq.din,
     };
+    Ok((ds, xim_decode_issues))
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn fit_xrun_sidecar_from_dataset(
+    checkpoint: &Path,
+    summary_tsv: &Path,
+    ds: &XrunDataset,
+    cfg: &XrunSweepConfig,
+    device: &Device,
+) -> Result<XrunTrainOnlyOutput> {
+    let (tr_ds, va_ds) = split_train_val(ds, cfg.val_frac, cfg.seed);
+    if tr_ds.p == 0 || va_ds.p == 0 {
+        bail!(
+            "XRUN split is empty (train_p={}, val_p={}); increase data size or adjust val_frac",
+            tr_ds.p,
+            va_ds.p
+        );
+    }
+
+    let mut trainer = XrunTrainer::new(cfg.train.clone(), ds.din, device)?;
+    let meta = trainer.train(&tr_ds, &va_ds, device)?;
+    let ckpt_meta = XrunCheckpointMeta {
+        train: cfg.train.clone(),
+        predict: XrunPredictConfig {
+            max_runs: cfg.max_runs,
+            sort_by: cfg.sort_by.clone(),
+            batch_size: cfg.batch_size.max(1),
+        },
+        in_dim: ds.din,
+        best_val: Some(meta.best_val),
+        version: 1,
+    };
+    save_xrun_checkpoint(checkpoint, &trainer.varmap, &ckpt_meta)?;
+    let summary_rows = [XrunSweepRow {
+        pool: format!("{:?}", cfg.train.pool),
+        tau: cfg.train.tau,
+        best_val: meta.best_val,
+    }];
+    write_xrun_summary_tsv(summary_tsv, &summary_rows)?;
+    Ok(XrunTrainOnlyOutput {
+        checkpoint_prefix: checkpoint_base(checkpoint),
+        best_val: meta.best_val,
+    })
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Train only the XRUN sidecar from an existing base TOPAZ checkpoint.
+///
+/// This reuses the saved base model to rebuild bag scores and winner-hidden
+/// embeddings, trains the XRUN calibrator, and writes the sidecar back into the
+/// same `topaz.model` archive.
+pub fn run_xrun_training(cfg: &XrunSweepConfig) -> Result<XrunTrainOnlyOutput> {
+    let device = get_device(&cfg.device)?;
+    let (ds, xim_decode_issues) = prepare_xrun_dataset_from_checkpoint(cfg, &device)?;
+    let out = fit_xrun_sidecar_from_dataset(&cfg.checkpoint, &cfg.output_tsv, &ds, cfg, &device)?;
+    report_xim_decode_issues(
+        "xrun",
+        &xim_decode_issues,
+        &diagnostic_tsv_path(&cfg.output_tsv, "xim_skipped"),
+    )?;
+    Ok(out)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Evaluate a grid of XRUN calibrator settings without retraining the base
+/// TOPAZ model.
+pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
+    let device = get_device(&cfg.device)?;
+    let (ds, xim_decode_issues) = prepare_xrun_dataset_from_checkpoint(cfg, &device)?;
     let (tr_ds, va_ds) = split_train_val(&ds, cfg.val_frac, cfg.seed);
 
     let pools: Vec<String> = cfg
@@ -3214,12 +3303,7 @@ pub fn run_xrun_sweep(cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
         }
     }
 
-    let mut text = String::new();
-    text.push_str("pool\ttau\tbest_val\n");
-    for r in &rows {
-        text.push_str(&format!("{}\t{}\t{}\n", r.pool, r.tau, r.best_val));
-    }
-    std::fs::write(&cfg.output_tsv, text)?;
+    write_xrun_summary_tsv(&cfg.output_tsv, &rows)?;
     report_xim_decode_issues(
         "xrun",
         &xim_decode_issues,
@@ -3495,6 +3579,54 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_xrun_sidecar_from_dataset_writes_summary_and_sidecar() -> Result<()> {
+        let device = Device::Cpu;
+        let base = tmp_base("xrun_only");
+        let summary = base.with_extension("xrun.tsv");
+
+        let ds = XrunDataset {
+            xseq: vec![
+                2.0, 0.2, 0.1, 1.8, 0.3, 0.2, 0.0, 0.0, 0.0, // precursor 0
+                -1.5, 0.1, -0.2, -1.2, 0.0, -0.1, 0.0, 0.0, 0.0, // precursor 1
+            ],
+            mask: vec![true, true, false, true, true, false],
+            y: vec![1.0, 0.0],
+            p: 2,
+            r: 3,
+            din: 3,
+        };
+        let cfg = XrunSweepConfig {
+            checkpoint: base.clone(),
+            output_tsv: summary.clone(),
+            val_frac: 0.5,
+            seed: 7,
+            max_runs: 3,
+            sort_by: "run".to_string(),
+            train: XrunTrainConfig {
+                d_model: 8,
+                attn_hidden: 8,
+                head_hidden: vec![4],
+                batch_size: 2,
+                max_epochs: 2,
+                patience: 1,
+                dropout: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let out = fit_xrun_sidecar_from_dataset(&base, &summary, &ds, &cfg, &device)?;
+        assert_eq!(out.checkpoint_prefix, base);
+        assert!(xrun_checkpoint_exists(&base));
+        let summary_text = std::fs::read_to_string(&summary)?;
+        assert!(summary_text.contains("pool\ttau\tbest_val"));
+
+        let _ = std::fs::remove_file(base.with_extension("model"));
+        let _ = std::fs::remove_file(summary);
+        Ok(())
+    }
+
+    #[test]
     fn test_xim_branch_smoke_end_to_end() -> Result<()> {
         let device = Device::Cpu;
         let rows = synthetic_rows();
@@ -3604,6 +3736,13 @@ mod tests {
 /// Stub entry point used when the crate is built without the IO features
 /// required by the XRUN sweep.
 pub fn run_xrun_sweep(_cfg: &XrunSweepConfig) -> Result<Vec<XrunSweepRow>> {
+    bail!("redeem-topaz built without io-sqlite/io-parquet features");
+}
+
+#[cfg(not(all(feature = "io-sqlite", feature = "io-parquet")))]
+/// Stub entry point used when the crate is built without the IO features
+/// required by standalone XRUN training.
+pub fn run_xrun_training(_cfg: &XrunSweepConfig) -> Result<XrunTrainOnlyOutput> {
     bail!("redeem-topaz built without io-sqlite/io-parquet features");
 }
 

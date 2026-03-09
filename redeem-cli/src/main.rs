@@ -20,6 +20,8 @@ use redeem_cli::topaz::train as topaz_train;
 use redeem_cli::topaz::train::input::TopazTrainConfig;
 use redeem_cli::topaz::xrun as topaz_xrun;
 use redeem_cli::topaz::xrun::input::TopazXrunSweepConfig;
+use redeem_cli::topaz::xrun_train as topaz_xrun_train;
+use redeem_cli::topaz::xrun_train::input::TopazXrunTrainConfig;
 
 fn main() -> Result<()> {
     env_logger::Builder::default()
@@ -554,6 +556,118 @@ fn main() -> Result<()> {
                         ),
                 )
                 .subcommand(
+                    Command::new("xrun-train")
+                        .about("Train only the XRUN calibrator from an existing TOPAZ checkpoint")
+                        .arg(
+                            Arg::new("config")
+                                .help("Path to XRUN training configuration file (omit to print a template)")
+                                .required(false)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("osw_path")
+                                .long("osw")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_path")
+                                .long("xic")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_paths")
+                                .long("xic-paths")
+                                .help("Comma-separated XIC parquet paths; run_id mapping is inferred from parquet metadata")
+                                .value_delimiter(',')
+                                .num_args(1..)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_map_path")
+                                .long("xic-map")
+                                .help("Optional TSV mapping OSW run_id -> XIC parquet path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xim_path")
+                                .long("xim")
+                                .help("Optional XIM parquet path for ion-mobilogram inputs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xim_paths")
+                                .long("xim-paths")
+                                .help("Comma-separated XIM parquet paths; run_id mapping is inferred from parquet metadata")
+                                .value_delimiter(',')
+                                .num_args(1..)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xim_map_path")
+                                .long("xim-map")
+                                .help("Optional TSV mapping OSW run_id -> XIM parquet path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_cache_dir")
+                                .long("xic-cache-dir")
+                                .help("Optional on-disk cache directory for decoded XICs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
+                        )
+                        .arg(
+                            Arg::new("xic_cache_max_bytes")
+                                .long("xic-cache-max-bytes")
+                                .help("Max disk cache size in bytes (0 = no cap)")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
+                            Arg::new("xim_cache_dir")
+                                .long("xim-cache-dir")
+                                .help("Optional on-disk cache directory for decoded XIMs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
+                        )
+                        .arg(
+                            Arg::new("xim_cache_max_bytes")
+                                .long("xim-cache-max-bytes")
+                                .help("Max XIM disk cache size in bytes (0 = no cap)")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
+                            Arg::new("checkpoint")
+                                .long("checkpoint")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("output_tsv")
+                                .long("output-tsv")
+                                .help("Optional one-row summary TSV for the XRUN-only run")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("device")
+                                .long("device")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+                        )
+                        .arg(
+                            Arg::new("restrict_xic")
+                                .long("restrict-osw-to-xic-map")
+                                .help("Drop rows with no XIC traces")
+                                .action(ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
                     Command::new("xrun-sweep")
                         .about("Run XRUN calibrator sweep")
                         .arg(
@@ -973,6 +1087,23 @@ fn handle_topaz(matches: &ArgMatches) -> Result<()> {
             }
             let cfg = TopazInferConfig::from_arguments(config_path.unwrap(), sub)?;
             topaz_infer::run(&cfg)
+        }
+        Some(("xrun-train", sub)) => {
+            let config_path: Option<&PathBuf> = sub.get_one("config");
+            if config_path.is_none() {
+                let default = TopazXrunTrainConfig::default();
+                let json = serde_json::to_string_pretty(&default)?;
+                eprintln!(
+                    "\n\u{2139}\u{fe0f}  No config file provided.\n\n\
+                     Save the following JSON template to a file (e.g. xrun_train.json),\n\
+                     fill in the fields, and re-run:\n\n\
+                       redeem topaz xrun-train xrun_train.json\n"
+                );
+                println!("{}", json);
+                std::process::exit(0);
+            }
+            let cfg = TopazXrunTrainConfig::from_arguments(config_path.unwrap(), sub)?;
+            topaz_xrun_train::run(&cfg)
         }
         Some(("xrun-sweep", sub)) => {
             let config_path: Option<&PathBuf> = sub.get_one("config");

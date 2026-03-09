@@ -62,7 +62,7 @@ pub use model_interface::{
 pub use preprocess::Preprocessor;
 pub use run::{
     DiagnosticsConfig, FeatureMode, FeatureSelectConfig, InferRunConfig, InferRunOutput,
-    TrainRunConfig, TrainRunOutput, XrunRunConfig, XrunSweepConfig, XrunSweepRow, run_inference,
-    run_training, run_xrun_sweep,
+    TrainRunConfig, TrainRunOutput, XrunRunConfig, XrunSweepConfig, XrunSweepRow,
+    XrunTrainOnlyOutput, run_inference, run_training, run_xrun_sweep, run_xrun_training,
 };
 pub use xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
