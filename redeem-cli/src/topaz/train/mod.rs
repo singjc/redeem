@@ -29,6 +29,7 @@ pub fn run(cfg: &TopazTrainConfig) -> Result<()> {
                 seed: cfg.inner.seed,
                 osw_path: Some(&cfg.inner.osw_path),
                 score_tsv_path: None,
+                topaz_table_name: Some("SCORE_TOPAZ"),
                 xic_path: Some(&cfg.inner.xic_path),
                 xic_paths: cfg.inner.xic_paths.as_deref(),
                 xic_map_path: cfg.inner.xic_map_path.as_deref(),

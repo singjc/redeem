@@ -28,6 +28,7 @@ pub struct TopazReportInputs<'a> {
     pub seed: u64,
     pub osw_path: Option<&'a Path>,
     pub score_tsv_path: Option<&'a Path>,
+    pub topaz_table_name: Option<&'a str>,
     pub xic_path: Option<&'a Path>,
     pub xic_paths: Option<&'a [PathBuf]>,
     pub xic_map_path: Option<&'a Path>,
@@ -59,10 +60,7 @@ pub fn write_topaz_report(inputs: &TopazReportInputs<'_>) -> Result<()> {
         None
     };
 
-    let topaz_scores = inputs
-        .score_tsv_path
-        .and_then(|p| load_score_tsv(p).ok())
-        .filter(|rows| !rows.is_empty());
+    let topaz_scores = load_topaz_scores(inputs);
     let ms2_scores = inputs
         .osw_path
         .and_then(|p| redeem_topaz::io::osw::read_score_table(p, "SCORE_MS2").ok())
@@ -161,6 +159,67 @@ pub fn write_topaz_report(inputs: &TopazReportInputs<'_>) -> Result<()> {
 
     report.save_to_file(&inputs.report_path.to_string_lossy().to_string())?;
     Ok(())
+}
+
+/// Load the final TOPAZ score rows used by the report.
+///
+/// The report prefers the inference TSV because it is the exact row set written
+/// by the scoring pipeline. When that TSV is unavailable, it falls back to the
+/// configured TOPAZ OSW score table. This makes `redeem topaz report` usable on
+/// remote systems where only the scored OSW and `head_embeddings.tsv` were
+/// copied back.
+fn load_topaz_scores(inputs: &TopazReportInputs<'_>) -> Option<Vec<ScoreLite>> {
+    if let Some(path) = inputs.score_tsv_path {
+        match load_score_tsv(path) {
+            Ok(rows) if !rows.is_empty() => {
+                log::info!("Loaded TOPAZ scores from TSV {:?}", path);
+                return Some(rows);
+            }
+            Ok(_) => {
+                log::warn!(
+                    "TOPAZ score TSV {:?} is empty; trying OSW table fallback",
+                    path
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to load TOPAZ score TSV {:?}: {err:#}; trying OSW table fallback",
+                    path
+                );
+            }
+        }
+    }
+
+    let Some(osw_path) = inputs.osw_path else {
+        return None;
+    };
+    let table_name = inputs.topaz_table_name.unwrap_or("SCORE_TOPAZ");
+    match redeem_topaz::io::osw::read_score_table(osw_path, table_name) {
+        Ok(rows) if !rows.is_empty() => {
+            log::info!(
+                "Loaded TOPAZ scores from OSW table {:?} in {:?}",
+                table_name,
+                osw_path
+            );
+            Some(rows.into_iter().map(ScoreLite::from_ms2).collect())
+        }
+        Ok(_) => {
+            log::warn!(
+                "TOPAZ OSW table {:?} in {:?} is empty; report will only include embeddings",
+                table_name,
+                osw_path
+            );
+            None
+        }
+        Err(err) => {
+            log::warn!(
+                "Failed to load TOPAZ OSW table {:?} from {:?}: {err:#}",
+                table_name,
+                osw_path
+            );
+            None
+        }
+    }
 }
 
 struct HeadEmbeddings {

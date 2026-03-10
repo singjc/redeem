@@ -14,6 +14,19 @@ pub fn run(cfg: &TopazInferConfig) -> Result<()> {
         out.n_rows
     );
     if cfg.inner.diagnostics.save_head_embeddings {
+        let report_osw = cfg
+            .inner
+            .output_osw
+            .as_deref()
+            .unwrap_or(&cfg.inner.osw_path);
+        let topaz_table_name = if cfg.inner.xrun.enabled {
+            cfg.inner
+                .output_table_xrun
+                .as_deref()
+                .unwrap_or(cfg.inner.output_table.as_str())
+        } else {
+            cfg.inner.output_table.as_str()
+        };
         let outdir = cfg
             .inner
             .diagnostics
@@ -27,8 +40,9 @@ pub fn run(cfg: &TopazInferConfig) -> Result<()> {
                 head_embeddings_path: &head_path,
                 report_path: &report_path,
                 seed: 0,
-                osw_path: Some(&cfg.inner.osw_path),
+                osw_path: Some(report_osw),
                 score_tsv_path: Some(&cfg.inner.output_tsv),
+                topaz_table_name: Some(topaz_table_name),
                 xic_path: Some(&cfg.inner.xic_path),
                 xic_paths: cfg.inner.xic_paths.as_deref(),
                 xic_map_path: cfg.inner.xic_map_path.as_deref(),
