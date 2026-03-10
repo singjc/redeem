@@ -549,6 +549,12 @@ fn main() -> Result<()> {
                                 .action(ArgAction::SetTrue),
                         )
                         .arg(
+                            Arg::new("stream_inference")
+                                .long("stream-inference")
+                                .help("Overlap chunk-wise XIC/XIM loading with GPU scoring")
+                                .action(ArgAction::SetTrue),
+                        )
+                        .arg(
                             Arg::new("xrun")
                                 .long("xrun")
                                 .help("Apply the saved XRUN calibrator sidecar during inference")
