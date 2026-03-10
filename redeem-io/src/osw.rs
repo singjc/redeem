@@ -484,6 +484,42 @@ pub fn read_feature_rows(_path: &std::path::Path, _cfg: &OswReadConfig) -> Resul
 }
 
 #[cfg(feature = "sqlite")]
+/// Prepare an output OSW path for score-table writeback.
+///
+/// When `output_path` differs from `input_path`, this function overwrites the
+/// destination with a byte-for-byte copy of the original OSW SQLite file before
+/// any TOPAZ score tables are written. That preserves all upstream OpenSWATH
+/// tables required by later diagnostics and reporting steps.
+///
+/// When `output_path == input_path`, the function is a no-op and TOPAZ writes
+/// score tables in place.
+pub fn prepare_output_osw(
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<()> {
+    if input_path == output_path {
+        return Ok(());
+    }
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if output_path.exists() {
+        std::fs::remove_file(output_path)?;
+    }
+    std::fs::copy(input_path, output_path)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "sqlite"))]
+/// Stub used when `redeem-io` is built without SQLite support.
+pub fn prepare_output_osw(
+    _input_path: &std::path::Path,
+    _output_path: &std::path::Path,
+) -> Result<()> {
+    bail!("redeem-io compiled without feature `sqlite`")
+}
+
+#[cfg(feature = "sqlite")]
 /// Write or update a TOPAZ-compatible score table in an OSW file.
 ///
 /// The target table is created if missing. Existing rows with the same
@@ -523,6 +559,38 @@ pub fn write_score_table(path: &std::path::Path, table: &str, rows: &[ScoreRow])
     }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::prepare_output_osw;
+    use anyhow::Result;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("redeem_io_{name}_{stamp}.sqlite"));
+        path
+    }
+
+    #[test]
+    fn test_prepare_output_osw_copies_source_file() -> Result<()> {
+        let src = tmp_path("src");
+        let dst = tmp_path("dst");
+        fs::write(&src, b"sqlite-placeholder")?;
+
+        prepare_output_osw(&src, &dst)?;
+
+        assert_eq!(fs::read(&src)?, fs::read(&dst)?);
+        let _ = fs::remove_file(src);
+        let _ = fs::remove_file(dst);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "sqlite")]

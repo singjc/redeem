@@ -2961,6 +2961,10 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         print_trace_summary(&sum, "infer");
         warn_if_missing_ms1(&sum, "infer");
     }
+    // Release any full-dataset prefetched trace buffers before XRUN, writeback,
+    // and report generation. Those later stages rebuild only the smaller
+    // winner-row subsets they actually need.
+    drop(prefetched);
 
     let base_scores = scores.clone();
     let xrun_applied = if cfg.xrun.enabled {
@@ -3132,6 +3136,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     if let Some(osw_path) = &cfg.output_osw {
         #[cfg(feature = "io-sqlite")]
         {
+            crate::io::osw::prepare_output_osw(&cfg.osw_path, osw_path)?;
             if let Some(base_name) = cfg
                 .output_table_base
                 .as_ref()
