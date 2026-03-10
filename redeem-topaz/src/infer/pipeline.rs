@@ -23,6 +23,8 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(feature = "io-sqlite", feature = "io-parquet"))]
 use std::path::Path;
+#[cfg(feature = "io-parquet")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "io-parquet")]
@@ -34,7 +36,7 @@ use std::hash::{Hash, Hasher};
 #[cfg(feature = "io-parquet")]
 use std::io::Write;
 #[cfg(feature = "io-parquet")]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_core::{Device, Tensor};
 
@@ -54,6 +56,112 @@ use crate::model_interface::{BagRankerWithHiddenInterface, CandidateScorerInterf
 use crate::preprocess::Preprocessor;
 
 static WARNED_MISSING_MS1: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "io-parquet")]
+static XIC_RUN_FILTER_FALLBACK_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(feature = "io-parquet")]
+static XIM_RUN_FILTER_FALLBACK_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(feature = "io-parquet")]
+fn xic_run_filter_fallback_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    XIC_RUN_FILTER_FALLBACK_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(feature = "io-parquet")]
+fn xim_run_filter_fallback_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    XIM_RUN_FILTER_FALLBACK_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(feature = "io-parquet")]
+/// Return `true` when this XIC parquet path is known to require fallback
+/// loading without the `RUN_ID` filter.
+///
+/// OpenMS exports occasionally write parquet-internal run identifiers that do
+/// not match the corresponding OSW `RUN_ID`. Once that mismatch is detected for
+/// a given path, repeated chunked inference should skip the failing
+/// `filter_run_id(...)` probe and go straight to the working fallback path.
+fn should_skip_xic_run_filter(path: &Path) -> bool {
+    xic_run_filter_fallback_paths()
+        .lock()
+        .map(|set| set.contains(path))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "io-parquet")]
+/// Remember that this XIC parquet path only works when queried without a
+/// `RUN_ID` filter.
+fn mark_xic_run_filter_unusable(path: &Path) {
+    if let Ok(mut set) = xic_run_filter_fallback_paths().lock() {
+        set.insert(path.to_path_buf());
+    }
+}
+
+#[cfg(feature = "io-parquet")]
+/// Return `true` when this XIM parquet path is known to require fallback
+/// loading without the `RUN_ID` filter.
+fn should_skip_xim_run_filter(path: &Path) -> bool {
+    xim_run_filter_fallback_paths()
+        .lock()
+        .map(|set| set.contains(path))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "io-parquet")]
+/// Remember that this XIM parquet path only works when queried without a
+/// `RUN_ID` filter.
+fn mark_xim_run_filter_unusable(path: &Path) {
+    if let Ok(mut set) = xim_run_filter_fallback_paths().lock() {
+        set.insert(path.to_path_buf());
+    }
+}
+
+#[cfg(feature = "rayon")]
+/// Split very large per-run parquet fetch requests into smaller task shards.
+///
+/// TOPAZ commonly groups work by `RUN_ID`, but on larger datasets a single run
+/// can still contain hundreds of thousands of requested precursor or feature
+/// identifiers. Without sharding, Rayon sees one large task per run and ends up
+/// under-utilizing CPU workers whenever only a few runs dominate the request
+/// set. This helper keeps request semantics unchanged while turning oversized
+/// `(run_id, id_set, extra)` tuples into multiple smaller tasks that can be
+/// scheduled independently.
+///
+/// `extra` typically carries the parquet path for the run. It is cloned only
+/// when a request is actually split.
+fn shard_fetch_tasks<T: Clone>(items: Vec<(u64, HashSet<u64>, T)>) -> Vec<(u64, HashSet<u64>, T)> {
+    let threads = rayon::current_num_threads().max(1);
+    let target_tasks = threads.saturating_mul(2);
+    if items.len() >= target_tasks {
+        return items;
+    }
+
+    let total_ids = items.iter().map(|(_, ids, _)| ids.len()).sum::<usize>();
+    if total_ids <= items.len() {
+        return items;
+    }
+
+    let ids_per_task = total_ids.div_ceil(target_tasks).max(1);
+    let mut out = Vec::with_capacity(target_tasks.max(items.len()));
+    for (run_id, ids, extra) in items {
+        if ids.len() <= ids_per_task {
+            out.push((run_id, ids, extra));
+            continue;
+        }
+
+        let mut batch = HashSet::with_capacity(ids_per_task);
+        for id in ids {
+            batch.insert(id);
+            if batch.len() >= ids_per_task {
+                out.push((run_id, std::mem::take(&mut batch), extra.clone()));
+                batch = HashSet::with_capacity(ids_per_task);
+            }
+        }
+        if !batch.is_empty() {
+            out.push((run_id, batch, extra));
+        }
+    }
+    out
+}
 
 use serde::{Deserialize, Serialize};
 
@@ -1353,17 +1461,29 @@ fn fetch_precursors_cached_with_fallback(
     disk: Option<&XicDiskCache>,
     fetch_cfg: &XicFetchConfig,
 ) -> Result<HashMap<u64, PrecursorXic>> {
-    let out = fetch_precursors_cached(path, run_id, prec_set, cache, disk, fetch_cfg)?;
+    let skip_run_filter = should_skip_xic_run_filter(path);
+    let out = if skip_run_filter {
+        HashMap::new()
+    } else {
+        fetch_precursors_cached(path, run_id, prec_set, cache, disk, fetch_cfg)?
+    };
     if !out.is_empty() || prec_set.is_empty() {
         return Ok(out);
     }
 
-    log::warn!(
-        "XIC map path {:?}: fetched 0 of {} precursors (run_id={}); retrying without RUN_ID filter",
-        path,
-        prec_set.len(),
-        run_id
-    );
+    if skip_run_filter {
+        log::debug!(
+            "XIC map path {:?}: skipping RUN_ID-filtered fetch because this file previously required fallback loading",
+            path
+        );
+    } else {
+        log::warn!(
+            "XIC map path {:?}: fetched 0 of {} precursors (run_id={}); retrying without RUN_ID filter",
+            path,
+            prec_set.len(),
+            run_id
+        );
+    }
 
     let mut reader = crate::io::xic_parquet::XicParquetReader::new(path);
     if let Some(levels) = &fetch_cfg.ms_levels {
@@ -1387,6 +1507,7 @@ fn fetch_precursors_cached_with_fallback(
         );
         return Ok(out);
     }
+    mark_xic_run_filter_unusable(path);
     log::info!(
         "XIC map path {:?}: fallback fetched {} of {} precursors (ignoring RUN_ID)",
         path,
@@ -1502,17 +1623,29 @@ fn fetch_features_cached_with_fallback(
     disk: Option<&XimDiskCache>,
     fetch_cfg: &XimFetchConfig,
 ) -> Result<HashMap<u64, FeatureXim>> {
-    let out = fetch_features_cached(path, run_id, feature_set, cache, disk, fetch_cfg)?;
+    let skip_run_filter = should_skip_xim_run_filter(path);
+    let out = if skip_run_filter {
+        HashMap::new()
+    } else {
+        fetch_features_cached(path, run_id, feature_set, cache, disk, fetch_cfg)?
+    };
     if !out.is_empty() || feature_set.is_empty() {
         return Ok(out);
     }
 
-    log::warn!(
-        "XIM map path {:?}: fetched 0 of {} features (run_id={}); retrying without RUN_ID filter",
-        path,
-        feature_set.len(),
-        run_id
-    );
+    if skip_run_filter {
+        log::debug!(
+            "XIM map path {:?}: skipping RUN_ID-filtered fetch because this file previously required fallback loading",
+            path
+        );
+    } else {
+        log::warn!(
+            "XIM map path {:?}: fetched 0 of {} features (run_id={}); retrying without RUN_ID filter",
+            path,
+            feature_set.len(),
+            run_id
+        );
+    }
 
     let mut reader = crate::io::xim_parquet::XimParquetReader::new(path);
     if let Some(levels) = &fetch_cfg.ms_levels {
@@ -1539,6 +1672,7 @@ fn fetch_features_cached_with_fallback(
         );
         return Ok(out);
     }
+    mark_xim_run_filter_unusable(path);
     log::info!(
         "XIM map path {:?}: fallback fetched {} of {} features (ignoring RUN_ID)",
         path,
@@ -1770,31 +1904,53 @@ pub fn build_xim_tensors_from_parquet_cached(
     for row in rows {
         by_run.entry(row.run_id).or_default().insert(row.feature_id);
     }
-
-    let items: Vec<(u64, HashSet<u64>)> = by_run.into_iter().collect();
+    #[cfg(feature = "rayon")]
+    let items = shard_fetch_tasks(
+        by_run
+            .into_iter()
+            .map(|(run_id, feature_ids)| (run_id, feature_ids, ()))
+            .collect(),
+    );
+    #[cfg(not(feature = "rayon"))]
+    let items: Vec<(u64, HashSet<u64>, ())> = by_run
+        .into_iter()
+        .map(|(run_id, feature_ids)| (run_id, feature_ids, ()))
+        .collect();
 
     #[cfg(feature = "rayon")]
     let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
         .into_par_iter()
-        .map(|(run_id, feature_ids)| {
-            let fetched =
-                fetch_features_cached(xim_path, run_id, &feature_ids, cache, disk, fetch_cfg)?;
-            Ok((run_id, fetched))
+        .map(|(run_id, feature_ids, _)| {
+            fetch_features_cached_with_fallback(
+                xim_path,
+                run_id,
+                &feature_ids,
+                cache,
+                disk,
+                fetch_cfg,
+            )
+            .map(|map| (run_id, map))
         })
         .collect::<Result<Vec<_>>>()?;
     #[cfg(not(feature = "rayon"))]
     let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
         .into_iter()
-        .map(|(run_id, feature_ids)| {
-            let fetched =
-                fetch_features_cached(xim_path, run_id, &feature_ids, cache, disk, fetch_cfg)?;
-            Ok((run_id, fetched))
+        .map(|(run_id, feature_ids, _)| {
+            fetch_features_cached_with_fallback(
+                xim_path,
+                run_id,
+                &feature_ids,
+                cache,
+                disk,
+                fetch_cfg,
+            )
+            .map(|map| (run_id, map))
         })
         .collect::<Result<Vec<_>>>()?;
 
     let mut xim_by_run: HashMap<u64, HashMap<u64, FeatureXim>> = HashMap::new();
     for (run_id, map) in fetched_all {
-        xim_by_run.insert(run_id, map);
+        xim_by_run.entry(run_id).or_default().extend(map);
     }
 
     let row_len = c_total * cfg.l;
@@ -1875,6 +2031,8 @@ pub fn build_xim_tensors_from_parquet_map_cached(
                 .map(|path| (run_id, feature_ids, path))
         })
         .collect();
+    #[cfg(feature = "rayon")]
+    let items = shard_fetch_tasks(items);
 
     #[cfg(feature = "rayon")]
     let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
@@ -1909,7 +2067,7 @@ pub fn build_xim_tensors_from_parquet_map_cached(
 
     let mut xim_by_run: HashMap<u64, HashMap<u64, FeatureXim>> = HashMap::new();
     for (run_id, map) in fetched_all {
-        xim_by_run.insert(run_id, map);
+        xim_by_run.entry(run_id).or_default().extend(map);
     }
 
     let row_len = c_total * cfg.l;
@@ -2546,12 +2704,43 @@ pub fn build_trace_tensors_from_parquet_cached(
             .insert(row.precursor_id);
     }
 
+    #[cfg(feature = "rayon")]
+    let items = shard_fetch_tasks(
+        by_run
+            .into_iter()
+            .map(|(run_id, prec_set)| (run_id, prec_set, ()))
+            .collect(),
+    );
+    #[cfg(not(feature = "rayon"))]
+    let items: Vec<(u64, HashSet<u64>, ())> = by_run
+        .into_iter()
+        .map(|(run_id, prec_set)| (run_id, prec_set, ()))
+        .collect();
+
+    #[cfg(feature = "rayon")]
+    let fetched_all: Vec<(u64, HashMap<u64, PrecursorXic>)> = items
+        .into_par_iter()
+        .map(|(run_id, prec_set, _)| {
+            fetch_precursors_cached_with_fallback(
+                xic_path, run_id, &prec_set, cache, disk, fetch_cfg,
+            )
+            .map(|map| (run_id, map))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(feature = "rayon"))]
+    let fetched_all: Vec<(u64, HashMap<u64, PrecursorXic>)> = items
+        .into_iter()
+        .map(|(run_id, prec_set, _)| {
+            fetch_precursors_cached_with_fallback(
+                xic_path, run_id, &prec_set, cache, disk, fetch_cfg,
+            )
+            .map(|map| (run_id, map))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut xic_by_run: HashMap<u64, HashMap<u64, PrecursorXic>> = HashMap::new();
-    for (run_id, prec_set) in by_run {
-        let fetched = fetch_precursors_cached_with_fallback(
-            xic_path, run_id, &prec_set, cache, disk, fetch_cfg,
-        )?;
-        xic_by_run.insert(run_id, fetched);
+    for (run_id, map) in fetched_all {
+        xic_by_run.entry(run_id).or_default().extend(map);
     }
 
     let row_len = c_total * cfg.l;
@@ -2671,86 +2860,8 @@ pub fn build_trace_tensors_from_parquet_map_cached(
                 .map(|path| (run_id, prec_set, path))
         })
         .collect();
-
-    let fetch_one = |run_id: u64,
-                     prec_set: HashSet<u64>,
-                     path: std::path::PathBuf,
-                     fetch_cfg: &XicFetchConfig|
-     -> Result<(u64, HashMap<u64, PrecursorXic>)> {
-        if prec_set.is_empty() {
-            return Ok((run_id, HashMap::new()));
-        }
-        let mut reader = crate::io::xic_parquet::XicParquetReader::new(&path);
-        reader.filter_run_id(run_id);
-        if let Some(levels) = &fetch_cfg.ms_levels {
-            reader.filter_ms_level(levels.clone());
-        }
-        if let Some(flag) = fetch_cfg.detecting_transition {
-            reader.filter_detecting_transition(flag);
-        }
-        if let Some(flag) = fetch_cfg.decoy {
-            reader.filter_decoy(flag);
-        }
-        reader.filter_precursor_id(prec_set.iter().copied());
-        let fetched = reader.fetch()?;
-        let requested = prec_set.len();
-        let fetched_count = fetched.len();
-        if fetched_count == 0 {
-            log::warn!(
-                "XIC map path {:?}: fetched 0 of {} precursors (run_id={})",
-                path,
-                requested,
-                run_id
-            );
-            let mut fallback = crate::io::xic_parquet::XicParquetReader::new(&path);
-            if let Some(levels) = &fetch_cfg.ms_levels {
-                fallback.filter_ms_level(levels.clone());
-            }
-            if let Some(flag) = fetch_cfg.detecting_transition {
-                fallback.filter_detecting_transition(flag);
-            }
-            if let Some(flag) = fetch_cfg.decoy {
-                fallback.filter_decoy(flag);
-            }
-            fallback.filter_precursor_id(prec_set.iter().copied());
-            let fetched_fb = fallback.fetch()?;
-            let fetched_fb_count = fetched_fb.len();
-            if fetched_fb_count == 0 {
-                log::warn!(
-                    "XIC map path {:?}: fallback fetched 0 of {} precursors (ignoring RUN_ID)",
-                    path,
-                    requested
-                );
-            } else {
-                log::info!(
-                    "XIC map path {:?}: fallback fetched {} of {} precursors (ignoring RUN_ID)",
-                    path,
-                    fetched_fb_count,
-                    requested
-                );
-            }
-            let mut map: HashMap<u64, PrecursorXic> = HashMap::new();
-            for xic in fetched_fb {
-                map.insert(xic.precursor_id, xic);
-            }
-            return Ok((run_id, map));
-        } else {
-            log::info!(
-                "XIC map path {:?}: fetched {} of {} precursors (run_id={})",
-                path,
-                fetched_count,
-                requested,
-                run_id
-            );
-        }
-        let mut map: HashMap<u64, PrecursorXic> = HashMap::new();
-        for xic in fetched {
-            map.insert(xic.precursor_id, xic);
-        }
-        Ok((run_id, map))
-    };
-
-    let use_cache = cache.is_enabled() || disk.is_some();
+    #[cfg(feature = "rayon")]
+    let items = shard_fetch_tasks(items);
     #[cfg(feature = "rayon")]
     let disk_owned = disk.cloned();
     #[cfg(feature = "rayon")]
@@ -2760,41 +2871,31 @@ pub fn build_trace_tensors_from_parquet_map_cached(
     let fetched_all: Vec<(u64, HashMap<u64, PrecursorXic>)> = items
         .into_par_iter()
         .map(|(run_id, prec_set, path)| {
-            if use_cache {
-                let cache = cache_owned.clone();
-                let disk = disk_owned.clone();
-                fetch_precursors_cached_with_fallback(
-                    &path,
-                    run_id,
-                    &prec_set,
-                    &cache,
-                    disk.as_ref(),
-                    fetch_cfg,
-                )
-                .map(|map| (run_id, map))
-            } else {
-                fetch_one(run_id, prec_set, path, fetch_cfg)
-            }
+            let cache = cache_owned.clone();
+            let disk = disk_owned.clone();
+            fetch_precursors_cached_with_fallback(
+                &path,
+                run_id,
+                &prec_set,
+                &cache,
+                disk.as_ref(),
+                fetch_cfg,
+            )
+            .map(|map| (run_id, map))
         })
         .collect::<Result<Vec<_>>>()?;
     #[cfg(not(feature = "rayon"))]
     let fetched_all: Vec<(u64, HashMap<u64, PrecursorXic>)> = items
         .into_iter()
         .map(|(run_id, prec_set, path)| {
-            if use_cache {
-                fetch_precursors_cached_with_fallback(
-                    &path, run_id, &prec_set, cache, disk, fetch_cfg,
-                )
+            fetch_precursors_cached_with_fallback(&path, run_id, &prec_set, cache, disk, fetch_cfg)
                 .map(|map| (run_id, map))
-            } else {
-                fetch_one(run_id, prec_set, path, fetch_cfg)
-            }
         })
         .collect::<Result<Vec<_>>>()?;
 
     let mut xic_by_run: HashMap<u64, HashMap<u64, PrecursorXic>> = HashMap::new();
     for (run_id, map) in fetched_all {
-        xic_by_run.insert(run_id, map);
+        xic_by_run.entry(run_id).or_default().extend(map);
     }
 
     if log::log_enabled!(log::Level::Info) {
@@ -2950,6 +3051,28 @@ pub fn infer_score_table_from_osw_xic(
     let scores = scores_t.to_vec1::<f32>()?;
 
     Ok(build_score_table_from_rows(&rows, &scores, pep_bins))
+}
+
+#[cfg(all(test, feature = "rayon"))]
+mod shard_tests {
+    use super::shard_fetch_tasks;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_shard_fetch_tasks_splits_large_single_run() {
+        let ids: HashSet<u64> = (0..2048).collect();
+        let shards = shard_fetch_tasks(vec![(42, ids, PathBuf::from("run_a.xic"))]);
+        assert!(shards.len() > 1);
+        assert!(shards.iter().all(|(run_id, _, _)| *run_id == 42));
+        assert_eq!(
+            shards
+                .iter()
+                .map(|(_, batch, _)| batch.len())
+                .sum::<usize>(),
+            2048
+        );
+    }
 }
 
 #[cfg(all(test, feature = "io-sqlite", feature = "io-parquet"))]

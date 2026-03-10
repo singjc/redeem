@@ -374,6 +374,13 @@ pub struct InferRunConfig {
     pub xim_cache_max_bytes: Option<u64>,
     /// Candidate-row chunk size used to keep full-dataset inference bounded in memory.
     pub trace_chunk_size: usize,
+    /// If `true`, pre-build the full inference XIC/XIM tensors once and only
+    /// chunk the model forward passes.
+    ///
+    /// This usually speeds up large inference jobs because parquet decoding and
+    /// cache lookup happen once per run instead of once per scoring chunk, but
+    /// it increases peak host RAM usage.
+    pub prefetch_traces_once: bool,
     /// XRUN loading/application settings.
     pub xrun: XrunRunConfig,
 }
@@ -417,6 +424,7 @@ impl Default for InferRunConfig {
             xim_cache_dir: None,
             xim_cache_max_bytes: None,
             trace_chunk_size: 5000,
+            prefetch_traces_once: false,
             xrun: XrunRunConfig::default(),
         }
     }
@@ -1091,6 +1099,116 @@ fn build_traces_for_train_val(
     let x_tr = x_all[..split].to_vec();
     let x_va = x_all[split..].to_vec();
     Ok((x_tr, x_va))
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Build the full inference XIC/XIM tensors once before chunked scoring.
+///
+/// When `restrict_osw_to_xic_map` is active without an explicit XIC map, TOPAZ
+/// filters away rows whose extracted traces are entirely zero. This helper
+/// keeps the row list and the returned tensor buffers aligned by applying that
+/// filter immediately after prefetch.
+fn prefetch_modalities_for_inference(
+    rows: &mut Vec<FeatureRow>,
+    cfg: &InferRunConfig,
+    xim_trace_cfg: &Option<TraceBuildConfig>,
+    cache_opt: Option<&SharedXicCache>,
+    disk_cache: Option<&XicDiskCache>,
+    xim_cache_opt: Option<&SharedXimCache>,
+    xim_disk_cache: Option<&XimDiskCache>,
+    apply_trace_filter: bool,
+    xim_decode_issues: &mut Vec<crate::io::xim_parquet::XimDecodeIssue>,
+) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+    log::info!(
+        "Prefetching XIC/XIM tensors once for inference (N={} rows)",
+        rows.len()
+    );
+    let x_trace = build_traces_for_rows(
+        rows,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xic_map_path,
+        &cfg.trace,
+        &cfg.fetch,
+        cache_opt,
+        disk_cache,
+    )?;
+    let x_xim = build_xim_for_rows(
+        rows,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+        &cfg.xim_map_path,
+        xim_trace_cfg,
+        &cfg.xim_fetch,
+        xim_cache_opt,
+        xim_disk_cache,
+    )?;
+    drain_xim_decode_issues(xim_decode_issues);
+
+    if !apply_trace_filter {
+        return Ok((x_trace, x_xim));
+    }
+
+    let original_rows = std::mem::take(rows);
+    let (rows_f, x_tr_f, x_xim_f) = filter_rows_by_trace_with_aux(
+        original_rows,
+        x_trace,
+        x_xim,
+        cfg.trace.total_c(),
+        cfg.trace.l,
+        xim_trace_cfg.as_ref().map(|c| c.total_c()),
+        xim_trace_cfg.as_ref().map(|c| c.l),
+    );
+    *rows = rows_f;
+    Ok((x_tr_f, x_xim_f))
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Score one contiguous row-aligned chunk from already-built XIC/XIM tensors.
+///
+/// `x_trace` must contain `rows.len() * trace_cfg.total_c() * trace_cfg.l`
+/// floats in row-major `(N, C, L)` order. When present, `x_xim` must contain
+/// `rows.len() * xim_cfg.total_c() * xim_cfg.l` floats with the same row order.
+fn score_inference_chunk(
+    model: &TopazBagRanker,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    x_xim: Option<&[f32]>,
+    table_feature_cols: &[String],
+    target_cols: &[String],
+    trace_cfg: &TraceBuildConfig,
+    xim_trace_cfg: Option<&TraceBuildConfig>,
+    use_heuristic_features: bool,
+    feat_dim: usize,
+    device: &Device,
+    batch_size: usize,
+    pre: Option<&crate::Preprocessor>,
+) -> Result<Vec<f32>> {
+    let n = rows.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let x_feat = if use_heuristic_features {
+        rows_to_feature_matrix_with_cols(rows, table_feature_cols, target_cols, pre)
+    } else {
+        Vec::new()
+    };
+    let x_feat_t = candle_core::Tensor::from_vec(x_feat, (n, feat_dim), device)?;
+    let x_trace_t =
+        candle_core::Tensor::from_slice(x_trace, (n, trace_cfg.total_c(), trace_cfg.l), device)?;
+    let x_xim_t = if let (Some(x_xim), Some(xim_cfg)) = (x_xim, xim_trace_cfg) {
+        Some(candle_core::Tensor::from_slice(
+            x_xim,
+            (n, xim_cfg.total_c(), xim_cfg.l),
+            device,
+        )?)
+    } else {
+        None
+    };
+    let scores_t =
+        score_candidates_with_aux(model, &x_feat_t, &x_trace_t, x_xim_t.as_ref(), batch_size)?;
+    Ok(scores_t.to_vec1::<f32>()?)
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -2656,7 +2774,23 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         cfg.trace_chunk_size.max(1)
     };
 
-    let mut scores: Vec<f32> = if apply_trace_filter {
+    let prefetched = if cfg.prefetch_traces_once {
+        Some(prefetch_modalities_for_inference(
+            &mut rows,
+            cfg,
+            &xim_trace_cfg,
+            cache_opt,
+            disk_cache.as_ref(),
+            xim_cache_opt,
+            xim_disk_cache.as_ref(),
+            apply_trace_filter,
+            &mut xim_decode_issues,
+        )?)
+    } else {
+        None
+    };
+
+    let mut scores: Vec<f32> = if apply_trace_filter && prefetched.is_none() {
         Vec::new()
     } else {
         vec![0f32; rows.len()]
@@ -2668,118 +2802,151 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     let mut sum_ms2 = 0usize;
 
     let mut offset = 0usize;
-    for chunk in rows.chunks(chunk_size) {
-        let x_trace = build_traces_for_rows(
-            chunk,
-            &cfg.xic_path,
-            &cfg.xic_paths,
-            &cfg.xic_map_path,
-            &cfg.trace,
-            &cfg.fetch,
-            cache_opt,
-            disk_cache.as_ref(),
-        )?;
-        let x_xim = build_xim_for_rows(
-            chunk,
-            &cfg.xim_path,
-            &cfg.xim_paths,
-            &cfg.xim_map_path,
-            &xim_trace_cfg,
-            &cfg.xim_fetch,
-            xim_cache_opt,
-            xim_disk_cache.as_ref(),
-        )?;
-        drain_xim_decode_issues(&mut xim_decode_issues);
-
-        let (chunk_rows, x_trace, x_xim) = if apply_trace_filter {
-            let (rows_f, x_tr_f, x_xim_f) = filter_rows_by_trace_with_aux(
-                chunk.to_vec(),
-                x_trace,
-                x_xim,
-                cfg.trace.total_c(),
-                cfg.trace.l,
-                xim_trace_cfg.as_ref().map(|c| c.total_c()),
-                xim_trace_cfg.as_ref().map(|c| c.l),
-            );
-            if rows_f.is_empty() {
+    if let Some((x_trace_all, x_xim_all)) = prefetched.as_ref() {
+        let trace_row_span = cfg.trace.total_c() * cfg.trace.l;
+        let xim_row_span = xim_trace_cfg
+            .as_ref()
+            .map(|xim_cfg| xim_cfg.total_c() * xim_cfg.l);
+        for start in (0..rows.len()).step_by(chunk_size) {
+            let end = (start + chunk_size).min(rows.len());
+            let row_slice = &rows[start..end];
+            let n_chunk = row_slice.len();
+            if n_chunk == 0 {
                 continue;
             }
-            (rows_f, x_tr_f, x_xim_f)
-        } else {
-            (Vec::new(), x_trace, x_xim)
-        };
+            let x_trace = &x_trace_all[start * trace_row_span..end * trace_row_span];
+            let x_xim = x_xim_all
+                .as_ref()
+                .and_then(|all| xim_row_span.map(|span| &all[start * span..end * span]));
 
-        let row_slice: &[FeatureRow] = if apply_trace_filter {
-            &chunk_rows
-        } else {
-            chunk
-        };
-        let n_chunk = row_slice.len();
-        if n_chunk == 0 {
-            continue;
-        }
+            if cfg.diagnostics.trace_summary {
+                let sum = trace_summary(
+                    x_trace,
+                    n_chunk,
+                    cfg.trace.total_c(),
+                    cfg.trace.l,
+                    cfg.trace.ms1_cmax,
+                    cfg.trace.ms2_cmax,
+                );
+                sum_n += sum.n;
+                sum_ms1 += sum.ms1_nonzero_rows;
+                sum_ms2 += sum.ms2_nonzero_rows;
+            }
 
-        if cfg.diagnostics.trace_summary {
-            let sum = trace_summary(
-                &x_trace,
-                n_chunk,
-                cfg.trace.total_c(),
-                cfg.trace.l,
-                cfg.trace.ms1_cmax,
-                cfg.trace.ms2_cmax,
-            );
-            sum_n += sum.n;
-            sum_ms1 += sum.ms1_nonzero_rows;
-            sum_ms2 += sum.ms2_nonzero_rows;
-        }
-
-        let x_feat = if meta.model.use_heuristic_features {
-            rows_to_feature_matrix_with_cols(
+            let scores_chunk = score_inference_chunk(
+                &model,
                 row_slice,
+                x_trace,
+                x_xim,
                 &table.feature_cols,
                 &target_cols,
-                meta.preprocess.as_ref(),
-            )
-        } else {
-            Vec::new()
-        };
-        let x_feat_t = candle_core::Tensor::from_vec(x_feat, (n_chunk, feat_dim), &device)?;
-        let x_trace_t = candle_core::Tensor::from_slice(
-            &x_trace,
-            (n_chunk, cfg.trace.total_c(), cfg.trace.l),
-            &device,
-        )?;
-        let x_xim_t = if let (Some(x_xim), Some(xim_cfg)) = (x_xim.as_ref(), xim_trace_cfg.as_ref())
-        {
-            Some(candle_core::Tensor::from_slice(
-                x_xim,
-                (n_chunk, xim_cfg.total_c(), xim_cfg.l),
+                &cfg.trace,
+                xim_trace_cfg.as_ref(),
+                meta.model.use_heuristic_features,
+                feat_dim,
                 &device,
-            )?)
-        } else {
-            None
-        };
-        let scores_t = score_candidates_with_aux(
-            &model,
-            &x_feat_t,
-            &x_trace_t,
-            x_xim_t.as_ref(),
-            cfg.batch_size.max(1),
-        )?;
-        let scores_chunk = scores_t.to_vec1::<f32>()?;
+                cfg.batch_size.max(1),
+                meta.preprocess.as_ref(),
+            )?;
 
-        if apply_trace_filter {
-            rows_scored.extend(chunk_rows);
-            scores.extend(scores_chunk);
-        } else {
             scores[offset..offset + n_chunk].copy_from_slice(&scores_chunk);
             offset += n_chunk;
+        }
+    } else {
+        for chunk in rows.chunks(chunk_size) {
+            let x_trace = build_traces_for_rows(
+                chunk,
+                &cfg.xic_path,
+                &cfg.xic_paths,
+                &cfg.xic_map_path,
+                &cfg.trace,
+                &cfg.fetch,
+                cache_opt,
+                disk_cache.as_ref(),
+            )?;
+            let x_xim = build_xim_for_rows(
+                chunk,
+                &cfg.xim_path,
+                &cfg.xim_paths,
+                &cfg.xim_map_path,
+                &xim_trace_cfg,
+                &cfg.xim_fetch,
+                xim_cache_opt,
+                xim_disk_cache.as_ref(),
+            )?;
+            drain_xim_decode_issues(&mut xim_decode_issues);
+
+            let (chunk_rows, x_trace, x_xim) = if apply_trace_filter {
+                let (rows_f, x_tr_f, x_xim_f) = filter_rows_by_trace_with_aux(
+                    chunk.to_vec(),
+                    x_trace,
+                    x_xim,
+                    cfg.trace.total_c(),
+                    cfg.trace.l,
+                    xim_trace_cfg.as_ref().map(|c| c.total_c()),
+                    xim_trace_cfg.as_ref().map(|c| c.l),
+                );
+                if rows_f.is_empty() {
+                    continue;
+                }
+                (rows_f, x_tr_f, x_xim_f)
+            } else {
+                (Vec::new(), x_trace, x_xim)
+            };
+
+            let row_slice: &[FeatureRow] = if apply_trace_filter {
+                &chunk_rows
+            } else {
+                chunk
+            };
+            let n_chunk = row_slice.len();
+            if n_chunk == 0 {
+                continue;
+            }
+
+            if cfg.diagnostics.trace_summary {
+                let sum = trace_summary(
+                    &x_trace,
+                    n_chunk,
+                    cfg.trace.total_c(),
+                    cfg.trace.l,
+                    cfg.trace.ms1_cmax,
+                    cfg.trace.ms2_cmax,
+                );
+                sum_n += sum.n;
+                sum_ms1 += sum.ms1_nonzero_rows;
+                sum_ms2 += sum.ms2_nonzero_rows;
+            }
+
+            let scores_chunk = score_inference_chunk(
+                &model,
+                row_slice,
+                &x_trace,
+                x_xim.as_deref(),
+                &table.feature_cols,
+                &target_cols,
+                &cfg.trace,
+                xim_trace_cfg.as_ref(),
+                meta.model.use_heuristic_features,
+                feat_dim,
+                &device,
+                cfg.batch_size.max(1),
+                meta.preprocess.as_ref(),
+            )?;
+
+            if apply_trace_filter {
+                rows_scored.extend(chunk_rows);
+                scores.extend(scores_chunk);
+            } else {
+                scores[offset..offset + n_chunk].copy_from_slice(&scores_chunk);
+                offset += n_chunk;
+            }
         }
     }
 
     log_xic_cache_stats("infer", &cache_stats);
     log_xim_cache_stats("infer", &xim_cache_stats);
-    if apply_trace_filter {
+    if apply_trace_filter && prefetched.is_none() {
         rows = rows_scored;
     }
     if cfg.diagnostics.trace_summary {

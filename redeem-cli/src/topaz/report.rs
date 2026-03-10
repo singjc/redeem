@@ -9,8 +9,8 @@ use redeem_topaz::building_blocks::trace_window::nearest_index_sorted;
 use redeem_topaz::infer::stats::tdc_summary;
 use redeem_topaz::infer::{XicFetchConfig, XimFetchConfig};
 use redeem_topaz::inspect::{
-    fetch_xic_for_row, fetch_xims_for_rows, read_run_path_map, resolve_run_path,
-    valid_im_bounds, valid_rt_bounds,
+    fetch_xic_for_row, fetch_xims_for_rows, read_run_path_map, resolve_run_path, valid_im_bounds,
+    valid_rt_bounds,
 };
 use redeem_topaz::io::osw::FeatureRow;
 use redeem_topaz::io::xic::PrecursorXic;
@@ -1225,8 +1225,10 @@ fn build_example_plots(
 
         let mut raw_xims = HashMap::new();
         if let Some(path) = resolve_run_path(run_id, inputs.xim_path, xim_run_map.as_ref()) {
-            let candidate_rows: Vec<FeatureRow> =
-                candidates.iter().map(|candidate| candidate.row.clone()).collect();
+            let candidate_rows: Vec<FeatureRow> = candidates
+                .iter()
+                .map(|candidate| candidate.row.clone())
+                .collect();
             match fetch_xims_for_rows(&candidate_rows, &path, inputs.xim_fetch) {
                 Ok(xims) => {
                     raw_xims = xims;

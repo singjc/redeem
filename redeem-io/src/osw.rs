@@ -194,7 +194,10 @@ pub fn read_feature_rows_for_bags(
         list_columns(&conn, "FEATURE")?.into_iter().collect();
 
     let run_ids: HashSet<u64> = bag_keys.iter().map(|(run_id, _)| *run_id).collect();
-    let precursor_ids: HashSet<u64> = bag_keys.iter().map(|(_, precursor_id)| *precursor_id).collect();
+    let precursor_ids: HashSet<u64> = bag_keys
+        .iter()
+        .map(|(_, precursor_id)| *precursor_id)
+        .collect();
     let bag_set: HashSet<(u64, u64)> = bag_keys.iter().copied().collect();
 
     let run_placeholders = vec!["?"; run_ids.len()].join(", ");

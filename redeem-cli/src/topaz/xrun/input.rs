@@ -92,34 +92,23 @@ pub(crate) fn load_xrun_config_from_arguments(
 fn resolve_paths_relative_to(cfg: &mut XrunSweepConfig, base: &PathBuf) {
     cfg.osw_path = resolve_relative(base, &cfg.osw_path);
     cfg.xic_path = resolve_relative(base, &cfg.xic_path);
-    cfg.xic_paths = cfg
-        .xic_paths
-        .take()
-        .map(|paths| paths.into_iter().map(|p| resolve_relative(base, &p)).collect());
-    cfg.xic_map_path = cfg
-        .xic_map_path
-        .take()
-        .map(|p| resolve_relative(base, &p));
-    cfg.xim_path = cfg
-        .xim_path
-        .take()
-        .map(|p| resolve_relative(base, &p));
-    cfg.xim_paths = cfg
-        .xim_paths
-        .take()
-        .map(|paths| paths.into_iter().map(|p| resolve_relative(base, &p)).collect());
-    cfg.xim_map_path = cfg
-        .xim_map_path
-        .take()
-        .map(|p| resolve_relative(base, &p));
-    cfg.xic_cache_dir = cfg
-        .xic_cache_dir
-        .take()
-        .map(|p| resolve_relative(base, &p));
-    cfg.xim_cache_dir = cfg
-        .xim_cache_dir
-        .take()
-        .map(|p| resolve_relative(base, &p));
+    cfg.xic_paths = cfg.xic_paths.take().map(|paths| {
+        paths
+            .into_iter()
+            .map(|p| resolve_relative(base, &p))
+            .collect()
+    });
+    cfg.xic_map_path = cfg.xic_map_path.take().map(|p| resolve_relative(base, &p));
+    cfg.xim_path = cfg.xim_path.take().map(|p| resolve_relative(base, &p));
+    cfg.xim_paths = cfg.xim_paths.take().map(|paths| {
+        paths
+            .into_iter()
+            .map(|p| resolve_relative(base, &p))
+            .collect()
+    });
+    cfg.xim_map_path = cfg.xim_map_path.take().map(|p| resolve_relative(base, &p));
+    cfg.xic_cache_dir = cfg.xic_cache_dir.take().map(|p| resolve_relative(base, &p));
+    cfg.xim_cache_dir = cfg.xim_cache_dir.take().map(|p| resolve_relative(base, &p));
     cfg.checkpoint = resolve_relative(base, &cfg.checkpoint);
     cfg.output_tsv = resolve_relative(base, &cfg.output_tsv);
 }

@@ -543,6 +543,12 @@ fn main() -> Result<()> {
                                 .value_parser(clap::value_parser!(usize)),
                         )
                         .arg(
+                            Arg::new("prefetch_traces_once")
+                                .long("prefetch-traces-once")
+                                .help("Build full-dataset XIC/XIM tensors once, then chunk only model scoring")
+                                .action(ArgAction::SetTrue),
+                        )
+                        .arg(
                             Arg::new("xrun")
                                 .long("xrun")
                                 .help("Apply the saved XRUN calibrator sidecar during inference")

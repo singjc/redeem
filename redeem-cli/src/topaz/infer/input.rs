@@ -89,6 +89,9 @@ impl TopazInferConfig {
         if let Some(v) = try_get_one::<usize>(matches, "pep_bins") {
             cfg.inner.pep_bins = *v;
         }
+        if try_get_flag(matches, "prefetch_traces_once") {
+            cfg.inner.prefetch_traces_once = true;
+        }
         if try_get_flag(matches, "xrun") {
             cfg.inner.xrun.enabled = true;
         }
@@ -128,11 +131,12 @@ fn try_get_flag(matches: &ArgMatches, id: &str) -> bool {
 fn resolve_paths_relative_to(cfg: &mut TopazInferConfig, base: &PathBuf) {
     cfg.inner.osw_path = resolve_relative(base, &cfg.inner.osw_path);
     cfg.inner.xic_path = resolve_relative(base, &cfg.inner.xic_path);
-    cfg.inner.xic_paths = cfg
-        .inner
-        .xic_paths
-        .take()
-        .map(|paths| paths.into_iter().map(|p| resolve_relative(base, &p)).collect());
+    cfg.inner.xic_paths = cfg.inner.xic_paths.take().map(|paths| {
+        paths
+            .into_iter()
+            .map(|p| resolve_relative(base, &p))
+            .collect()
+    });
     cfg.inner.xic_map_path = cfg
         .inner
         .xic_map_path
@@ -143,11 +147,12 @@ fn resolve_paths_relative_to(cfg: &mut TopazInferConfig, base: &PathBuf) {
         .xim_path
         .take()
         .map(|p| resolve_relative(base, &p));
-    cfg.inner.xim_paths = cfg
-        .inner
-        .xim_paths
-        .take()
-        .map(|paths| paths.into_iter().map(|p| resolve_relative(base, &p)).collect());
+    cfg.inner.xim_paths = cfg.inner.xim_paths.take().map(|paths| {
+        paths
+            .into_iter()
+            .map(|p| resolve_relative(base, &p))
+            .collect()
+    });
     cfg.inner.xim_map_path = cfg
         .inner
         .xim_map_path

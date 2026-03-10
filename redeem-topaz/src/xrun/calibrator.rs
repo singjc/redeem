@@ -182,9 +182,7 @@ mod tests {
         let p = 256usize;
         let r = 64usize;
         let din = 128usize;
-        let xseq: Vec<f32> = (0..p * r * din)
-            .map(|i| ((i % 37) as f32) * 0.01)
-            .collect();
+        let xseq: Vec<f32> = (0..p * r * din).map(|i| ((i % 37) as f32) * 0.01).collect();
         let mask_u8 = vec![1u8; p * r];
         let x = Tensor::from_vec(xseq, (p, r, din), &device)?;
         let m = Tensor::from_vec(mask_u8, (p, r), &device)?;
