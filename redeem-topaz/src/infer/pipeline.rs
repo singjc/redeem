@@ -1366,9 +1366,20 @@ fn fill_xim_row_from_feature(
 }
 
 #[cfg(feature = "io-parquet")]
+/// Fetch XIC precursors into the shared caches and return the materialized rows.
+///
+/// `cache_run_id` is the OSW run identifier used to key the in-memory and
+/// on-disk caches. `parquet_run_filter` controls whether the parquet `RUN_ID`
+/// column should also be filtered during the file scan.
+///
+/// When TOPAZ is driven by an explicit `xic_map.tsv`, the path selection
+/// already disambiguates the run. In that case callers pass
+/// `parquet_run_filter=None` so buggy parquet-internal run identifiers do not
+/// block otherwise valid precursor rows from being loaded.
 fn fetch_precursors_cached(
     path: &Path,
-    run_id: u64,
+    cache_run_id: u64,
+    parquet_run_filter: Option<u64>,
     prec_set: &HashSet<u64>,
     cache: &SharedXicCache,
     disk: Option<&XicDiskCache>,
@@ -1380,7 +1391,7 @@ fn fetch_precursors_cached(
 
     for &pid in prec_set {
         let key = CacheKey {
-            run_id,
+            run_id: cache_run_id,
             precursor_id: pid,
         };
         if let Some(xic) = cache.get(path, key) {
@@ -1389,7 +1400,7 @@ fn fetch_precursors_cached(
             continue;
         }
         if let Some(disk_cache) = disk {
-            if let Ok(Some(xic)) = disk_cache.load(path, run_id, pid) {
+            if let Ok(Some(xic)) = disk_cache.load(path, cache_run_id, pid) {
                 cache.insert(path, key, xic.clone());
                 stats.inc_disk_hit(1);
                 out.insert(pid, xic);
@@ -1402,7 +1413,9 @@ fn fetch_precursors_cached(
     if !missing.is_empty() {
         stats.inc_miss(missing.len() as u64);
         let mut reader = crate::io::xic_parquet::XicParquetReader::new(path);
-        reader.filter_run_id(run_id);
+        if let Some(run_id) = parquet_run_filter {
+            reader.filter_run_id(run_id);
+        }
         if let Some(levels) = &fetch_cfg.ms_levels {
             reader.filter_ms_level(levels.clone());
         }
@@ -1417,33 +1430,48 @@ fn fetch_precursors_cached(
         let requested = missing.len();
         let fetched_count = fetched.len();
         if fetched_count == 0 {
-            log::warn!(
-                "XIC cache path {:?}: fetched 0 of {} precursors (run_id={})",
-                path,
-                requested,
-                run_id
-            );
+            match parquet_run_filter {
+                Some(run_id) => log::warn!(
+                    "XIC cache path {:?}: fetched 0 of {} precursors (run_id={})",
+                    path,
+                    requested,
+                    run_id
+                ),
+                None => log::warn!(
+                    "XIC cache path {:?}: fetched 0 of {} precursors (mapped file; RUN_ID filter disabled)",
+                    path,
+                    requested
+                ),
+            }
         } else {
-            log::info!(
-                "XIC cache path {:?}: fetched {} of {} precursors (run_id={})",
-                path,
-                fetched_count,
-                requested,
-                run_id
-            );
+            match parquet_run_filter {
+                Some(run_id) => log::debug!(
+                    "XIC cache path {:?}: fetched {} of {} precursors (run_id={})",
+                    path,
+                    fetched_count,
+                    requested,
+                    run_id
+                ),
+                None => log::debug!(
+                    "XIC cache path {:?}: fetched {} of {} precursors (mapped file; RUN_ID filter disabled)",
+                    path,
+                    fetched_count,
+                    requested
+                ),
+            }
         }
         for xic in fetched {
             let pid = xic.precursor_id;
             cache.insert(
                 path,
                 CacheKey {
-                    run_id,
+                    run_id: cache_run_id,
                     precursor_id: pid,
                 },
                 xic.clone(),
             );
             if let Some(disk_cache) = disk {
-                let _ = disk_cache.store(path, run_id, &xic);
+                let _ = disk_cache.store(path, cache_run_id, &xic);
             }
             out.insert(pid, xic);
         }
@@ -1465,7 +1493,7 @@ fn fetch_precursors_cached_with_fallback(
     let out = if skip_run_filter {
         HashMap::new()
     } else {
-        fetch_precursors_cached(path, run_id, prec_set, cache, disk, fetch_cfg)?
+        fetch_precursors_cached(path, run_id, Some(run_id), prec_set, cache, disk, fetch_cfg)?
     };
     if !out.is_empty() || prec_set.is_empty() {
         return Ok(out);
@@ -1508,7 +1536,7 @@ fn fetch_precursors_cached_with_fallback(
         return Ok(out);
     }
     mark_xic_run_filter_unusable(path);
-    log::info!(
+    log::debug!(
         "XIC map path {:?}: fallback fetched {} of {} precursors (ignoring RUN_ID)",
         path,
         fetched_count,
@@ -1535,9 +1563,20 @@ fn fetch_precursors_cached_with_fallback(
 }
 
 #[cfg(feature = "io-parquet")]
+/// Fetch XIM mobilograms into the shared caches and return the materialized rows.
+///
+/// `cache_run_id` is the OSW run identifier used to key the in-memory and
+/// on-disk caches. `parquet_run_filter` controls whether the parquet `RUN_ID`
+/// column should also be filtered during the file scan.
+///
+/// When TOPAZ is driven by an explicit `xim_map.tsv`, the path selection
+/// already disambiguates the run. In that case callers pass
+/// `parquet_run_filter=None` so buggy parquet-internal run identifiers do not
+/// block otherwise valid feature rows from being loaded.
 fn fetch_features_cached(
     path: &Path,
-    run_id: u64,
+    cache_run_id: u64,
+    parquet_run_filter: Option<u64>,
     feature_set: &HashSet<u64>,
     cache: &SharedXimCache,
     disk: Option<&XimDiskCache>,
@@ -1548,14 +1587,17 @@ fn fetch_features_cached(
     let stats = cache.stats();
 
     for &feature_id in feature_set {
-        let key = XimCacheKey { run_id, feature_id };
+        let key = XimCacheKey {
+            run_id: cache_run_id,
+            feature_id,
+        };
         if let Some(xim) = cache.get(path, key) {
             stats.inc_mem_hit(1);
             out.insert(feature_id, xim);
             continue;
         }
         if let Some(disk_cache) = disk {
-            if let Ok(Some(xim)) = disk_cache.load(path, run_id, feature_id) {
+            if let Ok(Some(xim)) = disk_cache.load(path, cache_run_id, feature_id) {
                 cache.insert(path, key, xim.clone());
                 stats.inc_disk_hit(1);
                 out.insert(feature_id, xim);
@@ -1568,7 +1610,9 @@ fn fetch_features_cached(
     if !missing.is_empty() {
         stats.inc_miss(missing.len() as u64);
         let mut reader = crate::io::xim_parquet::XimParquetReader::new(path);
-        reader.filter_run_id(run_id);
+        if let Some(run_id) = parquet_run_filter {
+            reader.filter_run_id(run_id);
+        }
         if let Some(levels) = &fetch_cfg.ms_levels {
             reader.filter_ms_level(levels.clone());
         }
@@ -1586,26 +1630,48 @@ fn fetch_features_cached(
         let requested = missing.len();
         let fetched_count = fetched.len();
         if fetched_count == 0 {
-            log::warn!(
-                "XIM cache path {:?}: fetched 0 of {} features (run_id={})",
-                path,
-                requested,
-                run_id
-            );
+            match parquet_run_filter {
+                Some(run_id) => log::warn!(
+                    "XIM cache path {:?}: fetched 0 of {} features (run_id={})",
+                    path,
+                    requested,
+                    run_id
+                ),
+                None => log::warn!(
+                    "XIM cache path {:?}: fetched 0 of {} features (mapped file; RUN_ID filter disabled)",
+                    path,
+                    requested
+                ),
+            }
         } else {
-            log::info!(
-                "XIM cache path {:?}: fetched {} of {} features (run_id={})",
-                path,
-                fetched_count,
-                requested,
-                run_id
-            );
+            match parquet_run_filter {
+                Some(run_id) => log::debug!(
+                    "XIM cache path {:?}: fetched {} of {} features (run_id={})",
+                    path,
+                    fetched_count,
+                    requested,
+                    run_id
+                ),
+                None => log::debug!(
+                    "XIM cache path {:?}: fetched {} of {} features (mapped file; RUN_ID filter disabled)",
+                    path,
+                    fetched_count,
+                    requested
+                ),
+            }
         }
         for xim in fetched {
             let feature_id = xim.feature_id;
-            cache.insert(path, XimCacheKey { run_id, feature_id }, xim.clone());
+            cache.insert(
+                path,
+                XimCacheKey {
+                    run_id: cache_run_id,
+                    feature_id,
+                },
+                xim.clone(),
+            );
             if let Some(disk_cache) = disk {
-                let _ = disk_cache.store(path, run_id, &xim);
+                let _ = disk_cache.store(path, cache_run_id, &xim);
             }
             out.insert(feature_id, xim);
         }
@@ -1627,7 +1693,15 @@ fn fetch_features_cached_with_fallback(
     let out = if skip_run_filter {
         HashMap::new()
     } else {
-        fetch_features_cached(path, run_id, feature_set, cache, disk, fetch_cfg)?
+        fetch_features_cached(
+            path,
+            run_id,
+            Some(run_id),
+            feature_set,
+            cache,
+            disk,
+            fetch_cfg,
+        )?
     };
     if !out.is_empty() || feature_set.is_empty() {
         return Ok(out);
@@ -1673,7 +1747,7 @@ fn fetch_features_cached_with_fallback(
         return Ok(out);
     }
     mark_xim_run_filter_unusable(path);
-    log::info!(
+    log::debug!(
         "XIM map path {:?}: fallback fetched {} of {} features (ignoring RUN_ID)",
         path,
         fetched_count,
@@ -1980,6 +2054,12 @@ pub fn build_xim_tensors_from_parquet_cached(
 }
 
 /// Cached version of [`build_xim_tensors_from_parquet_map`].
+///
+/// When an explicit `run_id -> xim_path` map is provided, the selected parquet
+/// file already identifies the source run. This loader therefore skips parquet
+/// `RUN_ID` filtering and fetches mobilograms by `FEATURE_ID` directly from the
+/// mapped file. That avoids OpenMS run-id mismatches inside the parquet file
+/// from forcing a slow fallback path.
 #[cfg(feature = "io-parquet")]
 pub fn build_xim_tensors_from_parquet_map_cached(
     rows: &[FeatureRow],
@@ -2038,14 +2118,8 @@ pub fn build_xim_tensors_from_parquet_map_cached(
     let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
         .into_par_iter()
         .map(|(run_id, feature_ids, path)| {
-            let fetched = fetch_features_cached_with_fallback(
-                &path,
-                run_id,
-                &feature_ids,
-                cache,
-                disk,
-                fetch_cfg,
-            )?;
+            let fetched =
+                fetch_features_cached(&path, run_id, None, &feature_ids, cache, disk, fetch_cfg)?;
             Ok((run_id, fetched))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2053,14 +2127,8 @@ pub fn build_xim_tensors_from_parquet_map_cached(
     let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
         .into_iter()
         .map(|(run_id, feature_ids, path)| {
-            let fetched = fetch_features_cached_with_fallback(
-                &path,
-                run_id,
-                &feature_ids,
-                cache,
-                disk,
-                fetch_cfg,
-            )?;
+            let fetched =
+                fetch_features_cached(&path, run_id, None, &feature_ids, cache, disk, fetch_cfg)?;
             Ok((run_id, fetched))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2806,6 +2874,12 @@ pub fn build_trace_tensors_from_parquet_map(
 }
 
 /// Cached version of [`build_trace_tensors_from_parquet_map`].
+///
+/// When an explicit `run_id -> xic_path` map is provided, the selected parquet
+/// file already identifies the source run. This loader therefore skips parquet
+/// `RUN_ID` filtering and fetches chromatograms by `PRECURSOR_ID` directly from
+/// the mapped file. That avoids OpenMS run-id mismatches inside the parquet
+/// file from forcing a slow fallback path.
 #[cfg(feature = "io-parquet")]
 pub fn build_trace_tensors_from_parquet_map_cached(
     rows: &[FeatureRow],
@@ -2873,9 +2947,10 @@ pub fn build_trace_tensors_from_parquet_map_cached(
         .map(|(run_id, prec_set, path)| {
             let cache = cache_owned.clone();
             let disk = disk_owned.clone();
-            fetch_precursors_cached_with_fallback(
+            fetch_precursors_cached(
                 &path,
                 run_id,
+                None,
                 &prec_set,
                 &cache,
                 disk.as_ref(),
@@ -2888,7 +2963,7 @@ pub fn build_trace_tensors_from_parquet_map_cached(
     let fetched_all: Vec<(u64, HashMap<u64, PrecursorXic>)> = items
         .into_iter()
         .map(|(run_id, prec_set, path)| {
-            fetch_precursors_cached_with_fallback(&path, run_id, &prec_set, cache, disk, fetch_cfg)
+            fetch_precursors_cached(&path, run_id, None, &prec_set, cache, disk, fetch_cfg)
                 .map(|map| (run_id, map))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2927,7 +3002,7 @@ pub fn build_trace_tensors_from_parquet_map_cached(
                                 max_int = p.intensity.abs();
                             }
                         }
-                        log::info!(
+                        log::trace!(
                             "XIC probe run_id={} ({label}): exp_rt={} rt_range=[{}, {}] max_intensity={}",
                             row.run_id,
                             row.exp_rt,
@@ -2936,7 +3011,7 @@ pub fn build_trace_tensors_from_parquet_map_cached(
                             max_int
                         );
                     } else {
-                        log::warn!(
+                        log::trace!(
                             "XIC probe run_id={} has no {} transitions for precursor_id={}",
                             row.run_id,
                             label,

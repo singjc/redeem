@@ -29,6 +29,9 @@ pub struct TopazReportInputs<'a> {
     pub osw_path: Option<&'a Path>,
     pub score_tsv_path: Option<&'a Path>,
     pub topaz_table_name: Option<&'a str>,
+    pub topaz_label: Option<&'a str>,
+    pub topaz_base_table_name: Option<&'a str>,
+    pub topaz_base_label: Option<&'a str>,
     pub xic_path: Option<&'a Path>,
     pub xic_paths: Option<&'a [PathBuf]>,
     pub xic_map_path: Option<&'a Path>,
@@ -60,7 +63,17 @@ pub fn write_topaz_report(inputs: &TopazReportInputs<'_>) -> Result<()> {
         None
     };
 
-    let topaz_scores = load_topaz_scores(inputs);
+    let topaz_label = inputs.topaz_label.unwrap_or("TOPAZ");
+    let topaz_scores = load_score_source(
+        inputs.score_tsv_path,
+        inputs.osw_path,
+        inputs.topaz_table_name.unwrap_or("SCORE_TOPAZ"),
+        topaz_label,
+    );
+    let topaz_base_label = inputs.topaz_base_label.unwrap_or("TOPAZ Base");
+    let topaz_base_scores = inputs.topaz_base_table_name.and_then(|table_name| {
+        load_score_source(None, inputs.osw_path, table_name, topaz_base_label)
+    });
     let ms2_scores = inputs
         .osw_path
         .and_then(|p| redeem_topaz::io::osw::read_score_table(p, "SCORE_MS2").ok())
@@ -106,30 +119,75 @@ pub fn write_topaz_report(inputs: &TopazReportInputs<'_>) -> Result<()> {
 
     if let (Some(scores), Some(meta)) = (topaz_scores.as_ref(), feature_meta.as_ref()) {
         if let Some(topaz_ids) = compute_id_counts(scores, meta, 0.01) {
+            let mut methods = Vec::new();
+            methods.push(NamedIdCounts {
+                label: topaz_label.to_string(),
+                counts: topaz_ids,
+                color: "rgba(31, 119, 180, 0.8)",
+                union_color: "rgba(31, 119, 180, 0.15)",
+                union_pattern: PatternShape::RightDiagonalLine,
+            });
+            if let Some(base_scores) = topaz_base_scores.as_ref() {
+                if let Some(base_ids) = compute_id_counts(base_scores, meta, 0.01) {
+                    methods.push(NamedIdCounts {
+                        label: topaz_base_label.to_string(),
+                        counts: base_ids,
+                        color: "rgba(44, 160, 44, 0.8)",
+                        union_color: "rgba(44, 160, 44, 0.15)",
+                        union_pattern: PatternShape::VerticalLine,
+                    });
+                }
+            }
             let ms2_ids = ms2_scores
                 .as_ref()
                 .and_then(|rows| compute_id_counts(rows, meta, 0.01));
+            if let Some(ms2_ids) = ms2_ids {
+                methods.push(NamedIdCounts {
+                    label: "SCORE_MS2".to_string(),
+                    counts: ms2_ids,
+                    color: "rgba(255, 127, 14, 0.8)",
+                    union_color: "rgba(255, 127, 14, 0.15)",
+                    union_pattern: PatternShape::DiagonalCross,
+                });
+            }
             let mut id_section = ReportSection::new("Identifications");
-            id_section.add_plot(plot_id_bars(&topaz_ids, ms2_ids.as_ref()));
+            id_section.add_plot(plot_id_bars(&methods));
             report.add_section(id_section);
         }
     }
 
-    if let (Some(scores), Some(meta), Some(ms2)) = (
-        topaz_scores.as_ref(),
-        feature_meta.as_ref(),
-        ms2_scores.as_ref(),
-    ) {
-        let pairs = build_score_pairs(scores, ms2, meta, precursor_meta.as_ref());
-        if !pairs.is_empty() {
-            let topaz_cutoff = cutoff_from_score_rows(scores, 0.01);
-            let ms2_cutoff = cutoff_from_score_rows(ms2, 0.01);
-            let mut sec = ReportSection::new("TOPAZ vs SCORE_MS2");
-            sec.add_plot(plot_score_scatter_with_marginals(
-                &pairs,
-                topaz_cutoff,
-                ms2_cutoff,
-            ));
+    if let (Some(meta), Some(ms2)) = (feature_meta.as_ref(), ms2_scores.as_ref()) {
+        let mut sec = ReportSection::new("TOPAZ vs SCORE_MS2");
+        let mut added_plot = false;
+        if let Some(base_scores) = topaz_base_scores.as_ref() {
+            let pairs = build_score_pairs(base_scores, ms2, meta, precursor_meta.as_ref());
+            if !pairs.is_empty() {
+                sec.add_plot(plot_score_scatter_with_marginals(
+                    &pairs,
+                    cutoff_from_score_rows(base_scores, 0.01),
+                    cutoff_from_score_rows(ms2, 0.01),
+                    topaz_base_label,
+                    "SCORE_MS2",
+                    &format!("{topaz_base_label} vs SCORE_MS2"),
+                ));
+                added_plot = true;
+            }
+        }
+        if let Some(scores) = topaz_scores.as_ref() {
+            let pairs = build_score_pairs(scores, ms2, meta, precursor_meta.as_ref());
+            if !pairs.is_empty() {
+                sec.add_plot(plot_score_scatter_with_marginals(
+                    &pairs,
+                    cutoff_from_score_rows(scores, 0.01),
+                    cutoff_from_score_rows(ms2, 0.01),
+                    topaz_label,
+                    "SCORE_MS2",
+                    &format!("{topaz_label} vs SCORE_MS2"),
+                ));
+                added_plot = true;
+            }
+        }
+        if added_plot {
             report.add_section(sec);
         }
     }
@@ -161,43 +219,46 @@ pub fn write_topaz_report(inputs: &TopazReportInputs<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Load the final TOPAZ score rows used by the report.
+/// Load score rows for one method from either a TSV or an OSW score table.
 ///
-/// The report prefers the inference TSV because it is the exact row set written
-/// by the scoring pipeline. When that TSV is unavailable, it falls back to the
-/// configured TOPAZ OSW score table. This makes `redeem topaz report` usable on
-/// remote systems where only the scored OSW and `head_embeddings.tsv` were
-/// copied back.
-fn load_topaz_scores(inputs: &TopazReportInputs<'_>) -> Option<Vec<ScoreLite>> {
-    if let Some(path) = inputs.score_tsv_path {
+/// The report prefers a TSV when available because it mirrors the exact row set
+/// emitted by inference. When the TSV is missing, the function falls back to
+/// reading the named score table from the OSW, which is the common case for
+/// report-only reruns on remote systems.
+fn load_score_source(
+    score_tsv_path: Option<&Path>,
+    osw_path: Option<&Path>,
+    table_name: &str,
+    label: &str,
+) -> Option<Vec<ScoreLite>> {
+    if let Some(path) = score_tsv_path {
         match load_score_tsv(path) {
             Ok(rows) if !rows.is_empty() => {
-                log::info!("Loaded TOPAZ scores from TSV {:?}", path);
+                log::info!("Loaded {label} scores from TSV {:?}", path);
                 return Some(rows);
             }
             Ok(_) => {
                 log::warn!(
-                    "TOPAZ score TSV {:?} is empty; trying OSW table fallback",
+                    "{label} score TSV {:?} is empty; trying OSW table fallback",
                     path
                 );
             }
             Err(err) => {
                 log::warn!(
-                    "Failed to load TOPAZ score TSV {:?}: {err:#}; trying OSW table fallback",
+                    "Failed to load {label} score TSV {:?}: {err:#}; trying OSW table fallback",
                     path
                 );
             }
         }
     }
 
-    let Some(osw_path) = inputs.osw_path else {
+    let Some(osw_path) = osw_path else {
         return None;
     };
-    let table_name = inputs.topaz_table_name.unwrap_or("SCORE_TOPAZ");
     match redeem_topaz::io::osw::read_score_table(osw_path, table_name) {
         Ok(rows) if !rows.is_empty() => {
             log::info!(
-                "Loaded TOPAZ scores from OSW table {:?} in {:?}",
+                "Loaded {label} scores from OSW table {:?} in {:?}",
                 table_name,
                 osw_path
             );
@@ -205,7 +266,7 @@ fn load_topaz_scores(inputs: &TopazReportInputs<'_>) -> Option<Vec<ScoreLite>> {
         }
         Ok(_) => {
             log::warn!(
-                "TOPAZ OSW table {:?} in {:?} is empty; report will only include embeddings",
+                "{label} OSW table {:?} in {:?} is empty; report will skip this comparison",
                 table_name,
                 osw_path
             );
@@ -213,7 +274,7 @@ fn load_topaz_scores(inputs: &TopazReportInputs<'_>) -> Option<Vec<ScoreLite>> {
         }
         Err(err) => {
             log::warn!(
-                "Failed to load TOPAZ OSW table {:?} from {:?}: {err:#}",
+                "Failed to load {label} OSW table {:?} from {:?}: {err:#}",
                 table_name,
                 osw_path
             );
@@ -254,6 +315,15 @@ impl ScoreLite {
 struct IdCounts {
     per_run: std::collections::HashMap<u64, usize>,
     union: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NamedIdCounts {
+    label: String,
+    counts: IdCounts,
+    color: &'static str,
+    union_color: &'static str,
+    union_pattern: PatternShape,
 }
 
 fn load_head_embeddings_tsv(path: &Path) -> Result<HeadEmbeddings> {
@@ -711,8 +781,11 @@ fn build_score_pairs(
 
 fn plot_score_scatter_with_marginals(
     pairs: &[ScorePair],
-    topaz_cutoff: Option<f64>,
-    ms2_cutoff: Option<f64>,
+    x_cutoff: Option<f64>,
+    y_cutoff: Option<f64>,
+    x_label: &str,
+    y_label: &str,
+    title: &str,
 ) -> Plot {
     let mut t_x = Vec::new();
     let mut t_y = Vec::new();
@@ -761,7 +834,7 @@ fn plot_score_scatter_with_marginals(
             .hover_text_array(d_hover),
     );
 
-    if let Some(cut) = topaz_cutoff {
+    if let Some(cut) = x_cutoff {
         plot.add_trace(
             Scatter::new(
                 vec![cut, cut],
@@ -770,7 +843,7 @@ fn plot_score_scatter_with_marginals(
                     if y_max.is_finite() { y_max } else { 1.0 },
                 ],
             )
-            .name("TOPAZ cutoff (1% FDR)")
+            .name(format!("{x_label} cutoff (1% FDR)"))
             .mode(Mode::Lines)
             .line(
                 Line::new()
@@ -779,7 +852,7 @@ fn plot_score_scatter_with_marginals(
             ),
         );
     }
-    if let Some(cut) = ms2_cutoff {
+    if let Some(cut) = y_cutoff {
         plot.add_trace(
             Scatter::new(
                 vec![
@@ -788,7 +861,7 @@ fn plot_score_scatter_with_marginals(
                 ],
                 vec![cut, cut],
             )
-            .name("SCORE_MS2 cutoff (1% FDR)")
+            .name(format!("{y_label} cutoff (1% FDR)"))
             .mode(Mode::Lines)
             .line(
                 Line::new()
@@ -801,21 +874,21 @@ fn plot_score_scatter_with_marginals(
     // Marginal histograms.
     plot.add_trace(
         Histogram::new(t_x)
-            .name("Target (TOPAZ)")
+            .name(format!("Target ({x_label})"))
             .opacity(0.6)
             .marker(Marker::new().color("rgba(31, 119, 180, 0.6)"))
             .y_axis("y2"),
     );
     plot.add_trace(
         Histogram::new(d_x)
-            .name("Decoy (TOPAZ)")
+            .name(format!("Decoy ({x_label})"))
             .opacity(0.6)
             .marker(Marker::new().color("rgba(214, 39, 40, 0.6)"))
             .y_axis("y2"),
     );
     plot.add_trace(
         Histogram::new_vertical(t_y)
-            .name("Target (MS2)")
+            .name(format!("Target ({y_label})"))
             .opacity(0.6)
             .marker(Marker::new().color("rgba(31, 119, 180, 0.6)"))
             .orientation(Orientation::Horizontal)
@@ -823,7 +896,7 @@ fn plot_score_scatter_with_marginals(
     );
     plot.add_trace(
         Histogram::new_vertical(d_y)
-            .name("Decoy (MS2)")
+            .name(format!("Decoy ({y_label})"))
             .opacity(0.6)
             .marker(Marker::new().color("rgba(214, 39, 40, 0.6)"))
             .orientation(Orientation::Horizontal)
@@ -832,13 +905,13 @@ fn plot_score_scatter_with_marginals(
 
     plot.set_layout(
         Layout::new()
-            .title("TOPAZ vs SCORE_MS2")
+            .title(title)
             .x_axis(
                 Axis::new()
-                    .title("TOPAZ score (max candidate logit)")
+                    .title(format!("{x_label} score"))
                     .domain(&[0.0, 0.78]),
             )
-            .y_axis(Axis::new().title("SCORE_MS2").domain(&[0.0, 0.78]))
+            .y_axis(Axis::new().title(y_label).domain(&[0.0, 0.78]))
             .x_axis2(
                 Axis::new()
                     .title("Count")
@@ -857,13 +930,13 @@ fn plot_score_scatter_with_marginals(
     plot
 }
 
-fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
-    let mut run_set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    for r in topaz.per_run.keys() {
-        run_set.insert(*r);
+fn plot_id_bars(methods: &[NamedIdCounts]) -> Plot {
+    if methods.is_empty() {
+        return Plot::new();
     }
-    if let Some(ms2) = ms2 {
-        for r in ms2.per_run.keys() {
+    let mut run_set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for method in methods {
+        for r in method.counts.per_run.keys() {
             run_set.insert(*r);
         }
     }
@@ -871,132 +944,70 @@ fn plot_id_bars(topaz: &IdCounts, ms2: Option<&IdCounts>) -> Plot {
     let runs: Vec<u64> = run_set.into_iter().collect();
     let run_labels: Vec<String> = runs.iter().map(|r| r.to_string()).collect();
 
-    // Central x positions for each run
     let centers: Vec<f64> = (0..runs.len()).map(|i| i as f64).collect();
-
-    // Offset the two methods left/right around each run center
-    let dx = 0.22;
-    let topaz_x: Vec<f64> = centers.iter().map(|x| x - dx).collect();
-    let ms2_x: Vec<f64> = centers.iter().map(|x| x + dx).collect();
-
-    let bar_width = 0.38;
-
-    let topaz_vals: Vec<usize> = runs
-        .iter()
-        .map(|r| *topaz.per_run.get(r).unwrap_or(&0))
-        .collect();
-    let topaz_gap: Vec<usize> = topaz_vals
-        .iter()
-        .map(|v| topaz.union.saturating_sub(*v))
-        .collect();
-
-    let hover_topaz: Vec<String> = runs
-        .iter()
-        .zip(topaz_vals.iter())
-        .map(|(r, v)| format!("run_id={r}<br>topaz_ids={v}<br>union_ids={}", topaz.union))
-        .collect();
-
-    let hover_topaz_gap: Vec<String> = runs
-        .iter()
-        .zip(topaz_gap.iter())
-        .map(|(r, v)| {
-            format!(
-                "run_id={r}<br>topaz_missing_vs_union={v}<br>union_ids={}",
-                topaz.union
-            )
-        })
-        .collect();
-
     let mut plot = Plot::new();
+    let n_methods = methods.len() as f64;
+    let bar_width = (0.8 / n_methods).min(0.35);
 
-    // TOPAZ stack
-    plot.add_trace(
-        Bar::new(topaz_x.clone(), topaz_vals)
-            .name("TOPAZ per-run")
-            .width(bar_width)
-            .marker(Marker::new().color("rgba(31, 119, 180, 0.8)"))
-            .hover_info(HoverInfo::Text)
-            .hover_text_array(hover_topaz)
-            .legend_group("TOPAZ"),
-    );
-
-    plot.add_trace(
-        Bar::new(topaz_x.clone(), topaz_gap)
-            .name("TOPAZ union (1% FDR)")
-            .width(bar_width)
-            .marker(
-                Marker::new()
-                    .color("rgba(31, 119, 180, 0.15)")
-                    .line(
-                        Line::new()
-                            .color("rgba(31, 119, 180, 0.9)")
-                            .width(1.5)
-                            .dash(DashType::Dash),
-                    )
-                    .pattern(Pattern::new().shape(PatternShape::RightDiagonalLine)),
-            )
-            .hover_info(HoverInfo::Text)
-            .hover_text_array(hover_topaz_gap)
-            .legend_group("TOPAZ"),
-    );
-
-    if let Some(ms2) = ms2 {
-        let ms2_vals: Vec<usize> = runs
+    for (idx, method) in methods.iter().enumerate() {
+        let offset = (idx as f64 - (n_methods - 1.0) / 2.0) * bar_width;
+        let method_x: Vec<f64> = centers.iter().map(|x| x + offset).collect();
+        let method_vals: Vec<usize> = runs
             .iter()
-            .map(|r| *ms2.per_run.get(r).unwrap_or(&0))
+            .map(|r| *method.counts.per_run.get(r).unwrap_or(&0))
             .collect();
-
-        let ms2_gap: Vec<usize> = ms2_vals
+        let method_gap: Vec<usize> = method_vals
             .iter()
-            .map(|v| ms2.union.saturating_sub(*v))
+            .map(|v| method.counts.union.saturating_sub(*v))
             .collect();
-
-        let hover_ms2: Vec<String> = runs
+        let hover_per_run: Vec<String> = runs
             .iter()
-            .zip(ms2_vals.iter())
-            .map(|(r, v)| format!("run_id={r}<br>ms2_ids={v}<br>union_ids={}", ms2.union))
-            .collect();
-
-        let hover_ms2_gap: Vec<String> = runs
-            .iter()
-            .zip(ms2_gap.iter())
+            .zip(method_vals.iter())
             .map(|(r, v)| {
                 format!(
-                    "run_id={r}<br>ms2_missing_vs_union={v}<br>union_ids={}",
-                    ms2.union
+                    "run_id={r}<br>{} per-run IDs={v}<br>union_ids={}",
+                    method.label, method.counts.union
+                )
+            })
+            .collect();
+        let hover_union: Vec<String> = runs
+            .iter()
+            .zip(method_gap.iter())
+            .map(|(r, v)| {
+                format!(
+                    "run_id={r}<br>{} missing_vs_union={v}<br>union_ids={}",
+                    method.label, method.counts.union
                 )
             })
             .collect();
 
-        // SCORE_MS2 stack
         plot.add_trace(
-            Bar::new(ms2_x.clone(), ms2_vals)
-                .name("SCORE_MS2 per-run")
+            Bar::new(method_x.clone(), method_vals)
+                .name(format!("{} per-run", method.label))
                 .width(bar_width)
-                .marker(Marker::new().color("rgba(255, 127, 14, 0.8)"))
+                .marker(Marker::new().color(method.color))
                 .hover_info(HoverInfo::Text)
-                .hover_text_array(hover_ms2)
-                .legend_group("SCORE_MS2"),
+                .hover_text_array(hover_per_run)
+                .legend_group(method.label.clone()),
         );
-
         plot.add_trace(
-            Bar::new(ms2_x.clone(), ms2_gap)
-                .name("SCORE_MS2 union (1% FDR)")
+            Bar::new(method_x, method_gap)
+                .name(format!("{} union (1% FDR)", method.label))
                 .width(bar_width)
                 .marker(
                     Marker::new()
-                        .color("rgba(255, 127, 14, 0.15)")
+                        .color(method.union_color)
                         .line(
                             Line::new()
-                                .color("rgba(255, 127, 14, 0.9)")
+                                .color(method.color)
                                 .width(1.5)
                                 .dash(DashType::Dash),
                         )
-                        .pattern(Pattern::new().shape(PatternShape::DiagonalCross)),
+                        .pattern(Pattern::new().shape(method.union_pattern.clone())),
                 )
                 .hover_info(HoverInfo::Text)
-                .hover_text_array(hover_ms2_gap)
-                .legend_group("SCORE_MS2"),
+                .hover_text_array(hover_union)
+                .legend_group(method.label.clone()),
         );
     }
 

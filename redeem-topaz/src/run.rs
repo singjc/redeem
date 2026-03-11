@@ -943,7 +943,7 @@ fn build_traces_for_rows(
     disk: Option<&XicDiskCache>,
 ) -> Result<Vec<f32>> {
     if let Some(map) = resolve_xic_map(xic_paths, xic_map_path)? {
-        log::info!(
+        log::debug!(
             "Using XIC map with {} entries from {:?}",
             map.len(),
             xic_map_path
@@ -980,7 +980,7 @@ fn build_xim_for_rows(
         return Ok(None);
     };
     if let Some(map) = resolve_xim_map(xim_paths, xim_map_path)? {
-        log::info!(
+        log::debug!(
             "Using XIM map with {} entries from {:?}",
             map.len(),
             xim_map_path
@@ -1133,6 +1133,7 @@ fn prefetch_modalities_for_inference(
     apply_trace_filter: bool,
     xim_decode_issues: &mut Vec<crate::io::xim_parquet::XimDecodeIssue>,
 ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+    let started = Instant::now();
     log::info!(
         "Prefetching XIC/XIM tensors once for inference (N={} rows)",
         rows.len()
@@ -1147,6 +1148,11 @@ fn prefetch_modalities_for_inference(
         cache_opt,
         disk_cache,
     )?;
+    log::info!(
+        "Inference prefetch stage | XIC complete for {} rows in {}",
+        rows.len(),
+        format_duration(started.elapsed())
+    );
     let x_xim = build_xim_for_rows(
         rows,
         &cfg.xim_path,
@@ -1158,11 +1164,17 @@ fn prefetch_modalities_for_inference(
         xim_disk_cache,
     )?;
     drain_xim_decode_issues(xim_decode_issues);
+    log::info!(
+        "Inference prefetch stage | XIM complete for {} rows in {}",
+        rows.len(),
+        format_duration(started.elapsed())
+    );
 
     if !apply_trace_filter {
         return Ok((x_trace, x_xim));
     }
 
+    let original_n = rows.len();
     let original_rows = std::mem::take(rows);
     let (rows_f, x_tr_f, x_xim_f) = filter_rows_by_trace_with_aux(
         original_rows,
@@ -1174,6 +1186,11 @@ fn prefetch_modalities_for_inference(
         xim_trace_cfg.as_ref().map(|c| c.l),
     );
     *rows = rows_f;
+    log::info!(
+        "Inference prefetch stage | trace-based filter retained {}/{} rows",
+        rows.len(),
+        original_n
+    );
     Ok((x_tr_f, x_xim_f))
 }
 
@@ -1252,6 +1269,7 @@ fn score_rows_streaming_inference(
     let chunk_size = cfg.trace_chunk_size.max(1);
     let queue_depth = 2usize;
     let (tx, rx) = mpsc::sync_channel::<Result<Option<InferenceChunkPayload>>>(queue_depth);
+    let mut progress = InferenceProgressLogger::new("streaming", rows.len(), chunk_size);
 
     let mut scores = if apply_trace_filter {
         Vec::new()
@@ -1275,6 +1293,7 @@ fn score_rows_streaming_inference(
     let mut xim_decode_issues = Vec::new();
     let mut decode_time = Duration::ZERO;
     let mut score_time = Duration::ZERO;
+    let mut processed_chunks = 0usize;
 
     thread::scope(|scope| -> Result<()> {
         let tx_producer = tx.clone();
@@ -1348,6 +1367,7 @@ fn score_rows_streaming_inference(
                 Some(payload) => {
                     xim_decode_issues.extend(payload.xim_decode_issues);
                     decode_time += payload.decode_time;
+                    processed_chunks += 1;
                     let row_slice: &[FeatureRow] =
                         if let Some(rows_override) = payload.rows_override.as_ref() {
                             rows_override.as_slice()
@@ -1355,6 +1375,7 @@ fn score_rows_streaming_inference(
                             &rows[payload.start..payload.end]
                         };
                     if row_slice.is_empty() {
+                        progress.maybe_log(payload.end.min(rows.len()), processed_chunks);
                         continue;
                     }
 
@@ -1399,6 +1420,7 @@ fn score_rows_streaming_inference(
                         scores[offset..offset + row_slice.len()].copy_from_slice(&scores_chunk);
                         offset += row_slice.len();
                     }
+                    progress.maybe_log(payload.end.min(rows.len()), processed_chunks);
                 }
             }
         }
@@ -1553,6 +1575,101 @@ fn log_inference_runtime_stats(stats: &InferenceRuntimeStats, n_rows: usize) {
             score_s,
             score_pct
         ),
+    }
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Periodically emits chunk-level inference progress with a coarse ETA.
+///
+/// Progress is reported in terms of input rows consumed rather than retained
+/// rows because trace-based filtering can drop zero-trace rows after loading.
+/// This keeps the percentage monotonic and lets long-running jobs show clear
+/// forward motion in the logs.
+struct InferenceProgressLogger {
+    mode: &'static str,
+    total_rows: usize,
+    total_chunks: usize,
+    started: Instant,
+    last_log: Instant,
+    log_every: Duration,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+impl InferenceProgressLogger {
+    /// Create a progress logger for one inference pass.
+    fn new(mode: &'static str, total_rows: usize, chunk_size: usize) -> Self {
+        let now = Instant::now();
+        let total_chunks = if total_rows == 0 {
+            0
+        } else {
+            total_rows.div_ceil(chunk_size.max(1))
+        };
+        Self {
+            mode,
+            total_rows,
+            total_chunks,
+            started: now,
+            last_log: now,
+            log_every: Duration::from_secs(30),
+        }
+    }
+
+    /// Log progress after a completed chunk when enough time has elapsed.
+    fn maybe_log(&mut self, processed_rows: usize, processed_chunks: usize) {
+        let now = Instant::now();
+        let should_log = processed_rows >= self.total_rows
+            || processed_chunks >= self.total_chunks
+            || now.duration_since(self.last_log) >= self.log_every
+            || processed_chunks <= 1;
+        if !should_log {
+            return;
+        }
+        self.last_log = now;
+
+        let elapsed = now.duration_since(self.started);
+        let pct = if self.total_rows > 0 {
+            100.0 * processed_rows as f64 / self.total_rows as f64
+        } else {
+            100.0
+        };
+        let rows_per_sec = if elapsed.as_secs_f64() > 0.0 {
+            processed_rows as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let eta = if processed_rows > 0 && processed_rows < self.total_rows {
+            let remaining_rows = (self.total_rows - processed_rows) as f64;
+            Duration::from_secs_f64(remaining_rows / rows_per_sec.max(1e-9))
+        } else {
+            Duration::ZERO
+        };
+
+        log::info!(
+            "Inference progress ({}) | chunks={}/{} rows={}/{} ({:.1}%) elapsed={} eta={} rate={:.0} rows/s",
+            self.mode,
+            processed_chunks,
+            self.total_chunks,
+            processed_rows,
+            self.total_rows,
+            pct,
+            format_duration(elapsed),
+            format_duration(eta),
+            rows_per_sec
+        );
+    }
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Format a wall-clock duration for human-readable progress logs.
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem_secs = secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{mins:02}:{rem_secs:02}")
+    } else {
+        format!("{mins:02}:{rem_secs:02}")
     }
 }
 
@@ -3119,6 +3236,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
 
     let mut offset = 0usize;
     if let Some((x_trace_all, x_xim_all)) = prefetched.as_ref() {
+        let mut progress = InferenceProgressLogger::new("prefetch", rows.len(), chunk_size);
         let trace_row_span = cfg.trace.total_c() * cfg.trace.l;
         let xim_row_span = xim_trace_cfg
             .as_ref()
@@ -3169,6 +3287,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
 
             scores[offset..offset + n_chunk].copy_from_slice(&scores_chunk);
             offset += n_chunk;
+            progress.maybe_log(end, start / chunk_size + 1);
         }
     } else if cfg.stream_inference {
         let streamed = score_rows_streaming_inference(
@@ -3202,6 +3321,9 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         }
         xim_decode_issues.extend(streamed.xim_decode_issues);
     } else {
+        let mut progress = InferenceProgressLogger::new("chunked", rows.len(), chunk_size);
+        let mut processed_rows = 0usize;
+        let mut processed_chunks = 0usize;
         for chunk in rows.chunks(chunk_size) {
             let decode_started = Instant::now();
             let x_trace = build_traces_for_rows(
@@ -3251,7 +3373,10 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 chunk
             };
             let n_chunk = row_slice.len();
+            processed_rows += chunk.len();
+            processed_chunks += 1;
             if n_chunk == 0 {
+                progress.maybe_log(processed_rows, processed_chunks);
                 continue;
             }
 
@@ -3294,6 +3419,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 scores[offset..offset + n_chunk].copy_from_slice(&scores_chunk);
                 offset += n_chunk;
             }
+            progress.maybe_log(processed_rows, processed_chunks);
         }
     }
 

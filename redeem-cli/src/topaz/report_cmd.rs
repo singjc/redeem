@@ -16,6 +16,11 @@ pub fn run(
         .output_osw
         .as_deref()
         .unwrap_or(&cfg.inner.osw_path);
+    let topaz_label = if cfg.inner.xrun.enabled {
+        "TOPAZ XRUN"
+    } else {
+        "TOPAZ"
+    };
     let topaz_table_name = if cfg.inner.xrun.enabled {
         cfg.inner
             .output_table_xrun
@@ -45,6 +50,9 @@ pub fn run(
         osw_path: Some(report_osw),
         score_tsv_path: Some(&cfg.inner.output_tsv),
         topaz_table_name: Some(topaz_table_name),
+        topaz_label: Some(topaz_label),
+        topaz_base_table_name: cfg.inner.output_table_base.as_deref(),
+        topaz_base_label: Some("TOPAZ Base"),
         xic_path: Some(&cfg.inner.xic_path),
         xic_paths: cfg.inner.xic_paths.as_deref(),
         xic_map_path: cfg.inner.xic_map_path.as_deref(),

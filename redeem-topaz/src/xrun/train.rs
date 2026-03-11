@@ -10,6 +10,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{self as nn, Optimizer, VarBuilder, VarMap, optim::AdamW};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 use crate::xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};
 
@@ -102,6 +103,81 @@ pub struct XrunDataset {
     pub p: usize,
     pub r: usize,
     pub din: usize,
+}
+
+/// Periodically emits batch-level progress for XRUN calibrator training.
+///
+/// XRUN epochs can still take minutes on large multi-run datasets. This logger
+/// provides a coarse ETA and running loss so long jobs show visible progress
+/// between the per-epoch summaries.
+struct XrunProgressLogger {
+    total_epochs: usize,
+    batches_per_epoch: usize,
+    total_batches: usize,
+    started: Instant,
+    last_log: Instant,
+    log_every: Duration,
+}
+
+impl XrunProgressLogger {
+    /// Create a progress logger for XRUN training with fixed epoch and batch counts.
+    fn new(total_epochs: usize, batches_per_epoch: usize) -> Self {
+        let now = Instant::now();
+        let total_epochs = total_epochs.max(1);
+        let batches_per_epoch = batches_per_epoch.max(1);
+        Self {
+            total_epochs,
+            batches_per_epoch,
+            total_batches: total_epochs * batches_per_epoch,
+            started: now,
+            last_log: now,
+            log_every: Duration::from_secs(15),
+        }
+    }
+
+    /// Emit an `info!` progress line when enough time has elapsed.
+    fn maybe_log(&mut self, epoch: usize, batch_in_epoch: usize, mean_loss: f32) {
+        let now = Instant::now();
+        let processed_batches = ((epoch.saturating_sub(1)) * self.batches_per_epoch
+            + batch_in_epoch)
+            .min(self.total_batches);
+        let should_log = processed_batches >= self.total_batches
+            || now.duration_since(self.last_log) >= self.log_every
+            || processed_batches <= 1;
+        if !should_log {
+            return;
+        }
+        self.last_log = now;
+
+        let elapsed = now.duration_since(self.started);
+        let pct = 100.0 * processed_batches as f64 / self.total_batches as f64;
+        let batches_per_sec = if elapsed.as_secs_f64() > 0.0 {
+            processed_batches as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let eta = if processed_batches > 0 && processed_batches < self.total_batches {
+            let remaining = (self.total_batches - processed_batches) as f64;
+            Duration::from_secs_f64(remaining / batches_per_sec.max(1e-9))
+        } else {
+            Duration::ZERO
+        };
+
+        log::info!(
+            "[xrun] Progress | epoch={}/{} batch={}/{} overall={}/{} ({:.1}%) elapsed={} eta={} rate={:.1} batches/s loss={:.4}",
+            epoch,
+            self.total_epochs,
+            batch_in_epoch.min(self.batches_per_epoch),
+            self.batches_per_epoch,
+            processed_batches,
+            self.total_batches,
+            pct,
+            format_duration(elapsed),
+            format_duration(eta),
+            batches_per_sec,
+            mean_loss
+        );
+    }
 }
 
 impl XrunDataset {
@@ -366,6 +442,8 @@ impl XrunTrainer {
         let mut best_val = f32::INFINITY;
         let mut bad = 0usize;
         let mut best_path: Option<std::path::PathBuf> = None;
+        let batches_per_epoch = train.p.div_ceil(self.cfg.batch_size.max(1));
+        let mut progress = XrunProgressLogger::new(self.cfg.max_epochs.max(1), batches_per_epoch);
 
         for epoch in 1..=self.cfg.max_epochs.max(1) {
             let mut tr_loss = 0f32;
@@ -432,6 +510,7 @@ impl XrunTrainer {
 
                 tr_loss += loss.to_scalar::<f32>()?;
                 tr_batches += 1;
+                progress.maybe_log(epoch, tr_batches, tr_loss / tr_batches as f32);
                 s += take;
             }
 
@@ -501,5 +580,18 @@ impl XrunTrainer {
             best_val,
             epochs: self.cfg.max_epochs.max(1),
         })
+    }
+}
+
+/// Format a wall-clock duration for compact XRUN progress logs.
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem_secs = secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{mins:02}:{rem_secs:02}")
+    } else {
+        format!("{mins:02}:{rem_secs:02}")
     }
 }

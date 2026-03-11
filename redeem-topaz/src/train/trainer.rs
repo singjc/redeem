@@ -6,6 +6,7 @@ use crate::train::losses;
 use crate::train::scheduler::CosineWarmupScheduler;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{self as nn, Optimizer, VarBuilder, VarMap, optim::AdamW};
+use std::time::{Duration, Instant};
 
 /// One tensor mini-batch used by the base TOPAZ trainer.
 #[derive(Debug)]
@@ -40,6 +41,82 @@ pub struct TrainHistory {
     pub epochs_ran: usize,
     pub best_epoch: usize,
     pub best_val: f32,
+}
+
+/// Periodically emits batch-level progress for long base-TOPAZ training runs.
+///
+/// The logger reports global progress across all epochs so multi-hour jobs show
+/// visible forward motion in the logs instead of only emitting one line per
+/// finished epoch.
+struct TrainingProgressLogger {
+    total_epochs: usize,
+    batches_per_epoch: usize,
+    total_batches: usize,
+    started: Instant,
+    last_log: Instant,
+    log_every: Duration,
+}
+
+impl TrainingProgressLogger {
+    /// Create a progress logger for a fixed `(epochs, batches)` training plan.
+    fn new(total_epochs: usize, batches_per_epoch: usize) -> Self {
+        let now = Instant::now();
+        let total_epochs = total_epochs.max(1);
+        let batches_per_epoch = batches_per_epoch.max(1);
+        Self {
+            total_epochs,
+            batches_per_epoch,
+            total_batches: total_epochs * batches_per_epoch,
+            started: now,
+            last_log: now,
+            log_every: Duration::from_secs(30),
+        }
+    }
+
+    /// Emit an `info!` log when enough time has elapsed or training completed.
+    fn maybe_log(&mut self, epoch: usize, batch_in_epoch: usize, mean_loss: f32, lr: f64) {
+        let now = Instant::now();
+        let processed_batches = ((epoch.saturating_sub(1)) * self.batches_per_epoch
+            + batch_in_epoch)
+            .min(self.total_batches);
+        let should_log = processed_batches >= self.total_batches
+            || now.duration_since(self.last_log) >= self.log_every
+            || processed_batches <= 1;
+        if !should_log {
+            return;
+        }
+        self.last_log = now;
+
+        let elapsed = now.duration_since(self.started);
+        let pct = 100.0 * processed_batches as f64 / self.total_batches as f64;
+        let batches_per_sec = if elapsed.as_secs_f64() > 0.0 {
+            processed_batches as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let eta = if processed_batches > 0 && processed_batches < self.total_batches {
+            let remaining = (self.total_batches - processed_batches) as f64;
+            Duration::from_secs_f64(remaining / batches_per_sec.max(1e-9))
+        } else {
+            Duration::ZERO
+        };
+
+        log::info!(
+            "Training progress | epoch={}/{} batch={}/{} overall={}/{} ({:.1}%) elapsed={} eta={} rate={:.1} batches/s loss={:.4} lr={:.3e}",
+            epoch,
+            self.total_epochs,
+            batch_in_epoch.min(self.batches_per_epoch),
+            self.batches_per_epoch,
+            processed_batches,
+            self.total_batches,
+            pct,
+            format_duration(elapsed),
+            format_duration(eta),
+            batches_per_sec,
+            mean_loss,
+            lr
+        );
+    }
 }
 
 /// Stateful TOPAZ trainer holding the model, optimizer, and optional auxiliary
@@ -326,7 +403,8 @@ impl Trainer {
     ) -> Result<Vec<TrainMetrics>> {
         let mut out = Vec::new();
         let mut step = 0usize;
-        let total_steps = max_epochs.max(1) * batches.len().max(1);
+        let epochs = max_epochs.max(1);
+        let total_steps = epochs * batches.len().max(1);
         let sched = scheduler.cloned().unwrap_or_else(|| {
             CosineWarmupScheduler::new(
                 self.config.learning_rate as f64,
@@ -336,8 +414,9 @@ impl Trainer {
                 self.config.min_lr_ratio as f64,
             )
         });
+        let mut progress = TrainingProgressLogger::new(epochs, batches.len());
 
-        for epoch in 0..max_epochs.max(1) {
+        for epoch in 0..epochs {
             let mut order: Vec<usize> = (0..batches.len()).collect();
             if batches.len() > 1 {
                 let seed = self
@@ -346,13 +425,24 @@ impl Trainer {
                     .wrapping_add(epoch as u64 + 1);
                 shuffle_indices(&mut order, seed);
             }
+            let mut epoch_sum = 0.0f32;
+            let mut epoch_batches = 0usize;
             for &bi in &order {
                 let batch = &batches[bi];
                 if self.config.use_lr_scheduler {
                     let lr = sched.lr_at_step(step);
                     self.opt.set_learning_rate(lr);
                 }
-                out.push(self.train_step(batch)?);
+                let metrics = self.train_step(batch)?;
+                epoch_sum += metrics.loss;
+                epoch_batches += 1;
+                progress.maybe_log(
+                    epoch + 1,
+                    epoch_batches,
+                    epoch_sum / epoch_batches as f32,
+                    self.opt.learning_rate(),
+                );
+                out.push(metrics);
                 step += 1;
             }
         }
@@ -406,9 +496,12 @@ impl Trainer {
             best_path = Some(p);
         }
 
+        let epochs = max_epochs.max(1);
+        let mut progress = TrainingProgressLogger::new(epochs, train_batches.len());
         let mut epochs_ran = 0usize;
-        for epoch in 1..=max_epochs.max(1) {
+        for epoch in 1..=epochs {
             let mut train_sum = 0f32;
+            let mut train_batches_done = 0usize;
             let mut order: Vec<usize> = (0..train_batches.len()).collect();
             if train_batches.len() > 1 {
                 let seed = self.shuffle_seed.unwrap_or(0).wrapping_add(epoch as u64);
@@ -422,6 +515,13 @@ impl Trainer {
                 }
                 let metrics = self.train_step(batch)?;
                 train_sum += metrics.loss;
+                train_batches_done += 1;
+                progress.maybe_log(
+                    epoch,
+                    train_batches_done,
+                    train_sum / train_batches_done as f32,
+                    self.opt.learning_rate(),
+                );
                 step += 1;
             }
             epochs_ran = epoch;
@@ -501,6 +601,19 @@ fn shuffle_indices(idxs: &mut [usize], seed: u64) {
         state ^= state << 17;
         let j = (state as usize) % (i + 1);
         idxs.swap(i, j);
+    }
+}
+
+/// Format a wall-clock duration for compact progress logs.
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem_secs = secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{mins:02}:{rem_secs:02}")
+    } else {
+        format!("{mins:02}:{rem_secs:02}")
     }
 }
 
