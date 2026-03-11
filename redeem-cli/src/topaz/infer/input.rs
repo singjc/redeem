@@ -95,6 +95,9 @@ impl TopazInferConfig {
         if try_get_flag(matches, "stream_inference") {
             cfg.inner.stream_inference = true;
         }
+        if try_get_flag(matches, "fast_inference") {
+            cfg.inner.fast_inference = true;
+        }
         if try_get_flag(matches, "xrun") {
             cfg.inner.xrun.enabled = true;
         }

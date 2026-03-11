@@ -555,6 +555,12 @@ fn main() -> Result<()> {
                                 .action(ArgAction::SetTrue),
                         )
                         .arg(
+                            Arg::new("fast_inference")
+                                .long("fast-inference")
+                                .help("Skip XRUN application, head embeddings, and automatic report generation during the main inference run")
+                                .action(ArgAction::SetTrue),
+                        )
+                        .arg(
                             Arg::new("xrun")
                                 .long("xrun")
                                 .help("Apply the saved XRUN calibrator sidecar during inference")

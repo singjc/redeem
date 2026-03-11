@@ -11,10 +11,12 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use std::sync::mpsc;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -394,6 +396,19 @@ pub struct InferRunConfig {
     /// when `prefetch_traces_once` is enabled, because the full-dataset prefetch
     /// path already loads everything eagerly.
     pub stream_inference: bool,
+    /// If `true`, run a score-only inference pass.
+    ///
+    /// Fast inference skips expensive post-processing stages that are useful
+    /// for analysis but not required to write the base score TSV/OSW tables:
+    ///
+    /// - XRUN calibration application
+    /// - head-embedding export
+    /// - automatic HTML report generation in `redeem-cli`
+    ///
+    /// This is the recommended mode for large production-scoring jobs where
+    /// the primary goal is to materialize score tables quickly and defer
+    /// diagnostics to a later `topaz report` command.
+    pub fast_inference: bool,
     /// XRUN loading/application settings.
     pub xrun: XrunRunConfig,
 }
@@ -439,6 +454,7 @@ impl Default for InferRunConfig {
             trace_chunk_size: 5000,
             prefetch_traces_once: false,
             stream_inference: false,
+            fast_inference: false,
             xrun: XrunRunConfig::default(),
         }
     }
@@ -1243,12 +1259,64 @@ fn score_inference_chunk(
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Choose a smaller streaming work unit than the user-facing `trace_chunk_size`.
+///
+/// Large chunk sizes are useful for coarse memory budgeting, but waiting for a
+/// full chunk of decoded XIC/XIM tensors before GPU scoring starts can leave
+/// the device idle for a long time. Streaming therefore subdivides each chunk
+/// into smaller work units that are large enough to keep batching efficient
+/// while small enough to reduce time-to-first-score.
+fn derive_stream_work_unit_size(cfg: &InferRunConfig) -> usize {
+    let chunk_size = cfg.trace_chunk_size.max(1);
+    let batch_floor = cfg.batch_size.max(1);
+    let target = batch_floor.max(10_000).min(50_000);
+    chunk_size.min(target).max(1)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Choose a small producer-pool size for streaming inference.
+///
+/// Producer workers spend most of their time in XIC/XIM parquet decode/build
+/// functions, which already use Rayon internally. A small worker pool gives the
+/// host side enough parallel slack to overlap multiple subchunks without
+/// creating excessive oversubscription on CPU-limited jobs.
+fn derive_stream_producer_workers() -> usize {
+    let available = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    available.saturating_sub(1).clamp(1, 3)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Derive the bounded queue depth for subchunk streaming.
+///
+/// The queue depth scales with the producer pool so workers can stay busy, but
+/// stays small enough that each queued payload does not blow up host RAM.
+fn derive_stream_queue_depth(producer_workers: usize) -> usize {
+    producer_workers.saturating_mul(2).clamp(2, 8)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Partition the inference row slice into contiguous streaming work units.
+fn build_stream_work_ranges(total_rows: usize, work_unit_size: usize) -> Vec<(usize, usize)> {
+    if total_rows == 0 {
+        return Vec::new();
+    }
+    let work_unit_size = work_unit_size.max(1);
+    (0..total_rows)
+        .step_by(work_unit_size)
+        .map(|start| (start, (start + work_unit_size).min(total_rows)))
+        .collect()
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 /// Stream inference chunks through a bounded host queue.
 ///
-/// The producer thread decodes XIC/XIM parquet data for one chunk ahead while
-/// the main thread performs GPU scoring for the current chunk. This reduces the
-/// wall-time spent with an idle GPU compared with the purely sequential chunked
-/// inference path, but keeps memory bounded unlike `prefetch_traces_once`.
+/// A small pool of producer workers decodes XIC/XIM parquet data for upcoming
+/// row subchunks while the main thread performs GPU scoring for the current
+/// subchunk. Compared with the legacy whole-chunk streaming implementation,
+/// this lowers time-to-first-score and gives the decode side more opportunity
+/// to use available CPU cores before the GPU becomes the bottleneck.
 fn score_rows_streaming_inference(
     model: &TopazBagRanker,
     rows: &[FeatureRow],
@@ -1267,9 +1335,21 @@ fn score_rows_streaming_inference(
     apply_trace_filter: bool,
 ) -> Result<StreamingInferenceOutput> {
     let chunk_size = cfg.trace_chunk_size.max(1);
-    let queue_depth = 2usize;
-    let (tx, rx) = mpsc::sync_channel::<Result<Option<InferenceChunkPayload>>>(queue_depth);
-    let mut progress = InferenceProgressLogger::new("streaming", rows.len(), chunk_size);
+    let work_unit_size = derive_stream_work_unit_size(cfg);
+    let work_ranges = build_stream_work_ranges(rows.len(), work_unit_size);
+    let producer_workers = derive_stream_producer_workers();
+    let queue_depth = derive_stream_queue_depth(producer_workers);
+    let (tx, rx) = mpsc::sync_channel::<Result<StreamingProducerMessage>>(queue_depth);
+    let mut progress = InferenceProgressLogger::new("streaming", rows.len(), work_unit_size);
+    let next_work_idx = AtomicUsize::new(0);
+
+    log::info!(
+        "Streaming inference configured | chunk_size={} work_unit_size={} producer_workers={} queue_depth={}",
+        chunk_size,
+        work_unit_size,
+        producer_workers,
+        queue_depth
+    );
 
     let mut scores = if apply_trace_filter {
         Vec::new()
@@ -1281,7 +1361,6 @@ fn score_rows_streaming_inference(
     } else {
         None
     };
-    let mut offset = 0usize;
     let mut summary = crate::infer::diagnostics::TraceSummary {
         n: 0,
         l: cfg.trace.l,
@@ -1293,141 +1372,241 @@ fn score_rows_streaming_inference(
     let mut xim_decode_issues = Vec::new();
     let mut decode_time = Duration::ZERO;
     let mut score_time = Duration::ZERO;
-    let mut processed_chunks = 0usize;
+    let mut processed_units = 0usize;
 
     thread::scope(|scope| -> Result<()> {
-        let tx_producer = tx.clone();
-        let producer = scope.spawn(move || -> Result<()> {
-            for (chunk_idx, chunk) in rows.chunks(chunk_size).enumerate() {
-                let decode_started = Instant::now();
-                let start = chunk_idx * chunk_size;
-                let end = start + chunk.len();
-                let x_trace = build_traces_for_rows(
-                    chunk,
-                    &cfg.xic_path,
-                    &cfg.xic_paths,
-                    &cfg.xic_map_path,
-                    &cfg.trace,
-                    &cfg.fetch,
-                    cache_opt,
-                    disk_cache,
-                )?;
-                let x_xim = build_xim_for_rows(
-                    chunk,
-                    &cfg.xim_path,
-                    &cfg.xim_paths,
-                    &cfg.xim_map_path,
-                    xim_trace_cfg,
-                    &cfg.xim_fetch,
-                    xim_cache_opt,
-                    xim_disk_cache,
-                )?;
+        let mut workers = Vec::new();
+        for _worker_idx in 0..producer_workers {
+            let tx_producer = tx.clone();
+            let next_work_idx_ref = &next_work_idx;
+            let work_ranges_ref = &work_ranges;
+            let rows_ref = rows;
+            let cfg_ref = cfg;
+            let xim_trace_cfg_ref = xim_trace_cfg;
+            let cache_opt_ref = cache_opt;
+            let disk_cache_ref = disk_cache;
+            let xim_cache_opt_ref = xim_cache_opt;
+            let xim_disk_cache_ref = xim_disk_cache;
+            let worker = scope.spawn(move || -> Result<()> {
+                loop {
+                    let seq_idx = next_work_idx_ref.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(start, end)) = work_ranges_ref.get(seq_idx) else {
+                        break;
+                    };
+                    let chunk = &rows_ref[start..end];
+                    let decode_started = Instant::now();
+                    let x_trace = build_traces_for_rows(
+                        chunk,
+                        &cfg_ref.xic_path,
+                        &cfg_ref.xic_paths,
+                        &cfg_ref.xic_map_path,
+                        &cfg_ref.trace,
+                        &cfg_ref.fetch,
+                        cache_opt_ref,
+                        disk_cache_ref,
+                    )?;
+                    let x_xim = build_xim_for_rows(
+                        chunk,
+                        &cfg_ref.xim_path,
+                        &cfg_ref.xim_paths,
+                        &cfg_ref.xim_map_path,
+                        xim_trace_cfg_ref,
+                        &cfg_ref.xim_fetch,
+                        xim_cache_opt_ref,
+                        xim_disk_cache_ref,
+                    )?;
 
-                let (rows_override, x_trace, x_xim) = if apply_trace_filter {
-                    let (rows_f, x_tr_f, x_xim_f) = filter_rows_by_trace_with_aux(
-                        chunk.to_vec(),
+                    let (rows_override, x_trace, x_xim) = if apply_trace_filter {
+                        let (rows_f, x_tr_f, x_xim_f) = filter_rows_by_trace_with_aux(
+                            chunk.to_vec(),
+                            x_trace,
+                            x_xim,
+                            cfg_ref.trace.total_c(),
+                            cfg_ref.trace.l,
+                            xim_trace_cfg_ref.as_ref().map(|c| c.total_c()),
+                            xim_trace_cfg_ref.as_ref().map(|c| c.l),
+                        );
+                        (Some(rows_f), x_tr_f, x_xim_f)
+                    } else {
+                        (None, x_trace, x_xim)
+                    };
+
+                    let payload = InferenceChunkPayload {
+                        seq_idx,
+                        start,
+                        end,
+                        rows_override,
                         x_trace,
                         x_xim,
-                        cfg.trace.total_c(),
-                        cfg.trace.l,
-                        xim_trace_cfg.as_ref().map(|c| c.total_c()),
-                        xim_trace_cfg.as_ref().map(|c| c.l),
-                    );
-                    (Some(rows_f), x_tr_f, x_xim_f)
-                } else {
-                    (None, x_trace, x_xim)
-                };
-
-                let payload = InferenceChunkPayload {
-                    start,
-                    end,
-                    rows_override,
-                    x_trace,
-                    x_xim,
-                    xim_decode_issues: crate::io::xim_parquet::take_decode_issues(),
-                    decode_time: decode_started.elapsed(),
-                };
+                        xim_decode_issues: crate::io::xim_parquet::take_decode_issues(),
+                        decode_time: decode_started.elapsed(),
+                    };
+                    tx_producer
+                        .send(Ok(StreamingProducerMessage::Payload(payload)))
+                        .context("streaming inference consumer dropped before decode finished")?;
+                }
                 tx_producer
-                    .send(Ok(Some(payload)))
-                    .context("streaming inference consumer dropped before decode finished")?;
-            }
-            tx_producer
-                .send(Ok(None))
-                .context("streaming inference consumer dropped before completion")?;
-            Ok(())
-        });
+                    .send(Ok(StreamingProducerMessage::Done))
+                    .context("streaming inference consumer dropped before completion")?;
+                Ok(())
+            });
+            workers.push(worker);
+        }
         drop(tx);
 
-        loop {
+        let mut completed_workers = 0usize;
+        let mut next_expected = 0usize;
+        let mut pending: BTreeMap<usize, InferenceChunkPayload> = BTreeMap::new();
+
+        while completed_workers < producer_workers {
             let message = rx
                 .recv()
                 .context("streaming inference producer disconnected")?;
             match message? {
-                None => break,
-                Some(payload) => {
-                    xim_decode_issues.extend(payload.xim_decode_issues);
-                    decode_time += payload.decode_time;
-                    processed_chunks += 1;
-                    let row_slice: &[FeatureRow] =
-                        if let Some(rows_override) = payload.rows_override.as_ref() {
-                            rows_override.as_slice()
-                        } else {
-                            &rows[payload.start..payload.end]
-                        };
-                    if row_slice.is_empty() {
-                        progress.maybe_log(payload.end.min(rows.len()), processed_chunks);
-                        continue;
-                    }
-
-                    if cfg.diagnostics.trace_summary {
-                        let sum = trace_summary(
-                            &payload.x_trace,
-                            row_slice.len(),
-                            cfg.trace.total_c(),
-                            cfg.trace.l,
-                            cfg.trace.ms1_cmax,
-                            cfg.trace.ms2_cmax,
-                        );
-                        summary.n += sum.n;
-                        summary.ms1_nonzero_rows += sum.ms1_nonzero_rows;
-                        summary.ms2_nonzero_rows += sum.ms2_nonzero_rows;
-                    }
-
-                    let score_started = Instant::now();
-                    let scores_chunk = score_inference_chunk(
-                        model,
-                        row_slice,
-                        &payload.x_trace,
-                        payload.x_xim.as_deref(),
-                        table_feature_cols,
-                        target_cols,
-                        &cfg.trace,
-                        xim_trace_cfg.as_ref(),
-                        use_heuristic_features,
-                        feat_dim,
-                        device,
-                        cfg.batch_size.max(1),
-                        pre,
-                    )?;
-                    score_time += score_started.elapsed();
-
-                    if let Some(mut filtered) = payload.rows_override {
-                        if let Some(all_rows) = rows_filtered.as_mut() {
-                            all_rows.append(&mut filtered);
-                        }
-                        scores.extend(scores_chunk);
-                    } else {
-                        scores[offset..offset + row_slice.len()].copy_from_slice(&scores_chunk);
-                        offset += row_slice.len();
-                    }
-                    progress.maybe_log(payload.end.min(rows.len()), processed_chunks);
+                StreamingProducerMessage::Done => {
+                    completed_workers += 1;
                 }
+                StreamingProducerMessage::Payload(payload) => {
+                    pending.insert(payload.seq_idx, payload);
+                }
+            }
+
+            while let Some(payload) = pending.remove(&next_expected) {
+                xim_decode_issues.extend(payload.xim_decode_issues);
+                decode_time += payload.decode_time;
+                processed_units += 1;
+                let row_slice: &[FeatureRow] =
+                    if let Some(rows_override) = payload.rows_override.as_ref() {
+                        rows_override.as_slice()
+                    } else {
+                        &rows[payload.start..payload.end]
+                    };
+                if row_slice.is_empty() {
+                    progress.maybe_log(payload.end.min(rows.len()), processed_units);
+                    next_expected += 1;
+                    continue;
+                }
+
+                if cfg.diagnostics.trace_summary {
+                    let sum = trace_summary(
+                        &payload.x_trace,
+                        row_slice.len(),
+                        cfg.trace.total_c(),
+                        cfg.trace.l,
+                        cfg.trace.ms1_cmax,
+                        cfg.trace.ms2_cmax,
+                    );
+                    summary.n += sum.n;
+                    summary.ms1_nonzero_rows += sum.ms1_nonzero_rows;
+                    summary.ms2_nonzero_rows += sum.ms2_nonzero_rows;
+                }
+
+                let score_started = Instant::now();
+                let scores_chunk = score_inference_chunk(
+                    model,
+                    row_slice,
+                    &payload.x_trace,
+                    payload.x_xim.as_deref(),
+                    table_feature_cols,
+                    target_cols,
+                    &cfg.trace,
+                    xim_trace_cfg.as_ref(),
+                    use_heuristic_features,
+                    feat_dim,
+                    device,
+                    cfg.batch_size.max(1),
+                    pre,
+                )?;
+                score_time += score_started.elapsed();
+
+                if let Some(mut filtered) = payload.rows_override {
+                    if let Some(all_rows) = rows_filtered.as_mut() {
+                        all_rows.append(&mut filtered);
+                    }
+                    scores.extend(scores_chunk);
+                } else {
+                    scores[payload.start..payload.start + row_slice.len()]
+                        .copy_from_slice(&scores_chunk);
+                }
+                progress.maybe_log(payload.end.min(rows.len()), processed_units);
+                next_expected += 1;
             }
         }
 
-        producer
-            .join()
-            .map_err(|_| anyhow::anyhow!("streaming inference producer thread panicked"))??;
+        while let Some(payload) = pending.remove(&next_expected) {
+            xim_decode_issues.extend(payload.xim_decode_issues);
+            decode_time += payload.decode_time;
+            processed_units += 1;
+            let row_slice: &[FeatureRow] =
+                if let Some(rows_override) = payload.rows_override.as_ref() {
+                    rows_override.as_slice()
+                } else {
+                    &rows[payload.start..payload.end]
+                };
+            if row_slice.is_empty() {
+                progress.maybe_log(payload.end.min(rows.len()), processed_units);
+                next_expected += 1;
+                continue;
+            }
+
+            if cfg.diagnostics.trace_summary {
+                let sum = trace_summary(
+                    &payload.x_trace,
+                    row_slice.len(),
+                    cfg.trace.total_c(),
+                    cfg.trace.l,
+                    cfg.trace.ms1_cmax,
+                    cfg.trace.ms2_cmax,
+                );
+                summary.n += sum.n;
+                summary.ms1_nonzero_rows += sum.ms1_nonzero_rows;
+                summary.ms2_nonzero_rows += sum.ms2_nonzero_rows;
+            }
+
+            let score_started = Instant::now();
+            let scores_chunk = score_inference_chunk(
+                model,
+                row_slice,
+                &payload.x_trace,
+                payload.x_xim.as_deref(),
+                table_feature_cols,
+                target_cols,
+                &cfg.trace,
+                xim_trace_cfg.as_ref(),
+                use_heuristic_features,
+                feat_dim,
+                device,
+                cfg.batch_size.max(1),
+                pre,
+            )?;
+            score_time += score_started.elapsed();
+
+            if let Some(mut filtered) = payload.rows_override {
+                if let Some(all_rows) = rows_filtered.as_mut() {
+                    all_rows.append(&mut filtered);
+                }
+                scores.extend(scores_chunk);
+            } else {
+                scores[payload.start..payload.start + row_slice.len()]
+                    .copy_from_slice(&scores_chunk);
+            }
+            progress.maybe_log(payload.end.min(rows.len()), processed_units);
+            next_expected += 1;
+        }
+
+        if next_expected != work_ranges.len() {
+            bail!(
+                "streaming inference terminated early: processed {} of {} work units",
+                next_expected,
+                work_ranges.len()
+            );
+        }
+
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("streaming inference producer thread panicked"))??;
+        }
         Ok(())
     })?;
 
@@ -1438,6 +1617,8 @@ fn score_rows_streaming_inference(
         xim_decode_issues,
         decode_time,
         score_time,
+        work_unit_size,
+        producer_workers,
         queue_depth,
     })
 }
@@ -1501,6 +1682,7 @@ struct BagTensorPack {
 /// contains the filtered chunk rows; otherwise the main thread reuses the
 /// original `rows[start..end]` slice.
 struct InferenceChunkPayload {
+    seq_idx: usize,
     start: usize,
     end: usize,
     rows_override: Option<Vec<FeatureRow>>,
@@ -1519,7 +1701,20 @@ struct StreamingInferenceOutput {
     xim_decode_issues: Vec<crate::io::xim_parquet::XimDecodeIssue>,
     decode_time: Duration,
     score_time: Duration,
+    work_unit_size: usize,
+    producer_workers: usize,
     queue_depth: usize,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Messages sent from producer workers to the streaming inference consumer.
+///
+/// Payloads can arrive out of order when multiple workers are active, so the
+/// consumer buffers them by `seq_idx` and only scores them once all earlier
+/// subchunks have been processed.
+enum StreamingProducerMessage {
+    Payload(InferenceChunkPayload),
+    Done,
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -1531,6 +1726,8 @@ struct StreamingInferenceOutput {
 struct InferenceRuntimeStats {
     mode: &'static str,
     chunk_size: usize,
+    work_unit_size: Option<usize>,
+    producer_workers: Option<usize>,
     queue_depth: Option<usize>,
     decode_time: Duration,
     score_time: Duration,
@@ -1553,29 +1750,33 @@ fn log_inference_runtime_stats(stats: &InferenceRuntimeStats, n_rows: usize) {
         0.0
     };
 
-    match stats.queue_depth {
-        Some(queue_depth) => log::info!(
-            "Inference runtime ({}) | rows={} chunk_size={} queue_depth={} decode={:.1}s ({:.1}%) score={:.1}s ({:.1}%)",
-            stats.mode,
-            n_rows,
-            stats.chunk_size,
-            queue_depth,
-            decode_s,
-            decode_pct,
-            score_s,
-            score_pct
-        ),
-        None => log::info!(
-            "Inference runtime ({}) | rows={} chunk_size={} decode={:.1}s ({:.1}%) score={:.1}s ({:.1}%)",
-            stats.mode,
-            n_rows,
-            stats.chunk_size,
-            decode_s,
-            decode_pct,
-            score_s,
-            score_pct
-        ),
+    let mut extra = Vec::new();
+    if let Some(work_unit_size) = stats.work_unit_size {
+        extra.push(format!("work_unit_size={work_unit_size}"));
     }
+    if let Some(producer_workers) = stats.producer_workers {
+        extra.push(format!("producer_workers={producer_workers}"));
+    }
+    if let Some(queue_depth) = stats.queue_depth {
+        extra.push(format!("queue_depth={queue_depth}"));
+    }
+    let extra = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", extra.join(" "))
+    };
+
+    log::info!(
+        "Inference runtime ({}) | rows={} chunk_size={}{} decode={:.1}s ({:.1}%) score={:.1}s ({:.1}%)",
+        stats.mode,
+        n_rows,
+        stats.chunk_size,
+        extra,
+        decode_s,
+        decode_pct,
+        score_s,
+        score_pct
+    );
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -3198,6 +3399,8 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             "chunked"
         },
         chunk_size,
+        work_unit_size: None,
+        producer_workers: None,
         queue_depth: None,
         decode_time: Duration::ZERO,
         score_time: Duration::ZERO,
@@ -3309,6 +3512,8 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         )?;
         runtime_stats.decode_time += streamed.decode_time;
         runtime_stats.score_time += streamed.score_time;
+        runtime_stats.work_unit_size = Some(streamed.work_unit_size);
+        runtime_stats.producer_workers = Some(streamed.producer_workers);
         runtime_stats.queue_depth = Some(streamed.queue_depth);
         scores = streamed.scores;
         if let Some(filtered) = streamed.rows_filtered {
@@ -3446,8 +3651,17 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     // winner-row subsets they actually need.
     drop(prefetched);
 
+    let skip_xrun = cfg.fast_inference && cfg.xrun.enabled;
+    let skip_head_embeddings = cfg.fast_inference && cfg.diagnostics.save_head_embeddings;
+    if skip_xrun {
+        log::info!("fast_inference=true: skipping XRUN application during main inference run");
+    }
+    if skip_head_embeddings {
+        log::info!("fast_inference=true: skipping head-embedding export during main inference run");
+    }
+
     let base_scores = scores.clone();
-    let xrun_applied = if cfg.xrun.enabled {
+    let xrun_applied = if cfg.xrun.enabled && !cfg.fast_inference {
         let (_xrun_varmap, xrun_model, xrun_meta) = load_xrun_calibrator(&base, &device)?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -3498,7 +3712,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     let table_rows_final = build_score_table_from_rows(&rows, &scores, cfg.pep_bins);
     crate::infer::write_score_tsv(&cfg.output_tsv, &table_rows_final)?;
 
-    if cfg.diagnostics.save_head_embeddings {
+    if cfg.diagnostics.save_head_embeddings && !cfg.fast_inference {
         let outdir = cfg
             .diagnostics
             .head_embeddings_outdir
@@ -3627,7 +3841,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 log::info!("Wrote base TOPAZ scores to OSW table {:?}", base_name);
             }
 
-            let final_table_name = if cfg.xrun.enabled {
+            let final_table_name = if cfg.xrun.enabled && !cfg.fast_inference {
                 cfg.output_table_xrun
                     .as_deref()
                     .filter(|name| !name.is_empty())

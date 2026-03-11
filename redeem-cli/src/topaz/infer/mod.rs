@@ -13,7 +13,13 @@ pub fn run(cfg: &TopazInferConfig) -> Result<()> {
         "[ReDeeM::Topaz] Inference complete. Scored {} rows.",
         out.n_rows
     );
-    if cfg.inner.diagnostics.save_head_embeddings {
+    if cfg.inner.fast_inference {
+        if cfg.inner.diagnostics.save_head_embeddings || cfg.inner.xrun.enabled {
+            log::info!(
+                "fast_inference=true: skipping automatic TOPAZ report generation during main inference run"
+            );
+        }
+    } else if cfg.inner.diagnostics.save_head_embeddings {
         let report_osw = cfg
             .inner
             .output_osw
