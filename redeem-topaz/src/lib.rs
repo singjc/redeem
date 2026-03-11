@@ -46,6 +46,7 @@ pub mod infer;
 pub mod io;
 pub mod model;
 pub mod preprocess;
+pub mod preprocessed;
 pub mod run;
 pub mod train;
 pub mod xrun;
@@ -60,9 +61,14 @@ pub use model_interface::{
     BagRankerInterface, BagRankerWithHiddenInterface, CandidateScorerInterface, ModelInterface,
 };
 pub use preprocess::Preprocessor;
+pub use preprocessed::{
+    PreprocessedBundleReader, PreprocessedBundleWriter, PreprocessedChunk, PreprocessedChunkMeta,
+    PreprocessedDataset, PreprocessedManifest, PreprocessedProvenance,
+};
 pub use run::{
     DiagnosticsConfig, FeatureMode, FeatureSelectConfig, InferRunConfig, InferRunOutput,
-    TrainRunConfig, TrainRunOutput, XrunRunConfig, XrunSweepConfig, XrunSweepRow,
-    XrunTrainOnlyOutput, run_inference, run_training, run_xrun_sweep, run_xrun_training,
+    PreprocessRunConfig, PreprocessRunOutput, TrainRunConfig, TrainRunOutput, XrunRunConfig,
+    XrunSweepConfig, XrunSweepRow, XrunTrainOnlyOutput, run_inference, run_preprocess,
+    run_training, run_xrun_sweep, run_xrun_training,
 };
 pub use xrun::calibrator::{XrunAttentionCalibrator, XrunConfig};

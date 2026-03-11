@@ -15,6 +15,8 @@ use redeem_cli::properties::train::input::PropertyTrainConfig;
 use redeem_cli::properties::train::trainer;
 use redeem_cli::topaz::infer as topaz_infer;
 use redeem_cli::topaz::infer::input::TopazInferConfig;
+use redeem_cli::topaz::preprocess as topaz_preprocess;
+use redeem_cli::topaz::preprocess::input::TopazPreprocessConfig;
 use redeem_cli::topaz::report_cmd as topaz_report_cmd;
 use redeem_cli::topaz::train as topaz_train;
 use redeem_cli::topaz::train::input::TopazTrainConfig;
@@ -222,6 +224,113 @@ fn main() -> Result<()> {
             Command::new("topaz")
                 .about("Train or run TOPAZ trace-first DIA scorer")
                 .subcommand(
+                    Command::new("preprocess")
+                        .about("Materialize OSW + XIC/XIM inputs into a reusable TOPAZ bundle")
+                        .arg(
+                            Arg::new("config")
+                                .help("Path to preprocessing configuration file (omit to print a template)")
+                                .required(false)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("osw_path")
+                                .long("osw")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_path")
+                                .long("xic")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_paths")
+                                .long("xic-paths")
+                                .help("Comma-separated XIC parquet paths; run_id mapping is inferred from parquet metadata")
+                                .value_delimiter(',')
+                                .num_args(1..)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xic_map_path")
+                                .long("xic-map")
+                                .help("Optional TSV mapping OSW run_id -> XIC parquet path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xim_path")
+                                .long("xim")
+                                .help("Optional XIM parquet path for ion-mobilogram inputs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xim_paths")
+                                .long("xim-paths")
+                                .help("Comma-separated XIM parquet paths; run_id mapping is inferred from parquet metadata")
+                                .value_delimiter(',')
+                                .num_args(1..)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("xim_map_path")
+                                .long("xim-map")
+                                .help("Optional TSV mapping OSW run_id -> XIM parquet path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("output_path")
+                                .long("output")
+                                .help("Path to the output .topazdata bundle")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("chunk_row_count")
+                                .long("chunk-rows")
+                                .help("Number of rows stored per bundle chunk")
+                                .value_parser(clap::value_parser!(usize)),
+                        )
+                        .arg(
+                            Arg::new("xic_cache_dir")
+                                .long("xic-cache-dir")
+                                .help("Optional on-disk cache directory for decoded XICs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
+                        )
+                        .arg(
+                            Arg::new("xic_cache_max_bytes")
+                                .long("xic-cache-max-bytes")
+                                .help("Max disk cache size in bytes (0 = no cap)")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
+                            Arg::new("xim_cache_dir")
+                                .long("xim-cache-dir")
+                                .help("Optional on-disk cache directory for decoded XIMs")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::DirPath),
+                        )
+                        .arg(
+                            Arg::new("xim_cache_max_bytes")
+                                .long("xim-cache-max-bytes")
+                                .help("Max XIM disk cache size in bytes (0 = no cap)")
+                                .value_parser(clap::value_parser!(u64)),
+                        )
+                        .arg(
+                            Arg::new("restrict_xic")
+                                .long("restrict-osw-to-xic-map")
+                                .help("Drop rows whose RUN_ID is not represented in the XIC map")
+                                .action(ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
                     Command::new("train")
                         .about("Train TOPAZ from OSW + XIC")
                         .arg(
@@ -312,6 +421,13 @@ fn main() -> Result<()> {
                             Arg::new("init_checkpoint")
                                 .long("init-checkpoint")
                                 .help("Initialize TOPAZ weights from an existing checkpoint prefix or .safetensors path")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("preprocessed_path")
+                                .long("preprocessed")
+                                .help("Optional preprocessed TOPAZ bundle generated by `topaz preprocess`")
                                 .value_parser(clap::value_parser!(PathBuf))
                                 .value_hint(ValueHint::FilePath),
                         )
@@ -498,6 +614,13 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("preprocessed_path")
+                                .long("preprocessed")
+                                .help("Optional preprocessed TOPAZ bundle generated by `topaz preprocess`")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
                             Arg::new("output_tsv")
                                 .long("output-tsv")
                                 .value_parser(clap::value_parser!(PathBuf))
@@ -667,6 +790,13 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("preprocessed_path")
+                                .long("preprocessed")
+                                .help("Optional preprocessed TOPAZ bundle generated by `topaz preprocess`")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
                             Arg::new("output_tsv")
                                 .long("output-tsv")
                                 .help("Optional one-row summary TSV for the XRUN-only run")
@@ -775,6 +905,13 @@ fn main() -> Result<()> {
                         .arg(
                             Arg::new("checkpoint")
                                 .long("checkpoint")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("preprocessed_path")
+                                .long("preprocessed")
+                                .help("Optional preprocessed TOPAZ bundle generated by `topaz preprocess`")
                                 .value_parser(clap::value_parser!(PathBuf))
                                 .value_hint(ValueHint::FilePath),
                         )
@@ -1071,6 +1208,24 @@ fn handle_classifiers(matches: &ArgMatches) -> Result<()> {
 
 fn handle_topaz(matches: &ArgMatches) -> Result<()> {
     match matches.subcommand() {
+        Some(("preprocess", sub)) => {
+            let config_path: Option<&PathBuf> = sub.get_one("config");
+            if config_path.is_none() {
+                let default = TopazPreprocessConfig::default();
+                let json = serde_json::to_string_pretty(&default)?;
+                eprintln!(
+                    "\n\u{2139}\u{fe0f}  No config file provided.\n\n\
+                     Save the following JSON template to a file (e.g. topaz_preprocess.json),\n\
+                     fill in the fields, and re-run:\n\n\
+                       redeem topaz preprocess topaz_preprocess.json\n"
+                );
+                println!("{}", json);
+                std::process::exit(0);
+            }
+
+            let cfg = TopazPreprocessConfig::from_arguments(config_path.unwrap(), sub)?;
+            topaz_preprocess::run(&cfg)
+        }
         Some(("train", sub)) => {
             let config_path: Option<&PathBuf> = sub.get_one("config");
             if config_path.is_none() {

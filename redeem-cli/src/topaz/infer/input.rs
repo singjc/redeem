@@ -65,6 +65,9 @@ impl TopazInferConfig {
         if let Some(p) = try_get_one::<PathBuf>(matches, "checkpoint") {
             cfg.inner.checkpoint = p.clone();
         }
+        if let Some(p) = try_get_one::<PathBuf>(matches, "preprocessed_path") {
+            cfg.inner.preprocessed_path = Some(p.clone());
+        }
         if let Some(p) = try_get_one::<PathBuf>(matches, "output_tsv") {
             cfg.inner.output_tsv = p.clone();
         }
@@ -175,6 +178,11 @@ fn resolve_paths_relative_to(cfg: &mut TopazInferConfig, base: &PathBuf) {
         .take()
         .map(|p| resolve_relative(base, &p));
     cfg.inner.checkpoint = resolve_relative(base, &cfg.inner.checkpoint);
+    cfg.inner.preprocessed_path = cfg
+        .inner
+        .preprocessed_path
+        .take()
+        .map(|p| resolve_relative(base, &p));
     cfg.inner.output_tsv = resolve_relative(base, &cfg.inner.output_tsv);
     cfg.inner.output_osw = cfg
         .inner

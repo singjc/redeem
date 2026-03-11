@@ -75,6 +75,9 @@ pub(crate) fn load_xrun_config_from_arguments(
     if let Some(p) = matches.get_one::<PathBuf>("checkpoint") {
         cfg.checkpoint = p.clone();
     }
+    if let Some(p) = matches.get_one::<PathBuf>("preprocessed_path") {
+        cfg.preprocessed_path = Some(p.clone());
+    }
     if let Some(p) = matches.get_one::<PathBuf>("output_tsv") {
         cfg.output_tsv = p.clone();
     }
@@ -110,6 +113,10 @@ fn resolve_paths_relative_to(cfg: &mut XrunSweepConfig, base: &PathBuf) {
     cfg.xic_cache_dir = cfg.xic_cache_dir.take().map(|p| resolve_relative(base, &p));
     cfg.xim_cache_dir = cfg.xim_cache_dir.take().map(|p| resolve_relative(base, &p));
     cfg.checkpoint = resolve_relative(base, &cfg.checkpoint);
+    cfg.preprocessed_path = cfg
+        .preprocessed_path
+        .take()
+        .map(|p| resolve_relative(base, &p));
     cfg.output_tsv = resolve_relative(base, &cfg.output_tsv);
 }
 

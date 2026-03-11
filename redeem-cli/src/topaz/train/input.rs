@@ -61,6 +61,9 @@ impl TopazTrainConfig {
         if let Some(p) = matches.get_one::<PathBuf>("init_checkpoint") {
             cfg.inner.init_checkpoint = Some(p.clone());
         }
+        if let Some(p) = matches.get_one::<PathBuf>("preprocessed_path") {
+            cfg.inner.preprocessed_path = Some(p.clone());
+        }
         if let Some(p) = matches.get_one::<PathBuf>("output_prefix") {
             cfg.inner.output_prefix = p.clone();
         }
