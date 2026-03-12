@@ -163,9 +163,36 @@ pub fn list_run_ids(path: &Path) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+#[cfg(feature = "parquet")]
+/// Read the first parquet row and return its `RUN_ID`.
+///
+/// This helper is meant for fast diagnostics when each `*.xim` file is
+/// expected to contain mobilograms for exactly one run. It avoids scanning the
+/// entire parquet file the way [`list_run_ids`] does.
+pub fn first_run_id(path: &Path) -> Result<Option<u64>> {
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let col_idx = XimParquetReader::build_index(&reader)?;
+    let idx_run = XimParquetReader::ensure_idx(&col_idx, "RUN_ID")?;
+    let mut iter = reader.get_row_iter(None)?;
+    if let Some(row) = iter.next() {
+        let row = row?;
+        return Ok(Some(
+            XimParquetReader::get_i64(&row, idx_run, "RUN_ID")? as u64
+        ));
+    }
+    Ok(None)
+}
+
 #[cfg(not(feature = "parquet"))]
 /// Stub used when `redeem-io` is built without parquet support.
 pub fn list_run_ids(_path: &Path) -> Result<Vec<u64>> {
+    bail!("XIM parquet reader not available (enable feature `parquet`)")
+}
+
+#[cfg(not(feature = "parquet"))]
+/// Stub used when `redeem-io` is built without parquet support.
+pub fn first_run_id(_path: &Path) -> Result<Option<u64>> {
     bail!("XIM parquet reader not available (enable feature `parquet`)")
 }
 

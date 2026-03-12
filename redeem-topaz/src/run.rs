@@ -1121,12 +1121,11 @@ fn log_run_id_summary(
     let run_ids = if let Some(paths) = xic_paths {
         let mut set = HashSet::new();
         for path in paths {
-            match crate::io::xic_parquet::list_run_ids(path) {
-                Ok(runs) => {
-                    for run_id in runs {
-                        set.insert(run_id);
-                    }
+            match crate::io::xic_parquet::first_run_id(path) {
+                Ok(Some(run_id)) => {
+                    set.insert(run_id);
                 }
+                Ok(None) => {}
                 Err(e) => {
                     log::warn!("Failed to read XIC run_ids from {:?}: {e:#}", path);
                 }
@@ -1155,12 +1154,11 @@ fn log_run_id_summary(
     let xim_run_ids = if let Some(paths) = xim_paths {
         let mut set = HashSet::new();
         for path in paths {
-            match crate::io::xim_parquet::list_run_ids(path) {
-                Ok(runs) => {
-                    for run_id in runs {
-                        set.insert(run_id);
-                    }
+            match crate::io::xim_parquet::first_run_id(path) {
+                Ok(Some(run_id)) => {
+                    set.insert(run_id);
                 }
+                Ok(None) => {}
                 Err(e) => {
                     log::warn!("Failed to read XIM run_ids from {:?}: {e:#}", path);
                 }
