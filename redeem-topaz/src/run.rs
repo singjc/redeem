@@ -1098,7 +1098,18 @@ fn collect_preprocess_provenance(
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn log_run_id_summary(rows: &[FeatureRow], xic_path: &Path, xic_paths: &Option<Vec<PathBuf>>) {
+/// Log the distinct OSW, XIC, and XIM run identifiers seen in the current run.
+///
+/// The XIC/XIM summaries read parquet metadata directly from the configured
+/// inputs so mismatches between OSW run ids and raw trace files are visible
+/// immediately near startup.
+fn log_run_id_summary(
+    rows: &[FeatureRow],
+    xic_path: &Path,
+    xic_paths: &Option<Vec<PathBuf>>,
+    xim_path: &Option<PathBuf>,
+    xim_paths: &Option<Vec<PathBuf>>,
+) {
     if !log::log_enabled!(log::Level::Info) {
         return;
     }
@@ -1139,6 +1150,42 @@ fn log_run_id_summary(rows: &[FeatureRow], xic_path: &Path, xic_paths: &Option<V
     };
     if !run_ids.is_empty() {
         log::info!("XIC run_ids (n={}): {:?}", run_ids.len(), run_ids);
+    }
+
+    let xim_run_ids = if let Some(paths) = xim_paths {
+        let mut set = HashSet::new();
+        for path in paths {
+            match crate::io::xim_parquet::list_run_ids(path) {
+                Ok(runs) => {
+                    for run_id in runs {
+                        set.insert(run_id);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to read XIM run_ids from {:?}: {e:#}", path);
+                }
+            }
+        }
+        let mut runs: Vec<u64> = set.into_iter().collect();
+        runs.sort_unstable();
+        runs
+    } else if let Some(path) = xim_path {
+        match crate::io::xim_parquet::list_run_ids(path) {
+            Ok(mut runs) => {
+                runs.sort_unstable();
+                runs.dedup();
+                runs
+            }
+            Err(e) => {
+                log::warn!("Failed to read XIM run_ids: {e:#}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if !xim_run_ids.is_empty() {
+        log::info!("XIM run_ids (n={}): {:?}", xim_run_ids.len(), xim_run_ids);
     }
 }
 
@@ -3451,7 +3498,13 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
     if rows.is_empty() {
         bail!("no rows in OSW");
     }
-    log_run_id_summary(&rows, &cfg.xic_path, &cfg.xic_paths);
+    log_run_id_summary(
+        &rows,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+    );
     if cfg.restrict_osw_to_xic_map {
         rows = filter_rows_by_xic_map(rows, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows.is_empty() {
@@ -3924,7 +3977,13 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
     if rows.is_empty() {
         bail!("no rows after filtering");
     }
-    log_run_id_summary(&rows, &cfg.xic_path, &cfg.xic_paths);
+    log_run_id_summary(
+        &rows,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+    );
     if cfg.restrict_osw_to_xic_map {
         rows = filter_rows_by_xic_map(rows, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows.is_empty() {
@@ -4677,7 +4736,13 @@ fn prepare_xrun_dataset_from_preprocessed(
         dataset.rows
     };
     let mut rows_aligned = all_rows.clone();
-    log_run_id_summary(&rows_aligned, &cfg.xic_path, &cfg.xic_paths);
+    log_run_id_summary(
+        &rows_aligned,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+    );
     if cfg.restrict_osw_to_xic_map {
         rows_aligned = filter_rows_by_xic_map(rows_aligned, &cfg.xic_paths, &cfg.xic_map_path)?;
     }
@@ -4764,7 +4829,13 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     if rows.is_empty() {
         bail!("no rows after filtering");
     }
-    log_run_id_summary(&rows, &cfg.xic_path, &cfg.xic_paths);
+    log_run_id_summary(
+        &rows,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+    );
     if cfg.restrict_osw_to_xic_map {
         rows = filter_rows_by_xic_map(rows, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows.is_empty() {
@@ -5361,7 +5432,13 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
     if rows.is_empty() {
         bail!("no rows in OSW");
     }
-    log_run_id_summary(&rows, &cfg.xic_path, &cfg.xic_paths);
+    log_run_id_summary(
+        &rows,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+    );
     if cfg.restrict_osw_to_xic_map {
         rows = filter_rows_by_xic_map(rows, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows.is_empty() {
@@ -5983,7 +6060,13 @@ fn prepare_xrun_dataset_from_checkpoint(
     } else {
         table.rows
     };
-    log_run_id_summary(&rows_aligned, &cfg.xic_path, &cfg.xic_paths);
+    log_run_id_summary(
+        &rows_aligned,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+    );
     if cfg.restrict_osw_to_xic_map {
         rows_aligned = filter_rows_by_xic_map(rows_aligned, &cfg.xic_paths, &cfg.xic_map_path)?;
         if rows_aligned.is_empty() {
