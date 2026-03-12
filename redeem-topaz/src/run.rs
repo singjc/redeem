@@ -1661,21 +1661,44 @@ fn derive_stream_queue_depth(producer_workers: usize) -> usize {
 /// Each worker spends most of its time in XIC/XIM fetch and tensor-assembly
 /// helpers, which already use Rayon internally. A moderate number of outer
 /// workers is enough to keep the global Rayon pool fed while avoiding
-/// excessive memory growth from too many in-flight chunks.
-fn derive_preprocess_producer_workers(total_chunks: usize) -> usize {
+/// excessive memory growth from too many in-flight chunks. XIM-heavy
+/// preprocessing is capped more aggressively because each in-flight work unit
+/// carries substantially larger tensors than XIC-only preprocessing.
+fn derive_preprocess_producer_workers(
+    total_chunks: usize,
+    has_xim: bool,
+    chunk_row_count: usize,
+) -> usize {
     let available = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    available.min(total_chunks.max(1)).clamp(1, 8)
+    let max_workers = if has_xim {
+        if chunk_row_count >= 50_000 {
+            3
+        } else if chunk_row_count >= 25_000 {
+            4
+        } else {
+            6
+        }
+    } else {
+        8
+    };
+    available.min(total_chunks.max(1)).clamp(1, max_workers)
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 /// Bound the number of preprocessing payloads waiting to be written.
 ///
 /// Preprocessed chunks can be large because they carry full XIC/XIM tensors, so
-/// the queue should stay shallow even on CPU-rich nodes.
-fn derive_preprocess_queue_depth(producer_workers: usize) -> usize {
-    producer_workers.clamp(2, 6)
+/// the queue should stay shallow even on CPU-rich nodes. XIM-heavy runs keep an
+/// even tighter queue to avoid holding multiple large mobilogram groups in
+/// memory at once.
+fn derive_preprocess_queue_depth(producer_workers: usize, has_xim: bool) -> usize {
+    if has_xim {
+        producer_workers.clamp(1, 2)
+    } else {
+        producer_workers.clamp(2, 6)
+    }
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -1685,18 +1708,26 @@ fn derive_preprocess_queue_depth(producer_workers: usize) -> usize {
 /// Grouping adjacent chunks reduces the number of full parquet scans needed for
 /// XIM-heavy datasets because one worker can materialize a larger union of
 /// feature ids and then split the finished tensor back into regular archive
-/// chunks. Trace-filtered preprocessing keeps a group size of `1` so row
+/// chunks. Very large XIM chunk sizes disable grouping to keep peak memory
+/// bounded. Trace-filtered preprocessing also keeps a group size of `1` so row
 /// filtering remains localized to the original chunk boundaries.
 fn derive_preprocess_chunk_group_size(
     has_xim: bool,
     apply_trace_filter: bool,
     producer_workers: usize,
+    chunk_row_count: usize,
 ) -> usize {
     if apply_trace_filter {
         return 1;
     }
     if has_xim {
-        if producer_workers >= 6 { 2 } else { 3 }
+        if chunk_row_count >= 50_000 {
+            1
+        } else if producer_workers >= 6 {
+            2
+        } else {
+            3
+        }
     } else {
         4
     }
@@ -3542,12 +3573,17 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
         remaining_work.len(),
         remaining_source_rows
     );
-    let producer_workers = derive_preprocess_producer_workers(remaining_work.len());
-    let queue_depth = derive_preprocess_queue_depth(producer_workers);
+    let producer_workers = derive_preprocess_producer_workers(
+        remaining_work.len(),
+        cfg.xim_trace.is_some(),
+        chunk_row_count,
+    );
+    let queue_depth = derive_preprocess_queue_depth(producer_workers, cfg.xim_trace.is_some());
     let chunk_group_size = derive_preprocess_chunk_group_size(
         cfg.xim_trace.is_some(),
         apply_trace_filter,
         producer_workers,
+        chunk_row_count,
     );
     let grouped_work: Vec<Vec<(usize, usize, usize)>> = if remaining_work.is_empty() {
         Vec::new()
