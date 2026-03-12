@@ -3,19 +3,27 @@ use clap::ArgMatches;
 use std::fs;
 use std::path::PathBuf;
 
+use redeem_topaz::TopazConfig;
+use redeem_topaz::checkpoint::read_checkpoint_meta;
 use redeem_topaz::PreprocessRunConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct TopazPreprocessConfig {
+    #[serde(flatten)]
     pub inner: PreprocessRunConfig,
+    #[serde(default)]
+    pub checkpoint: Option<PathBuf>,
+    #[serde(default)]
+    pub model: Option<TopazConfig>,
 }
 
 impl Default for TopazPreprocessConfig {
     fn default() -> Self {
         Self {
             inner: PreprocessRunConfig::default(),
+            checkpoint: None,
+            model: None,
         }
     }
 }
@@ -53,6 +61,9 @@ impl TopazPreprocessConfig {
         if let Some(p) = matches.get_one::<PathBuf>("output_path") {
             cfg.inner.output_path = p.clone();
         }
+        if let Some(p) = matches.get_one::<PathBuf>("checkpoint") {
+            cfg.checkpoint = Some(p.clone());
+        }
         if let Some(v) = matches.get_one::<usize>("chunk_row_count") {
             cfg.inner.chunk_row_count = *v;
         }
@@ -73,8 +84,38 @@ impl TopazPreprocessConfig {
         }
 
         resolve_paths_relative_to(&mut cfg.inner, &config_dir);
+        cfg.checkpoint = cfg
+            .checkpoint
+            .take()
+            .map(|p| resolve_relative(&config_dir, &p));
+        infer_missing_xim_trace(&mut cfg)?;
         Ok(cfg)
     }
+}
+
+fn infer_missing_xim_trace(cfg: &mut TopazPreprocessConfig) -> Result<()> {
+    if cfg.inner.xim_trace.is_some() {
+        return Ok(());
+    }
+    if let Some(model) = cfg.model.as_ref() {
+        cfg.inner.xim_trace = model.xim.as_ref().map(|xim| redeem_topaz::infer::TraceBuildConfig {
+            l: xim.l,
+            ms1_cmax: xim.ms1_cmax,
+            ms2_cmax: xim.ms2_cmax,
+            normalize_max: true,
+        });
+        return Ok(());
+    }
+    if let Some(checkpoint) = cfg.checkpoint.as_ref() {
+        let meta = read_checkpoint_meta(checkpoint)?;
+        cfg.inner.xim_trace = meta.model.xim.as_ref().map(|xim| redeem_topaz::infer::TraceBuildConfig {
+            l: xim.l,
+            ms1_cmax: xim.ms1_cmax,
+            ms2_cmax: xim.ms2_cmax,
+            normalize_max: true,
+        });
+    }
+    Ok(())
 }
 
 fn resolve_paths_relative_to(cfg: &mut PreprocessRunConfig, base: &PathBuf) {

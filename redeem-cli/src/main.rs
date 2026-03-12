@@ -292,6 +292,13 @@ fn main() -> Result<()> {
                                 .value_hint(ValueHint::FilePath),
                         )
                         .arg(
+                            Arg::new("checkpoint")
+                                .long("checkpoint")
+                                .help("Optional TOPAZ checkpoint used to infer XIM tensor settings when xim_trace is omitted")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
                             Arg::new("chunk_row_count")
                                 .long("chunk-rows")
                                 .help("Number of rows stored per bundle chunk")
