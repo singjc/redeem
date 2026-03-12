@@ -3,9 +3,9 @@ use clap::ArgMatches;
 use std::fs;
 use std::path::PathBuf;
 
+use redeem_topaz::PreprocessRunConfig;
 use redeem_topaz::TopazConfig;
 use redeem_topaz::checkpoint::read_checkpoint_meta;
-use redeem_topaz::PreprocessRunConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,22 +98,29 @@ fn infer_missing_xim_trace(cfg: &mut TopazPreprocessConfig) -> Result<()> {
         return Ok(());
     }
     if let Some(model) = cfg.model.as_ref() {
-        cfg.inner.xim_trace = model.xim.as_ref().map(|xim| redeem_topaz::infer::TraceBuildConfig {
-            l: xim.l,
-            ms1_cmax: xim.ms1_cmax,
-            ms2_cmax: xim.ms2_cmax,
-            normalize_max: true,
-        });
+        cfg.inner.xim_trace = model
+            .xim
+            .as_ref()
+            .map(|xim| redeem_topaz::infer::TraceBuildConfig {
+                l: xim.l,
+                ms1_cmax: xim.ms1_cmax,
+                ms2_cmax: xim.ms2_cmax,
+                normalize_max: true,
+            });
         return Ok(());
     }
     if let Some(checkpoint) = cfg.checkpoint.as_ref() {
         let meta = read_checkpoint_meta(checkpoint)?;
-        cfg.inner.xim_trace = meta.model.xim.as_ref().map(|xim| redeem_topaz::infer::TraceBuildConfig {
-            l: xim.l,
-            ms1_cmax: xim.ms1_cmax,
-            ms2_cmax: xim.ms2_cmax,
-            normalize_max: true,
-        });
+        cfg.inner.xim_trace =
+            meta.model
+                .xim
+                .as_ref()
+                .map(|xim| redeem_topaz::infer::TraceBuildConfig {
+                    l: xim.l,
+                    ms1_cmax: xim.ms1_cmax,
+                    ms2_cmax: xim.ms2_cmax,
+                    normalize_max: true,
+                });
     }
     Ok(())
 }

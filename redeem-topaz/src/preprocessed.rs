@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zip::CompressionMethod;
@@ -44,7 +44,7 @@ const FORMAT_VERSION: u32 = 1;
 /// was built from the expected OSW/XIC/XIM inputs. Compatibility checks rely on
 /// the structured trace/config fields in [`PreprocessedManifest`], not on these
 /// file paths.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PreprocessedProvenance {
     /// Source OSW path used when the bundle was created.
     pub osw_path: Option<PathBuf>,
@@ -65,6 +65,10 @@ pub struct PreprocessedChunkMeta {
     pub index: usize,
     /// Number of rows stored in this chunk.
     pub rows: usize,
+    /// Number of source OSW rows consumed to build this chunk before optional
+    /// trace-based filtering removed all-zero candidates.
+    #[serde(default)]
+    pub source_rows: usize,
 }
 
 /// Bundle-wide metadata used to validate compatibility before scoring or
@@ -124,6 +128,22 @@ impl PreprocessedManifest {
     /// Return the scalar feature width `D` stored in the bundle.
     pub fn feat_dim(&self) -> usize {
         self.feature_cols.len()
+    }
+
+    /// Compare two manifests for resume compatibility.
+    ///
+    /// Resume uses the stage directory as an extension of the final archive, so
+    /// shape-critical settings must match exactly before an unfinished job can
+    /// continue. Fields that naturally differ between runs such as
+    /// `created_unix_secs`, `row_count`, and `chunks` are intentionally ignored.
+    pub fn is_resume_compatible_with(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.chunk_row_count == other.chunk_row_count
+            && self.feature_cols == other.feature_cols
+            && self.trace == other.trace
+            && self.xim_trace == other.xim_trace
+            && self.osw == other.osw
+            && self.provenance == other.provenance
     }
 }
 
@@ -257,169 +277,25 @@ impl PreprocessedBundleWriter {
         rows: &[FeatureRow],
         x_trace: &[f32],
         x_xim: Option<&[f32]>,
+        source_rows: usize,
     ) -> Result<()> {
         let writer = self
             .writer
             .as_mut()
             .context("cannot write chunk after bundle has been finished")?;
         let rows_len = rows.len();
-        let trace_expected = rows_len * self.manifest.trace.total_c() * self.manifest.trace.l;
-        if x_trace.len() != trace_expected {
-            bail!(
-                "preprocessed XIC chunk shape mismatch: rows={} expected {} floats but got {}",
-                rows_len,
-                trace_expected,
-                x_trace.len()
-            );
-        }
-        match (self.manifest.xim_trace.as_ref(), x_xim) {
-            (Some(xim_cfg), Some(buf)) => {
-                let expected = rows_len * xim_cfg.total_c() * xim_cfg.l;
-                if buf.len() != expected {
-                    bail!(
-                        "preprocessed XIM chunk shape mismatch: rows={} expected {} floats but got {}",
-                        rows_len,
-                        expected,
-                        buf.len()
-                    );
-                }
-            }
-            (Some(_), None) => bail!("bundle manifest expects XIM data but chunk omitted it"),
-            (None, Some(_)) => bail!("bundle manifest disables XIM but chunk provided XIM data"),
-            (None, None) => {}
-        }
-
         let chunk_idx = self.manifest.chunks.len();
-        let prefix = chunk_prefix(chunk_idx);
-        let feat_dim = self.manifest.feature_cols.len();
         let opts = zip_options();
-
-        write_entry(
-            writer,
-            &format!("{prefix}/feature_id.u64le"),
-            opts,
-            &encode_u64_slice(&rows.iter().map(|r| r.feature_id).collect::<Vec<_>>()),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/precursor_id.u64le"),
-            opts,
-            &encode_u64_slice(&rows.iter().map(|r| r.precursor_id).collect::<Vec<_>>()),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/run_id.u64le"),
-            opts,
-            &encode_u64_slice(&rows.iter().map(|r| r.run_id).collect::<Vec<_>>()),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/exp_rt.f32le"),
-            opts,
-            &encode_f32_slice(&rows.iter().map(|r| r.exp_rt).collect::<Vec<_>>()),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/rt_left_width.f32le"),
-            opts,
-            &encode_f32_slice(
-                &rows
-                    .iter()
-                    .map(|r| r.rt_left_width.unwrap_or(f32::NAN))
-                    .collect::<Vec<_>>(),
-            ),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/rt_right_width.f32le"),
-            opts,
-            &encode_f32_slice(
-                &rows
-                    .iter()
-                    .map(|r| r.rt_right_width.unwrap_or(f32::NAN))
-                    .collect::<Vec<_>>(),
-            ),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/exp_im.f32le"),
-            opts,
-            &encode_f32_slice(
-                &rows
-                    .iter()
-                    .map(|r| r.exp_im.unwrap_or(f32::NAN))
-                    .collect::<Vec<_>>(),
-            ),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/exp_im_left_width.f32le"),
-            opts,
-            &encode_f32_slice(
-                &rows
-                    .iter()
-                    .map(|r| r.exp_im_left_width.unwrap_or(f32::NAN))
-                    .collect::<Vec<_>>(),
-            ),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/exp_im_right_width.f32le"),
-            opts,
-            &encode_f32_slice(
-                &rows
-                    .iter()
-                    .map(|r| r.exp_im_right_width.unwrap_or(f32::NAN))
-                    .collect::<Vec<_>>(),
-            ),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/is_decoy.u8"),
-            opts,
-            &rows
-                .iter()
-                .map(|r| if r.is_decoy { 1u8 } else { 0u8 })
-                .collect::<Vec<_>>(),
-        )?;
-
-        let mut features = Vec::with_capacity(rows_len * feat_dim);
-        for row in rows {
-            if row.features.len() != feat_dim {
-                bail!(
-                    "row feature width mismatch in preprocessed chunk: expected {} cols but feature_id {} has {}",
-                    feat_dim,
-                    row.feature_id,
-                    row.features.len()
-                );
-            }
-            features.extend_from_slice(&row.features);
-        }
-        write_entry(
-            writer,
-            &format!("{prefix}/features.f32le"),
-            opts,
-            &encode_f32_slice(&features),
-        )?;
-        write_entry(
-            writer,
-            &format!("{prefix}/x_trace.f32le"),
-            opts,
-            &encode_f32_slice(x_trace),
-        )?;
-        if let Some(buf) = x_xim {
-            write_entry(
-                writer,
-                &format!("{prefix}/x_xim.f32le"),
-                opts,
-                &encode_f32_slice(buf),
-            )?;
+        for (name, bytes) in encode_chunk_entries(&self.manifest, chunk_idx, rows, x_trace, x_xim)?
+        {
+            write_entry(writer, &name, opts, &bytes)?;
         }
 
         self.manifest.row_count += rows_len;
         self.manifest.chunks.push(PreprocessedChunkMeta {
             index: chunk_idx,
             rows: rows_len,
+            source_rows: source_rows.max(rows_len),
         });
         Ok(())
     }
@@ -441,6 +317,145 @@ impl PreprocessedBundleWriter {
     }
 }
 
+/// Resumable staging writer used by `topaz preprocess`.
+///
+/// Chunks are first materialized into a sidecar directory next to the final
+/// `.topazdata` archive. Every completed chunk updates a partial manifest on
+/// disk, so a timed-out preprocessing job can restart from the last committed
+/// chunk instead of rebuilding the entire bundle. Once all chunks are present,
+/// [`finish`](Self::finish) repacks the staging directory into the final zip
+/// archive expected by the rest of TOPAZ.
+#[derive(Debug, Clone)]
+pub struct ResumablePreprocessedBundleWriter {
+    final_path: PathBuf,
+    stage_dir: PathBuf,
+    manifest: PreprocessedManifest,
+}
+
+impl ResumablePreprocessedBundleWriter {
+    /// Open an existing staging directory if it matches the requested manifest,
+    /// otherwise create a new resumable writer from scratch.
+    pub fn resume_or_create(
+        final_path: impl AsRef<Path>,
+        manifest: PreprocessedManifest,
+    ) -> Result<Self> {
+        let final_path = final_path.as_ref().to_path_buf();
+        let stage_dir = staging_dir_for(&final_path);
+        let manifest_path = stage_manifest_path(&stage_dir);
+        if stage_dir.exists() && manifest_path.exists() {
+            let existing = read_manifest_file(&manifest_path)?;
+            if !existing.is_resume_compatible_with(&manifest) {
+                bail!(
+                    "existing preprocessing stage at {:?} is incompatible with the requested inputs; delete it or choose a new output path",
+                    stage_dir
+                );
+            }
+            validate_staged_chunks(&stage_dir, &existing)?;
+            return Ok(Self {
+                final_path,
+                stage_dir,
+                manifest: existing,
+            });
+        }
+
+        fs::create_dir_all(&stage_dir)?;
+        write_manifest_file(&manifest_path, &manifest)?;
+        Ok(Self {
+            final_path,
+            stage_dir,
+            manifest,
+        })
+    }
+
+    /// Access the current partial manifest, including already-written chunks.
+    pub fn manifest(&self) -> &PreprocessedManifest {
+        &self.manifest
+    }
+
+    /// Number of rows already materialized into the staging directory.
+    pub fn completed_rows(&self) -> usize {
+        self.manifest.row_count
+    }
+
+    /// Number of chunks already materialized into the staging directory.
+    pub fn completed_chunks(&self) -> usize {
+        self.manifest.chunks.len()
+    }
+
+    /// Append one chunk to the staging directory and persist the partial
+    /// manifest so a later retry can resume from this point.
+    pub fn write_chunk(
+        &mut self,
+        rows: &[FeatureRow],
+        x_trace: &[f32],
+        x_xim: Option<&[f32]>,
+        source_rows: usize,
+    ) -> Result<()> {
+        let chunk_idx = self.manifest.chunks.len();
+        let chunk_dir = staged_chunk_dir(&self.stage_dir, chunk_idx);
+        let tmp_dir = staged_chunk_tmp_dir(&self.stage_dir, chunk_idx);
+        if tmp_dir.exists() {
+            fs::remove_dir_all(&tmp_dir)?;
+        }
+        fs::create_dir_all(&tmp_dir)?;
+        for (name, bytes) in encode_chunk_entries(&self.manifest, chunk_idx, rows, x_trace, x_xim)?
+        {
+            let suffix = chunk_suffix_from_entry(&name);
+            let path = tmp_dir.join(suffix);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, bytes)?;
+        }
+        if chunk_dir.exists() {
+            fs::remove_dir_all(&chunk_dir)?;
+        }
+        fs::rename(&tmp_dir, &chunk_dir)?;
+
+        self.manifest.row_count += rows.len();
+        self.manifest.chunks.push(PreprocessedChunkMeta {
+            index: chunk_idx,
+            rows: rows.len(),
+            source_rows: source_rows.max(rows.len()),
+        });
+        write_manifest_file(&stage_manifest_path(&self.stage_dir), &self.manifest)?;
+        Ok(())
+    }
+
+    /// Package the staged chunks into the final `.topazdata` archive and remove
+    /// the staging directory after a successful commit.
+    pub fn finish(self) -> Result<PreprocessedManifest> {
+        let tmp_path = temp_output_path(&self.final_path);
+        if let Some(parent) = tmp_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = File::create(&tmp_path)
+            .with_context(|| format!("failed to create preprocessed archive {:?}", tmp_path))?;
+        let mut writer = ZipWriter::new(file);
+        let opts = zip_options();
+
+        for chunk in &self.manifest.chunks {
+            let dir = staged_chunk_dir(&self.stage_dir, chunk.index);
+            for suffix in chunk_entry_suffixes(self.manifest.xim_trace.is_some()) {
+                let entry_name = format!("{}/{}", chunk_prefix(chunk.index), suffix);
+                let path = dir.join(suffix);
+                write_entry_from_path(&mut writer, &entry_name, opts, &path)?;
+            }
+        }
+        let manifest_bytes = serde_json::to_vec_pretty(&self.manifest)?;
+        write_entry(&mut writer, MANIFEST_ENTRY, opts, &manifest_bytes)?;
+        writer.finish()?;
+        fs::rename(&tmp_path, &self.final_path).with_context(|| {
+            format!(
+                "failed to atomically move preprocessed archive into place {:?}",
+                self.final_path
+            )
+        })?;
+        fs::remove_dir_all(&self.stage_dir).ok();
+        Ok(self.manifest)
+    }
+}
+
 fn zip_options() -> SimpleFileOptions {
     SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
 }
@@ -458,6 +473,239 @@ fn write_entry(
     writer.start_file(name, opts)?;
     writer.write_all(bytes)?;
     Ok(())
+}
+
+fn write_entry_from_path(
+    writer: &mut ZipWriter<File>,
+    name: &str,
+    opts: SimpleFileOptions,
+    path: &Path,
+) -> Result<()> {
+    writer.start_file(name, opts)?;
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open staged preprocessing entry {:?}", path))?;
+    std::io::copy(&mut file, writer)?;
+    Ok(())
+}
+
+fn encode_chunk_entries(
+    manifest: &PreprocessedManifest,
+    chunk_idx: usize,
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    x_xim: Option<&[f32]>,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let rows_len = rows.len();
+    let trace_expected = rows_len * manifest.trace.total_c() * manifest.trace.l;
+    if x_trace.len() != trace_expected {
+        bail!(
+            "preprocessed XIC chunk shape mismatch: rows={} expected {} floats but got {}",
+            rows_len,
+            trace_expected,
+            x_trace.len()
+        );
+    }
+    match (manifest.xim_trace.as_ref(), x_xim) {
+        (Some(xim_cfg), Some(buf)) => {
+            let expected = rows_len * xim_cfg.total_c() * xim_cfg.l;
+            if buf.len() != expected {
+                bail!(
+                    "preprocessed XIM chunk shape mismatch: rows={} expected {} floats but got {}",
+                    rows_len,
+                    expected,
+                    buf.len()
+                );
+            }
+        }
+        (Some(_), None) => bail!("bundle manifest expects XIM data but chunk omitted it"),
+        (None, Some(_)) => bail!("bundle manifest disables XIM but chunk provided XIM data"),
+        (None, None) => {}
+    }
+
+    let prefix = chunk_prefix(chunk_idx);
+    let feat_dim = manifest.feature_cols.len();
+    let mut features = Vec::with_capacity(rows_len * feat_dim);
+    for row in rows {
+        if row.features.len() != feat_dim {
+            bail!(
+                "row feature width mismatch in preprocessed chunk: expected {} cols but feature_id {} has {}",
+                feat_dim,
+                row.feature_id,
+                row.features.len()
+            );
+        }
+        features.extend_from_slice(&row.features);
+    }
+
+    let mut out = Vec::with_capacity(12);
+    out.push((
+        format!("{prefix}/feature_id.u64le"),
+        encode_u64_slice(&rows.iter().map(|r| r.feature_id).collect::<Vec<_>>()),
+    ));
+    out.push((
+        format!("{prefix}/precursor_id.u64le"),
+        encode_u64_slice(&rows.iter().map(|r| r.precursor_id).collect::<Vec<_>>()),
+    ));
+    out.push((
+        format!("{prefix}/run_id.u64le"),
+        encode_u64_slice(&rows.iter().map(|r| r.run_id).collect::<Vec<_>>()),
+    ));
+    out.push((
+        format!("{prefix}/exp_rt.f32le"),
+        encode_f32_slice(&rows.iter().map(|r| r.exp_rt).collect::<Vec<_>>()),
+    ));
+    out.push((
+        format!("{prefix}/rt_left_width.f32le"),
+        encode_f32_slice(
+            &rows
+                .iter()
+                .map(|r| r.rt_left_width.unwrap_or(f32::NAN))
+                .collect::<Vec<_>>(),
+        ),
+    ));
+    out.push((
+        format!("{prefix}/rt_right_width.f32le"),
+        encode_f32_slice(
+            &rows
+                .iter()
+                .map(|r| r.rt_right_width.unwrap_or(f32::NAN))
+                .collect::<Vec<_>>(),
+        ),
+    ));
+    out.push((
+        format!("{prefix}/exp_im.f32le"),
+        encode_f32_slice(
+            &rows
+                .iter()
+                .map(|r| r.exp_im.unwrap_or(f32::NAN))
+                .collect::<Vec<_>>(),
+        ),
+    ));
+    out.push((
+        format!("{prefix}/exp_im_left_width.f32le"),
+        encode_f32_slice(
+            &rows
+                .iter()
+                .map(|r| r.exp_im_left_width.unwrap_or(f32::NAN))
+                .collect::<Vec<_>>(),
+        ),
+    ));
+    out.push((
+        format!("{prefix}/exp_im_right_width.f32le"),
+        encode_f32_slice(
+            &rows
+                .iter()
+                .map(|r| r.exp_im_right_width.unwrap_or(f32::NAN))
+                .collect::<Vec<_>>(),
+        ),
+    ));
+    out.push((
+        format!("{prefix}/is_decoy.u8"),
+        rows.iter()
+            .map(|r| if r.is_decoy { 1u8 } else { 0u8 })
+            .collect::<Vec<_>>(),
+    ));
+    out.push((
+        format!("{prefix}/features.f32le"),
+        encode_f32_slice(&features),
+    ));
+    out.push((format!("{prefix}/x_trace.f32le"), encode_f32_slice(x_trace)));
+    if let Some(buf) = x_xim {
+        out.push((format!("{prefix}/x_xim.f32le"), encode_f32_slice(buf)));
+    }
+    Ok(out)
+}
+
+fn write_manifest_file(path: &Path, manifest: &PreprocessedManifest) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(manifest)?)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_manifest_file(path: &Path) -> Result<PreprocessedManifest> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read preprocessing manifest {:?}", path))?;
+    let manifest: PreprocessedManifest = serde_json::from_slice(&bytes)?;
+    Ok(manifest)
+}
+
+fn validate_staged_chunks(stage_dir: &Path, manifest: &PreprocessedManifest) -> Result<()> {
+    for chunk in &manifest.chunks {
+        let dir = staged_chunk_dir(stage_dir, chunk.index);
+        if !dir.is_dir() {
+            bail!("preprocessing stage is missing chunk directory {:?}", dir);
+        }
+        for suffix in chunk_entry_suffixes(manifest.xim_trace.is_some()) {
+            let path = dir.join(suffix);
+            if !path.is_file() {
+                bail!("preprocessing stage is missing chunk entry {:?}", path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stage_manifest_path(stage_dir: &Path) -> PathBuf {
+    stage_dir.join("manifest.partial.json")
+}
+
+fn staging_dir_for(final_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.work", final_path.display()))
+}
+
+fn temp_output_path(final_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tmp", final_path.display()))
+}
+
+fn staged_chunk_dir(stage_dir: &Path, chunk_idx: usize) -> PathBuf {
+    stage_dir.join(format!("chunks/{chunk_idx:06}"))
+}
+
+fn staged_chunk_tmp_dir(stage_dir: &Path, chunk_idx: usize) -> PathBuf {
+    stage_dir.join(format!("chunks/{chunk_idx:06}.tmp"))
+}
+
+fn chunk_suffix_from_entry(name: &str) -> &str {
+    name.splitn(3, '/').nth(2).unwrap_or(name)
+}
+
+fn chunk_entry_suffixes(has_xim: bool) -> &'static [&'static str] {
+    if has_xim {
+        &[
+            "feature_id.u64le",
+            "precursor_id.u64le",
+            "run_id.u64le",
+            "exp_rt.f32le",
+            "rt_left_width.f32le",
+            "rt_right_width.f32le",
+            "exp_im.f32le",
+            "exp_im_left_width.f32le",
+            "exp_im_right_width.f32le",
+            "is_decoy.u8",
+            "features.f32le",
+            "x_trace.f32le",
+            "x_xim.f32le",
+        ]
+    } else {
+        &[
+            "feature_id.u64le",
+            "precursor_id.u64le",
+            "run_id.u64le",
+            "exp_rt.f32le",
+            "rt_left_width.f32le",
+            "rt_right_width.f32le",
+            "exp_im.f32le",
+            "exp_im_left_width.f32le",
+            "exp_im_right_width.f32le",
+            "is_decoy.u8",
+            "features.f32le",
+            "x_trace.f32le",
+        ]
+    }
 }
 
 fn read_manifest(path: &Path) -> Result<PreprocessedManifest> {
@@ -745,7 +993,7 @@ mod tests {
         let x_trace = vec![0.0; rows.len() * 4];
         let x_xim = vec![1.0; rows.len() * 9];
         let mut writer = PreprocessedBundleWriter::new(&path, manifest)?;
-        writer.write_chunk(&rows, &x_trace, Some(&x_xim))?;
+        writer.write_chunk(&rows, &x_trace, Some(&x_xim), rows.len())?;
         writer.finish()?;
 
         let reader = PreprocessedBundleReader::open(&path)?;
@@ -759,6 +1007,49 @@ mod tests {
         assert_eq!(chunk.x_xim.as_ref().map(|v| v.len()), Some(x_xim.len()));
 
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_resumable_bundle_writer_resumes_from_staging() -> Result<()> {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "redeem_topaz_preprocessed_resume_test_{}.topazdata",
+            std::process::id()
+        ));
+        let manifest = PreprocessedManifest::new(
+            2,
+            vec!["a".to_string(), "b".to_string()],
+            TraceBuildConfig {
+                l: 2,
+                ms1_cmax: 0,
+                ms2_cmax: 2,
+                normalize_max: false,
+            },
+            Some(TraceBuildConfig {
+                l: 3,
+                ms1_cmax: 1,
+                ms2_cmax: 2,
+                normalize_max: true,
+            }),
+            OswReadConfig::default(),
+            PreprocessedProvenance::default(),
+        );
+        let rows = sample_rows();
+        let x_trace = vec![0.0; rows.len() * 4];
+        let x_xim = vec![1.0; rows.len() * 9];
+
+        let mut writer =
+            ResumablePreprocessedBundleWriter::resume_or_create(&path, manifest.clone())?;
+        writer.write_chunk(&rows[..1], &x_trace[..4], Some(&x_xim[..9]), 1)?;
+        drop(writer);
+
+        let writer = ResumablePreprocessedBundleWriter::resume_or_create(&path, manifest)?;
+        assert_eq!(writer.completed_chunks(), 1);
+        assert_eq!(writer.completed_rows(), 1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(staging_dir_for(&path));
         Ok(())
     }
 }

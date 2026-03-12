@@ -129,7 +129,7 @@ pub enum OswLevel {
 
 /// OSW reader configuration mirroring the PyProphet/OpenSWATH feature-table
 /// choices used by TOPAZ.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OswReadConfig {
     /// Which feature table(s) to read.
     pub level: OswLevel,

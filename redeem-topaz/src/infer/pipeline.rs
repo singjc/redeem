@@ -169,7 +169,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// These settings define how precursor chromatograms are converted from
 /// variable-length point lists into fixed-size tensors usable by TOPAZ.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TraceBuildConfig {
     /// Output trace length `L`, i.e. number of retention-time samples per row.
     pub l: usize,

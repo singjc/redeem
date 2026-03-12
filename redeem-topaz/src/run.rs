@@ -35,8 +35,8 @@ use crate::infer::{TraceBuildConfig, XicFetchConfig, XimFetchConfig};
 use crate::io::osw::OswReadConfig;
 use crate::model::topaz::TopazConfig;
 use crate::preprocessed::{
-    PreprocessedBundleReader, PreprocessedBundleWriter, PreprocessedManifest,
-    PreprocessedProvenance,
+    PreprocessedBundleReader, PreprocessedManifest, PreprocessedProvenance,
+    ResumablePreprocessedBundleWriter,
 };
 use crate::train::TrainFilter;
 use crate::xrun::XrunTrainConfig;
@@ -1679,6 +1679,30 @@ fn derive_preprocess_queue_depth(producer_workers: usize) -> usize {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Choose how many contiguous archive chunks a preprocessing worker should
+/// merge into one fetch/build task.
+///
+/// Grouping adjacent chunks reduces the number of full parquet scans needed for
+/// XIM-heavy datasets because one worker can materialize a larger union of
+/// feature ids and then split the finished tensor back into regular archive
+/// chunks. Trace-filtered preprocessing keeps a group size of `1` so row
+/// filtering remains localized to the original chunk boundaries.
+fn derive_preprocess_chunk_group_size(
+    has_xim: bool,
+    apply_trace_filter: bool,
+    producer_workers: usize,
+) -> usize {
+    if apply_trace_filter {
+        return 1;
+    }
+    if has_xim {
+        if producer_workers >= 6 { 2 } else { 3 }
+    } else {
+        4
+    }
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 /// Partition the inference row slice into contiguous streaming work units.
 fn build_stream_work_ranges(total_rows: usize, work_unit_size: usize) -> Vec<(usize, usize)> {
     if total_rows == 0 {
@@ -2115,9 +2139,20 @@ struct PreprocessChunkPayload {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// One completed preprocessing work group.
+///
+/// Each producer may combine multiple adjacent archive chunks into one larger
+/// XIC/XIM fetch so parquet files are scanned fewer times on XIM-heavy
+/// datasets. The ordered writer still commits the constituent chunks one by
+/// one, preserving the on-disk archive layout.
+struct PreprocessChunkGroupPayload {
+    payloads: Vec<PreprocessChunkPayload>,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 /// Messages exchanged between preprocessing workers and the ordered writer.
 enum PreprocessProducerMessage {
-    Payload(PreprocessChunkPayload),
+    PayloadGroup(PreprocessChunkGroupPayload),
     Done,
 }
 
@@ -3150,6 +3185,110 @@ fn preprocess_chunk_payload(
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Build one or more preprocessing payloads from a contiguous group of archive
+/// chunks.
+///
+/// When `group_ranges` contains multiple adjacent chunks, this helper builds
+/// XIC/XIM tensors once for the full row union and then slices the result back
+/// into per-chunk payloads. That substantially reduces repeated parquet scans
+/// for XIM-heavy datasets while preserving the final archive layout.
+fn preprocess_chunk_group_payloads(
+    rows: &[FeatureRow],
+    group_ranges: &[(usize, usize, usize)],
+    cfg: &PreprocessRunConfig,
+    cache_opt: Option<&SharedXicCache>,
+    disk_cache: Option<&XicDiskCache>,
+    xim_cache_opt: Option<&SharedXimCache>,
+    xim_disk_cache: Option<&XimDiskCache>,
+    apply_trace_filter: bool,
+) -> Result<PreprocessChunkGroupPayload> {
+    if group_ranges.is_empty() {
+        return Ok(PreprocessChunkGroupPayload {
+            payloads: Vec::new(),
+        });
+    }
+    if apply_trace_filter || group_ranges.len() == 1 {
+        let mut payloads = Vec::with_capacity(group_ranges.len());
+        for &(seq_idx, start, end) in group_ranges {
+            payloads.push(preprocess_chunk_payload(
+                rows,
+                seq_idx,
+                start,
+                end,
+                cfg,
+                cache_opt,
+                disk_cache,
+                xim_cache_opt,
+                xim_disk_cache,
+                apply_trace_filter,
+            )?);
+        }
+        return Ok(PreprocessChunkGroupPayload { payloads });
+    }
+
+    let group_start = group_ranges
+        .first()
+        .map(|(_, start, _)| *start)
+        .unwrap_or(0);
+    let group_end = group_ranges
+        .last()
+        .map(|(_, _, end)| *end)
+        .unwrap_or(group_start);
+    let group_rows = &rows[group_start..group_end];
+    let x_trace_all = build_traces_for_rows(
+        group_rows,
+        &cfg.xic_path,
+        &cfg.xic_paths,
+        &cfg.xic_map_path,
+        &cfg.trace,
+        &cfg.fetch,
+        cache_opt,
+        disk_cache,
+    )?;
+    let x_xim_all = build_xim_for_rows(
+        group_rows,
+        &cfg.xim_path,
+        &cfg.xim_paths,
+        &cfg.xim_map_path,
+        &cfg.xim_trace,
+        &cfg.xim_fetch,
+        xim_cache_opt,
+        xim_disk_cache,
+    )?;
+    let xim_decode_issues = crate::io::xim_parquet::take_decode_issues();
+
+    let trace_row_span = cfg.trace.total_c() * cfg.trace.l;
+    let xim_row_span = cfg
+        .xim_trace
+        .as_ref()
+        .map(|trace| trace.total_c() * trace.l);
+    let mut payloads = Vec::with_capacity(group_ranges.len());
+    for (payload_idx, &(seq_idx, start, end)) in group_ranges.iter().enumerate() {
+        let local_start = start.saturating_sub(group_start);
+        let local_end = end.saturating_sub(group_start);
+        let trace_slice =
+            x_trace_all[local_start * trace_row_span..local_end * trace_row_span].to_vec();
+        let xim_slice = x_xim_all.as_ref().and_then(|all| {
+            xim_row_span.map(|span| all[local_start * span..local_end * span].to_vec())
+        });
+        payloads.push(PreprocessChunkPayload {
+            seq_idx,
+            source_rows: end.saturating_sub(start),
+            rows: rows[start..end].to_vec(),
+            x_trace: trace_slice,
+            x_xim: xim_slice,
+            xim_decode_issues: if payload_idx == 0 {
+                xim_decode_issues.clone()
+            } else {
+                Vec::new()
+            },
+        });
+    }
+
+    Ok(PreprocessChunkGroupPayload { payloads })
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 /// Materialize OSW rows plus fixed-width XIC/XIM tensors into a reusable bundle.
 pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> {
     crate::io::xim_parquet::clear_decode_issues();
@@ -3244,21 +3383,63 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
         cfg.osw.clone(),
         provenance,
     );
-    let mut writer = PreprocessedBundleWriter::new(&cfg.output_path, manifest)?;
+    let mut writer =
+        ResumablePreprocessedBundleWriter::resume_or_create(&cfg.output_path, manifest)?;
     let chunk_row_count = cfg.chunk_row_count.max(1);
     let mut progress = InferenceProgressLogger::new("preprocess", rows.len(), chunk_row_count);
-    let mut written_rows = 0usize;
-    let mut written_chunks = 0usize;
     let work_ranges = build_stream_work_ranges(rows.len(), chunk_row_count);
-    let producer_workers = derive_preprocess_producer_workers(work_ranges.len());
+    let completed_chunks = writer.completed_chunks();
+    let mut written_rows = writer.completed_rows();
+    let mut written_chunks = completed_chunks;
+    let mut processed_source_rows: usize = writer
+        .manifest()
+        .chunks
+        .iter()
+        .map(|chunk| {
+            if chunk.source_rows == 0 {
+                chunk.rows
+            } else {
+                chunk.source_rows
+            }
+        })
+        .sum();
+    if completed_chunks > 0 {
+        log::info!(
+            "Resuming preprocessing from {:?} (completed_chunks={} completed_rows={})",
+            cfg.output_path,
+            completed_chunks,
+            written_rows
+        );
+    }
+    let remaining_work: Vec<(usize, usize, usize)> = work_ranges
+        .iter()
+        .enumerate()
+        .skip(completed_chunks)
+        .map(|(seq_idx, &(start, end))| (seq_idx, start, end))
+        .collect();
+    let producer_workers = derive_preprocess_producer_workers(remaining_work.len());
     let queue_depth = derive_preprocess_queue_depth(producer_workers);
+    let chunk_group_size = derive_preprocess_chunk_group_size(
+        cfg.xim_trace.is_some(),
+        apply_trace_filter,
+        producer_workers,
+    );
+    let grouped_work: Vec<Vec<(usize, usize, usize)>> = if remaining_work.is_empty() {
+        Vec::new()
+    } else {
+        remaining_work
+            .chunks(chunk_group_size.max(1))
+            .map(|group| group.to_vec())
+            .collect()
+    };
     #[cfg(feature = "rayon")]
     let rayon_threads = rayon::current_num_threads();
     #[cfg(not(feature = "rayon"))]
     let rayon_threads = 1usize;
     log::info!(
-        "Parallel preprocessing configured | chunk_rows={} producer_workers={} queue_depth={} rayon_threads={}",
+        "Parallel preprocessing configured | chunk_rows={} chunk_group_size={} producer_workers={} queue_depth={} rayon_threads={}",
         chunk_row_count,
+        chunk_group_size,
         producer_workers,
         queue_depth,
         rayon_threads
@@ -3266,13 +3447,12 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
 
     let next_chunk_idx = AtomicUsize::new(0);
     let (tx, rx) = mpsc::sync_channel::<Result<PreprocessProducerMessage>>(queue_depth);
-    let mut processed_source_rows = 0usize;
 
     thread::scope(|scope| -> Result<()> {
         for _worker_idx in 0..producer_workers {
             let tx_producer = tx.clone();
             let next_chunk_idx_ref = &next_chunk_idx;
-            let work_ranges_ref = &work_ranges;
+            let grouped_work_ref = &grouped_work;
             let rows_ref = rows.as_slice();
             let cfg_ref = cfg;
             let cache_opt_ref = cache_opt;
@@ -3282,14 +3462,12 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
             scope.spawn(move || -> Result<()> {
                 loop {
                     let seq_idx = next_chunk_idx_ref.fetch_add(1, Ordering::Relaxed);
-                    let Some(&(start, end)) = work_ranges_ref.get(seq_idx) else {
+                    let Some(group_ranges) = grouped_work_ref.get(seq_idx) else {
                         break;
                     };
-                    let payload = preprocess_chunk_payload(
+                    let payload_group = preprocess_chunk_group_payloads(
                         rows_ref,
-                        seq_idx,
-                        start,
-                        end,
+                        group_ranges,
                         cfg_ref,
                         cache_opt_ref,
                         disk_cache_ref,
@@ -3298,7 +3476,7 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
                         apply_trace_filter,
                     )?;
                     tx_producer
-                        .send(Ok(PreprocessProducerMessage::Payload(payload)))
+                        .send(Ok(PreprocessProducerMessage::PayloadGroup(payload_group)))
                         .context(
                             "preprocess writer dropped before chunk preprocessing completed",
                         )?;
@@ -3312,7 +3490,7 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
         drop(tx);
 
         let mut completed_workers = 0usize;
-        let mut next_expected = 0usize;
+        let mut next_expected = completed_chunks;
         let mut pending: BTreeMap<usize, PreprocessChunkPayload> = BTreeMap::new();
 
         while completed_workers < producer_workers {
@@ -3321,8 +3499,10 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
                 PreprocessProducerMessage::Done => {
                     completed_workers += 1;
                 }
-                PreprocessProducerMessage::Payload(payload) => {
-                    pending.insert(payload.seq_idx, payload);
+                PreprocessProducerMessage::PayloadGroup(group) => {
+                    for payload in group.payloads {
+                        pending.insert(payload.seq_idx, payload);
+                    }
                 }
             }
 
@@ -3334,6 +3514,7 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
                         &payload.rows,
                         &payload.x_trace,
                         payload.x_xim.as_deref(),
+                        payload.source_rows,
                     )?;
                     written_rows += payload.rows.len();
                     written_chunks += 1;
@@ -3347,7 +3528,12 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
             xim_decode_issues.extend(payload.xim_decode_issues);
             processed_source_rows += payload.source_rows;
             if !payload.rows.is_empty() {
-                writer.write_chunk(&payload.rows, &payload.x_trace, payload.x_xim.as_deref())?;
+                writer.write_chunk(
+                    &payload.rows,
+                    &payload.x_trace,
+                    payload.x_xim.as_deref(),
+                    payload.source_rows,
+                )?;
                 written_rows += payload.rows.len();
                 written_chunks += 1;
             }
@@ -3357,6 +3543,11 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
         Ok(())
     })?;
 
+    log::info!(
+        "Finalizing preprocessed bundle archive {:?} from {} staged chunks...",
+        cfg.output_path,
+        writer.completed_chunks()
+    );
     let manifest = writer.finish()?;
     log_xic_cache_stats("preprocess", &cache_stats);
     log_xim_cache_stats("preprocess", &xim_cache_stats);
