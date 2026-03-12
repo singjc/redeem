@@ -2147,6 +2147,32 @@ struct PreprocessChunkPayload {
 /// one, preserving the on-disk archive layout.
 struct PreprocessChunkGroupPayload {
     payloads: Vec<PreprocessChunkPayload>,
+    stage_stats: PreprocessStageRuntimeStats,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Cumulative wall-clock counters for XIC/XIM preprocessing.
+///
+/// The preprocessing pipeline spends most of its time in two host-side stages:
+/// building fixed-width chromatogram tensors and building fixed-width
+/// mobilogram tensors. Tracking them separately makes it obvious whether XIM
+/// preprocessing dominates runtime on a given dataset.
+#[derive(Debug, Clone, Copy, Default)]
+struct PreprocessStageRuntimeStats {
+    xic_rows: usize,
+    xim_rows: usize,
+    xic_build_time: Duration,
+    xim_build_time: Duration,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+impl std::ops::AddAssign for PreprocessStageRuntimeStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.xic_rows += rhs.xic_rows;
+        self.xim_rows += rhs.xim_rows;
+        self.xic_build_time += rhs.xic_build_time;
+        self.xim_build_time += rhs.xim_build_time;
+    }
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -2219,6 +2245,50 @@ fn log_inference_runtime_stats(stats: &InferenceRuntimeStats, n_rows: usize) {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+/// Emit cumulative XIC/XIM preprocessing throughput counters.
+///
+/// The reported rows-per-second values are computed from the number of source
+/// rows whose XIC/XIM tensors have been materialized divided by the measured
+/// wall-clock time spent inside each builder. This intentionally excludes zip
+/// writing and bookkeeping so the log isolates the expensive preprocessing
+/// stages themselves.
+fn log_preprocess_stage_throughput(stats: &PreprocessStageRuntimeStats) {
+    let xic_secs = stats.xic_build_time.as_secs_f64();
+    let xic_rows_per_sec = if xic_secs > 0.0 {
+        stats.xic_rows as f64 / xic_secs
+    } else {
+        0.0
+    };
+
+    if stats.xim_rows == 0 {
+        log::info!(
+            "Preprocess stage throughput | xic={:.0} rows/s (rows={} time={:.1}s) xim=disabled",
+            xic_rows_per_sec,
+            stats.xic_rows,
+            xic_secs
+        );
+        return;
+    }
+
+    let xim_secs = stats.xim_build_time.as_secs_f64();
+    let xim_rows_per_sec = if xim_secs > 0.0 {
+        stats.xim_rows as f64 / xim_secs
+    } else {
+        0.0
+    };
+
+    log::info!(
+        "Preprocess stage throughput | xic={:.0} rows/s (rows={} time={:.1}s) xim={:.0} rows/s (rows={} time={:.1}s)",
+        xic_rows_per_sec,
+        stats.xic_rows,
+        xic_secs,
+        xim_rows_per_sec,
+        stats.xim_rows,
+        xim_secs
+    );
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 /// Periodically emits chunk-level inference progress with a coarse ETA.
 ///
 /// Progress is reported in terms of input rows consumed rather than retained
@@ -2255,14 +2325,14 @@ impl InferenceProgressLogger {
     }
 
     /// Log progress after a completed chunk when enough time has elapsed.
-    fn maybe_log(&mut self, processed_rows: usize, processed_chunks: usize) {
+    fn maybe_log(&mut self, processed_rows: usize, processed_chunks: usize) -> bool {
         let now = Instant::now();
         let should_log = processed_rows >= self.total_rows
             || processed_chunks >= self.total_chunks
             || now.duration_since(self.last_log) >= self.log_every
             || processed_chunks <= 1;
         if !should_log {
-            return;
+            return false;
         }
         self.last_log = now;
 
@@ -2296,6 +2366,7 @@ impl InferenceProgressLogger {
             format_duration(eta),
             rows_per_sec
         );
+        true
     }
 }
 
@@ -3138,8 +3209,9 @@ fn preprocess_chunk_payload(
     xim_cache_opt: Option<&SharedXimCache>,
     xim_disk_cache: Option<&XimDiskCache>,
     apply_trace_filter: bool,
-) -> Result<PreprocessChunkPayload> {
+) -> Result<(PreprocessChunkPayload, PreprocessStageRuntimeStats)> {
     let chunk = &rows[start..end];
+    let xic_started = Instant::now();
     let x_trace = build_traces_for_rows(
         chunk,
         &cfg.xic_path,
@@ -3150,6 +3222,8 @@ fn preprocess_chunk_payload(
         cache_opt,
         disk_cache,
     )?;
+    let xic_elapsed = xic_started.elapsed();
+    let xim_started = Instant::now();
     let x_xim = build_xim_for_rows(
         chunk,
         &cfg.xim_path,
@@ -3160,6 +3234,7 @@ fn preprocess_chunk_payload(
         xim_cache_opt,
         xim_disk_cache,
     )?;
+    let xim_elapsed = xim_started.elapsed();
     let (rows_chunk, x_trace, x_xim) = if apply_trace_filter {
         filter_rows_by_trace_with_aux(
             chunk.to_vec(),
@@ -3174,14 +3249,33 @@ fn preprocess_chunk_payload(
         (chunk.to_vec(), x_trace, x_xim)
     };
 
-    Ok(PreprocessChunkPayload {
-        seq_idx,
-        source_rows: end.saturating_sub(start),
-        rows: rows_chunk,
-        x_trace,
-        x_xim,
-        xim_decode_issues: crate::io::xim_parquet::take_decode_issues(),
-    })
+    let source_rows = end.saturating_sub(start);
+    let stats = PreprocessStageRuntimeStats {
+        xic_rows: source_rows,
+        xim_rows: if cfg.xim_trace.is_some() {
+            source_rows
+        } else {
+            0
+        },
+        xic_build_time: xic_elapsed,
+        xim_build_time: if cfg.xim_trace.is_some() {
+            xim_elapsed
+        } else {
+            Duration::ZERO
+        },
+    };
+
+    Ok((
+        PreprocessChunkPayload {
+            seq_idx,
+            source_rows,
+            rows: rows_chunk,
+            x_trace,
+            x_xim,
+            xim_decode_issues: crate::io::xim_parquet::take_decode_issues(),
+        },
+        stats,
+    ))
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -3205,12 +3299,14 @@ fn preprocess_chunk_group_payloads(
     if group_ranges.is_empty() {
         return Ok(PreprocessChunkGroupPayload {
             payloads: Vec::new(),
+            stage_stats: PreprocessStageRuntimeStats::default(),
         });
     }
     if apply_trace_filter || group_ranges.len() == 1 {
         let mut payloads = Vec::with_capacity(group_ranges.len());
+        let mut stage_stats = PreprocessStageRuntimeStats::default();
         for &(seq_idx, start, end) in group_ranges {
-            payloads.push(preprocess_chunk_payload(
+            let (payload, payload_stats) = preprocess_chunk_payload(
                 rows,
                 seq_idx,
                 start,
@@ -3221,9 +3317,14 @@ fn preprocess_chunk_group_payloads(
                 xim_cache_opt,
                 xim_disk_cache,
                 apply_trace_filter,
-            )?);
+            )?;
+            payloads.push(payload);
+            stage_stats += payload_stats;
         }
-        return Ok(PreprocessChunkGroupPayload { payloads });
+        return Ok(PreprocessChunkGroupPayload {
+            payloads,
+            stage_stats,
+        });
     }
 
     let group_start = group_ranges
@@ -3235,6 +3336,7 @@ fn preprocess_chunk_group_payloads(
         .map(|(_, _, end)| *end)
         .unwrap_or(group_start);
     let group_rows = &rows[group_start..group_end];
+    let xic_started = Instant::now();
     let x_trace_all = build_traces_for_rows(
         group_rows,
         &cfg.xic_path,
@@ -3245,6 +3347,8 @@ fn preprocess_chunk_group_payloads(
         cache_opt,
         disk_cache,
     )?;
+    let xic_elapsed = xic_started.elapsed();
+    let xim_started = Instant::now();
     let x_xim_all = build_xim_for_rows(
         group_rows,
         &cfg.xim_path,
@@ -3255,6 +3359,7 @@ fn preprocess_chunk_group_payloads(
         xim_cache_opt,
         xim_disk_cache,
     )?;
+    let xim_elapsed = xim_started.elapsed();
     let xim_decode_issues = crate::io::xim_parquet::take_decode_issues();
 
     let trace_row_span = cfg.trace.total_c() * cfg.trace.l;
@@ -3285,7 +3390,23 @@ fn preprocess_chunk_group_payloads(
         });
     }
 
-    Ok(PreprocessChunkGroupPayload { payloads })
+    Ok(PreprocessChunkGroupPayload {
+        payloads,
+        stage_stats: PreprocessStageRuntimeStats {
+            xic_rows: group_rows.len(),
+            xim_rows: if cfg.xim_trace.is_some() {
+                group_rows.len()
+            } else {
+                0
+            },
+            xic_build_time: xic_elapsed,
+            xim_build_time: if cfg.xim_trace.is_some() {
+                xim_elapsed
+            } else {
+                Duration::ZERO
+            },
+        },
+    })
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -3403,20 +3524,24 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
             }
         })
         .sum();
-    if completed_chunks > 0 {
-        log::info!(
-            "Resuming preprocessing from {:?} (completed_chunks={} completed_rows={})",
-            cfg.output_path,
-            completed_chunks,
-            written_rows
-        );
-    }
     let remaining_work: Vec<(usize, usize, usize)> = work_ranges
         .iter()
         .enumerate()
         .skip(completed_chunks)
         .map(|(seq_idx, &(start, end))| (seq_idx, start, end))
         .collect();
+    let remaining_source_rows: usize = remaining_work
+        .iter()
+        .map(|(_, start, end)| end.saturating_sub(*start))
+        .sum();
+    log::info!(
+        "Preprocess resume state | output={:?} resumed_chunks={} resumed_rows={} remaining_chunks={} remaining_rows={}",
+        cfg.output_path,
+        completed_chunks,
+        written_rows,
+        remaining_work.len(),
+        remaining_source_rows
+    );
     let producer_workers = derive_preprocess_producer_workers(remaining_work.len());
     let queue_depth = derive_preprocess_queue_depth(producer_workers);
     let chunk_group_size = derive_preprocess_chunk_group_size(
@@ -3436,10 +3561,13 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
     let rayon_threads = rayon::current_num_threads();
     #[cfg(not(feature = "rayon"))]
     let rayon_threads = 1usize;
+    let grouped_work_unit_rows = chunk_row_count.saturating_mul(chunk_group_size.max(1));
     log::info!(
-        "Parallel preprocessing configured | chunk_rows={} chunk_group_size={} producer_workers={} queue_depth={} rayon_threads={}",
+        "Parallel preprocessing configured | chunk_rows={} grouped_work_unit_size={} rows ({} chunk(s)) grouped_work_units={} producer_workers={} queue_depth={} rayon_threads={}",
         chunk_row_count,
+        grouped_work_unit_rows,
         chunk_group_size,
+        grouped_work.len(),
         producer_workers,
         queue_depth,
         rayon_threads
@@ -3491,7 +3619,8 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
 
         let mut completed_workers = 0usize;
         let mut next_expected = completed_chunks;
-        let mut pending: BTreeMap<usize, PreprocessChunkPayload> = BTreeMap::new();
+        let mut pending: BTreeMap<usize, PreprocessChunkGroupPayload> = BTreeMap::new();
+        let mut stage_totals = PreprocessStageRuntimeStats::default();
 
         while completed_workers < producer_workers {
             let message = rx.recv().context("preprocess worker disconnected")?;
@@ -3500,13 +3629,47 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
                     completed_workers += 1;
                 }
                 PreprocessProducerMessage::PayloadGroup(group) => {
-                    for payload in group.payloads {
-                        pending.insert(payload.seq_idx, payload);
+                    if let Some(first_seq_idx) =
+                        group.payloads.first().map(|payload| payload.seq_idx)
+                    {
+                        pending.insert(first_seq_idx, group);
                     }
                 }
             }
 
-            while let Some(payload) = pending.remove(&next_expected) {
+            while let Some(group) = pending.remove(&next_expected) {
+                let PreprocessChunkGroupPayload {
+                    payloads,
+                    stage_stats,
+                } = group;
+                for payload in payloads {
+                    xim_decode_issues.extend(payload.xim_decode_issues);
+                    processed_source_rows += payload.source_rows;
+                    if !payload.rows.is_empty() {
+                        writer.write_chunk(
+                            &payload.rows,
+                            &payload.x_trace,
+                            payload.x_xim.as_deref(),
+                            payload.source_rows,
+                        )?;
+                        written_rows += payload.rows.len();
+                        written_chunks += 1;
+                    }
+                    next_expected += 1;
+                }
+                stage_totals += stage_stats;
+                if progress.maybe_log(processed_source_rows.min(rows.len()), next_expected) {
+                    log_preprocess_stage_throughput(&stage_totals);
+                }
+            }
+        }
+
+        while let Some(group) = pending.remove(&next_expected) {
+            let PreprocessChunkGroupPayload {
+                payloads,
+                stage_stats,
+            } = group;
+            for payload in payloads {
                 xim_decode_issues.extend(payload.xim_decode_issues);
                 processed_source_rows += payload.source_rows;
                 if !payload.rows.is_empty() {
@@ -3519,26 +3682,12 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
                     written_rows += payload.rows.len();
                     written_chunks += 1;
                 }
-                progress.maybe_log(processed_source_rows.min(rows.len()), next_expected + 1);
                 next_expected += 1;
             }
-        }
-
-        while let Some(payload) = pending.remove(&next_expected) {
-            xim_decode_issues.extend(payload.xim_decode_issues);
-            processed_source_rows += payload.source_rows;
-            if !payload.rows.is_empty() {
-                writer.write_chunk(
-                    &payload.rows,
-                    &payload.x_trace,
-                    payload.x_xim.as_deref(),
-                    payload.source_rows,
-                )?;
-                written_rows += payload.rows.len();
-                written_chunks += 1;
+            stage_totals += stage_stats;
+            if progress.maybe_log(processed_source_rows.min(rows.len()), next_expected) {
+                log_preprocess_stage_throughput(&stage_totals);
             }
-            progress.maybe_log(processed_source_rows.min(rows.len()), next_expected + 1);
-            next_expected += 1;
         }
         Ok(())
     })?;
