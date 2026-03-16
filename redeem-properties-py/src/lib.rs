@@ -81,8 +81,8 @@ fn resolve_pretrained(name: &str, family: &str) -> PyResult<(String, PathBuf)> {
 /// This function searches the pretrained model registry for the given model name.
 /// It checks the following locations in order:
 ///   1. The directory specified by the `REDEEM_PRETRAINED_MODELS_DIR` environment variable.
-///   2. The `data/pretrained_models/` directory relative to the current working directory.
-///   3. The user's local data directory (e.g., `~/.local/share/redeem/models/` on Linux).
+///   2. The user's local data directory (e.g., `~/.local/share/redeem/pretrained_models/` on Linux).
+///   3. The `data/pretrained_models/` directory in development locations.
 ///
 /// Args:
 ///     name (str): The identifier of the pretrained model (e.g., "rt", "ccs", "ms2").
@@ -172,9 +172,10 @@ fn validate_pretrained(py: Python, name: &str) -> PyResult<PyObject> {
 /// ``RTModel.from_pretrained()``, ``CCSModel.from_pretrained()``, and
 /// ``MS2Model.from_pretrained()``.
 ///
-/// The models are downloaded to ``data/pretrained_models/`` relative to the current
-/// working directory. If the models already exist, this function returns immediately
-/// without re-downloading.
+/// The models are downloaded to a stable user-local directory (or
+/// ``REDEEM_PRETRAINED_MODELS_DIR`` when set), so they are reusable across working
+/// directories. If the models already exist, this function returns immediately without
+/// re-downloading.
 ///
 /// Returns:
 ///     str: The absolute path to the extracted pretrained models directory.
@@ -240,8 +241,8 @@ impl RTModel {
     /// Models are located using the ``redeem_properties`` pretrained-model registry.
     /// On first use the search order is:
     ///   1. ``$REDEEM_PRETRAINED_MODELS_DIR/<name>``
-    ///   2. ``data/pretrained_models/`` relative to the current directory
-    ///   3. ``$HOME/.local/share/redeem/models/<name>``
+    ///   2. user-local pretrained directory (e.g. ``~/.local/share/redeem/pretrained_models``)
+    ///   3. ``data/pretrained_models/`` development locations
     ///
     /// Accepted ``name`` values (case-insensitive):
     ///   - ``"rt"`` / ``"alphapeptdeep-rt"`` / ``"alphapeptdeep-rt-cnn-lstm"``
