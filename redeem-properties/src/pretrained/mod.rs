@@ -93,6 +93,18 @@ pub fn default_pretrained_models_dir() -> PathBuf {
     PathBuf::from("./.redeem_models_cache")
 }
 
+/// Resolve the configured pretrained-models directory for writes.
+///
+/// If `REDEEM_PRETRAINED_MODELS_DIR` is set and non-empty, it takes precedence.
+/// Otherwise, fall back to the cross-platform default user-local location.
+fn configured_pretrained_models_dir() -> PathBuf {
+    env::var("REDEEM_PRETRAINED_MODELS_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_pretrained_models_dir)
+}
+
 impl std::str::FromStr for PretrainedModel {
     type Err = anyhow::Error;
 
@@ -268,7 +280,7 @@ pub fn locate_pretrained_model(model: PretrainedModel) -> Result<PathBuf> {
 #[cfg(feature = "embed-pretrained")]
 fn extract_embedded_model_to_cache(model: &PretrainedModel) -> Result<PathBuf> {
     if let Some(file) = EMBEDDED_PRETRAINED_DIR.get_file(model.filename()) {
-        let target_base = default_pretrained_models_dir();
+        let target_base = configured_pretrained_models_dir();
 
         fs::create_dir_all(&target_base).with_context(|| {
             format!("Failed to create cache directory {}", target_base.display())
@@ -298,7 +310,7 @@ fn extract_embedded_model_to_cache(model: &PretrainedModel) -> Result<PathBuf> {
 /// This is helpful when downstream code expects a stable file path (for example loader functions).
 pub fn cache_pretrained_model(model: PretrainedModel) -> Result<PathBuf> {
     let src = locate_pretrained_model(model.clone())?;
-    let target_base = default_pretrained_models_dir();
+    let target_base = configured_pretrained_models_dir();
 
     fs::create_dir_all(&target_base)
         .with_context(|| format!("Failed to create cache directory {}", target_base.display()))?;
