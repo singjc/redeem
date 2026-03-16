@@ -229,6 +229,7 @@ pub fn get_mod_features_from_parsed_arc(
 #[cfg(test)]
 mod tests {
 
+    use crate::pretrained::{locate_pretrained_model, PretrainedModel};
     use crate::utils::peptdeep_utils::parse_model_constants;
     use crate::utils::peptdeep_utils::ModelConstants;
     use crate::utils::peptdeep_utils::{load_mod_to_feature, load_mod_to_feature_arc};
@@ -303,8 +304,9 @@ mod tests {
         let seq_len = 11 + 2;
         let mod_feature_size = 109;
 
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/rt.pth.model_const.yaml");
+        let model_path = locate_pretrained_model(PretrainedModel::AlphapeptdeepRtCnnLstm)
+            .expect("Failed to locate RT pretrained model");
+        let constants_path = model_path.with_extension("pth.model_const.yaml");
         let constants: ModelConstants =
             parse_model_constants(constants_path.to_str().unwrap()).unwrap();
         let mod_to_feature: HashMap<String, Vec<f32>> = load_mod_to_feature(&constants).unwrap();
