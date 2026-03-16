@@ -1,4 +1,4 @@
-use anyhow::{Context, Error, Result};
+use anyhow::{Error, Result};
 use csv::ReaderBuilder;
 use log::info;
 use once_cell::sync::Lazy;
@@ -20,8 +20,6 @@ const MODIFICATIONS_TSV_BYTES: &[u8] = include_bytes!(concat!(
 ));
 
 const PRETRAINED_MODELS_URL: &str = "https://github.com/singjc/redeem/releases/download/v0.1.0-alpha/pretrained_models.zip";
-const PRETRAINED_MODELS_ZIP: &str = "data/pretrained_models.zip";
-const PRETRAINED_MODELS_PATH: &str = "data/pretrained_models";
 
 // Constants and Utility Structs
 
@@ -546,8 +544,12 @@ pub fn download_pretrained_models_exist() -> Result<PathBuf, io::Error> {
 }
 
 fn download_pretrained_models_inner() -> Result<PathBuf, io::Error> {
-    let zip_path = PathBuf::from(PRETRAINED_MODELS_ZIP);
-    let extract_dir = PathBuf::from(PRETRAINED_MODELS_PATH);
+    let extract_dir = if let Ok(dir) = std::env::var("REDEEM_PRETRAINED_MODELS_DIR") {
+        PathBuf::from(dir)
+    } else {
+        crate::pretrained::default_pretrained_models_dir()
+    };
+    let zip_path = extract_dir.join("pretrained_models.zip");
 
     // If already fully extracted, return immediately
     if extract_dir.exists() {
@@ -607,19 +609,27 @@ fn download_pretrained_models_inner() -> Result<PathBuf, io::Error> {
         fs::rename(&tmp_path, &zip_path)?;
     }
 
-    // Unzip into the parent directory (e.g., "data/") so that the zip's
-    // top-level "pretrained_models/" folder lands at "data/pretrained_models/".
+    // Unzip directly into `extract_dir`. If the archive has a top-level
+    // "pretrained_models/" folder, strip that prefix first.
     info!("Unzipping pretrained models...");
     let file = File::open(&zip_path)?;
     let mut archive = ZipArchive::new(file)?;
 
-    let parent_dir = extract_dir
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(&extract_dir)?;
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let outpath = parent_dir.join(file.mangled_name());
+        let archive_path = file.mangled_name();
+        let relative_path = archive_path
+            .strip_prefix("pretrained_models")
+            .unwrap_or(archive_path.as_path());
+
+        // Skip entries that correspond to the stripped root itself.
+        if relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let outpath = extract_dir.join(relative_path);
 
         if file.name().ends_with('/') {
             fs::create_dir_all(&outpath)?;
@@ -730,7 +740,12 @@ mod tests {
         assert!(path.is_dir(), "Pretrained models path is not a directory: {:?}", path);
         
         // Check that the path matches expected location
-        assert_eq!(path, PathBuf::from(PRETRAINED_MODELS_PATH));
+        let expected = if let Ok(dir) = std::env::var("REDEEM_PRETRAINED_MODELS_DIR") {
+            PathBuf::from(dir)
+        } else {
+            crate::pretrained::default_pretrained_models_dir()
+        };
+        assert_eq!(path, expected);
         
         println!("Pretrained models successfully available at: {:?}", path);
     }

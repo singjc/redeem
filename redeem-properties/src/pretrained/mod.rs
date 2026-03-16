@@ -48,6 +48,51 @@ impl PretrainedModel {
     }
 }
 
+/// Resolve a writable, cross-platform default directory for pretrained models.
+///
+/// Priority:
+/// 1. `$XDG_DATA_HOME/redeem/pretrained_models` (Linux/Unix)
+/// 2. `%LOCALAPPDATA%/redeem/pretrained_models` then `%APPDATA%/redeem/pretrained_models` (Windows)
+/// 3. `$HOME/Library/Application Support/redeem/pretrained_models` (macOS)
+/// 4. `$HOME/.local/share/redeem/pretrained_models` (Linux fallback)
+/// 5. `./.redeem_models_cache` (last resort)
+pub fn default_pretrained_models_dir() -> PathBuf {
+    if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("redeem/pretrained_models");
+        }
+    }
+
+    if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+        if !local_app_data.is_empty() {
+            return PathBuf::from(local_app_data).join("redeem/pretrained_models");
+        }
+    }
+
+    if let Ok(app_data) = env::var("APPDATA") {
+        if !app_data.is_empty() {
+            return PathBuf::from(app_data).join("redeem/pretrained_models");
+        }
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        if !home.is_empty() {
+            #[cfg(target_os = "macos")]
+            {
+                return PathBuf::from(home)
+                    .join("Library/Application Support/redeem/pretrained_models");
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                return PathBuf::from(home).join(".local/share/redeem/pretrained_models");
+            }
+        }
+    }
+
+    PathBuf::from("./.redeem_models_cache")
+}
+
 impl std::str::FromStr for PretrainedModel {
     type Err = anyhow::Error;
 
@@ -170,9 +215,9 @@ impl PretrainedModel {
 ///
 /// Search order:
 /// 1. Directory pointed to by `REDEEM_PRETRAINED_MODELS_DIR` environment variable.
-/// 2. `data/pretrained_models/` relative to the crate (useful during development).
-/// 3. `data/pretrained_models/` in the current working directory.
-/// 4. User cache directory: `$HOME/.local/share/redeem/models/`.
+/// 2. User-local models directory (cross-platform; see `default_pretrained_models_dir`).
+/// 3. `data/pretrained_models/` relative to the crate (useful during development).
+/// 4. `data/pretrained_models/` in the current working directory.
 pub fn locate_pretrained_model(model: PretrainedModel) -> Result<PathBuf> {
     // If crate was built with `embed-pretrained`, try extracting embedded asset to cache first.
     #[cfg(feature = "embed-pretrained")]
@@ -189,7 +234,13 @@ pub fn locate_pretrained_model(model: PretrainedModel) -> Result<PathBuf> {
         }
     }
 
-    // 2) Try relative to the crate manifest dir (useful during development/running from repo)
+    // 2) User-local default models dir (stable across working directories)
+    let user_candidate = default_pretrained_models_dir().join(model.filename());
+    if user_candidate.exists() {
+        return Ok(user_candidate);
+    }
+
+    // 3) Try relative to the crate manifest dir (useful during development/running from repo)
     if let Ok(manifest) = env::var("CARGO_MANIFEST_DIR") {
         let candidate = Path::new(&manifest)
             .join("data/pretrained_models")
@@ -199,25 +250,16 @@ pub fn locate_pretrained_model(model: PretrainedModel) -> Result<PathBuf> {
         }
     }
 
-    // 3) Try ./data/pretrained_models in current working dir
+    // 4) Try ./data/pretrained_models in current working dir
     let cwd_candidate = Path::new("data/pretrained_models").join(model.filename());
     if cwd_candidate.exists() {
         return Ok(cwd_candidate);
     }
 
-    // 4) User cache: $HOME/.local/share/redeem/models/<filename>
-    if let Ok(home) = env::var("HOME") {
-        let user_candidate = Path::new(&home)
-            .join(".local/share/redeem/models")
-            .join(model.filename());
-        if user_candidate.exists() {
-            return Ok(user_candidate);
-        }
-    }
-
     Err(anyhow::anyhow!(
-        "Pretrained model not found for {:?}. Try setting REDEEM_PRETRAINED_MODELS_DIR or placing the models under data/pretrained_models/",
-        model
+        "Pretrained model not found for {:?}. Looked in REDEEM_PRETRAINED_MODELS_DIR, {}, crate data/pretrained_models, and cwd data/pretrained_models.",
+        model,
+        default_pretrained_models_dir().display()
     ))
 }
 
@@ -226,14 +268,7 @@ pub fn locate_pretrained_model(model: PretrainedModel) -> Result<PathBuf> {
 #[cfg(feature = "embed-pretrained")]
 fn extract_embedded_model_to_cache(model: &PretrainedModel) -> Result<PathBuf> {
     if let Some(file) = EMBEDDED_PRETRAINED_DIR.get_file(model.filename()) {
-        // target cache dir: $XDG_DATA_HOME/redeem/models or fallback to $HOME/.local/share/redeem/models
-        let target_base = if let Ok(xdg) = env::var("XDG_DATA_HOME") {
-            PathBuf::from(xdg).join("redeem/models")
-        } else if let Ok(home) = env::var("HOME") {
-            PathBuf::from(home).join(".local/share/redeem/models")
-        } else {
-            PathBuf::from("./.redeem_models_cache")
-        };
+        let target_base = default_pretrained_models_dir();
 
         fs::create_dir_all(&target_base).with_context(|| {
             format!("Failed to create cache directory {}", target_base.display())
@@ -263,14 +298,7 @@ fn extract_embedded_model_to_cache(model: &PretrainedModel) -> Result<PathBuf> {
 /// This is helpful when downstream code expects a stable file path (for example loader functions).
 pub fn cache_pretrained_model(model: PretrainedModel) -> Result<PathBuf> {
     let src = locate_pretrained_model(model.clone())?;
-    // target cache dir: $XDG_DATA_HOME/redeem/models or fallback to $HOME/.local/share/redeem/models
-    let target_base = if let Ok(xdg) = env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg).join("redeem/models")
-    } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".local/share/redeem/models")
-    } else {
-        PathBuf::from("./.redeem_models_cache")
-    };
+    let target_base = default_pretrained_models_dir();
 
     fs::create_dir_all(&target_base)
         .with_context(|| format!("Failed to create cache directory {}", target_base.display()))?;
