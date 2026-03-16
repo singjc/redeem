@@ -307,6 +307,7 @@ impl Default for TrainRunConfig {
                 ms1_cmax: 0,
                 ms2_cmax: 6,
                 normalize_max: true,
+                mask_rt_peak_bounds: false,
             },
             xim_trace: None,
             fetch: XicFetchConfig::default(),
@@ -457,6 +458,7 @@ impl Default for InferRunConfig {
                 ms1_cmax: 0,
                 ms2_cmax: 6,
                 normalize_max: true,
+                mask_rt_peak_bounds: false,
             },
             xim_trace: None,
             fetch: XicFetchConfig::default(),
@@ -544,6 +546,7 @@ impl Default for PreprocessRunConfig {
                 ms1_cmax: 0,
                 ms2_cmax: 6,
                 normalize_max: true,
+                mask_rt_peak_bounds: false,
             },
             xim_trace: None,
             fetch: XicFetchConfig::default(),
@@ -674,6 +677,7 @@ impl Default for XrunSweepConfig {
                 ms1_cmax: 0,
                 ms2_cmax: 6,
                 normalize_max: true,
+                mask_rt_peak_bounds: false,
             },
             xim_trace: None,
             fetch: XicFetchConfig::default(),
@@ -849,6 +853,7 @@ fn effective_xim_trace_cfg(
             ms1_cmax: xim.ms1_cmax,
             ms2_cmax: xim.ms2_cmax,
             normalize_max: true,
+            mask_rt_peak_bounds: false,
         })
     })
 }
@@ -858,6 +863,7 @@ fn same_trace_cfg(a: &TraceBuildConfig, b: &TraceBuildConfig) -> bool {
         && a.ms1_cmax == b.ms1_cmax
         && a.ms2_cmax == b.ms2_cmax
         && a.normalize_max == b.normalize_max
+        && a.mask_rt_peak_bounds == b.mask_rt_peak_bounds
 }
 
 fn same_osw_cfg(a: &OswReadConfig, b: &OswReadConfig) -> bool {
@@ -889,15 +895,17 @@ fn validate_preprocessed_manifest_for_training(
 ) -> Result<()> {
     if !same_trace_cfg(&manifest.trace, &cfg.trace) {
         bail!(
-            "preprocessed trace configuration mismatch: bundle has l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, config requests l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}",
+            "preprocessed trace configuration mismatch: bundle has l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, mask_rt_peak_bounds={}, config requests l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, mask_rt_peak_bounds={}",
             manifest.trace.l,
             manifest.trace.ms1_cmax,
             manifest.trace.ms2_cmax,
             manifest.trace.normalize_max,
+            manifest.trace.mask_rt_peak_bounds,
             cfg.trace.l,
             cfg.trace.ms1_cmax,
             cfg.trace.ms2_cmax,
-            cfg.trace.normalize_max
+            cfg.trace.normalize_max,
+            cfg.trace.mask_rt_peak_bounds
         );
     }
     let expected_xim = effective_xim_trace_cfg(&cfg.xim_trace, model_cfg);
@@ -945,15 +953,17 @@ fn validate_preprocessed_manifest_for_inference(
 ) -> Result<()> {
     if !same_trace_cfg(&manifest.trace, &cfg.trace) {
         bail!(
-            "preprocessed trace configuration mismatch: bundle has l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, config requests l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}",
+            "preprocessed trace configuration mismatch: bundle has l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, mask_rt_peak_bounds={}, config requests l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, mask_rt_peak_bounds={}",
             manifest.trace.l,
             manifest.trace.ms1_cmax,
             manifest.trace.ms2_cmax,
             manifest.trace.normalize_max,
+            manifest.trace.mask_rt_peak_bounds,
             cfg.trace.l,
             cfg.trace.ms1_cmax,
             cfg.trace.ms2_cmax,
-            cfg.trace.normalize_max
+            cfg.trace.normalize_max,
+            cfg.trace.mask_rt_peak_bounds
         );
     }
     let expected_xim = effective_xim_trace_cfg(&cfg.xim_trace, &meta.model);
@@ -996,15 +1006,17 @@ fn validate_preprocessed_manifest_for_xrun(
 ) -> Result<()> {
     if !same_trace_cfg(&manifest.trace, &cfg.trace) {
         bail!(
-            "preprocessed trace configuration mismatch: bundle has l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, config requests l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}",
+            "preprocessed trace configuration mismatch: bundle has l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, mask_rt_peak_bounds={}, config requests l={}, ms1_cmax={}, ms2_cmax={}, normalize_max={}, mask_rt_peak_bounds={}",
             manifest.trace.l,
             manifest.trace.ms1_cmax,
             manifest.trace.ms2_cmax,
             manifest.trace.normalize_max,
+            manifest.trace.mask_rt_peak_bounds,
             cfg.trace.l,
             cfg.trace.ms1_cmax,
             cfg.trace.ms2_cmax,
-            cfg.trace.normalize_max
+            cfg.trace.normalize_max,
+            cfg.trace.mask_rt_peak_bounds
         );
     }
     let expected_xim = effective_xim_trace_cfg(&cfg.xim_trace, &meta.model);
@@ -6448,6 +6460,7 @@ mod tests {
             ms1_cmax: model_cfg.ms1_cmax,
             ms2_cmax: model_cfg.ms2_cmax,
             normalize_max: false,
+            mask_rt_peak_bounds: false,
         };
         let feature_cols = vec!["f0".to_string(), "f1".to_string()];
         let rows = synthetic_rows();
@@ -6673,6 +6686,7 @@ mod tests {
             ms1_cmax: model_cfg.ms1_cmax,
             ms2_cmax: model_cfg.ms2_cmax,
             normalize_max: false,
+            mask_rt_peak_bounds: false,
         };
         let xim_cfg = effective_xim_trace_cfg(&None, &model_cfg).expect("xim config should exist");
 

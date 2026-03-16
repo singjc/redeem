@@ -106,6 +106,7 @@ fn infer_missing_xim_trace(cfg: &mut TopazPreprocessConfig) -> Result<()> {
                 ms1_cmax: xim.ms1_cmax,
                 ms2_cmax: xim.ms2_cmax,
                 normalize_max: true,
+                mask_rt_peak_bounds: false,
             });
         return Ok(());
     }
@@ -120,6 +121,7 @@ fn infer_missing_xim_trace(cfg: &mut TopazPreprocessConfig) -> Result<()> {
                     ms1_cmax: xim.ms1_cmax,
                     ms2_cmax: xim.ms2_cmax,
                     normalize_max: true,
+                    mask_rt_peak_bounds: false,
                 });
     }
     Ok(())

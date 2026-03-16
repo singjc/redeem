@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use candle_core::{Device, Tensor};
 
 use crate::building_blocks::bagging::make_bags_with_traces;
-use crate::building_blocks::trace_window::extract_trace_tensor_centered;
+use crate::building_blocks::trace_window::extract_trace_tensor_centered_with_bounds;
 use crate::infer::score_candidates;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::infer::{ScoreTableRow, build_score_table_from_rows};
@@ -179,6 +179,13 @@ pub struct TraceBuildConfig {
     pub ms2_cmax: usize,
     /// Whether to max-normalize each extracted channel after cropping/padding.
     pub normalize_max: bool,
+    /// Whether to zero XIC samples outside `FEATURE.LEFT_WIDTH` / `RIGHT_WIDTH`
+    /// after extracting the centered fixed-width window.
+    ///
+    /// This affects chromatogram extraction only. XIM boundary masking remains
+    /// controlled by the ion-mobility peak boundaries on the feature row.
+    #[serde(default)]
+    pub mask_rt_peak_bounds: bool,
 }
 
 /// Bag-level scoring output containing only the winner hidden vector.
@@ -1256,6 +1263,18 @@ fn valid_im_bounds(row: &FeatureRow) -> Option<(f32, f32)> {
     Some((left, right))
 }
 
+fn valid_rt_bounds(row: &FeatureRow) -> Option<(f32, f32)> {
+    let left = row.rt_left_width?;
+    let right = row.rt_right_width?;
+    if !left.is_finite() || !right.is_finite() {
+        return None;
+    }
+    if left < 0.0 || right < 0.0 || left >= right {
+        return None;
+    }
+    Some((left, right))
+}
+
 /// Build a fixed-size mobilogram tensor for one set of XIM channels.
 ///
 /// The output follows the same row-major `(Cmax, L)` layout used by XIC trace
@@ -1809,15 +1828,21 @@ pub fn build_trace_tensors_from_source(
         if let Some(run_map) = xic_by_run.get(&row.run_id) {
             if let Some(xic) = run_map.get(&row.precursor_id) {
                 let (ms1_series, ms2_series) = split_ms1_ms2(xic);
+                let rt_bounds = if cfg.mask_rt_peak_bounds {
+                    valid_rt_bounds(row)
+                } else {
+                    None
+                };
 
                 let mut offset = 0usize;
                 if cfg.ms1_cmax > 0 {
                     if ms1_series.is_empty() && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed) {
                         log::warn!("missing MS1 traces for at least one precursor; padding zeros");
                     }
-                    let t_ms1 = extract_trace_tensor_centered(
+                    let t_ms1 = extract_trace_tensor_centered_with_bounds(
                         &ms1_series,
                         row.exp_rt,
+                        rt_bounds,
                         cfg.l,
                         cfg.ms1_cmax,
                         cfg.normalize_max,
@@ -1825,9 +1850,10 @@ pub fn build_trace_tensors_from_source(
                     dst[offset..offset + cfg.ms1_cmax * cfg.l].copy_from_slice(&t_ms1);
                     offset += cfg.ms1_cmax * cfg.l;
                 }
-                let t_ms2 = extract_trace_tensor_centered(
+                let t_ms2 = extract_trace_tensor_centered_with_bounds(
                     &ms2_series,
                     row.exp_rt,
+                    rt_bounds,
                     cfg.l,
                     cfg.ms2_cmax,
                     cfg.normalize_max,
@@ -2816,15 +2842,21 @@ pub fn build_trace_tensors_from_parquet_cached(
         if let Some(run_map) = xic_by_run.get(&row.run_id) {
             if let Some(xic) = run_map.get(&row.precursor_id) {
                 let (ms1_series, ms2_series) = split_ms1_ms2(xic);
+                let rt_bounds = if cfg.mask_rt_peak_bounds {
+                    valid_rt_bounds(row)
+                } else {
+                    None
+                };
 
                 let mut offset = 0usize;
                 if cfg.ms1_cmax > 0 {
                     if ms1_series.is_empty() && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed) {
                         log::warn!("missing MS1 traces for at least one precursor; padding zeros");
                     }
-                    let t_ms1 = extract_trace_tensor_centered(
+                    let t_ms1 = extract_trace_tensor_centered_with_bounds(
                         &ms1_series,
                         row.exp_rt,
+                        rt_bounds,
                         cfg.l,
                         cfg.ms1_cmax,
                         cfg.normalize_max,
@@ -2832,9 +2864,10 @@ pub fn build_trace_tensors_from_parquet_cached(
                     dst[offset..offset + cfg.ms1_cmax * cfg.l].copy_from_slice(&t_ms1);
                     offset += cfg.ms1_cmax * cfg.l;
                 }
-                let t_ms2 = extract_trace_tensor_centered(
+                let t_ms2 = extract_trace_tensor_centered_with_bounds(
                     &ms2_series,
                     row.exp_rt,
+                    rt_bounds,
                     cfg.l,
                     cfg.ms2_cmax,
                     cfg.normalize_max,
@@ -3029,15 +3062,21 @@ pub fn build_trace_tensors_from_parquet_map_cached(
         if let Some(run_map) = xic_by_run.get(&row.run_id) {
             if let Some(xic) = run_map.get(&row.precursor_id) {
                 let (ms1_series, ms2_series) = split_ms1_ms2(xic);
+                let rt_bounds = if cfg.mask_rt_peak_bounds {
+                    valid_rt_bounds(row)
+                } else {
+                    None
+                };
 
                 let mut offset = 0usize;
                 if cfg.ms1_cmax > 0 {
                     if ms1_series.is_empty() && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed) {
                         log::warn!("missing MS1 traces for at least one precursor; padding zeros");
                     }
-                    let t_ms1 = extract_trace_tensor_centered(
+                    let t_ms1 = extract_trace_tensor_centered_with_bounds(
                         &ms1_series,
                         row.exp_rt,
+                        rt_bounds,
                         cfg.l,
                         cfg.ms1_cmax,
                         cfg.normalize_max,
@@ -3045,9 +3084,10 @@ pub fn build_trace_tensors_from_parquet_map_cached(
                     dst[offset..offset + cfg.ms1_cmax * cfg.l].copy_from_slice(&t_ms1);
                     offset += cfg.ms1_cmax * cfg.l;
                 }
-                let t_ms2 = extract_trace_tensor_centered(
+                let t_ms2 = extract_trace_tensor_centered_with_bounds(
                     &ms2_series,
                     row.exp_rt,
+                    rt_bounds,
                     cfg.l,
                     cfg.ms2_cmax,
                     cfg.normalize_max,
@@ -3156,12 +3196,36 @@ mod tests {
     use crate::building_blocks::trace_input::TraceInputMode;
     use crate::infer::{build_score_table_from_rows, score_candidates, write_score_tsv};
     use crate::io::osw::{OswLevel, OswReadConfig};
+    use crate::io::xic::{PrecursorXic, TransitionTrace, XicPoint, XicSource};
     use crate::io::xim::XimPoint;
     use crate::model::topaz::{TopazBagRanker, TopazConfig};
     use candle_core::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
     use std::collections::{HashMap, HashSet};
     use std::fs;
+
+    #[derive(Default)]
+    struct MockXicSource {
+        by_run: HashMap<u64, Vec<PrecursorXic>>,
+    }
+
+    impl XicSource for MockXicSource {
+        fn fetch_precursors(
+            &mut self,
+            run_id: u64,
+            precursor_ids: &[u64],
+        ) -> Result<Vec<PrecursorXic>> {
+            let Some(items) = self.by_run.get(&run_id) else {
+                return Ok(Vec::new());
+            };
+            let wanted: HashSet<u64> = precursor_ids.iter().copied().collect();
+            Ok(items
+                .iter()
+                .filter(|xic| wanted.contains(&xic.precursor_id))
+                .cloned()
+                .collect())
+        }
+    }
 
     #[derive(Default)]
     struct MockXimSource {
@@ -3251,6 +3315,7 @@ mod tests {
             ms1_cmax: cfg.ms1_cmax,
             ms2_cmax: cfg.ms2_cmax,
             normalize_max: false,
+            mask_rt_peak_bounds: false,
         };
         let fetch_cfg = XicFetchConfig {
             ms_levels: Some(vec![2]),
@@ -3357,6 +3422,7 @@ mod tests {
             ms1_cmax: 1,
             ms2_cmax: 1,
             normalize_max: false,
+            mask_rt_peak_bounds: false,
         };
         let x = build_xim_tensors_from_source(&rows, &mut source, &cfg)?;
         assert_eq!(x.len(), rows.len() * cfg.total_c() * cfg.l);
@@ -3364,6 +3430,54 @@ mod tests {
         assert!(row0.iter().any(|&v| v != 0.0));
         let row1 = &x[cfg.total_c() * cfg.l..];
         assert!(row1.iter().all(|&v| v == 0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_trace_tensors_from_source_masks_rt_peak_bounds() -> Result<()> {
+        let rows = vec![FeatureRow {
+            feature_id: 10,
+            precursor_id: 100,
+            run_id: 7,
+            group_id: "7_100".to_string(),
+            exp_rt: 5.0,
+            rt_left_width: Some(4.0),
+            rt_right_width: Some(6.0),
+            exp_im: None,
+            exp_im_left_width: None,
+            exp_im_right_width: None,
+            is_decoy: false,
+            features: vec![],
+        }];
+        let mut source = MockXicSource::default();
+        source.by_run.insert(
+            7,
+            vec![PrecursorXic {
+                precursor_id: 100,
+                transitions: vec![TransitionTrace {
+                    annotation: "y7".to_string(),
+                    ordinal: 0,
+                    ms_level: Some(2),
+                    points: (0..10)
+                        .map(|i| XicPoint {
+                            rt: i as f32,
+                            intensity: (i + 1) as f32,
+                        })
+                        .collect(),
+                }],
+            }],
+        );
+
+        let cfg = TraceBuildConfig {
+            l: 5,
+            ms1_cmax: 0,
+            ms2_cmax: 1,
+            normalize_max: false,
+            mask_rt_peak_bounds: true,
+        };
+        let x = build_trace_tensors_from_source(&rows, &mut source, &cfg)?;
+        assert_eq!(x, vec![0.0, 5.0, 6.0, 7.0, 0.0]);
+
         Ok(())
     }
 }

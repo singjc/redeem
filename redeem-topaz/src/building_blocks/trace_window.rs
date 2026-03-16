@@ -90,6 +90,19 @@ pub fn extract_trace_tensor_centered(
     cmax: usize,
     normalize_max: bool,
 ) -> Vec<f32> {
+    extract_trace_tensor_centered_with_bounds(series, center_rt, None, l, cmax, normalize_max)
+}
+
+/// Build a fixed-size `(Cmax, L)` trace tensor, optionally masking samples
+/// outside a valid RT interval.
+pub fn extract_trace_tensor_centered_with_bounds(
+    series: &[crate::io::xic::TransitionTrace],
+    center_rt: f32,
+    rt_bounds: Option<(f32, f32)>,
+    l: usize,
+    cmax: usize,
+    normalize_max: bool,
+) -> Vec<f32> {
     let mut out = vec![0f32; cmax * l];
     let take = cmax.min(series.len());
     for c in 0..take {
@@ -105,8 +118,27 @@ pub fn extract_trace_tensor_centered(
             inten.push(p.intensity);
         }
         let ci = nearest_index_sorted(&rt, center_rt) as isize;
-        let win = pad_or_crop_centered(&inten, ci, l);
-        out[c * l..(c + 1) * l].copy_from_slice(&win);
+        if let Some((left, right)) = rt_bounds {
+            let half = (l as isize) / 2;
+            let start = ci - half;
+            for dst_idx in 0..l {
+                let src_idx = start + dst_idx as isize;
+                if src_idx < 0 || src_idx >= inten.len() as isize {
+                    continue;
+                }
+                let src_idx = src_idx as usize;
+                let keep = {
+                    let rt_value = rt[src_idx];
+                    rt_value >= left && rt_value <= right
+                };
+                if keep {
+                    out[c * l + dst_idx] = inten[src_idx];
+                }
+            }
+        } else {
+            let win = pad_or_crop_centered(&inten, ci, l);
+            out[c * l..(c + 1) * l].copy_from_slice(&win);
+        }
     }
 
     if normalize_max {

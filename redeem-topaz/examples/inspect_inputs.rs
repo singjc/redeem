@@ -57,12 +57,14 @@ fn parse_args() -> Result<Args> {
         ms1_cmax: 0,
         ms2_cmax: 6,
         normalize_max: true,
+        mask_rt_peak_bounds: false,
     };
     let mut xim_trace = TraceBuildConfig {
         l: 258,
         ms1_cmax: 0,
         ms2_cmax: 6,
         normalize_max: true,
+        mask_rt_peak_bounds: false,
     };
 
     let args: Vec<String> = std::env::args().collect();
