@@ -33,6 +33,7 @@ Quick start
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import Optional
 
 from redeem_properties._lib import (  # noqa: F401  (re-exported)
@@ -50,6 +51,7 @@ from redeem_properties._lib import (  # noqa: F401  (re-exported)
 )
 
 __all__ = [
+    "__version__",
     "RTModel",
     "CCSModel",
     "MS2Model",
@@ -62,6 +64,19 @@ __all__ = [
     "match_fragment_mzs",
     "ccs_to_mobility",
 ]
+
+
+def _detect_version() -> str:
+    """Return the installed package version for redeem_properties."""
+    for dist_name in ("redeem_properties", "redeem-properties-py"):
+        try:
+            return version(dist_name)
+        except PackageNotFoundError:
+            continue
+    return "0+unknown"
+
+
+__version__ = _detect_version()
 
 
 # ---------------------------------------------------------------------------
