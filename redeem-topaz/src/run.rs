@@ -2159,13 +2159,61 @@ fn select_bag_winners(
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 struct BagTensorPack {
-    xb: candle_core::Tensor,
-    tb: candle_core::Tensor,
-    tb_aux: Option<candle_core::Tensor>,
-    mask: candle_core::Tensor,
-    y_bag: Vec<f32>,
-    bag_pid: Vec<String>,
-    b: usize,
+    bags: crate::building_blocks::bagging::Bags,
+    aux_bags: Option<crate::building_blocks::bagging::Bags>,
+    mask_u8: Vec<u8>,
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+impl BagTensorPack {
+    fn batch_tensors(
+        &self,
+        start: usize,
+        take: usize,
+        device: &Device,
+    ) -> Result<(
+        candle_core::Tensor,
+        candle_core::Tensor,
+        candle_core::Tensor,
+        Option<candle_core::Tensor>,
+    )> {
+        let take = take.min(self.bags.b.saturating_sub(start));
+
+        let x0 = start * self.bags.k * self.bags.d;
+        let x1 = x0 + take * self.bags.k * self.bags.d;
+        let xb = candle_core::Tensor::from_slice(
+            &self.bags.x_bag[x0..x1],
+            (take, self.bags.k, self.bags.d),
+            device,
+        )?;
+
+        let t0 = start * self.bags.k * self.bags.c * self.bags.l;
+        let t1 = t0 + take * self.bags.k * self.bags.c * self.bags.l;
+        let tb = candle_core::Tensor::from_slice(
+            &self.bags.t_bag[t0..t1],
+            (take, self.bags.k, self.bags.c, self.bags.l),
+            device,
+        )?;
+
+        let m0 = start * self.bags.k;
+        let m1 = m0 + take * self.bags.k;
+        let mask =
+            candle_core::Tensor::from_slice(&self.mask_u8[m0..m1], (take, self.bags.k), device)?;
+
+        let tb_aux = if let Some(aux_bags) = self.aux_bags.as_ref() {
+            let a0 = start * aux_bags.k * aux_bags.c * aux_bags.l;
+            let a1 = a0 + take * aux_bags.k * aux_bags.c * aux_bags.l;
+            Some(candle_core::Tensor::from_slice(
+                &aux_bags.t_bag[a0..a1],
+                (take, aux_bags.k, aux_bags.c, aux_bags.l),
+                device,
+            )?)
+        } else {
+            None
+        };
+
+        Ok((xb, tb, mask, tb_aux))
+    }
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -2482,7 +2530,7 @@ fn build_bag_tensor_pack_with_cols(
     c_total: usize,
     l: usize,
     bag_k: usize,
-    device: &Device,
+    _device: &Device,
     pre: Option<&crate::Preprocessor>,
 ) -> Result<BagTensorPack> {
     let n = rows.len();
@@ -2497,12 +2545,9 @@ fn build_bag_tensor_pack_with_cols(
     let bags = make_bags_with_traces(
         &x_feat, n, d, x_trace, c_total, l, &y_rows, &pid_rows, bag_k,
     );
-    let xb = candle_core::Tensor::from_vec(bags.x_bag, (bags.b, bags.k, bags.d), device)?;
-    let tb = candle_core::Tensor::from_vec(bags.t_bag, (bags.b, bags.k, bags.c, bags.l), device)?;
     let mask_u8: Vec<u8> = bags.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
-    let mask = candle_core::Tensor::from_vec(mask_u8.clone(), (bags.b, bags.k), device)?;
 
-    let tb_aux = if let Some((x_aux, aux_cfg)) = x_aux {
+    let aux_bags = if let Some((x_aux, aux_cfg)) = x_aux {
         let aux_bags = make_bags_with_traces(
             &x_feat,
             n,
@@ -2517,23 +2562,15 @@ fn build_bag_tensor_pack_with_cols(
         if aux_bags.b != bags.b || aux_bags.k != bags.k || aux_bags.bag_pid != bags.bag_pid {
             bail!("auxiliary bagging order mismatch between XIC and XIM inputs");
         }
-        Some(candle_core::Tensor::from_vec(
-            aux_bags.t_bag,
-            (aux_bags.b, aux_bags.k, aux_bags.c, aux_bags.l),
-            device,
-        )?)
+        Some(aux_bags)
     } else {
         None
     };
 
     Ok(BagTensorPack {
-        xb,
-        tb,
-        tb_aux,
-        mask,
-        y_bag: bags.y_bag,
-        bag_pid: bags.bag_pid,
-        b: bags.b,
+        bags,
+        aux_bags,
+        mask_u8,
     })
 }
 
@@ -2576,7 +2613,7 @@ fn score_bags_from_rows_with_cols_with_aux(
         pre,
     )?;
 
-    let b = pack.b;
+    let b = pack.bags.b;
     let mut bag_scores = Vec::with_capacity(b);
     let mut hidden: Vec<f32> = Vec::new();
     let mut hidden_dim = 0usize;
@@ -2585,14 +2622,7 @@ fn score_bags_from_rows_with_cols_with_aux(
     let mut i = 0usize;
     while i < b {
         let take = (b - i).min(bs);
-        let xb_i = pack.xb.narrow(0, i, take)?;
-        let tb_i = pack.tb.narrow(0, i, take)?;
-        let m_i = pack.mask.narrow(0, i, take)?;
-        let tb_aux_i = if let Some(tb_aux) = pack.tb_aux.as_ref() {
-            Some(tb_aux.narrow(0, i, take)?)
-        } else {
-            None
-        };
+        let (xb_i, tb_i, m_i, tb_aux_i) = pack.batch_tensors(i, take, device)?;
 
         let (_cand, bag, win) =
             model.forward_bags_with_hidden_aux(&xb_i, &tb_i, &m_i, tb_aux_i.as_ref())?;
@@ -2608,12 +2638,12 @@ fn score_bags_from_rows_with_cols_with_aux(
         i += take;
     }
 
-    let is_decoy: Vec<bool> = pack.y_bag.iter().map(|&y| y < 0.5).collect();
+    let is_decoy: Vec<bool> = pack.bags.y_bag.iter().map(|&y| y < 0.5).collect();
     Ok(crate::infer::BagScoreOutput {
         bag_score: bag_scores,
-        bag_y: pack.y_bag,
+        bag_y: pack.bags.y_bag,
         is_decoy,
-        bag_pid: pack.bag_pid,
+        bag_pid: pack.bags.bag_pid,
         winner_hidden: hidden,
         hidden_dim,
     })
@@ -2672,7 +2702,7 @@ fn score_bags_with_heads_from_rows_with_cols_with_aux(
         pre,
     )?;
 
-    let b = pack.b;
+    let b = pack.bags.b;
     let mut bag_scores = Vec::with_capacity(b);
     let mut hidden: Vec<f32> = Vec::new();
     let mut hidden_dim = 0usize;
@@ -2695,14 +2725,7 @@ fn score_bags_with_heads_from_rows_with_cols_with_aux(
     let mut i = 0usize;
     while i < b {
         let take = (b - i).min(bs);
-        let xb_i = pack.xb.narrow(0, i, take)?;
-        let tb_i = pack.tb.narrow(0, i, take)?;
-        let m_i = pack.mask.narrow(0, i, take)?;
-        let tb_aux_i = if let Some(tb_aux) = pack.tb_aux.as_ref() {
-            Some(tb_aux.narrow(0, i, take)?)
-        } else {
-            None
-        };
+        let (xb_i, tb_i, m_i, tb_aux_i) = pack.batch_tensors(i, take, device)?;
 
         let (_cand, bag, win, comps) =
             model.forward_bags_with_heads_aux(&xb_i, &tb_i, &m_i, tb_aux_i.as_ref())?;
@@ -2770,12 +2793,12 @@ fn score_bags_with_heads_from_rows_with_cols_with_aux(
         i += take;
     }
 
-    let is_decoy: Vec<bool> = pack.y_bag.iter().map(|&y| y < 0.5).collect();
+    let is_decoy: Vec<bool> = pack.bags.y_bag.iter().map(|&y| y < 0.5).collect();
     Ok(crate::infer::BagHeadOutput {
         bag_score: bag_scores,
-        bag_y: pack.y_bag,
+        bag_y: pack.bags.y_bag,
         is_decoy,
-        bag_pid: pack.bag_pid,
+        bag_pid: pack.bags.bag_pid,
         winner_hidden: hidden,
         hidden_dim,
         emb_ms2,
@@ -4236,6 +4259,13 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
     };
     let _history = trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
 
+    // Training batches keep the full bag tensors resident on the device via
+    // `narrow` views. Release them before any post-training scoring so
+    // validation summaries, diagnostics, and XRUN preparation do not stack
+    // extra inference allocations on top of the training set footprint.
+    drop(batches);
+    drop(val_batches);
+
     if !rows_va.is_empty() {
         let out = score_bags_from_rows_with_cols_with_aux(
             &trainer.model,
@@ -4360,7 +4390,20 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
             r: seq.r,
             din: seq.din,
         };
+        let ds_din = ds.din;
         let (tr_ds, va_ds) = split_train_val(&ds, cfg.val_frac, cfg.seed);
+        drop(ds);
+        drop(bag_data);
+        drop(rows_all);
+        drop(x_all);
+        drop(x_all_xim);
+        drop(rows_tr);
+        drop(rows_va);
+        drop(x_tr);
+        drop(x_va);
+        drop(x_tr_xim);
+        drop(x_va_xim);
+        drop(trainer);
         if tr_ds.p == 0 || va_ds.p == 0 {
             log::warn!(
                 "Skipping XRUN training because train/val sequence split is empty (train_p={}, val_p={})",
@@ -4368,7 +4411,7 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
                 va_ds.p
             );
         } else {
-            let mut xrun_trainer = XrunTrainer::new(cfg.xrun.train.clone(), ds.din, device)?;
+            let mut xrun_trainer = XrunTrainer::new(cfg.xrun.train.clone(), ds_din, device)?;
             let xrun_meta = xrun_trainer.train(&tr_ds, &va_ds, device)?;
             let xrun_ckpt_meta = XrunCheckpointMeta {
                 train: cfg.xrun.train.clone(),
@@ -4377,7 +4420,7 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
                     sort_by: cfg.xrun.sort_by.clone(),
                     batch_size: cfg.xrun.batch_size.max(1),
                 },
-                in_dim: ds.din,
+                in_dim: ds_din,
                 best_val: Some(xrun_meta.best_val),
                 version: 1,
             };
@@ -5244,6 +5287,13 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     };
     let _history = trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
 
+    // Training batches keep the full bag tensors resident on the device via
+    // `narrow` views. Release them before any post-training scoring so
+    // validation summaries, diagnostics, and XRUN preparation do not stack
+    // extra inference allocations on top of the training set footprint.
+    drop(batches);
+    drop(val_batches);
+
     if !rows_va.is_empty() {
         let out = score_bags_from_rows_with_cols_with_aux(
             &trainer.model,
@@ -5372,7 +5422,20 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
             r: seq.r,
             din: seq.din,
         };
+        let ds_din = ds.din;
         let (tr_ds, va_ds) = split_train_val(&ds, cfg.val_frac, cfg.seed);
+        drop(ds);
+        drop(bag_data);
+        drop(rows_all);
+        drop(x_all);
+        drop(x_all_xim);
+        drop(rows_tr);
+        drop(rows_va);
+        drop(x_tr);
+        drop(x_va);
+        drop(x_tr_xim);
+        drop(x_va_xim);
+        drop(trainer);
         if tr_ds.p == 0 || va_ds.p == 0 {
             log::warn!(
                 "Skipping XRUN training because train/val sequence split is empty (train_p={}, val_p={})",
@@ -5380,7 +5443,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
                 va_ds.p
             );
         } else {
-            let mut xrun_trainer = XrunTrainer::new(cfg.xrun.train.clone(), ds.din, &device)?;
+            let mut xrun_trainer = XrunTrainer::new(cfg.xrun.train.clone(), ds_din, &device)?;
             let xrun_meta = xrun_trainer.train(&tr_ds, &va_ds, &device)?;
             let xrun_ckpt_meta = XrunCheckpointMeta {
                 train: cfg.xrun.train.clone(),
@@ -5389,7 +5452,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
                     sort_by: cfg.xrun.sort_by.clone(),
                     batch_size: cfg.xrun.batch_size.max(1),
                 },
-                in_dim: ds.din,
+                in_dim: ds_din,
                 best_val: Some(xrun_meta.best_val),
                 version: 1,
             };
