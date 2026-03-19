@@ -2004,13 +2004,14 @@ pub fn build_xim_tensors_from_parquet_cached(
     for row in rows {
         by_run.entry(row.run_id).or_default().insert(row.feature_id);
     }
+    // Do not shard parquet fetches here. The current parquet readers scan the
+    // file row-by-row, so splitting one run into many smaller ID batches would
+    // multiply full-file scans instead of improving locality.
     #[cfg(feature = "rayon")]
-    let items = shard_fetch_tasks(
-        by_run
-            .into_iter()
-            .map(|(run_id, feature_ids)| (run_id, feature_ids, ()))
-            .collect(),
-    );
+    let items: Vec<(u64, HashSet<u64>, ())> = by_run
+        .into_iter()
+        .map(|(run_id, feature_ids)| (run_id, feature_ids, ()))
+        .collect();
     #[cfg(not(feature = "rayon"))]
     let items: Vec<(u64, HashSet<u64>, ())> = by_run
         .into_iter()
@@ -2137,9 +2138,93 @@ pub fn build_xim_tensors_from_parquet_map_cached(
                 .map(|path| (run_id, feature_ids, path))
         })
         .collect();
-    #[cfg(feature = "rayon")]
-    let items = shard_fetch_tasks(items);
 
+    // Fast path when caches are disabled: go straight to parquet fetches
+    // instead of paying per-feature cache-probe overhead that cannot hit.
+    if !cache.is_enabled() && disk.is_none() {
+        #[cfg(feature = "rayon")]
+        let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
+            .into_par_iter()
+            .map(|(run_id, feature_ids, path)| {
+                let mut reader = crate::io::xim_parquet::XimParquetReader::new(&path);
+                if let Some(levels) = &fetch_cfg.ms_levels {
+                    reader.filter_ms_level(levels.clone());
+                }
+                if let Some(types) = &fetch_cfg.mobilogram_types {
+                    reader.filter_mobilogram_type(types.iter().map(|s| s.as_str()));
+                }
+                if let Some(flag) = fetch_cfg.detecting_transition {
+                    reader.filter_detecting_transition(flag);
+                }
+                if let Some(flag) = fetch_cfg.decoy {
+                    reader.filter_decoy(flag);
+                }
+                reader.filter_feature_id(feature_ids.iter().copied());
+                let fetched = reader.fetch()?;
+                let mut map = HashMap::with_capacity(fetched.len());
+                for xim in fetched {
+                    map.insert(xim.feature_id, xim);
+                }
+                Ok((run_id, map))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(not(feature = "rayon"))]
+        let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
+            .into_iter()
+            .map(|(run_id, feature_ids, path)| {
+                let mut reader = crate::io::xim_parquet::XimParquetReader::new(&path);
+                if let Some(levels) = &fetch_cfg.ms_levels {
+                    reader.filter_ms_level(levels.clone());
+                }
+                if let Some(types) = &fetch_cfg.mobilogram_types {
+                    reader.filter_mobilogram_type(types.iter().map(|s| s.as_str()));
+                }
+                if let Some(flag) = fetch_cfg.detecting_transition {
+                    reader.filter_detecting_transition(flag);
+                }
+                if let Some(flag) = fetch_cfg.decoy {
+                    reader.filter_decoy(flag);
+                }
+                reader.filter_feature_id(feature_ids.iter().copied());
+                let fetched = reader.fetch()?;
+                let mut map = HashMap::with_capacity(fetched.len());
+                for xim in fetched {
+                    map.insert(xim.feature_id, xim);
+                }
+                Ok((run_id, map))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut xim_by_run: HashMap<u64, HashMap<u64, FeatureXim>> = HashMap::new();
+        for (run_id, map) in fetched_all {
+            xim_by_run.entry(run_id).or_default().extend(map);
+        }
+
+        let row_len = c_total * cfg.l;
+        let fill_row = |row: &FeatureRow, dst: &mut [f32]| {
+            if let Some(run_map) = xim_by_run.get(&row.run_id) {
+                if let Some(xim) = run_map.get(&row.feature_id) {
+                    fill_xim_row_from_feature(row, xim, cfg, dst);
+                }
+            }
+        };
+
+        #[cfg(feature = "rayon")]
+        {
+            out.par_chunks_mut(row_len)
+                .zip(rows.par_iter())
+                .for_each(|(dst, row)| fill_row(row, dst));
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            for (i, row) in rows.iter().enumerate() {
+                let dst = &mut out[i * row_len..(i + 1) * row_len];
+                fill_row(row, dst);
+            }
+        }
+
+        return Ok(out);
+    }
     #[cfg(feature = "rayon")]
     let fetched_all: Vec<(u64, HashMap<u64, FeatureXim>)> = items
         .into_par_iter()
@@ -2798,13 +2883,14 @@ pub fn build_trace_tensors_from_parquet_cached(
             .insert(row.precursor_id);
     }
 
+    // Do not shard parquet fetches here. The current parquet readers scan the
+    // file row-by-row, so splitting one run into many smaller ID batches would
+    // multiply full-file scans instead of improving locality.
     #[cfg(feature = "rayon")]
-    let items = shard_fetch_tasks(
-        by_run
-            .into_iter()
-            .map(|(run_id, prec_set)| (run_id, prec_set, ()))
-            .collect(),
-    );
+    let items: Vec<(u64, HashSet<u64>, ())> = by_run
+        .into_iter()
+        .map(|(run_id, prec_set)| (run_id, prec_set, ()))
+        .collect();
     #[cfg(not(feature = "rayon"))]
     let items: Vec<(u64, HashSet<u64>, ())> = by_run
         .into_iter()
@@ -2967,8 +3053,122 @@ pub fn build_trace_tensors_from_parquet_map_cached(
                 .map(|path| (run_id, prec_set, path))
         })
         .collect();
-    #[cfg(feature = "rayon")]
-    let items = shard_fetch_tasks(items);
+
+    // Fast path when caches are disabled: go straight to parquet fetches
+    // instead of paying per-precursor cache-probe overhead that cannot hit.
+    if !cache.is_enabled() && disk.is_none() {
+        #[cfg(feature = "rayon")]
+        let fetched_all: Vec<(u64, HashMap<u64, PrecursorXic>)> = items
+            .into_par_iter()
+            .map(|(run_id, prec_set, path)| {
+                let mut reader = crate::io::xic_parquet::XicParquetReader::new(&path);
+                if let Some(levels) = &fetch_cfg.ms_levels {
+                    reader.filter_ms_level(levels.clone());
+                }
+                if let Some(flag) = fetch_cfg.detecting_transition {
+                    reader.filter_detecting_transition(flag);
+                }
+                if let Some(flag) = fetch_cfg.decoy {
+                    reader.filter_decoy(flag);
+                }
+                reader.filter_precursor_id(prec_set.iter().copied());
+                let fetched = reader.fetch()?;
+                let mut map = HashMap::with_capacity(fetched.len());
+                for xic in fetched {
+                    map.insert(xic.precursor_id, xic);
+                }
+                Ok((run_id, map))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(not(feature = "rayon"))]
+        let fetched_all: Vec<(u64, HashMap<u64, PrecursorXic>)> = items
+            .into_iter()
+            .map(|(run_id, prec_set, path)| {
+                let mut reader = crate::io::xic_parquet::XicParquetReader::new(&path);
+                if let Some(levels) = &fetch_cfg.ms_levels {
+                    reader.filter_ms_level(levels.clone());
+                }
+                if let Some(flag) = fetch_cfg.detecting_transition {
+                    reader.filter_detecting_transition(flag);
+                }
+                if let Some(flag) = fetch_cfg.decoy {
+                    reader.filter_decoy(flag);
+                }
+                reader.filter_precursor_id(prec_set.iter().copied());
+                let fetched = reader.fetch()?;
+                let mut map = HashMap::with_capacity(fetched.len());
+                for xic in fetched {
+                    map.insert(xic.precursor_id, xic);
+                }
+                Ok((run_id, map))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut xic_by_run: HashMap<u64, HashMap<u64, PrecursorXic>> = HashMap::new();
+        for (run_id, map) in fetched_all {
+            xic_by_run.entry(run_id).or_default().extend(map);
+        }
+
+        let row_len = c_total * cfg.l;
+        let fill_row = |row: &FeatureRow, dst: &mut [f32]| {
+            if let Some(run_map) = xic_by_run.get(&row.run_id) {
+                if let Some(xic) = run_map.get(&row.precursor_id) {
+                    let (ms1_series, ms2_series) = split_ms1_ms2(xic);
+                    let rt_bounds = if cfg.mask_rt_peak_bounds {
+                        valid_rt_bounds(row)
+                    } else {
+                        None
+                    };
+
+                    let mut offset = 0usize;
+                    if cfg.ms1_cmax > 0 {
+                        if ms1_series.is_empty()
+                            && !WARNED_MISSING_MS1.swap(true, Ordering::Relaxed)
+                        {
+                            log::warn!(
+                                "missing MS1 traces for at least one precursor; padding zeros"
+                            );
+                        }
+                        let t_ms1 = extract_trace_tensor_centered_with_bounds(
+                            &ms1_series,
+                            row.exp_rt,
+                            rt_bounds,
+                            cfg.l,
+                            cfg.ms1_cmax,
+                            cfg.normalize_max,
+                        );
+                        dst[offset..offset + cfg.ms1_cmax * cfg.l].copy_from_slice(&t_ms1);
+                        offset += cfg.ms1_cmax * cfg.l;
+                    }
+                    let t_ms2 = extract_trace_tensor_centered_with_bounds(
+                        &ms2_series,
+                        row.exp_rt,
+                        rt_bounds,
+                        cfg.l,
+                        cfg.ms2_cmax,
+                        cfg.normalize_max,
+                    );
+                    dst[offset..offset + cfg.ms2_cmax * cfg.l].copy_from_slice(&t_ms2);
+                }
+            }
+        };
+
+        #[cfg(feature = "rayon")]
+        {
+            out.par_chunks_mut(row_len)
+                .zip(rows.par_iter())
+                .for_each(|(dst, row)| fill_row(row, dst));
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            for (i, row) in rows.iter().enumerate() {
+                let dst = &mut out[i * row_len..(i + 1) * row_len];
+                fill_row(row, dst);
+            }
+        }
+
+        return Ok(out);
+    }
     #[cfg(feature = "rayon")]
     let disk_owned = disk.cloned();
     #[cfg(feature = "rayon")]
