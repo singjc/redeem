@@ -190,9 +190,7 @@ pub fn xrun_predict_deltas_for_bags(
     let p = seq.p;
     let r = seq.r;
     let din = seq.din;
-    let x = Tensor::from_vec(seq.xseq.clone(), (p, r, din), device)?;
     let mask_u8: Vec<u8> = seq.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
-    let m = Tensor::from_vec(mask_u8, (p, r), device)?;
 
     let mut delta_all = vec![0f32; p * r];
     let mut ent = vec![0f32; p];
@@ -201,8 +199,13 @@ pub fn xrun_predict_deltas_for_bags(
     let mut s = 0usize;
     while s < p {
         let take = (p - s).min(bs);
-        let xb = x.narrow(0, s, take)?;
-        let mb = m.narrow(0, s, take)?;
+        let x0 = s * r * din;
+        let x1 = x0 + take * r * din;
+        let xb = Tensor::from_slice(&seq.xseq[x0..x1], (take, r, din), device)?;
+
+        let m0 = s * r;
+        let m1 = m0 + take * r;
+        let mb = Tensor::from_slice(&mask_u8[m0..m1], (take, r), device)?;
         let (dlt, attn) = calibrator.forward_masked(&xb, &mb)?;
         let d_vec = dlt.to_vec2::<f32>()?;
         let a_vec = attn.to_vec2::<f32>()?;

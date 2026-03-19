@@ -181,14 +181,30 @@ impl XrunProgressLogger {
 }
 
 impl XrunDataset {
-    /// Materialize the dataset as Candle tensors on `device`.
+    /// Materialize a precursor-major minibatch as Candle tensors on `device`.
     ///
-    /// Returns `(x, mask, y)` with shapes `(P, R, D_in)`, `(P, R)`, and `(P,)`.
-    pub fn to_tensors(&self, device: &Device) -> Result<(Tensor, Tensor, Tensor)> {
-        let x = Tensor::from_vec(self.xseq.clone(), (self.p, self.r, self.din), device)?;
-        let mask_u8: Vec<u8> = self.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
-        let m = Tensor::from_vec(mask_u8, (self.p, self.r), device)?;
-        let y = Tensor::from_vec(self.y.clone(), (self.p,), device)?;
+    /// Returns `(x, mask, y)` with shapes `(take, R, D_in)`, `(take, R)`, and
+    /// `(take,)`.
+    pub fn batch_to_tensors(
+        &self,
+        start: usize,
+        take: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let take = take.min(self.p.saturating_sub(start));
+        let x0 = start * self.r * self.din;
+        let x1 = x0 + take * self.r * self.din;
+        let x = Tensor::from_slice(&self.xseq[x0..x1], (take, self.r, self.din), device)?;
+
+        let m0 = start * self.r;
+        let m1 = m0 + take * self.r;
+        let mask_u8: Vec<u8> = self.mask[m0..m1]
+            .iter()
+            .map(|&v| if v { 1 } else { 0 })
+            .collect();
+        let m = Tensor::from_vec(mask_u8, (take, self.r), device)?;
+
+        let y = Tensor::from_slice(&self.y[start..start + take], (take,), device)?;
         Ok((x, m, y))
     }
 }
@@ -432,9 +448,6 @@ impl XrunTrainer {
         val: &XrunDataset,
         device: &Device,
     ) -> Result<XrunTrainMeta> {
-        let (x_tr, m_tr, y_tr) = train.to_tensors(device)?;
-        let (x_va, m_va, y_va) = val.to_tensors(device)?;
-
         let n_pos = train.y.iter().filter(|&&v| v > 0.5).count() as f32;
         let n_neg = (train.y.len() as f32) - n_pos;
         let pos_weight = if n_pos > 0.0 { n_neg / n_pos } else { 1.0 };
@@ -452,9 +465,7 @@ impl XrunTrainer {
             let mut s = 0usize;
             while s < train.p {
                 let take = (train.p - s).min(self.cfg.batch_size.max(1));
-                let xb = x_tr.narrow(0, s, take)?;
-                let mb = m_tr.narrow(0, s, take)?;
-                let yb = y_tr.narrow(0, s, take)?;
+                let (xb, mb, yb) = train.batch_to_tensors(s, take, device)?;
 
                 let (delta, attn) = self.model.forward_masked(&xb, &mb)?;
                 let base = xb.narrow(2, 0, 1)?.squeeze(2)?;
@@ -519,9 +530,7 @@ impl XrunTrainer {
             let mut s = 0usize;
             while s < val.p {
                 let take = (val.p - s).min(self.cfg.batch_size.max(1));
-                let xb = x_va.narrow(0, s, take)?;
-                let mb = m_va.narrow(0, s, take)?;
-                let yb = y_va.narrow(0, s, take)?;
+                let (xb, mb, yb) = val.batch_to_tensors(s, take, device)?;
 
                 let (delta, attn) = self.model.forward_masked(&xb, &mb)?;
                 let base = xb.narrow(2, 0, 1)?.squeeze(2)?;
