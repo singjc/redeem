@@ -1563,7 +1563,7 @@ fn prefetch_modalities_for_inference(
     xim_cache_opt: Option<&SharedXimCache>,
     xim_disk_cache: Option<&XimDiskCache>,
     apply_trace_filter: bool,
-    xim_decode_issues: &mut Vec<crate::io::xim_parquet::XimDecodeIssue>,
+    xim_decode_issues: &mut crate::io::xim_parquet::XimDecodeIssueSummary,
 ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
     let started = Instant::now();
     log::info!(
@@ -1719,8 +1719,37 @@ fn derive_stream_queue_depth(producer_workers: usize) -> usize {
 /// helpers, which already use Rayon internally. A moderate number of outer
 /// workers is enough to keep the global Rayon pool fed while avoiding
 /// excessive memory growth from too many in-flight chunks. XIM-heavy
-/// preprocessing is capped more aggressively because each in-flight work unit
-/// carries substantially larger tensors than XIC-only preprocessing.
+/// preprocessing is still capped more aggressively because each in-flight work
+/// unit carries substantially larger tensors than XIC-only preprocessing.
+///
+/// The XIM parquet path currently parallelizes mostly across runs, which
+/// typically means only a handful of Rayon tasks per grouped work unit. On
+/// wide CPU nodes that leaves substantial headroom unless the outer producer
+/// pool is allowed to scale with available cores.
+fn derive_preprocess_producer_workers_for_available(
+    total_chunks: usize,
+    has_xim: bool,
+    chunk_row_count: usize,
+    available: usize,
+) -> usize {
+    let available = available.max(1);
+    let max_workers = if has_xim {
+        if chunk_row_count >= 100_000 {
+            available.div_ceil(8).clamp(2, 6)
+        } else if chunk_row_count >= 50_000 {
+            available.div_ceil(6).clamp(3, 8)
+        } else if chunk_row_count >= 25_000 {
+            available.div_ceil(4).clamp(4, 12)
+        } else {
+            available.div_ceil(3).clamp(6, 16)
+        }
+    } else {
+        available.div_ceil(2).clamp(4, 16)
+    };
+    total_chunks.max(1).min(available).clamp(1, max_workers)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn derive_preprocess_producer_workers(
     total_chunks: usize,
     has_xim: bool,
@@ -1729,18 +1758,12 @@ fn derive_preprocess_producer_workers(
     let available = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let max_workers = if has_xim {
-        if chunk_row_count >= 50_000 {
-            3
-        } else if chunk_row_count >= 25_000 {
-            4
-        } else {
-            6
-        }
-    } else {
-        8
-    };
-    available.min(total_chunks.max(1)).clamp(1, max_workers)
+    derive_preprocess_producer_workers_for_available(
+        total_chunks,
+        has_xim,
+        chunk_row_count,
+        available,
+    )
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -1863,7 +1886,7 @@ fn score_rows_streaming_inference(
         ms1_nonzero_rows: 0,
         ms2_nonzero_rows: 0,
     };
-    let mut xim_decode_issues = Vec::new();
+    let mut xim_decode_issues = crate::io::xim_parquet::XimDecodeIssueSummary::default();
     let mut decode_time = Duration::ZERO;
     let mut score_time = Duration::ZERO;
     let mut processed_units = 0usize;
@@ -1932,7 +1955,7 @@ fn score_rows_streaming_inference(
                         rows_override,
                         x_trace,
                         x_xim,
-                        xim_decode_issues: crate::io::xim_parquet::take_decode_issues(),
+                        xim_decode_issues: crate::io::xim_parquet::take_decode_issue_summary(),
                         decode_time: decode_started.elapsed(),
                     };
                     tx_producer
@@ -1966,7 +1989,7 @@ fn score_rows_streaming_inference(
             }
 
             while let Some(payload) = pending.remove(&next_expected) {
-                xim_decode_issues.extend(payload.xim_decode_issues);
+                xim_decode_issues.merge(payload.xim_decode_issues);
                 decode_time += payload.decode_time;
                 processed_units += 1;
                 let row_slice: &[FeatureRow] =
@@ -2028,7 +2051,7 @@ fn score_rows_streaming_inference(
         }
 
         while let Some(payload) = pending.remove(&next_expected) {
-            xim_decode_issues.extend(payload.xim_decode_issues);
+            xim_decode_issues.merge(payload.xim_decode_issues);
             decode_time += payload.decode_time;
             processed_units += 1;
             let row_slice: &[FeatureRow] =
@@ -2230,7 +2253,7 @@ struct InferenceChunkPayload {
     rows_override: Option<Vec<FeatureRow>>,
     x_trace: Vec<f32>,
     x_xim: Option<Vec<f32>>,
-    xim_decode_issues: Vec<crate::io::xim_parquet::XimDecodeIssue>,
+    xim_decode_issues: crate::io::xim_parquet::XimDecodeIssueSummary,
     decode_time: Duration,
 }
 
@@ -2240,7 +2263,7 @@ struct StreamingInferenceOutput {
     scores: Vec<f32>,
     rows_filtered: Option<Vec<FeatureRow>>,
     summary: crate::infer::diagnostics::TraceSummary,
-    xim_decode_issues: Vec<crate::io::xim_parquet::XimDecodeIssue>,
+    xim_decode_issues: crate::io::xim_parquet::XimDecodeIssueSummary,
     decode_time: Duration,
     score_time: Duration,
     work_unit_size: usize,
@@ -2271,7 +2294,7 @@ struct PreprocessChunkPayload {
     rows: Vec<FeatureRow>,
     x_trace: Vec<f32>,
     x_xim: Option<Vec<f32>>,
-    xim_decode_issues: Vec<crate::io::xim_parquet::XimDecodeIssue>,
+    xim_decode_issues: crate::io::xim_parquet::XimDecodeIssueSummary,
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -2857,8 +2880,8 @@ fn build_xrun_bag_data_from_rows_with_cols_with_aux(
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn drain_xim_decode_issues(accum: &mut Vec<crate::io::xim_parquet::XimDecodeIssue>) {
-    accum.extend(crate::io::xim_parquet::take_decode_issues());
+fn drain_xim_decode_issues(accum: &mut crate::io::xim_parquet::XimDecodeIssueSummary) {
+    accum.merge(crate::io::xim_parquet::take_decode_issue_summary());
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -2901,16 +2924,15 @@ fn write_xim_decode_issue_tsv(
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn report_xim_decode_issues(
     stage: &str,
-    issues: &[crate::io::xim_parquet::XimDecodeIssue],
+    issues: &crate::io::xim_parquet::XimDecodeIssueSummary,
     out_path: &Path,
 ) -> Result<()> {
     if issues.is_empty() {
         return Ok(());
     }
 
-    let mut uniq = issues.to_vec();
+    let mut uniq: Vec<_> = issues.unique.iter().cloned().collect();
     uniq.sort();
-    uniq.dedup();
 
     let mut files = HashSet::new();
     let mut features = HashSet::new();
@@ -2920,15 +2942,28 @@ fn report_xim_decode_issues(
     }
 
     write_xim_decode_issue_tsv(out_path, &uniq)?;
-    log::warn!(
-        "Skipped {} malformed XIM traces during {} loading ({} unique traces across {} features from {} files). Wrote diagnostics to {:?}",
-        issues.len(),
-        stage,
-        uniq.len(),
-        features.len(),
-        files.len(),
-        out_path
-    );
+    if issues.omitted_rows > 0 {
+        log::warn!(
+            "Skipped {} malformed XIM traces during {} loading (captured {} diagnostic rows across {} features from {} files; omitted {} additional rows from diagnostics). Wrote diagnostics to {:?}",
+            issues.total,
+            stage,
+            uniq.len(),
+            features.len(),
+            files.len(),
+            issues.omitted_rows,
+            out_path
+        );
+    } else {
+        log::warn!(
+            "Skipped {} malformed XIM traces during {} loading ({} diagnostic rows across {} features from {} files). Wrote diagnostics to {:?}",
+            issues.total,
+            stage,
+            uniq.len(),
+            features.len(),
+            files.len(),
+            out_path
+        );
+    }
     Ok(())
 }
 
@@ -3383,7 +3418,7 @@ fn preprocess_chunk_payload(
             rows: rows_chunk,
             x_trace,
             x_xim,
-            xim_decode_issues: crate::io::xim_parquet::take_decode_issues(),
+            xim_decode_issues: crate::io::xim_parquet::take_decode_issue_summary(),
         },
         stats,
     ))
@@ -3471,7 +3506,7 @@ fn preprocess_chunk_group_payloads(
         xim_disk_cache,
     )?;
     let xim_elapsed = xim_started.elapsed();
-    let xim_decode_issues = crate::io::xim_parquet::take_decode_issues();
+    let xim_decode_issues = crate::io::xim_parquet::take_decode_issue_summary();
 
     let trace_row_span = cfg.trace.total_c() * cfg.trace.l;
     let xim_row_span = cfg
@@ -3496,8 +3531,8 @@ fn preprocess_chunk_group_payloads(
             xim_decode_issues: if payload_idx == 0 {
                 xim_decode_issues.clone()
             } else {
-                Vec::new()
-            },
+                    crate::io::xim_parquet::XimDecodeIssueSummary::default()
+                },
         });
     }
 
@@ -3524,7 +3559,7 @@ fn preprocess_chunk_group_payloads(
 /// Materialize OSW rows plus fixed-width XIC/XIM tensors into a reusable bundle.
 pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> {
     crate::io::xim_parquet::clear_decode_issues();
-    let mut xim_decode_issues = Vec::new();
+    let mut xim_decode_issues = crate::io::xim_parquet::XimDecodeIssueSummary::default();
 
     let table = read_feature_rows(&cfg.osw_path, &cfg.osw)?;
     let mut rows = table.rows;
@@ -3765,7 +3800,7 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
                     stage_stats,
                 } = group;
                 for payload in payloads {
-                    xim_decode_issues.extend(payload.xim_decode_issues);
+                    xim_decode_issues.merge(payload.xim_decode_issues);
                     processed_source_rows += payload.source_rows;
                     if !payload.rows.is_empty() {
                         writer.write_chunk(
@@ -3792,7 +3827,7 @@ pub fn run_preprocess(cfg: &PreprocessRunConfig) -> Result<PreprocessRunOutput> 
                 stage_stats,
             } = group;
             for payload in payloads {
-                xim_decode_issues.extend(payload.xim_decode_issues);
+                xim_decode_issues.merge(payload.xim_decode_issues);
                 processed_source_rows += payload.source_rows;
                 if !payload.rows.is_empty() {
                     writer.write_chunk(
@@ -3996,7 +4031,8 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
             model_cfg.feat_dim = selected_cols.len();
         }
     }
-    validate_preprocessed_manifest_for_training(&manifest, cfg, &model_cfg, &selected_cols)?;
+    validate_preprocessed_manifest_for_training(&manifest, cfg, &model_cfg, &selected_cols)
+        .with_context(|| format!("while validating preprocessed bundle {:?}", bundle_path))?;
     let xim_trace_cfg = effective_xim_trace_cfg(&cfg.xim_trace, &model_cfg);
 
     log::info!(
@@ -4456,7 +4492,8 @@ fn run_inference_with_preprocessed(
 
     let reader = PreprocessedBundleReader::open(bundle_path)?;
     let manifest = reader.manifest().clone();
-    validate_preprocessed_manifest_for_inference(&manifest, cfg, &meta)?;
+    validate_preprocessed_manifest_for_inference(&manifest, cfg, &meta)
+        .with_context(|| format!("while validating preprocessed bundle {:?}", bundle_path))?;
     log::info!(
         "Loading preprocessed TOPAZ bundle {:?} (rows={} chunks={})",
         bundle_path,
@@ -4760,7 +4797,7 @@ fn run_inference_with_preprocessed(
 fn prepare_xrun_dataset_from_preprocessed(
     cfg: &XrunSweepConfig,
     device: &Device,
-) -> Result<(XrunDataset, Vec<crate::io::xim_parquet::XimDecodeIssue>)> {
+) -> Result<(XrunDataset, crate::io::xim_parquet::XimDecodeIssueSummary)> {
     let bundle_path = cfg
         .preprocessed_path
         .as_ref()
@@ -4775,7 +4812,8 @@ fn prepare_xrun_dataset_from_preprocessed(
 
     let reader = PreprocessedBundleReader::open(bundle_path)?;
     let manifest = reader.manifest().clone();
-    validate_preprocessed_manifest_for_xrun(&manifest, cfg, &meta)?;
+    validate_preprocessed_manifest_for_xrun(&manifest, cfg, &meta)
+        .with_context(|| format!("while validating preprocessed bundle {:?}", bundle_path))?;
     log::info!(
         "Loading preprocessed TOPAZ bundle {:?} for XRUN (rows={} chunks={})",
         bundle_path,
@@ -4854,7 +4892,7 @@ fn prepare_xrun_dataset_from_preprocessed(
             r: seq.r,
             din: seq.din,
         },
-        Vec::new(),
+        crate::io::xim_parquet::XimDecodeIssueSummary::default(),
     ))
 }
 
@@ -4866,7 +4904,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         return run_training_with_preprocessed(cfg, &device);
     }
     crate::io::xim_parquet::clear_decode_issues();
-    let mut xim_decode_issues = Vec::new();
+    let mut xim_decode_issues = crate::io::xim_parquet::XimDecodeIssueSummary::default();
     let init_base: Option<PathBuf> = cfg
         .init_checkpoint
         .as_ref()
@@ -5490,7 +5528,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         return run_inference_with_preprocessed(cfg, &device);
     }
     crate::io::xim_parquet::clear_decode_issues();
-    let mut xim_decode_issues = Vec::new();
+    let mut xim_decode_issues = crate::io::xim_parquet::XimDecodeIssueSummary::default();
 
     let base = checkpoint_base(&cfg.checkpoint);
     let meta = read_checkpoint_meta(&base)?;
@@ -5738,7 +5776,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             sum_ms1 = streamed.summary.ms1_nonzero_rows;
             sum_ms2 = streamed.summary.ms2_nonzero_rows;
         }
-        xim_decode_issues.extend(streamed.xim_decode_issues);
+        xim_decode_issues.merge(streamed.xim_decode_issues);
     } else {
         let mut progress = InferenceProgressLogger::new("chunked", rows.len(), chunk_size);
         let mut processed_rows = 0usize;
@@ -6112,12 +6150,12 @@ fn write_xrun_summary_tsv(path: &Path, rows: &[XrunSweepRow]) -> Result<()> {
 fn prepare_xrun_dataset_from_checkpoint(
     cfg: &XrunSweepConfig,
     device: &Device,
-) -> Result<(XrunDataset, Vec<crate::io::xim_parquet::XimDecodeIssue>)> {
+) -> Result<(XrunDataset, crate::io::xim_parquet::XimDecodeIssueSummary)> {
     if cfg.preprocessed_path.is_some() {
         return prepare_xrun_dataset_from_preprocessed(cfg, device);
     }
     crate::io::xim_parquet::clear_decode_issues();
-    let mut xim_decode_issues = Vec::new();
+    let mut xim_decode_issues = crate::io::xim_parquet::XimDecodeIssueSummary::default();
 
     let base = checkpoint_base(&cfg.checkpoint);
     let meta = read_checkpoint_meta(&base)?;
@@ -6452,6 +6490,34 @@ mod tests {
         );
         assert!(lines[1].contains("run1.xim\t7\t42\ty7\tMOBILITY_DATA\t5\tdata too small"));
         Ok(())
+    }
+
+    #[test]
+    fn test_preprocess_worker_heuristic_scales_xim_runs_on_wide_nodes() {
+        assert_eq!(
+            derive_preprocess_producer_workers_for_available(154, true, 25_000, 36),
+            9
+        );
+        assert_eq!(
+            derive_preprocess_producer_workers_for_available(154, true, 50_000, 36),
+            6
+        );
+    }
+
+    #[test]
+    fn test_preprocess_worker_heuristic_respects_available_and_chunk_limits() {
+        assert_eq!(
+            derive_preprocess_producer_workers_for_available(3, true, 25_000, 36),
+            3
+        );
+        assert_eq!(
+            derive_preprocess_producer_workers_for_available(154, true, 25_000, 8),
+            4
+        );
+        assert_eq!(
+            derive_preprocess_producer_workers_for_available(154, false, 25_000, 36),
+            16
+        );
     }
 
     fn synthetic_rows() -> Vec<FeatureRow> {
