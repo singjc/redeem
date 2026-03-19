@@ -28,6 +28,9 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 #[cfg(feature = "parquet")]
 use parquet::record::{Row, RowAccessor};
 
+#[cfg(feature = "parquet")]
+const MAX_XIM_DECODE_ISSUE_SAMPLES: usize = 8192;
+
 /// Diagnostic record emitted when one mobilogram row cannot be decoded.
 ///
 /// Each item corresponds to one parquet row that was skipped during loading.
@@ -52,17 +55,65 @@ pub struct XimDecodeIssue {
 }
 
 #[cfg(feature = "parquet")]
-static XIM_DECODE_ISSUES: OnceLock<Mutex<Vec<XimDecodeIssue>>> = OnceLock::new();
+#[derive(Debug, Default)]
+struct XimDecodeIssueAccumulator {
+    total: usize,
+    unique: HashSet<XimDecodeIssue>,
+    omitted_rows: usize,
+}
+
+/// Counted summary of XIM decode issues seen so far.
+///
+/// `unique` retains only a bounded sample of representative issue rows to keep
+/// diagnostics from growing without bound on heavily malformed inputs.
+#[derive(Debug, Clone, Default)]
+pub struct XimDecodeIssueSummary {
+    pub total: usize,
+    pub unique: std::collections::HashSet<XimDecodeIssue>,
+    pub omitted_rows: usize,
+}
+
+impl XimDecodeIssueSummary {
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.total += other.total;
+        self.omitted_rows += other.omitted_rows;
+        for issue in other.unique {
+            if self.unique.contains(&issue) {
+                continue;
+            }
+            if self.unique.len() < MAX_XIM_DECODE_ISSUE_SAMPLES {
+                self.unique.insert(issue);
+            } else {
+                self.omitted_rows += 1;
+            }
+        }
+    }
+}
 
 #[cfg(feature = "parquet")]
-fn decode_issue_store() -> &'static Mutex<Vec<XimDecodeIssue>> {
-    XIM_DECODE_ISSUES.get_or_init(|| Mutex::new(Vec::new()))
+static XIM_DECODE_ISSUES: OnceLock<Mutex<XimDecodeIssueAccumulator>> = OnceLock::new();
+
+#[cfg(feature = "parquet")]
+fn decode_issue_store() -> &'static Mutex<XimDecodeIssueAccumulator> {
+    XIM_DECODE_ISSUES.get_or_init(|| Mutex::new(XimDecodeIssueAccumulator::default()))
 }
 
 #[cfg(feature = "parquet")]
 fn record_decode_issue(issue: XimDecodeIssue) {
     if let Ok(mut issues) = decode_issue_store().lock() {
-        issues.push(issue);
+        issues.total += 1;
+        if issues.unique.contains(&issue) {
+            return;
+        }
+        if issues.unique.len() < MAX_XIM_DECODE_ISSUE_SAMPLES {
+            issues.unique.insert(issue);
+        } else {
+            issues.omitted_rows += 1;
+        }
     }
 }
 
@@ -73,27 +124,42 @@ fn record_decode_issue(issue: XimDecodeIssue) {
 #[cfg(feature = "parquet")]
 pub fn clear_decode_issues() {
     if let Ok(mut issues) = decode_issue_store().lock() {
-        issues.clear();
+        *issues = XimDecodeIssueAccumulator::default();
     }
 }
 
 /// Drain and return all skipped XIM decode records collected so far.
 ///
-/// The returned vector may contain multiple entries for the same
-/// `(xim_path, feature_id, annotation)` pair if the same malformed row was
-/// encountered more than once during the current process.
+/// The returned summary preserves the total number of skipped traces while
+/// storing only a bounded sample of representative diagnostic rows.
+#[cfg(feature = "parquet")]
+pub fn take_decode_issue_summary() -> XimDecodeIssueSummary {
+    if let Ok(mut issues) = decode_issue_store().lock() {
+        XimDecodeIssueSummary {
+            total: std::mem::take(&mut issues.total),
+            unique: std::mem::take(&mut issues.unique),
+            omitted_rows: std::mem::take(&mut issues.omitted_rows),
+        }
+    } else {
+        XimDecodeIssueSummary::default()
+    }
+}
+
+/// Backward-compatible helper that returns only the sampled issue rows.
 #[cfg(feature = "parquet")]
 pub fn take_decode_issues() -> Vec<XimDecodeIssue> {
-    if let Ok(mut issues) = decode_issue_store().lock() {
-        std::mem::take(&mut *issues)
-    } else {
-        Vec::new()
-    }
+    take_decode_issue_summary().unique.into_iter().collect()
 }
 
 /// Stub used when `redeem-io` is built without parquet support.
 #[cfg(not(feature = "parquet"))]
 pub fn clear_decode_issues() {}
+
+/// Stub used when `redeem-io` is built without parquet support.
+#[cfg(not(feature = "parquet"))]
+pub fn take_decode_issue_summary() -> XimDecodeIssueSummary {
+    XimDecodeIssueSummary::default()
+}
 
 /// Stub used when `redeem-io` is built without parquet support.
 #[cfg(not(feature = "parquet"))]
@@ -526,18 +592,6 @@ impl XimParquetReader {
                     "xim_trace".to_string()
                 }
             });
-            if precursor_id.is_none() {
-                record_decode_issue(XimDecodeIssue {
-                    xim_path: self.path.clone(),
-                    run_id: row_run,
-                    feature_id,
-                    annotation: annotation.clone(),
-                    field: "PRECURSOR_ID".to_string(),
-                    compression: -1,
-                    error: "NULL PRECURSOR_ID; using feature-level fallback".to_string(),
-                });
-            }
-
             let mob_bytes = Self::get_bytes(&row, idx_mob, "MOBILITY_DATA")?;
             let int_bytes = Self::get_bytes(&row, idx_int, "INTENSITY_DATA")?;
             let mob_comp = Self::get_i64(&row, idx_mob_c, "MOBILITY_COMPRESSION")?;
