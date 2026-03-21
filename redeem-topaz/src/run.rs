@@ -2544,6 +2544,14 @@ fn format_duration(duration: Duration) -> String {
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn log_elapsed(label: &str, started: Instant) {
+    log::info!(
+        "{label} completed in {}",
+        format_duration(started.elapsed())
+    );
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn build_bag_tensor_pack_with_cols(
     rows: &[FeatureRow],
     x_trace: &[f32],
@@ -3199,6 +3207,7 @@ struct XrunAppliedScores {
     row_scores: Vec<f32>,
     bag_pid: Vec<String>,
     bag_score: Vec<f32>,
+    head_out: Option<crate::infer::BagHeadOutput>,
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -3227,8 +3236,10 @@ fn apply_xrun_to_row_scores(
     xrun_meta: &XrunCheckpointMeta,
     device: &Device,
     base_batch_size: usize,
+    capture_head_embeddings: bool,
     pre: Option<&crate::Preprocessor>,
 ) -> Result<XrunAppliedScores> {
+    let xrun_started = Instant::now();
     let (winner_rows, bag_pid, bag_score, _bag_is_decoy, bag_y) =
         select_bag_winners(rows, row_scores);
     if winner_rows.is_empty() {
@@ -3236,9 +3247,11 @@ fn apply_xrun_to_row_scores(
             row_scores: row_scores.to_vec(),
             bag_pid,
             bag_score,
+            head_out: None,
         });
     }
 
+    let trace_build_started = Instant::now();
     let x_trace = build_traces_for_rows(
         &winner_rows,
         xic_path,
@@ -3260,6 +3273,8 @@ fn apply_xrun_to_row_scores(
         xim_cache_opt,
         xim_disk_cache,
     )?;
+    log_elapsed("XRUN inference trace gathering", trace_build_started);
+    let head_score_started = Instant::now();
     let head_out = score_bags_with_heads_from_rows_with_cols_with_aux(
         model,
         &winner_rows,
@@ -3277,6 +3292,7 @@ fn apply_xrun_to_row_scores(
         base_batch_size,
         pre,
     )?;
+    log_elapsed("XRUN inference winner-head scoring", head_score_started);
 
     let predict_cfg = XrunPredictConfig {
         max_runs: if xrun_cfg.max_runs > 0 {
@@ -3306,11 +3322,20 @@ fn apply_xrun_to_row_scores(
         crate::xrun::xrun_predict_deltas_for_bags(xrun_model, &bag_data, &predict_cfg, device)?;
     let row_scores = apply_xrun_deltas_to_rows(row_scores, rows, &bag_pid, &delta_bag);
     let bag_score = apply_xrun_deltas(&bag_score, &delta_bag);
+    let head_out = if capture_head_embeddings {
+        let mut out = head_out;
+        out.bag_score = bag_score.clone();
+        Some(out)
+    } else {
+        None
+    };
+    log_elapsed("XRUN inference stage", xrun_started);
 
     Ok(XrunAppliedScores {
         row_scores,
         bag_pid,
         bag_score,
+        head_out,
     })
 }
 
@@ -3531,8 +3556,8 @@ fn preprocess_chunk_group_payloads(
             xim_decode_issues: if payload_idx == 0 {
                 xim_decode_issues.clone()
             } else {
-                    crate::io::xim_parquet::XimDecodeIssueSummary::default()
-                },
+                crate::io::xim_parquet::XimDecodeIssueSummary::default()
+            },
         });
     }
 
@@ -3890,8 +3915,10 @@ fn apply_xrun_to_row_scores_from_preprocessed(
     xrun_meta: &XrunCheckpointMeta,
     device: &Device,
     base_batch_size: usize,
+    capture_head_embeddings: bool,
     pre: Option<&crate::Preprocessor>,
 ) -> Result<XrunAppliedScores> {
+    let xrun_started = Instant::now();
     let (winner_rows, bag_pid, bag_score, _bag_is_decoy, bag_y) =
         select_bag_winners(rows, row_scores);
     if winner_rows.is_empty() {
@@ -3899,8 +3926,10 @@ fn apply_xrun_to_row_scores_from_preprocessed(
             row_scores: row_scores.to_vec(),
             bag_pid,
             bag_score,
+            head_out: None,
         });
     }
+    let trace_build_started = Instant::now();
     let row_index = build_feature_row_index(rows);
     let x_trace_winners = gather_row_aligned_tensor_by_feature_id(
         &winner_rows,
@@ -3918,6 +3947,8 @@ fn apply_xrun_to_row_scores_from_preprocessed(
     } else {
         None
     };
+    log_elapsed("XRUN inference trace gathering", trace_build_started);
+    let head_score_started = Instant::now();
     let head_out = score_bags_with_heads_from_rows_with_cols_with_aux(
         model,
         &winner_rows,
@@ -3935,6 +3966,7 @@ fn apply_xrun_to_row_scores_from_preprocessed(
         base_batch_size,
         pre,
     )?;
+    log_elapsed("XRUN inference winner-head scoring", head_score_started);
 
     let predict_cfg = XrunPredictConfig {
         max_runs: if xrun_cfg.max_runs > 0 {
@@ -3964,11 +3996,20 @@ fn apply_xrun_to_row_scores_from_preprocessed(
         crate::xrun::xrun_predict_deltas_for_bags(xrun_model, &bag_data, &predict_cfg, device)?;
     let row_scores = apply_xrun_deltas_to_rows(row_scores, rows, &bag_pid, &delta_bag);
     let bag_score = apply_xrun_deltas(&bag_score, &delta_bag);
+    let head_out = if capture_head_embeddings {
+        let mut out = head_out;
+        out.bag_score = bag_score.clone();
+        Some(out)
+    } else {
+        None
+    };
+    log_elapsed("XRUN inference stage", xrun_started);
 
     Ok(XrunAppliedScores {
         row_scores,
         bag_pid,
         bag_score,
+        head_out,
     })
 }
 
@@ -4293,7 +4334,9 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
     } else {
         Vec::new()
     };
+    let base_train_started = Instant::now();
     let _history = trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
+    log_elapsed("Base TOPAZ training stage", base_train_started);
 
     // Training batches keep the full bag tensors resident on the device via
     // `narrow` views. Release them before any post-training scoring so
@@ -4303,6 +4346,7 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
     drop(val_batches);
 
     if !rows_va.is_empty() {
+        let val_summary_started = Instant::now();
         let out = score_bags_from_rows_with_cols_with_aux(
             &trainer.model,
             &rows_va,
@@ -4327,6 +4371,7 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
             summ.n_targets,
             summ.n_decoys
         );
+        log_elapsed("Validation TDC summary", val_summary_started);
     }
 
     if cfg.diagnostics.save_head_embeddings {
@@ -4380,6 +4425,7 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
     save_checkpoint(&cfg.output_prefix, &trainer.varmap, &meta)?;
 
     if cfg.xrun.enabled {
+        let xrun_train_started = Instant::now();
         let mut rows_all = rows_tr.clone();
         rows_all.extend(rows_va.iter().cloned());
         let mut x_all = x_tr.clone();
@@ -4466,6 +4512,7 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
                 xrun_meta.best_val
             );
         }
+        log_elapsed("XRUN training stage", xrun_train_started);
     }
 
     Ok(TrainRunOutput {
@@ -4547,6 +4594,7 @@ fn run_inference_with_preprocessed(
             None
         };
 
+    let inference_stage_started = Instant::now();
     let mut scores = vec![0f32; rows.len()];
     let mut sum_n = 0usize;
     let mut sum_ms1 = 0usize;
@@ -4597,6 +4645,7 @@ fn run_inference_with_preprocessed(
     }
 
     log_inference_runtime_stats(&runtime_stats, rows.len());
+    log_elapsed("Base inference scoring stage", inference_stage_started);
     if cfg.diagnostics.trace_summary {
         let sum = crate::infer::diagnostics::TraceSummary {
             n: sum_n,
@@ -4643,6 +4692,7 @@ fn run_inference_with_preprocessed(
             &xrun_meta,
             device,
             cfg.batch_size.max(1),
+            cfg.diagnostics.save_head_embeddings,
             meta.preprocess.as_ref(),
         )?;
         log::info!(
@@ -4656,9 +4706,13 @@ fn run_inference_with_preprocessed(
         None
     };
 
+    let table_build_started = Instant::now();
     let table_rows_base = build_score_table_from_rows(&rows, &base_scores, cfg.pep_bins);
     let table_rows_final = build_score_table_from_rows(&rows, &scores, cfg.pep_bins);
+    log_elapsed("Score table assembly", table_build_started);
+    let tsv_write_started = Instant::now();
     crate::infer::write_score_tsv(&cfg.output_tsv, &table_rows_final)?;
+    log_elapsed("Score TSV write", tsv_write_started);
 
     if cfg.diagnostics.save_head_embeddings && !cfg.fast_inference {
         let outdir = cfg
@@ -4667,7 +4721,15 @@ fn run_inference_with_preprocessed(
             .clone()
             .unwrap_or_else(|| PathBuf::from("head_embeddings"));
         std::fs::create_dir_all(&outdir)?;
-        if cfg.trace_chunk_size > 0 {
+        let head_embeddings_started = Instant::now();
+        if let Some(out) = xrun_applied
+            .as_ref()
+            .and_then(|applied| applied.head_out.as_ref())
+        {
+            log::info!("Reusing XRUN winner-head outputs for head embeddings...");
+            let out_path = outdir.join("head_embeddings.tsv");
+            write_head_embeddings_tsv(&out_path, out)?;
+        } else if cfg.trace_chunk_size > 0 {
             log::info!("Computing head embeddings from preprocessed winner rows...");
             let (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y) =
                 select_bag_winners(&rows, &scores);
@@ -4747,9 +4809,11 @@ fn run_inference_with_preprocessed(
             let out_path = outdir.join("head_embeddings.tsv");
             write_head_embeddings_tsv(&out_path, &out)?;
         }
+        log_elapsed("Head embedding export", head_embeddings_started);
     }
 
     if let Some(osw_path) = &cfg.output_osw {
+        let osw_write_started = Instant::now();
         crate::io::osw::prepare_output_osw(&cfg.osw_path, osw_path)?;
         if let Some(base_name) = cfg
             .output_table_base
@@ -4774,7 +4838,9 @@ fn run_inference_with_preprocessed(
             "Wrote final TOPAZ scores to OSW table {:?}",
             final_table_name
         );
+        log_elapsed("OSW score-table writeback", osw_write_started);
         if cfg.diagnostics.rank1_disagreements {
+            let diag_started = Instant::now();
             let outdir = cfg
                 .diagnostics
                 .rank1_outdir
@@ -4787,6 +4853,7 @@ fn run_inference_with_preprocessed(
                 summ.pstc_cutoff,
                 summ.ms2_cutoff
             );
+            log_elapsed("Rank-1 disagreement diagnostics", diag_started);
         }
     }
 
@@ -5323,7 +5390,9 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     } else {
         Vec::new()
     };
+    let base_train_started = Instant::now();
     let _history = trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
+    log_elapsed("Base TOPAZ training stage", base_train_started);
 
     // Training batches keep the full bag tensors resident on the device via
     // `narrow` views. Release them before any post-training scoring so
@@ -5333,6 +5402,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     drop(val_batches);
 
     if !rows_va.is_empty() {
+        let val_summary_started = Instant::now();
         let out = score_bags_from_rows_with_cols_with_aux(
             &trainer.model,
             &rows_va,
@@ -5357,6 +5427,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
             summ.n_targets,
             summ.n_decoys
         );
+        log_elapsed("Validation TDC summary", val_summary_started);
     }
 
     if cfg.diagnostics.save_head_embeddings {
@@ -5414,6 +5485,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     save_checkpoint(&cfg.output_prefix, &trainer.varmap, &meta)?;
 
     if cfg.xrun.enabled {
+        let xrun_train_started = Instant::now();
         let mut rows_all = rows_tr.clone();
         rows_all.extend(rows_va.iter().cloned());
         let mut x_all = x_tr.clone();
@@ -5500,6 +5572,7 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
                 xrun_meta.best_val
             );
         }
+        log_elapsed("XRUN training stage", xrun_train_started);
     }
 
     report_xim_decode_issues(
@@ -5658,6 +5731,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         score_time: Duration::ZERO,
     };
 
+    let inference_stage_started = Instant::now();
     let prefetched = if cfg.prefetch_traces_once {
         let prefetch_started = Instant::now();
         let prefetched = prefetch_modalities_for_inference(
@@ -5886,6 +5960,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         rows = rows_scored;
     }
     log_inference_runtime_stats(&runtime_stats, rows.len());
+    log_elapsed("Base inference scoring stage", inference_stage_started);
     if cfg.diagnostics.trace_summary {
         let sum = crate::infer::diagnostics::TraceSummary {
             n: sum_n,
@@ -5946,6 +6021,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             &xrun_meta,
             &device,
             cfg.batch_size.max(1),
+            cfg.diagnostics.save_head_embeddings,
             meta.preprocess.as_ref(),
         )?;
         drain_xim_decode_issues(&mut xim_decode_issues);
@@ -5960,9 +6036,13 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
         None
     };
 
+    let table_build_started = Instant::now();
     let table_rows_base = build_score_table_from_rows(&rows, &base_scores, cfg.pep_bins);
     let table_rows_final = build_score_table_from_rows(&rows, &scores, cfg.pep_bins);
+    log_elapsed("Score table assembly", table_build_started);
+    let tsv_write_started = Instant::now();
     crate::infer::write_score_tsv(&cfg.output_tsv, &table_rows_final)?;
+    log_elapsed("Score TSV write", tsv_write_started);
 
     if cfg.diagnostics.save_head_embeddings && !cfg.fast_inference {
         let outdir = cfg
@@ -5970,8 +6050,16 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             .head_embeddings_outdir
             .clone()
             .unwrap_or_else(|| PathBuf::from("head_embeddings"));
-        if cfg.trace_chunk_size > 0 {
-            std::fs::create_dir_all(&outdir)?;
+        std::fs::create_dir_all(&outdir)?;
+        let head_embeddings_started = Instant::now();
+        if let Some(out) = xrun_applied
+            .as_ref()
+            .and_then(|applied| applied.head_out.as_ref())
+        {
+            log::info!("Reusing XRUN winner-head outputs for head embeddings...");
+            let out_path = outdir.join("head_embeddings.tsv");
+            write_head_embeddings_tsv(&out_path, out)?;
+        } else if cfg.trace_chunk_size > 0 {
             log::info!("Computing head embeddings in a chunk-safe second pass...");
             let (winner_rows, bag_pid, bag_score, bag_is_decoy, bag_y) =
                 select_bag_winners(&rows, &scores);
@@ -6024,7 +6112,6 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 write_head_embeddings_tsv(&out_path, &out)?;
             }
         } else {
-            std::fs::create_dir_all(&outdir)?;
             let x_trace = build_traces_for_rows(
                 &rows,
                 &cfg.xic_path,
@@ -6077,9 +6164,11 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
             let out_path = outdir.join("head_embeddings.tsv");
             write_head_embeddings_tsv(&out_path, &out)?;
         }
+        log_elapsed("Head embedding export", head_embeddings_started);
     }
 
     if let Some(osw_path) = &cfg.output_osw {
+        let osw_write_started = Instant::now();
         #[cfg(feature = "io-sqlite")]
         {
             crate::io::osw::prepare_output_osw(&cfg.osw_path, osw_path)?;
@@ -6107,8 +6196,10 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                 "Wrote final TOPAZ scores to OSW table {:?}",
                 final_table_name
             );
+            log_elapsed("OSW score-table writeback", osw_write_started);
 
             if cfg.diagnostics.rank1_disagreements {
+                let diag_started = Instant::now();
                 let outdir = cfg
                     .diagnostics
                     .rank1_outdir
@@ -6122,6 +6213,7 @@ pub fn run_inference(cfg: &InferRunConfig) -> Result<InferRunOutput> {
                     summ.pstc_cutoff,
                     summ.ms2_cutoff
                 );
+                log_elapsed("Rank-1 disagreement diagnostics", diag_started);
             }
         }
     }
