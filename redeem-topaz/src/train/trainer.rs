@@ -245,9 +245,17 @@ impl Trainer {
                 None
             };
         let trace_repr_dim = model.trace_enc.emb_out_dim()
-            + model.xim_enc.as_ref().map(|enc| enc.emb_out_dim()).unwrap_or(0)
+            + model
+                .xim_enc
+                .as_ref()
+                .map(|enc| enc.emb_out_dim())
+                .unwrap_or(0)
             + model.trace_enc.coelution_dim()
-            + model.xim_enc.as_ref().map(|enc| enc.coelution_dim()).unwrap_or(0);
+            + model
+                .xim_enc
+                .as_ref()
+                .map(|enc| enc.coelution_dim())
+                .unwrap_or(0);
         let distill_head = if cfg.distill.is_enabled() {
             Some(DistillHead::new(
                 vb.pp("distill_head"),

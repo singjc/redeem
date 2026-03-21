@@ -298,7 +298,11 @@ pub fn bags_to_train_batches_with_aux_and_distill(
     };
     let (distill_targets, distill_mask) = if let Some((targets, mask, d_distill)) = distill {
         (
-            Some(Tensor::from_vec(targets, (bags.b, bags.k, d_distill), device)?),
+            Some(Tensor::from_vec(
+                targets,
+                (bags.b, bags.k, d_distill),
+                device,
+            )?),
             Some(Tensor::from_vec(mask, (bags.b, bags.k, d_distill), device)?),
         )
     } else {

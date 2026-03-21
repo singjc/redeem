@@ -9,7 +9,7 @@ use redeem_topaz::building_blocks::trace_window::nearest_index_sorted;
 use redeem_topaz::infer::stats::tdc_summary;
 use redeem_topaz::infer::{XicFetchConfig, XimFetchConfig};
 use redeem_topaz::inspect::{
-    fetch_xic_for_row, fetch_xims_for_rows, read_run_path_map, resolve_run_path, valid_im_bounds,
+    fetch_xic_for_row, fetch_xim_for_row, read_run_path_map, resolve_run_path, valid_im_bounds,
     valid_rt_bounds,
 };
 use redeem_topaz::io::osw::FeatureRow;
@@ -20,7 +20,27 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_PCA_MAX_ROWS: usize = 50_000;
+const EXAMPLE_Q_CUT: f64 = 0.01;
 const POWER_ITERS: usize = 50;
+
+#[derive(Debug, Clone, Copy)]
+enum ExampleCategory {
+    HighScoringTopaz,
+    LowQualityTopaz,
+    TopazOnly,
+    Ms2Only,
+}
+
+impl ExampleCategory {
+    fn title(self) -> &'static str {
+        match self {
+            Self::HighScoringTopaz => "Raw Traces: High-Scoring TOPAZ Targets",
+            Self::LowQualityTopaz => "Raw Traces: Low-Quality TOPAZ Targets",
+            Self::TopazOnly => "Raw Traces: TOPAZ-Only Targets",
+            Self::Ms2Only => "Raw Traces: SCORE_MS2-Only Targets",
+        }
+    }
+}
 
 pub struct TopazReportInputs<'a> {
     pub head_embeddings_path: &'a Path,
@@ -192,21 +212,24 @@ pub fn write_topaz_report(inputs: &TopazReportInputs<'_>) -> Result<()> {
         }
     }
 
-    if let (Some(osw_path), Some(scores)) = (inputs.osw_path, topaz_scores.as_ref()) {
-        match build_example_plots(
+    if let (Some(osw_path), Some(scores), Some(feature_meta)) = (
+        inputs.osw_path,
+        topaz_scores.as_ref(),
+        feature_meta.as_ref(),
+    ) {
+        match build_example_sections(
             osw_path,
             &emb,
             scores,
             ms2_scores.as_ref(),
             inputs,
             precursor_meta.as_ref(),
+            feature_meta,
         ) {
-            Ok(examples) if !examples.is_empty() => {
-                let mut sec = ReportSection::new("Raw Traces");
-                for plot in examples {
-                    sec.add_plot(plot);
+            Ok(sections) if !sections.is_empty() => {
+                for section in sections {
+                    report.add_section(section);
                 }
-                report.add_section(sec);
             }
             Ok(_) => {}
             Err(err) => {
@@ -1047,12 +1070,21 @@ struct ExampleCandidate {
 #[derive(Debug, Clone)]
 struct ExampleBag {
     bag_pid: String,
-    bag_score: f64,
-    is_decoy: bool,
     title: String,
     candidates: Vec<ExampleCandidate>,
     raw_xic: Option<PrecursorXic>,
-    raw_xims: HashMap<u64, FeatureXim>,
+    raw_xim: Option<FeatureXim>,
+}
+
+#[derive(Debug, Clone)]
+struct BagExampleSummary {
+    emb_idx: usize,
+    run_id: u64,
+    precursor_id: u64,
+    bag_score: f64,
+    is_decoy: bool,
+    topaz_rank1: Option<ScoreLite>,
+    ms2_rank1: Option<ScoreLite>,
 }
 
 fn infer_run_map_from_paths(
@@ -1090,28 +1122,131 @@ fn resolve_xim_run_map(inputs: &TopazReportInputs<'_>) -> Result<Option<HashMap<
     Ok(None)
 }
 
-fn bag_selection_order(emb: &HeadEmbeddings, limit: usize) -> Vec<usize> {
-    if limit == 0 {
-        return Vec::new();
+fn score_is_rank1(score: &ScoreLite) -> bool {
+    score.rank.unwrap_or(1) == 1
+}
+
+fn score_passes_q(score: Option<&ScoreLite>, q_cut: f64) -> bool {
+    match score {
+        Some(score) if score_is_rank1(score) => score.qvalue.is_some_and(|q| q <= q_cut),
+        _ => false,
     }
-    let mut idx: Vec<usize> = (0..emb.n).collect();
-    idx.sort_by(|&a, &b| {
-        emb.bag_score[b]
-            .partial_cmp(&emb.bag_score[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut out = Vec::new();
-    for want_decoy in [false, true] {
-        for &i in &idx {
-            if emb.is_decoy[i] == want_decoy {
-                out.push(i);
-                if out.len() >= limit {
-                    return out;
-                }
-            }
+}
+
+fn rank1_scores_by_bag(
+    rows: &[ScoreLite],
+    meta: &HashMap<u64, redeem_topaz::io::osw::FeatureMeta>,
+) -> HashMap<String, ScoreLite> {
+    let mut out = HashMap::new();
+    for row in rows {
+        if !score_is_rank1(row) {
+            continue;
+        }
+        let Some(feature) = meta.get(&row.feature_id) else {
+            continue;
+        };
+        let bag_pid = format!("{}_{}", feature.run_id, feature.precursor_id);
+        let replace = out
+            .get(&bag_pid)
+            .map(|prev: &ScoreLite| row.score > prev.score)
+            .unwrap_or(true);
+        if replace {
+            out.insert(bag_pid, row.clone());
         }
     }
     out
+}
+
+fn build_bag_summaries(
+    emb: &HeadEmbeddings,
+    topaz_scores: &[ScoreLite],
+    ms2_scores: Option<&Vec<ScoreLite>>,
+    feature_meta: &HashMap<u64, redeem_topaz::io::osw::FeatureMeta>,
+) -> Vec<BagExampleSummary> {
+    let topaz_by_bag = rank1_scores_by_bag(topaz_scores, feature_meta);
+    let ms2_by_bag = ms2_scores
+        .map(|rows| rank1_scores_by_bag(rows, feature_meta))
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for emb_idx in 0..emb.n {
+        let bag_pid = emb.bag_pid[emb_idx].clone();
+        let (run_id, precursor_id) = parse_bag_pid(&bag_pid);
+        let (Some(run_id), Some(precursor_id)) = (run_id, precursor_id) else {
+            continue;
+        };
+        out.push(BagExampleSummary {
+            emb_idx,
+            run_id,
+            precursor_id,
+            bag_score: emb.bag_score[emb_idx],
+            is_decoy: emb.is_decoy[emb_idx],
+            topaz_rank1: topaz_by_bag.get(&bag_pid).cloned(),
+            ms2_rank1: ms2_by_bag.get(&bag_pid).cloned(),
+        });
+    }
+    out
+}
+
+fn matches_example_category(summary: &BagExampleSummary, category: ExampleCategory) -> bool {
+    if summary.is_decoy {
+        return false;
+    }
+    let topaz_pass = score_passes_q(summary.topaz_rank1.as_ref(), EXAMPLE_Q_CUT);
+    let ms2_pass = score_passes_q(summary.ms2_rank1.as_ref(), EXAMPLE_Q_CUT);
+    match category {
+        ExampleCategory::HighScoringTopaz => topaz_pass,
+        ExampleCategory::LowQualityTopaz => summary.topaz_rank1.is_some() && !topaz_pass,
+        ExampleCategory::TopazOnly => topaz_pass && !ms2_pass,
+        ExampleCategory::Ms2Only => ms2_pass && !topaz_pass,
+    }
+}
+
+fn category_primary_score(summary: &BagExampleSummary, category: ExampleCategory) -> f64 {
+    match category {
+        ExampleCategory::Ms2Only => summary
+            .ms2_rank1
+            .as_ref()
+            .map(|score| score.score)
+            .unwrap_or(summary.bag_score),
+        ExampleCategory::TopazOnly | ExampleCategory::LowQualityTopaz => summary
+            .topaz_rank1
+            .as_ref()
+            .map(|score| score.score)
+            .unwrap_or(summary.bag_score),
+        ExampleCategory::HighScoringTopaz => summary.bag_score,
+    }
+}
+
+fn select_example_indices(
+    summaries: &[BagExampleSummary],
+    category: ExampleCategory,
+    limit: usize,
+) -> Vec<usize> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut selected: Vec<&BagExampleSummary> = summaries
+        .iter()
+        .filter(|summary| matches_example_category(summary, category))
+        .collect();
+    selected.sort_by(|a, b| {
+        category_primary_score(b, category)
+            .partial_cmp(&category_primary_score(a, category))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.bag_score
+                    .partial_cmp(&a.bag_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.run_id.cmp(&b.run_id))
+            .then_with(|| a.precursor_id.cmp(&b.precursor_id))
+    });
+    selected
+        .into_iter()
+        .take(limit)
+        .map(|summary| summary.emb_idx)
+        .collect()
 }
 
 fn score_rank_label(score: &ScoreLite) -> String {
@@ -1179,22 +1314,69 @@ fn palette_color(idx: usize) -> &'static str {
     COLORS[idx % COLORS.len()]
 }
 
-fn build_example_plots(
+fn build_example_sections(
     osw_path: &Path,
     emb: &HeadEmbeddings,
     topaz_scores: &[ScoreLite],
     ms2_scores: Option<&Vec<ScoreLite>>,
     inputs: &TopazReportInputs<'_>,
     precursor_meta: Option<&HashMap<u64, redeem_topaz::io::osw::PrecursorMeta>>,
+    feature_meta: &HashMap<u64, redeem_topaz::io::osw::FeatureMeta>,
+) -> Result<Vec<ReportSection>> {
+    let summaries = build_bag_summaries(emb, topaz_scores, ms2_scores, feature_meta);
+    if summaries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sections = Vec::new();
+    for category in [
+        ExampleCategory::HighScoringTopaz,
+        ExampleCategory::LowQualityTopaz,
+        ExampleCategory::TopazOnly,
+        ExampleCategory::Ms2Only,
+    ] {
+        let selected_indices = select_example_indices(&summaries, category, inputs.example_bags);
+        if selected_indices.is_empty() {
+            continue;
+        }
+        let plots = build_example_plots_for_indices(
+            osw_path,
+            emb,
+            topaz_scores,
+            ms2_scores,
+            inputs,
+            precursor_meta,
+            &selected_indices,
+        )?;
+        if plots.is_empty() {
+            continue;
+        }
+        let mut section = ReportSection::new(category.title());
+        for plot in plots {
+            section.add_plot(plot);
+        }
+        sections.push(section);
+    }
+
+    Ok(sections)
+}
+
+fn build_example_plots_for_indices(
+    osw_path: &Path,
+    emb: &HeadEmbeddings,
+    topaz_scores: &[ScoreLite],
+    ms2_scores: Option<&Vec<ScoreLite>>,
+    inputs: &TopazReportInputs<'_>,
+    precursor_meta: Option<&HashMap<u64, redeem_topaz::io::osw::PrecursorMeta>>,
+    selected_indices: &[usize],
 ) -> Result<Vec<Plot>> {
-    if inputs.example_bags == 0 {
+    if selected_indices.is_empty() {
         return Ok(Vec::new());
     }
     if inputs.xic_path.is_none() && inputs.xic_paths.is_none() && inputs.xic_map_path.is_none() {
         return Ok(Vec::new());
     }
 
-    let selected_indices = bag_selection_order(emb, inputs.example_bags);
     let selected_bags: Vec<(u64, u64)> = selected_indices
         .iter()
         .filter_map(|&idx| {
@@ -1238,6 +1420,7 @@ fn build_example_plots(
 
     let mut plots = Vec::new();
     for idx in selected_indices {
+        let idx = *idx;
         let bag_pid = emb.bag_pid[idx].clone();
         let bag_rows = match rows_by_pid.get(&bag_pid) {
             Some(rows) => rows.clone(),
@@ -1293,30 +1476,27 @@ fn build_example_plots(
             None => None,
         };
 
-        let mut raw_xims = HashMap::new();
-        if let Some(path) = resolve_run_path(run_id, inputs.xim_path, xim_run_map.as_ref()) {
-            let candidate_rows: Vec<FeatureRow> = candidates
-                .iter()
-                .map(|candidate| candidate.row.clone())
-                .collect();
-            match fetch_xims_for_rows(&candidate_rows, &path, inputs.xim_fetch) {
-                Ok(xims) => {
-                    raw_xims = xims;
-                }
+        let raw_xim = if let Some(path) =
+            resolve_run_path(run_id, inputs.xim_path, xim_run_map.as_ref())
+        {
+            match fetch_xim_for_row(first, &path, inputs.xim_fetch) {
+                Ok(xim) => xim,
                 Err(err) => {
                     log::warn!(
-                        "Skipping raw XIM example fetch for bag_pid={} from {:?}: {err:#}",
+                        "Skipping raw XIM example fetch for bag_pid={} feature_id={} from {:?}: {err:#}",
                         bag_pid,
+                        first.feature_id,
                         path
                     );
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         let example = ExampleBag {
             bag_pid,
-            bag_score: emb.bag_score[idx],
-            is_decoy: emb.is_decoy[idx],
             title: format!(
                 "{} | run_id={} | bag_score={:.3} | {}",
                 peptide,
@@ -1326,7 +1506,7 @@ fn build_example_plots(
             ),
             candidates,
             raw_xic,
-            raw_xims,
+            raw_xim,
         };
         plots.push(plot_example_bag(&example));
     }
@@ -1337,6 +1517,7 @@ fn plot_example_bag(example: &ExampleBag) -> Plot {
     let mut plot = Plot::new();
     let mut xic_y_max = 1.0f64;
     let mut xim_y_max = 1.0f64;
+    let top_candidate = example.candidates.first();
 
     if let Some(raw_xic) = example.raw_xic.as_ref() {
         for trace in &raw_xic.transitions {
@@ -1373,37 +1554,53 @@ fn plot_example_bag(example: &ExampleBag) -> Plot {
                         .text_array(vec![score_rank_label(&candidate.topaz)])
                         .text_position(Position::TopCenter)
                         .marker(Marker::new().color(color).size(9))
+                        .show_legend(false)
                         .hover_info(HoverInfo::Text)
                         .hover_text_array(vec![score_hover_html(candidate)]),
                 );
+            }
+            if let Some(candidate) = top_candidate {
                 if let Some((left, right)) = valid_rt_bounds(&candidate.row) {
+                    let color = palette_color(0);
                     plot.add_trace(
                         Scatter::new(vec![left as f64, left as f64], vec![0.0, xic_y_max])
-                            .name(format!("rt_left {}", candidate.row.feature_id))
+                            .name(format!("top rt_left {}", candidate.row.feature_id))
                             .mode(Mode::Lines)
-                            .line(Line::new().color(color).dash(DashType::Dash)),
+                            .show_legend(false)
+                            .line(Line::new().color(color).dash(DashType::Dash).width(1.8)),
                     );
                     plot.add_trace(
                         Scatter::new(vec![right as f64, right as f64], vec![0.0, xic_y_max])
-                            .name(format!("rt_right {}", candidate.row.feature_id))
+                            .name(format!("top rt_right {}", candidate.row.feature_id))
                             .mode(Mode::Lines)
-                            .line(Line::new().color(color).dash(DashType::Dash)),
+                            .show_legend(false)
+                            .line(Line::new().color(color).dash(DashType::Dash).width(1.8)),
                     );
                 }
             }
         }
     }
 
-    let mut first_xim = true;
-    for (i, candidate) in example.candidates.iter().enumerate() {
-        let Some(raw_xim) = example.raw_xims.get(&candidate.row.feature_id) else {
-            continue;
-        };
+    if let (Some(candidate), Some(raw_xim)) = (top_candidate, example.raw_xim.as_ref()) {
         let Some((coords, signal)) = summed_xim_trace(raw_xim) else {
-            continue;
+            plot.set_layout(
+                Layout::new()
+                    .title(format!("{} | {}", example.title, example.bag_pid))
+                    .x_axis(Axis::new().title("Retention time").domain(&[0.0, 0.46]))
+                    .y_axis(Axis::new().title("XIC intensity").domain(&[0.0, 1.0]))
+                    .x_axis2(Axis::new().title("Ion mobility").domain(&[0.54, 1.0]))
+                    .y_axis2(
+                        Axis::new()
+                            .title("XIM intensity")
+                            .domain(&[0.0, 1.0])
+                            .anchor("x2"),
+                    )
+                    .bar_mode(BarMode::Overlay),
+            );
+            return plot;
         };
         xim_y_max = xim_y_max.max(signal.iter().copied().fold(0.0, f64::max));
-        let color = palette_color(i);
+        let color = palette_color(0);
         plot.add_trace(
             Scatter::new(coords.clone(), signal.clone())
                 .name(format!(
@@ -1414,13 +1611,8 @@ fn plot_example_bag(example: &ExampleBag) -> Plot {
                 .mode(Mode::Lines)
                 .x_axis("x2")
                 .y_axis("y2")
-                .line(
-                    Line::new()
-                        .color(color)
-                        .width(if first_xim { 2.5 } else { 1.8 }),
-                ),
+                .line(Line::new().color(color).width(2.5)),
         );
-        first_xim = false;
         let apex_x = candidate.row.exp_im.unwrap_or(0.0) as f64;
         let apex_y = nearest_signal(&coords, &signal, apex_x).max(0.0);
         plot.add_trace(
@@ -1432,25 +1624,28 @@ fn plot_example_bag(example: &ExampleBag) -> Plot {
                 .text_array(vec![score_rank_label(&candidate.topaz)])
                 .text_position(Position::TopCenter)
                 .marker(Marker::new().color(color).size(9))
+                .show_legend(false)
                 .hover_info(HoverInfo::Text)
                 .hover_text_array(vec![score_hover_html(candidate)]),
         );
         if let Some((left, right)) = valid_im_bounds(&candidate.row) {
             plot.add_trace(
                 Scatter::new(vec![left as f64, left as f64], vec![0.0, xim_y_max])
-                    .name(format!("im_left {}", candidate.row.feature_id))
+                    .name(format!("top im_left {}", candidate.row.feature_id))
                     .mode(Mode::Lines)
                     .x_axis("x2")
                     .y_axis("y2")
-                    .line(Line::new().color(color).dash(DashType::Dash)),
+                    .show_legend(false)
+                    .line(Line::new().color(color).dash(DashType::Dash).width(1.8)),
             );
             plot.add_trace(
                 Scatter::new(vec![right as f64, right as f64], vec![0.0, xim_y_max])
-                    .name(format!("im_right {}", candidate.row.feature_id))
+                    .name(format!("top im_right {}", candidate.row.feature_id))
                     .mode(Mode::Lines)
                     .x_axis("x2")
                     .y_axis("y2")
-                    .line(Line::new().color(color).dash(DashType::Dash)),
+                    .show_legend(false)
+                    .line(Line::new().color(color).dash(DashType::Dash).width(1.8)),
             );
         }
     }

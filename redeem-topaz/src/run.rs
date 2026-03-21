@@ -66,8 +66,8 @@ use crate::model::topaz::TopazBagRanker;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::{
     Trainer, bags_to_train_batches, bags_to_train_batches_with_aux_and_distill,
-    filter_training_rows,
-    fit_preprocessor_from_rows_with_cols, split_rows_by_precursor, subsample_train_rows_by_bag,
+    filter_training_rows, fit_preprocessor_from_rows_with_cols, split_rows_by_precursor,
+    subsample_train_rows_by_bag,
 };
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::pipeline::{XrunPredictConfig, apply_xrun_deltas, apply_xrun_deltas_to_rows};
