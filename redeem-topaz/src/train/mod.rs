@@ -10,6 +10,8 @@ pub use pipeline::bags_to_train_batches;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 pub use pipeline::bags_to_train_batches_with_aux;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+pub use pipeline::bags_to_train_batches_with_aux_and_distill;
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 pub use pipeline::build_train_batches_from_osw_xic;
 pub use pipeline::{
     TrainFilter, filter_training_rows, fit_preprocessor_from_rows,

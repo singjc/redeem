@@ -151,3 +151,29 @@ pub fn winner_margin_loss(
     let denom = ok.sum_all()?.maximum(1.0f32)?;
     loss_sum.broadcast_div(&denom)
 }
+
+/// Masked Huber regression loss averaged over valid elements only.
+pub fn masked_huber_loss(
+    pred: &Tensor,
+    target: &Tensor,
+    mask: &Tensor,
+    delta: f32,
+) -> Result<Tensor> {
+    let pred = pred.to_dtype(DType::F32)?;
+    let target = target.to_dtype(DType::F32)?;
+    let mask = mask.to_dtype(DType::F32)?;
+    let delta = delta.max(1e-6);
+
+    let diff = pred.broadcast_sub(&target)?;
+    let abs = diff.abs()?;
+    let quad = abs.minimum(delta)?;
+    let linear = abs.broadcast_sub(&quad)?;
+    let sq = quad.sqr()?;
+    let half_sq = (sq * 0.5)?;
+    let lin_term = (linear * delta as f64)?;
+    let loss = half_sq.broadcast_add(&lin_term)?;
+
+    let loss_sum = loss.broadcast_mul(&mask)?.sum_all()?;
+    let denom = mask.sum_all()?.maximum(1.0f32)?;
+    loss_sum.broadcast_div(&denom)
+}

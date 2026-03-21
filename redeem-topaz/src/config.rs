@@ -2,6 +2,46 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Auxiliary trace-only distillation settings.
+///
+/// These targets are used only as supervision during training. They are not
+/// concatenated into the scorer inputs at inference time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistillConfig {
+    /// Heuristic columns to predict from the learned trace representation.
+    pub cols: Vec<String>,
+    /// Global loss weight applied to the masked regression objective.
+    pub lambda: f32,
+    /// Hidden layer widths for the auxiliary regressor.
+    pub hidden: Vec<usize>,
+    /// Dropout applied inside the auxiliary regressor.
+    pub dropout: f64,
+    /// Huber transition point used by the masked regression loss.
+    pub huber_delta: f32,
+    /// Minimum per-column standard deviation before a target is kept.
+    pub min_std: f32,
+}
+
+impl DistillConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.lambda > 0.0 && !self.cols.is_empty()
+    }
+}
+
+impl Default for DistillConfig {
+    fn default() -> Self {
+        Self {
+            cols: Vec::new(),
+            lambda: 0.0,
+            hidden: vec![128, 64],
+            dropout: 0.1,
+            huber_delta: 1.0,
+            min_std: 1e-3,
+        }
+    }
+}
+
 /// Base-model optimization and auxiliary-loss configuration.
 ///
 /// This struct intentionally excludes data-loading and trace extraction
@@ -24,6 +64,8 @@ pub struct Config {
     pub ms12_soft_temp: f32,
     pub max_grad_norm: f32,
     pub patience: usize,
+    pub eval_every: usize,
+    pub distill: DistillConfig,
     pub trainable_prefixes: Vec<String>,
     pub frozen_prefixes: Vec<String>,
 }
@@ -46,6 +88,8 @@ impl Default for Config {
             ms12_soft_temp: 1.0,
             max_grad_norm: 5.0,
             patience: 3,
+            eval_every: 1,
+            distill: DistillConfig::default(),
             trainable_prefixes: Vec::new(),
             frozen_prefixes: Vec::new(),
         }

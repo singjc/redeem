@@ -1,6 +1,6 @@
 //! Base TOPAZ trainer, early stopping, and optimizer setup.
 
-use crate::config::Config;
+use crate::config::{Config, DistillConfig};
 use crate::model::topaz::{TopazBagRanker, TopazConfig};
 use crate::train::losses;
 use crate::train::scheduler::CosineWarmupScheduler;
@@ -22,6 +22,10 @@ pub struct TrainBatch {
     pub mask: Tensor,
     /// (B,)
     pub yb: Tensor,
+    /// Optional auxiliary regression targets with shape `(B, K, T_distill)`.
+    pub distill_targets: Option<Tensor>,
+    /// Optional mask aligned to `distill_targets`, with `1` for valid targets.
+    pub distill_mask: Option<Tensor>,
 }
 
 /// Scalar losses returned after one optimization step.
@@ -33,6 +37,56 @@ pub struct TrainMetrics {
     pub loss_inbag: f32,
     pub loss_winner_margin: f32,
     pub loss_ms12: f32,
+    pub loss_distill: f32,
+}
+
+#[derive(Clone, Debug)]
+struct AuxLayerBlock {
+    lin: nn::Linear,
+    dropout: Option<nn::Dropout>,
+}
+
+impl AuxLayerBlock {
+    fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let h = xs.apply(&self.lin)?.apply(&nn::Activation::Relu)?;
+        if let Some(d) = &self.dropout {
+            d.forward(&h, train)
+        } else {
+            Ok(h)
+        }
+    }
+}
+
+struct DistillHead {
+    layers: Vec<AuxLayerBlock>,
+    head: nn::Linear,
+}
+
+impl DistillHead {
+    fn new(vb: VarBuilder, in_dim: usize, out_dim: usize, cfg: &DistillConfig) -> Result<Self> {
+        let mut layers = Vec::with_capacity(cfg.hidden.len());
+        let mut d = in_dim;
+        for (i, &h) in cfg.hidden.iter().enumerate() {
+            let lin = nn::linear(d, h, vb.pp(format!("lin{i}")))?;
+            let dropout = if cfg.dropout > 0.0 {
+                Some(nn::Dropout::new(cfg.dropout as f32))
+            } else {
+                None
+            };
+            layers.push(AuxLayerBlock { lin, dropout });
+            d = h;
+        }
+        let head = nn::linear(d, out_dim, vb.pp("head"))?;
+        Ok(Self { layers, head })
+    }
+
+    fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let mut h = xs.clone();
+        for layer in &self.layers {
+            h = layer.forward(&h, train)?;
+        }
+        h.apply(&self.head)
+    }
 }
 
 /// Summary of an early-stopped training run.
@@ -127,6 +181,7 @@ pub struct Trainer {
     pub model: TopazBagRanker,
     pub opt: AdamW,
     pub ms12_head: Option<nn::Linear>,
+    distill_head: Option<DistillHead>,
     pub pos_weight: Option<f32>,
     pub shuffle_seed: Option<u64>,
 }
@@ -189,6 +244,20 @@ impl Trainer {
             } else {
                 None
             };
+        let trace_repr_dim = model.trace_enc.emb_out_dim()
+            + model.xim_enc.as_ref().map(|enc| enc.emb_out_dim()).unwrap_or(0)
+            + model.trace_enc.coelution_dim()
+            + model.xim_enc.as_ref().map(|enc| enc.coelution_dim()).unwrap_or(0);
+        let distill_head = if cfg.distill.is_enabled() {
+            Some(DistillHead::new(
+                vb.pp("distill_head"),
+                trace_repr_dim,
+                cfg.distill.cols.len(),
+                &cfg.distill,
+            )?)
+        } else {
+            None
+        };
 
         let params = nn::optim::ParamsAdamW {
             lr: cfg.learning_rate as f64,
@@ -204,6 +273,7 @@ impl Trainer {
             model,
             opt,
             ms12_head,
+            distill_head,
             pos_weight: None,
             shuffle_seed: None,
         })
@@ -328,6 +398,28 @@ impl Trainer {
             }
         }
 
+        let mut loss_distill = Tensor::zeros((), DType::F32, bag.device())?;
+        if let (Some(head), Some(targets), Some(mask)) = (
+            self.distill_head.as_ref(),
+            batch.distill_targets.as_ref(),
+            batch.distill_mask.as_ref(),
+        ) {
+            let (_, _, n_targets) = targets.dims3()?;
+            if n_targets > 0 {
+                let trace_repr = Tensor::cat(&[emb.clone(), coe.clone()], 1)?;
+                let pred = head.forward(&trace_repr, true)?;
+                let target_flat = targets.reshape((b * k, n_targets))?;
+                let mask_flat = mask.reshape((b * k, n_targets))?;
+                loss_distill = losses::masked_huber_loss(
+                    &pred,
+                    &target_flat,
+                    &mask_flat,
+                    self.config.distill.huber_delta,
+                )?;
+                loss = (loss + (loss_distill.clone() * self.config.distill.lambda as f64)?)?;
+            }
+        }
+
         let mut grads = loss.backward()?;
         self.clip_grad_norm(&mut grads)?;
         self.opt.step(&grads)?;
@@ -339,6 +431,7 @@ impl Trainer {
             loss_inbag: loss_inbag.to_scalar::<f32>()?,
             loss_winner_margin: loss_wm.to_scalar::<f32>()?,
             loss_ms12: loss_ms12.to_scalar::<f32>()?,
+            loss_distill: loss_distill.to_scalar::<f32>()?,
         })
     }
 
@@ -481,6 +574,7 @@ impl Trainer {
         let mut bad = 0usize;
         let min_delta = 1e-4f32;
         let patience = self.config.patience.max(1);
+        let eval_every = self.config.eval_every.max(1);
 
         let mut best_path = None;
         if !val_batches.is_empty() {
@@ -536,6 +630,26 @@ impl Trainer {
                     );
                 } else {
                     log::info!("Epoch {:02} train={:.4}", epoch, train_loss);
+                }
+                continue;
+            }
+
+            if epoch % eval_every != 0 && epoch != epochs {
+                if self.config.use_lr_scheduler {
+                    log::info!(
+                        "Epoch {:02} train={:.4} lr={:.3e} val=skipped(eval_every={})",
+                        epoch,
+                        train_loss,
+                        self.opt.learning_rate(),
+                        eval_every
+                    );
+                } else {
+                    log::info!(
+                        "Epoch {:02} train={:.4} val=skipped(eval_every={})",
+                        epoch,
+                        train_loss,
+                        eval_every
+                    );
                 }
                 continue;
             }
@@ -663,6 +777,8 @@ mod tests {
             tb_aux: None,
             mask,
             yb,
+            distill_targets: None,
+            distill_mask: None,
         };
 
         let m1 = trainer.train_step(&batch)?;
