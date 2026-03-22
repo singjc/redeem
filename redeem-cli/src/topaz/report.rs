@@ -1582,6 +1582,32 @@ fn plot_example_bag(example: &ExampleBag) -> Plot {
     }
 
     if let (Some(candidate), Some(raw_xim)) = (top_candidate, example.raw_xim.as_ref()) {
+        let mut xim_traces = raw_xim.traces.iter().collect::<Vec<_>>();
+        xim_traces.sort_by(|a, b| {
+            a.mobilogram_type
+                .cmp(&b.mobilogram_type)
+                .then_with(|| a.ms_level.cmp(&b.ms_level))
+                .then_with(|| a.ordinal.cmp(&b.ordinal))
+                .then_with(|| a.annotation.cmp(&b.annotation))
+        });
+        for trace in xim_traces {
+            let x: Vec<f64> = trace.points.iter().map(|p| p.mobility as f64).collect();
+            let y: Vec<f64> = trace.points.iter().map(|p| p.intensity as f64).collect();
+            xim_y_max = xim_y_max.max(y.iter().copied().fold(0.0, f64::max));
+            let name = if trace.annotation.is_empty() {
+                "XIM trace".to_string()
+            } else {
+                format!("XIM {}", trace.annotation)
+            };
+            plot.add_trace(
+                Scatter::new(x, y)
+                    .name(name)
+                    .mode(Mode::Lines)
+                    .x_axis("x2")
+                    .y_axis("y2")
+                    .line(Line::new().color("rgba(31,119,180,0.28)").width(1.0)),
+            );
+        }
         let Some((coords, signal)) = summed_xim_trace(raw_xim) else {
             plot.set_layout(
                 Layout::new()
@@ -1603,15 +1629,11 @@ fn plot_example_bag(example: &ExampleBag) -> Plot {
         let color = palette_color(0);
         plot.add_trace(
             Scatter::new(coords.clone(), signal.clone())
-                .name(format!(
-                    "XIM {} {}",
-                    score_rank_label(&candidate.topaz),
-                    candidate.row.feature_id
-                ))
+                .name("XIM sum")
                 .mode(Mode::Lines)
                 .x_axis("x2")
                 .y_axis("y2")
-                .line(Line::new().color(color).width(2.5)),
+                .line(Line::new().color("#111111").width(2.5)),
         );
         let apex_x = candidate.row.exp_im.unwrap_or(0.0) as f64;
         let apex_y = nearest_signal(&coords, &signal, apex_x).max(0.0);
