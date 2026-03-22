@@ -1,6 +1,6 @@
 //! Base TOPAZ trainer, early stopping, and optimizer setup.
 
-use crate::config::{Config, DistillConfig};
+use crate::config::Config;
 use crate::model::topaz::{TopazBagRanker, TopazConfig};
 use crate::train::losses;
 use crate::train::scheduler::CosineWarmupScheduler;
@@ -36,7 +36,10 @@ pub struct TrainMetrics {
     pub loss_pair: f32,
     pub loss_inbag: f32,
     pub loss_winner_margin: f32,
+    pub loss_topk_runner: f32,
     pub loss_ms12: f32,
+    pub loss_xic_bag: f32,
+    pub loss_xim_bag: f32,
     pub loss_distill: f32,
 }
 
@@ -57,19 +60,25 @@ impl AuxLayerBlock {
     }
 }
 
-struct DistillHead {
+struct MlpHead {
     layers: Vec<AuxLayerBlock>,
     head: nn::Linear,
 }
 
-impl DistillHead {
-    fn new(vb: VarBuilder, in_dim: usize, out_dim: usize, cfg: &DistillConfig) -> Result<Self> {
-        let mut layers = Vec::with_capacity(cfg.hidden.len());
+impl MlpHead {
+    fn new(
+        vb: VarBuilder,
+        in_dim: usize,
+        out_dim: usize,
+        hidden: &[usize],
+        dropout: f64,
+    ) -> Result<Self> {
+        let mut layers = Vec::with_capacity(hidden.len());
         let mut d = in_dim;
-        for (i, &h) in cfg.hidden.iter().enumerate() {
+        for (i, &h) in hidden.iter().enumerate() {
             let lin = nn::linear(d, h, vb.pp(format!("lin{i}")))?;
-            let dropout = if cfg.dropout > 0.0 {
-                Some(nn::Dropout::new(cfg.dropout as f32))
+            let dropout = if dropout > 0.0 {
+                Some(nn::Dropout::new(dropout as f32))
             } else {
                 None
             };
@@ -181,7 +190,9 @@ pub struct Trainer {
     pub model: TopazBagRanker,
     pub opt: AdamW,
     pub ms12_head: Option<nn::Linear>,
-    distill_head: Option<DistillHead>,
+    xic_bag_head: Option<MlpHead>,
+    xim_bag_head: Option<MlpHead>,
+    distill_head: Option<MlpHead>,
     pub pos_weight: Option<f32>,
     pub shuffle_seed: Option<u64>,
 }
@@ -233,6 +244,23 @@ fn select_optimizer_vars(cfg: &Config, varmap: &VarMap) -> Result<Vec<candle_cor
 }
 
 impl Trainer {
+    fn masked_max_bag_logits(cand: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let (b, k) = cand.dims2()?;
+        let m = mask.to_dtype(DType::F32)?;
+        let neg_big = Tensor::full(-1e9f32, (b, k), cand.device())?;
+        let ones = m.ones_like()?;
+        let cand_masked = (cand.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
+        cand_masked.max(1)
+    }
+
+    fn zero_xim_input(&self, n: usize, device: &Device, dtype: DType) -> Result<Option<Tensor>> {
+        let Some(cfg) = &self.model.xim_cfg else {
+            return Ok(None);
+        };
+        let c_total = cfg.ms1_cmax + cfg.ms2_cmax;
+        Ok(Some(Tensor::zeros((n, c_total, cfg.l), dtype, device)?))
+    }
+
     /// Construct a trainer and initialize optimizer parameters.
     pub fn new(cfg: Config, model_cfg: &TopazConfig, device: &Device) -> Result<Self> {
         let varmap = VarMap::new();
@@ -256,12 +284,47 @@ impl Trainer {
                 .as_ref()
                 .map(|enc| enc.coelution_dim())
                 .unwrap_or(0);
+        let xic_repr_dim = model.trace_enc.emb_out_dim() + model.trace_enc.coelution_dim();
+        let xic_bag_head = if cfg.lambda_xic_bag > 0.0 {
+            Some(MlpHead::new(
+                vb.pp("xic_bag_head"),
+                xic_repr_dim,
+                1,
+                &cfg.branch_aux_hidden,
+                cfg.branch_aux_dropout,
+            )?)
+        } else {
+            None
+        };
+        let xim_repr_dim = model
+            .xim_enc
+            .as_ref()
+            .map(|enc| enc.emb_out_dim() + enc.coelution_dim());
+        let xim_bag_head = if cfg.lambda_xim_bag > 0.0 {
+            if let Some(in_dim) = xim_repr_dim {
+                Some(MlpHead::new(
+                    vb.pp("xim_bag_head"),
+                    in_dim,
+                    1,
+                    &cfg.branch_aux_hidden,
+                    cfg.branch_aux_dropout,
+                )?)
+            } else {
+                log::warn!(
+                    "lambda_xim_bag > 0 but model has no XIM branch; disabling XIM auxiliary bag head"
+                );
+                None
+            }
+        } else {
+            None
+        };
         let distill_head = if cfg.distill.is_enabled() {
-            Some(DistillHead::new(
+            Some(MlpHead::new(
                 vb.pp("distill_head"),
                 trace_repr_dim,
                 cfg.distill.cols.len(),
-                &cfg.distill,
+                &cfg.distill.hidden,
+                cfg.distill.dropout,
             )?)
         } else {
             None
@@ -281,6 +344,8 @@ impl Trainer {
             model,
             opt,
             ms12_head,
+            xic_bag_head,
+            xim_bag_head,
             distill_head,
             pos_weight: None,
             shuffle_seed: None,
@@ -343,19 +408,40 @@ impl Trainer {
             None
         };
 
-        let (emb, coe, coe_ms12) = self.model.encode_inputs(&tf, tf_aux.as_ref())?;
+        let (emb_xic, coe_xic, coe_ms12) = self.model.trace_enc.forward_components(&tf)?;
+        let (emb_xim, coe_xim) = if let Some(xim_enc) = &self.model.xim_enc {
+            let xim_tensor = if let Some(xim) = tf_aux.as_ref() {
+                xim.clone()
+            } else {
+                self.zero_xim_input(b * k, tf.device(), tf.dtype())?
+                    .expect("zero XIM requested without XIM config")
+            };
+            let (emb, coe, _coe_ms12_xim) = xim_enc.forward_components(&xim_tensor)?;
+            (Some(emb), Some(coe))
+        } else {
+            (None, None)
+        };
+        let emb = if let Some(emb_xim) = &emb_xim {
+            Tensor::cat(&[emb_xic.clone(), emb_xim.clone()], 1)?
+        } else {
+            emb_xic.clone()
+        };
+        let coe = if let Some(coe_xim) = &coe_xim {
+            Tensor::cat(&[coe_xic.clone(), coe_xim.clone()], 1)?
+        } else {
+            coe_xic.clone()
+        };
         let logits = self.model.scorer.forward(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
-
-        let m = batch.mask.to_dtype(DType::F32)?;
-        let neg_big = Tensor::full(-1e9f32, (b, k), cand.device())?;
-        let ones = m.ones_like()?;
-        let cand_masked = (cand.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
-        let bag = cand_masked.max(1)?;
+        let bag = Self::masked_max_bag_logits(&cand, &batch.mask)?;
 
         let loss_bag = losses::bce_with_logits_weighted(&bag, &batch.yb, self.pos_weight)?;
 
         let mut loss = loss_bag.clone();
+        let m = batch.mask.to_dtype(DType::F32)?;
+        let neg_big = Tensor::full(-1e9f32, (b, k), cand.device())?;
+        let ones = m.ones_like()?;
+        let cand_masked = (cand.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
         let mut loss_pair = Tensor::zeros((), DType::F32, bag.device())?;
         if self.config.lambda_pair > 0.0 {
             loss_pair = losses::pairwise_pos_neg_softplus(&bag, &batch.yb)?;
@@ -384,6 +470,18 @@ impl Trainer {
             loss = (loss + (loss_wm.clone() * self.config.lambda_winner_margin as f64)?)?;
         }
 
+        let mut loss_topk_runner = Tensor::zeros((), DType::F32, bag.device())?;
+        if self.config.lambda_topk_runner > 0.0 {
+            loss_topk_runner = losses::topk_runner_margin_loss(
+                &cand,
+                &batch.mask,
+                &batch.yb,
+                self.config.topk_runner_margin,
+                self.config.topk_runner_k,
+            )?;
+            loss = (loss + (loss_topk_runner.clone() * self.config.lambda_topk_runner as f64)?)?;
+        }
+
         let mut loss_ms12 = Tensor::zeros((), DType::F32, bag.device())?;
         if let Some(head) = &self.ms12_head {
             if coe_ms12.elem_count() > 0 {
@@ -404,6 +502,28 @@ impl Trainer {
                     losses::bce_with_logits_weighted(&ms12_logit, &batch.yb, self.pos_weight)?;
                 loss = (loss + (loss_ms12.clone() * self.config.lambda_ms12 as f64)?)?;
             }
+        }
+
+        let mut loss_xic_bag = Tensor::zeros((), DType::F32, bag.device())?;
+        if let Some(head) = &self.xic_bag_head {
+            let xic_repr = Tensor::cat(&[emb_xic.clone(), coe_xic.clone()], 1)?;
+            let xic_logits = head.forward(&xic_repr, true)?.squeeze(1)?;
+            let xic_cand = xic_logits.reshape((b, k))?;
+            let xic_bag = Self::masked_max_bag_logits(&xic_cand, &batch.mask)?;
+            loss_xic_bag = losses::bce_with_logits_weighted(&xic_bag, &batch.yb, self.pos_weight)?;
+            loss = (loss + (loss_xic_bag.clone() * self.config.lambda_xic_bag as f64)?)?;
+        }
+
+        let mut loss_xim_bag = Tensor::zeros((), DType::F32, bag.device())?;
+        if let (Some(head), Some(emb_xim), Some(coe_xim)) =
+            (&self.xim_bag_head, emb_xim.as_ref(), coe_xim.as_ref())
+        {
+            let xim_repr = Tensor::cat(&[emb_xim.clone(), coe_xim.clone()], 1)?;
+            let xim_logits = head.forward(&xim_repr, true)?.squeeze(1)?;
+            let xim_cand = xim_logits.reshape((b, k))?;
+            let xim_bag = Self::masked_max_bag_logits(&xim_cand, &batch.mask)?;
+            loss_xim_bag = losses::bce_with_logits_weighted(&xim_bag, &batch.yb, self.pos_weight)?;
+            loss = (loss + (loss_xim_bag.clone() * self.config.lambda_xim_bag as f64)?)?;
         }
 
         let mut loss_distill = Tensor::zeros((), DType::F32, bag.device())?;
@@ -438,7 +558,10 @@ impl Trainer {
             loss_pair: loss_pair.to_scalar::<f32>()?,
             loss_inbag: loss_inbag.to_scalar::<f32>()?,
             loss_winner_margin: loss_wm.to_scalar::<f32>()?,
+            loss_topk_runner: loss_topk_runner.to_scalar::<f32>()?,
             loss_ms12: loss_ms12.to_scalar::<f32>()?,
+            loss_xic_bag: loss_xic_bag.to_scalar::<f32>()?,
+            loss_xim_bag: loss_xim_bag.to_scalar::<f32>()?,
             loss_distill: loss_distill.to_scalar::<f32>()?,
         })
     }
@@ -459,12 +582,7 @@ impl Trainer {
         let (emb, coe, _coe_ms12) = self.model.encode_inputs(&tf, tf_aux.as_ref())?;
         let logits = self.model.scorer.forward_eval(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
-
-        let m = batch.mask.to_dtype(DType::F32)?;
-        let neg_big = Tensor::full(-1e9f32, (b, k), cand.device())?;
-        let ones = m.ones_like()?;
-        let cand_masked = (cand.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
-        cand_masked.max(1)
+        Self::masked_max_bag_logits(&cand, &batch.mask)
     }
 
     /// Evaluate mean bag BCE loss over a validation set.

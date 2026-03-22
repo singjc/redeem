@@ -152,6 +152,72 @@ pub fn winner_margin_loss(
     loss_sum.broadcast_div(&denom)
 }
 
+/// Top-k runner-up margin loss for target bags.
+///
+/// This focuses supervision on the hardest remaining in-bag alternatives by
+/// requiring the current winner to stay ahead of the top `k` runner-up
+/// candidates, not only the single second-best candidate.
+pub fn topk_runner_margin_loss(
+    cand_logits: &Tensor,
+    mask: &Tensor,
+    y_bag: &Tensor,
+    margin: f32,
+    top_k: usize,
+) -> Result<Tensor> {
+    let (b, k) = cand_logits.dims2()?;
+    if k < 2 || top_k == 0 {
+        return Tensor::zeros((), DType::F32, cand_logits.device());
+    }
+
+    let s = cand_logits.to_dtype(DType::F32)?;
+    let m = mask.to_dtype(DType::F32)?;
+    let y = y_bag.to_dtype(DType::F32)?;
+
+    let neg_big = Tensor::full(-1e9f32, (b, k), s.device())?;
+    let ones = m.ones_like()?;
+    let s_masked = (s.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones.clone() - &m)?)?)?;
+
+    let s_best = s_masked.max(1)?;
+    let k_best = s_masked.argmax(1)?.to_dtype(DType::I64)?;
+
+    let idx = Tensor::arange(0i64, k as i64, s.device())?
+        .reshape((1, k))?
+        .broadcast_as((b, k))?;
+    let k_best = k_best.reshape((b, 1))?.broadcast_as((b, k))?;
+    let onehot = idx.eq(&k_best)?;
+    let onehot_f = onehot.to_dtype(DType::F32)?;
+
+    let tgt = y.gt(0.5f32)?.to_dtype(DType::F32)?;
+    let mut current_mask = m.broadcast_mul(&(ones - &onehot_f)?)?;
+    let mut loss_sum = Tensor::zeros((), DType::F32, s.device())?;
+    let mut denom = Tensor::zeros((), DType::F32, s.device())?;
+
+    for _ in 0..top_k.min(k - 1) {
+        let has_runner = current_mask.sum(1)?.gt(0.0f32)?.to_dtype(DType::F32)?;
+        let ok = has_runner.broadcast_mul(&tgt)?;
+
+        let cur_ones = current_mask.ones_like()?;
+        let s_runner_masked = (s.broadcast_mul(&current_mask)?
+            + neg_big.broadcast_mul(&(cur_ones - &current_mask)?)?)?;
+        let s_runner = s_runner_masked.max(1)?;
+
+        let gap = s_best.broadcast_sub(&s_runner)?;
+        let margin_diff = (margin as f64 - gap)?;
+        let loss_vec = softplus(&margin_diff)?;
+        loss_sum = (loss_sum + loss_vec.broadcast_mul(&ok)?.sum_all()?)?;
+        denom = (denom + ok.sum_all()?)?;
+
+        let k_runner = s_runner_masked.argmax(1)?.to_dtype(DType::I64)?;
+        let k_runner = k_runner.reshape((b, 1))?.broadcast_as((b, k))?;
+        let runner_onehot = idx.eq(&k_runner)?.to_dtype(DType::F32)?;
+        let cur_ones = current_mask.ones_like()?;
+        current_mask = current_mask.broadcast_mul(&(cur_ones - &runner_onehot)?)?;
+    }
+
+    let denom = denom.maximum(1.0f32)?;
+    loss_sum.broadcast_div(&denom)
+}
+
 /// Masked Huber regression loss averaged over valid elements only.
 pub fn masked_huber_loss(
     pred: &Tensor,
