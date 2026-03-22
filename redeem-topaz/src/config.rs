@@ -42,6 +42,20 @@ impl Default for DistillConfig {
     }
 }
 
+/// Validation metric used for checkpoint selection and early stopping.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EarlyStopMetric {
+    ValLoss,
+    ValTdcTargets,
+}
+
+impl Default for EarlyStopMetric {
+    fn default() -> Self {
+        Self::ValLoss
+    }
+}
+
 /// Base-model optimization and auxiliary-loss configuration.
 ///
 /// This struct intentionally excludes data-loading and trace extraction
@@ -72,6 +86,8 @@ pub struct Config {
     pub max_grad_norm: f32,
     pub patience: usize,
     pub eval_every: usize,
+    pub early_stop_metric: EarlyStopMetric,
+    pub early_stop_qvalue: f32,
     pub distill: DistillConfig,
     pub trainable_prefixes: Vec<String>,
     pub frozen_prefixes: Vec<String>,
@@ -103,6 +119,8 @@ impl Default for Config {
             max_grad_norm: 5.0,
             patience: 3,
             eval_every: 1,
+            early_stop_metric: EarlyStopMetric::ValLoss,
+            early_stop_qvalue: 0.01,
             distill: DistillConfig::default(),
             trainable_prefixes: Vec::new(),
             frozen_prefixes: Vec::new(),

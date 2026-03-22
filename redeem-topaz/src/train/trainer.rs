@@ -1,6 +1,7 @@
 //! Base TOPAZ trainer, early stopping, and optimizer setup.
 
-use crate::config::Config;
+use crate::config::{Config, EarlyStopMetric};
+use crate::infer::{TdcSummary, tdc_summary};
 use crate::model::topaz::{TopazBagRanker, TopazConfig};
 use crate::train::losses;
 use crate::train::scheduler::CosineWarmupScheduler;
@@ -104,6 +105,7 @@ pub struct TrainHistory {
     pub epochs_ran: usize,
     pub best_epoch: usize,
     pub best_val: f32,
+    pub best_val_targets: Option<usize>,
 }
 
 /// Periodically emits batch-level progress for long base-TOPAZ training runs.
@@ -585,18 +587,47 @@ impl Trainer {
         Self::masked_max_bag_logits(&cand, &batch.mask)
     }
 
-    /// Evaluate mean bag BCE loss over a validation set.
-    pub fn eval_bag_loss(&self, batches: &[TrainBatch]) -> Result<f32> {
+    fn eval_bag_stats(
+        &self,
+        batches: &[TrainBatch],
+        tdc_q: Option<f32>,
+    ) -> Result<(f32, Option<TdcSummary>)> {
         if batches.is_empty() {
-            return Ok(f32::INFINITY);
+            return Ok((f32::INFINITY, None));
         }
         let mut sum = 0f32;
+        let mut scores = if tdc_q.is_some() {
+            Some(Vec::<f32>::new())
+        } else {
+            None
+        };
+        let mut is_decoy = if tdc_q.is_some() {
+            Some(Vec::<bool>::new())
+        } else {
+            None
+        };
         for batch in batches {
             let bag = self.bag_logits(batch)?;
             let loss = losses::bce_with_logits_weighted(&bag, &batch.yb, self.pos_weight)?;
             sum += loss.to_scalar::<f32>()?;
+            if let (Some(scores), Some(is_decoy)) = (scores.as_mut(), is_decoy.as_mut()) {
+                scores.extend(bag.to_vec1::<f32>()?);
+                is_decoy.extend(batch.yb.to_vec1::<f32>()?.into_iter().map(|y| y < 0.5));
+            }
         }
-        Ok(sum / batches.len() as f32)
+        let mean_loss = sum / batches.len() as f32;
+        let summary = if let (Some(q), Some(scores), Some(is_decoy)) = (tdc_q, scores, is_decoy) {
+            Some(tdc_summary(&scores, &is_decoy, q))
+        } else {
+            None
+        };
+        Ok((mean_loss, summary))
+    }
+
+    /// Evaluate mean bag BCE loss over a validation set.
+    pub fn eval_bag_loss(&self, batches: &[TrainBatch]) -> Result<f32> {
+        let (loss, _summary) = self.eval_bag_stats(batches, None)?;
+        Ok(loss)
     }
 
     /// Train for one epoch with deterministic shuffling.
@@ -681,6 +712,7 @@ impl Trainer {
                 epochs_ran: 0,
                 best_epoch: 0,
                 best_val: f32::INFINITY,
+                best_val_targets: None,
             });
         }
         let mut step = 0usize;
@@ -697,10 +729,12 @@ impl Trainer {
 
         let mut best_val = f32::INFINITY;
         let mut best_epoch = 0usize;
+        let mut best_val_targets = None;
         let mut bad = 0usize;
         let min_delta = 1e-4f32;
         let patience = self.config.patience.max(1);
         let eval_every = self.config.eval_every.max(1);
+        let early_stop_q = self.config.early_stop_qvalue.clamp(0.0, 1.0);
 
         let mut best_path = None;
         if !val_batches.is_empty() {
@@ -780,8 +814,38 @@ impl Trainer {
                 continue;
             }
 
-            let val_loss = self.eval_bag_loss(val_batches)?;
-            if self.config.use_lr_scheduler {
+            let need_tdc = matches!(
+                self.config.early_stop_metric,
+                EarlyStopMetric::ValTdcTargets
+            );
+            let (val_loss, val_tdc) =
+                self.eval_bag_stats(val_batches, need_tdc.then_some(early_stop_q))?;
+            if let Some(summ) = val_tdc.as_ref() {
+                if self.config.use_lr_scheduler {
+                    log::info!(
+                        "Epoch {:02} train={:.4} val_loss={:.4} val_tdc_targets@q={}/{} val_tdc_decoys={} val_tdc_cutoff={:.4} lr={:.3e}",
+                        epoch,
+                        train_loss,
+                        val_loss,
+                        early_stop_q,
+                        summ.n_targets,
+                        summ.n_decoys,
+                        summ.cutoff,
+                        self.opt.learning_rate()
+                    );
+                } else {
+                    log::info!(
+                        "Epoch {:02} train={:.4} val_loss={:.4} val_tdc_targets@q={}/{} val_tdc_decoys={} val_tdc_cutoff={:.4}",
+                        epoch,
+                        train_loss,
+                        val_loss,
+                        early_stop_q,
+                        summ.n_targets,
+                        summ.n_decoys,
+                        summ.cutoff
+                    );
+                }
+            } else if self.config.use_lr_scheduler {
                 log::info!(
                     "Epoch {:02} train={:.4} val={:.4} lr={:.3e}",
                     epoch,
@@ -798,9 +862,27 @@ impl Trainer {
                 );
             }
 
-            if val_loss + min_delta < best_val {
+            let improved = match self.config.early_stop_metric {
+                EarlyStopMetric::ValLoss => val_loss + min_delta < best_val,
+                EarlyStopMetric::ValTdcTargets => {
+                    let summ = val_tdc
+                        .as_ref()
+                        .expect("TDC summary missing for early-stop metric");
+                    match best_val_targets {
+                        None => true,
+                        Some(best_targets) => {
+                            summ.n_targets > best_targets
+                                || (summ.n_targets == best_targets
+                                    && val_loss + min_delta < best_val)
+                        }
+                    }
+                }
+            };
+
+            if improved {
                 best_val = val_loss;
                 best_epoch = epoch;
+                best_val_targets = val_tdc.as_ref().map(|summ| summ.n_targets);
                 bad = 0;
                 if let Some(path) = &best_path {
                     if let Err(err) = self.varmap.save(path) {
@@ -810,7 +892,19 @@ impl Trainer {
             } else {
                 bad += 1;
                 if bad >= patience {
-                    log::info!("Early stopping (best val={:.4})", best_val);
+                    match self.config.early_stop_metric {
+                        EarlyStopMetric::ValLoss => {
+                            log::info!("Early stopping (best val={:.4})", best_val);
+                        }
+                        EarlyStopMetric::ValTdcTargets => {
+                            log::info!(
+                                "Early stopping (best val_tdc_targets@q={:.2}={} tie_break_val_loss={:.4})",
+                                early_stop_q,
+                                best_val_targets.unwrap_or(0),
+                                best_val
+                            );
+                        }
+                    }
                     break;
                 }
             }
@@ -829,6 +923,7 @@ impl Trainer {
             epochs_ran,
             best_epoch,
             best_val,
+            best_val_targets,
         })
     }
 }
