@@ -57,6 +57,10 @@ pub struct TopazXimConfig {
     /// Width of the learned similarity embedding inside the coelution head.
     #[serde(alias = "coelution_emb_dim")]
     pub coelution_sim_emb_dim: usize,
+    /// Whether to add an explicit transition-interaction embedding over XIM channels.
+    pub use_transition_interaction: bool,
+    /// Width of the learned transition-interaction embedding appended per branch.
+    pub transition_interaction_dim: usize,
 }
 
 impl Default for TopazXimConfig {
@@ -71,6 +75,8 @@ impl Default for TopazXimConfig {
             coelution_beta: 10.0,
             coelution_max_lag: 2,
             coelution_sim_emb_dim: 8,
+            use_transition_interaction: false,
+            transition_interaction_dim: 16,
         }
     }
 }
@@ -117,6 +123,10 @@ pub struct TopazConfig {
     pub coelution_max_lag: usize,
     /// Width of the learned similarity embedding inside the coelution head.
     pub coelution_sim_emb_dim: usize,
+    /// Whether to add an explicit transition-interaction embedding over XIC channels.
+    pub use_transition_interaction: bool,
+    /// Width of the learned transition-interaction embedding appended per branch.
+    pub transition_interaction_dim: usize,
     /// Optional ion-mobilogram encoder branch used for diaPASEF-style inputs.
     pub xim: Option<TopazXimConfig>,
 }
@@ -137,6 +147,8 @@ impl Default for TopazConfig {
             coelution_beta: 10.0,
             coelution_max_lag: 2,
             coelution_sim_emb_dim: 8,
+            use_transition_interaction: false,
+            transition_interaction_dim: 16,
             xim: None,
         }
     }
@@ -192,6 +204,8 @@ impl TopazBagRanker {
             coelution_beta: cfg.coelution_beta,
             coelution_max_lag: cfg.coelution_max_lag,
             coelution_sim_emb_dim: cfg.coelution_sim_emb_dim,
+            use_transition_interaction: cfg.use_transition_interaction,
+            transition_interaction_dim: cfg.transition_interaction_dim,
             xim: None,
         }
     }
@@ -611,6 +625,44 @@ mod tests {
         let mask = Tensor::ones((b, k), DType::U8, &device)?;
 
         let (cand, bag, win) = model.forward_bags_with_hidden_aux(&xb, &tb, &mask, Some(&xim))?;
+        assert_eq!(cand.dims2()?, (b, k));
+        assert_eq!(bag.dims1()?, b);
+        assert_eq!(win.dims2()?.0, b);
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_bags_with_transition_interaction_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TopazConfig {
+            feat_dim: 4,
+            ms2_cmax: 3,
+            ms1_cmax: 2,
+            l: 10,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: TraceInputMode::Dual,
+            use_heuristic_features: true,
+            use_coelution_head: true,
+            use_transition_interaction: true,
+            transition_interaction_dim: 6,
+            ..Default::default()
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = TopazBagRanker::new(vb.pp("topaz"), &cfg)?;
+
+        let (b, k, d) = (2usize, 3usize, cfg.feat_dim);
+        let xb = Tensor::zeros((b, k, d), DType::F32, &device)?;
+        let tb = Tensor::zeros(
+            (b, k, cfg.ms1_cmax + cfg.ms2_cmax, cfg.l),
+            DType::F32,
+            &device,
+        )?;
+        let mask = Tensor::ones((b, k), DType::U8, &device)?;
+
+        let (cand, bag, win) = model.forward_bags_with_hidden(&xb, &tb, &mask)?;
         assert_eq!(cand.dims2()?, (b, k));
         assert_eq!(bag.dims1()?, b);
         assert_eq!(win.dims2()?.0, b);
