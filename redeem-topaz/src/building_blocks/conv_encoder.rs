@@ -20,6 +20,7 @@ use candle_nn::{self as nn, VarBuilder};
 
 use crate::building_blocks::coelution::{linspace_0_1, zscore_time};
 use crate::building_blocks::trace_input::{TraceInputMode, make_trace_input};
+use crate::building_blocks::transition_interaction::TransitionInteractionBlock;
 use crate::model::topaz::TopazConfig;
 
 /// A single convolutional branch operating on either MS1 or MS2 traces.
@@ -33,8 +34,9 @@ pub struct ConvBranch {
     conv1: nn::Conv1d,
     conv2: nn::Conv1d,
     proj: nn::Linear,
+    interaction: Option<TransitionInteractionBlock>,
     trace_input_mode: TraceInputMode,
-    emb_dim: usize,
+    total_emb_dim: usize,
 }
 
 impl ConvBranch {
@@ -46,10 +48,19 @@ impl ConvBranch {
     /// number of channels.
     pub fn new(
         vb: VarBuilder,
-        cin: usize,
+        c: usize,
+        l: usize,
         emb_dim: usize,
         trace_input_mode: TraceInputMode,
+        use_transition_interaction: bool,
+        transition_interaction_dim: usize,
     ) -> Result<Self> {
+        let dual_mul = if trace_input_mode == TraceInputMode::Dual {
+            2
+        } else {
+            1
+        };
+        let cin = c * dual_mul;
         let conv_cfg_k1 = nn::Conv1dConfig {
             padding: 0,
             ..Default::default()
@@ -63,20 +74,33 @@ impl ConvBranch {
         let conv1 = nn::conv1d(32, 64, 3, conv_cfg_k3, vb.pp("conv1"))?;
         let conv2 = nn::conv1d(64, 64, 3, conv_cfg_k3, vb.pp("conv2"))?;
         let proj = nn::linear(128, emb_dim, vb.pp("proj"))?;
+        let interaction = if use_transition_interaction && transition_interaction_dim > 0 && c > 1 {
+            Some(TransitionInteractionBlock::new(
+                vb.pp("transition_interaction"),
+                l,
+                trace_input_mode,
+                transition_interaction_dim,
+                transition_interaction_dim,
+            )?)
+        } else {
+            None
+        };
+        let total_emb_dim = emb_dim + interaction.as_ref().map(|b| b.out_dim()).unwrap_or(0);
 
         Ok(Self {
             conv0,
             conv1,
             conv2,
             proj,
+            interaction,
             trace_input_mode,
-            emb_dim,
+            total_emb_dim,
         })
     }
 
     /// Embedding dimensionality produced by this branch.
     pub fn emb_dim(&self) -> usize {
-        self.emb_dim
+        self.total_emb_dim
     }
 
     /// Encode a modality-specific trace tensor into one embedding per row.
@@ -98,7 +122,13 @@ impl ConvBranch {
         let h_max = h.max(2)?; // (N,64)
         let h_mean = h.mean(2)?; // (N,64)
         let h_pool = Tensor::cat(&[h_max, h_mean], 1)?; // (N,128)
-        h_pool.apply(&self.proj)
+        let base = h_pool.apply(&self.proj)?;
+        if let Some(interaction) = &self.interaction {
+            let inter = interaction.forward(x)?;
+            Tensor::cat(&[base, inter], 1)
+        } else {
+            Ok(base)
+        }
     }
 }
 
@@ -156,25 +186,25 @@ pub struct TraceHeadComponents {
 impl TraceEncoder {
     /// Build the full trace encoder from [`TopazConfig`].
     pub fn new(vb: VarBuilder, cfg: &TopazConfig) -> Result<Self> {
-        let dual_mul = if cfg.trace_input_mode == TraceInputMode::Dual {
-            2
-        } else {
-            1
-        };
-
         let ms2 = ConvBranch::new(
             vb.pp("ms2"),
-            cfg.ms2_cmax * dual_mul,
+            cfg.ms2_cmax,
+            cfg.l,
             cfg.trace_emb_dim,
             cfg.trace_input_mode,
+            cfg.use_transition_interaction,
+            cfg.transition_interaction_dim,
         )?;
 
         let ms1 = if cfg.ms1_cmax > 0 {
             Some(ConvBranch::new(
                 vb.pp("ms1"),
-                cfg.ms1_cmax * dual_mul,
+                cfg.ms1_cmax,
+                cfg.l,
                 cfg.trace_emb_dim,
                 cfg.trace_input_mode,
+                cfg.use_transition_interaction,
+                cfg.transition_interaction_dim,
             )?)
         } else {
             None

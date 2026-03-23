@@ -10,3 +10,4 @@ pub mod conv_encoder;
 pub mod mlp;
 pub mod trace_input;
 pub mod trace_window;
+pub mod transition_interaction;
