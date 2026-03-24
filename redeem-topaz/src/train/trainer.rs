@@ -423,16 +423,13 @@ impl Trainer {
         } else {
             (None, None)
         };
-        let emb = if let Some(emb_xim) = &emb_xim {
-            Tensor::cat(&[emb_xic.clone(), emb_xim.clone()], 1)?
-        } else {
-            emb_xic.clone()
-        };
-        let coe = if let Some(coe_xim) = &coe_xim {
-            Tensor::cat(&[coe_xic.clone(), coe_xim.clone()], 1)?
-        } else {
-            coe_xic.clone()
-        };
+        let (emb, coe) = self.model.fuse_modalities(
+            &emb_xic,
+            &coe_xic,
+            emb_xim.as_ref(),
+            coe_xim.as_ref(),
+            true,
+        )?;
         let logits = self.model.scorer.forward(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
         let bag = Self::masked_max_bag_logits(&cand, &batch.mask)?;

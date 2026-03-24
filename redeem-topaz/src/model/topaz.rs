@@ -21,7 +21,7 @@
 //! - `E`: learned trace-embedding dimension after branch fusion.
 
 use candle_core::{DType, Result, Tensor};
-use candle_nn::VarBuilder;
+use candle_nn::{self as nn, VarBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::building_blocks::trace_input::TraceInputMode;
@@ -127,6 +127,14 @@ pub struct TopazConfig {
     pub use_transition_interaction: bool,
     /// Width of the learned transition-interaction embedding appended per branch.
     pub transition_interaction_dim: usize,
+    /// Whether to learn per-candidate XIC/XIM fusion weights before final scoring.
+    pub use_modality_gated_fusion: bool,
+    /// Hidden layer widths for the modality gate MLP.
+    pub modality_gate_hidden: Vec<usize>,
+    /// Dropout applied inside the modality gate.
+    pub modality_gate_dropout: f64,
+    /// How the learned modality gate combines XIC and XIM evidence.
+    pub modality_gate_mode: ModalityGateMode,
     /// Optional ion-mobilogram encoder branch used for diaPASEF-style inputs.
     pub xim: Option<TopazXimConfig>,
 }
@@ -149,7 +157,117 @@ impl Default for TopazConfig {
             coelution_sim_emb_dim: 8,
             use_transition_interaction: false,
             transition_interaction_dim: 16,
+            use_modality_gated_fusion: false,
+            modality_gate_hidden: Vec::new(),
+            modality_gate_dropout: 0.0,
+            modality_gate_mode: ModalityGateMode::default(),
             xim: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModalityGateMode {
+    #[default]
+    Competitive,
+    ResidualXim,
+}
+
+#[derive(Clone, Debug)]
+struct FusionLayerBlock {
+    lin: nn::Linear,
+    dropout: Option<nn::Dropout>,
+}
+
+impl FusionLayerBlock {
+    fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let h = xs.apply(&self.lin)?.apply(&nn::Activation::Relu)?;
+        if let Some(d) = &self.dropout {
+            d.forward(&h, train)
+        } else {
+            Ok(h)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ModalityGate {
+    layers: Vec<FusionLayerBlock>,
+    head: nn::Linear,
+    mode: ModalityGateMode,
+}
+
+impl ModalityGate {
+    fn new(
+        vb: VarBuilder,
+        in_dim: usize,
+        hidden: &[usize],
+        dropout: f64,
+        mode: ModalityGateMode,
+    ) -> Result<Self> {
+        let mut layers = Vec::with_capacity(hidden.len());
+        let mut d = in_dim;
+        for (i, &h) in hidden.iter().enumerate() {
+            let lin = nn::linear(d, h, vb.pp(format!("lin{i}")))?;
+            let dropout = if dropout > 0.0 {
+                Some(nn::Dropout::new(dropout as f32))
+            } else {
+                None
+            };
+            layers.push(FusionLayerBlock { lin, dropout });
+            d = h;
+        }
+        let out_dim = match mode {
+            ModalityGateMode::Competitive => 2,
+            ModalityGateMode::ResidualXim => 1,
+        };
+        let head = nn::linear(d, out_dim, vb.pp("head"))?;
+        Ok(Self { layers, head, mode })
+    }
+
+    fn reweight(
+        &self,
+        xic_emb: &Tensor,
+        xic_coe: &Tensor,
+        xim_emb: &Tensor,
+        xim_coe: &Tensor,
+        train: bool,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let mut x = Tensor::cat(
+            &[
+                xic_emb.clone(),
+                xic_coe.clone(),
+                xim_emb.clone(),
+                xim_coe.clone(),
+            ],
+            1,
+        )?;
+        for layer in &self.layers {
+            x = layer.forward(&x, train)?;
+        }
+        let logits = x.apply(&self.head)?;
+        match self.mode {
+            ModalityGateMode::Competitive => {
+                let w = candle_nn::ops::softmax(&logits, 1)?;
+                let w_xic = w.narrow(1, 0, 1)?;
+                let w_xim = w.narrow(1, 1, 1)?;
+                Ok((
+                    xic_emb.broadcast_mul(&w_xic)?,
+                    xic_coe.broadcast_mul(&w_xic)?,
+                    xim_emb.broadcast_mul(&w_xim)?,
+                    xim_coe.broadcast_mul(&w_xim)?,
+                ))
+            }
+            ModalityGateMode::ResidualXim => {
+                let w_xim = candle_nn::ops::sigmoid(&logits)?;
+                Ok((
+                    xic_emb.clone(),
+                    xic_coe.clone(),
+                    xim_emb.broadcast_mul(&w_xim)?,
+                    xim_coe.broadcast_mul(&w_xim)?,
+                ))
+            }
         }
     }
 }
@@ -168,6 +286,8 @@ pub struct TopazBagRanker {
     /// Configuration for the optional mobilogram branch, retained so the model
     /// can create aligned zero tensors when XIM input is absent.
     pub xim_cfg: Option<TopazXimConfig>,
+    /// Optional learned gate that reweights XIC vs XIM evidence per candidate.
+    modality_gate: Option<ModalityGate>,
     /// Candidate-level MLP scorer operating on heuristic features plus trace
     /// embeddings.
     pub scorer: crate::building_blocks::mlp::CandidateScorer,
@@ -206,6 +326,10 @@ impl TopazBagRanker {
             coelution_sim_emb_dim: cfg.coelution_sim_emb_dim,
             use_transition_interaction: cfg.use_transition_interaction,
             transition_interaction_dim: cfg.transition_interaction_dim,
+            use_modality_gated_fusion: false,
+            modality_gate_hidden: Vec::new(),
+            modality_gate_dropout: 0.0,
+            modality_gate_mode: ModalityGateMode::default(),
             xim: None,
         }
     }
@@ -223,6 +347,35 @@ impl TopazBagRanker {
         Tensor::zeros((n, c_total, cfg.l), dtype, device)
     }
 
+    pub(crate) fn fuse_modalities(
+        &self,
+        xic_emb: &Tensor,
+        xic_coe: &Tensor,
+        xim_emb: Option<&Tensor>,
+        xim_coe: Option<&Tensor>,
+        train: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        if let (Some(xim_emb), Some(xim_coe)) = (xim_emb, xim_coe) {
+            let (xic_emb_f, xic_coe_f, xim_emb_f, xim_coe_f) =
+                if let Some(gate) = &self.modality_gate {
+                    gate.reweight(xic_emb, xic_coe, xim_emb, xim_coe, train)?
+                } else {
+                    (
+                        xic_emb.clone(),
+                        xic_coe.clone(),
+                        xim_emb.clone(),
+                        xim_coe.clone(),
+                    )
+                };
+            Ok((
+                Tensor::cat(&[xic_emb_f, xim_emb_f], 1)?,
+                Tensor::cat(&[xic_coe_f, xim_coe_f], 1)?,
+            ))
+        } else {
+            Ok((xic_emb.clone(), xic_coe.clone()))
+        }
+    }
+
     pub(crate) fn encode_inputs(
         &self,
         x_trace: &Tensor,
@@ -237,8 +390,8 @@ impl TopazBagRanker {
                 self.zero_xim_input(n, x_trace.device(), x_trace.dtype())?
             };
             let (emb_xim, coe_xim, _coe_ms12_xim) = xim_enc.forward_components(&xim_tensor)?;
-            let emb = Tensor::cat(&[emb_xic, emb_xim], 1)?;
-            let coe = Tensor::cat(&[coe_xic, coe_xim], 1)?;
+            let (emb, coe) =
+                self.fuse_modalities(&emb_xic, &coe_xic, Some(&emb_xim), Some(&coe_xim), false)?;
             Ok((emb, coe, coe_ms12_xic))
         } else {
             Ok((emb_xic, coe_xic, coe_ms12_xic))
@@ -261,6 +414,22 @@ impl TopazBagRanker {
         } else {
             None
         };
+        let modality_gate = if cfg.use_modality_gated_fusion && xim_enc.is_some() {
+            let xic_in_dim = trace_enc.emb_out_dim() + trace_enc.coelution_dim();
+            let xim_in_dim = xim_enc
+                .as_ref()
+                .map(|enc| enc.emb_out_dim() + enc.coelution_dim())
+                .unwrap_or(0);
+            Some(ModalityGate::new(
+                vb.pp("modality_gate"),
+                xic_in_dim + xim_in_dim,
+                &cfg.modality_gate_hidden,
+                cfg.modality_gate_dropout,
+                cfg.modality_gate_mode,
+            )?)
+        } else {
+            None
+        };
         let total_emb_dim =
             trace_enc.emb_out_dim() + xim_enc.as_ref().map(|enc| enc.emb_out_dim()).unwrap_or(0);
         let total_coe_dim = trace_enc.coelution_dim()
@@ -275,6 +444,7 @@ impl TopazBagRanker {
             trace_enc,
             xim_enc,
             xim_cfg: cfg.xim.clone(),
+            modality_gate,
             scorer,
         })
     }
@@ -432,8 +602,15 @@ impl TopazBagRanker {
                 self.zero_xim_input(b * k, tf.device(), tf.dtype())?
             };
             let (xim_emb_all, xim_coe_all, _xim_comps) = xim_enc.forward_with_heads(&tf_aux)?;
-            emb_all = Tensor::cat(&[emb_all, xim_emb_all], 1)?;
-            coe_all = Tensor::cat(&[coe_all, xim_coe_all], 1)?;
+            let (fused_emb, fused_coe) = self.fuse_modalities(
+                &emb_all,
+                &coe_all,
+                Some(&xim_emb_all),
+                Some(&xim_coe_all),
+                false,
+            )?;
+            emb_all = fused_emb;
+            coe_all = fused_coe;
             comps.emb_all = emb_all.clone();
             comps.coe_all = coe_all.clone();
         }
@@ -670,9 +847,129 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_bags_with_modality_gated_fusion_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TopazConfig {
+            feat_dim: 4,
+            ms2_cmax: 3,
+            ms1_cmax: 2,
+            l: 10,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: TraceInputMode::Dual,
+            use_heuristic_features: true,
+            use_coelution_head: true,
+            use_transition_interaction: true,
+            transition_interaction_dim: 6,
+            use_modality_gated_fusion: true,
+            modality_gate_hidden: vec![8],
+            modality_gate_mode: ModalityGateMode::Competitive,
+            xim: Some(TopazXimConfig {
+                ms2_cmax: 4,
+                ms1_cmax: 2,
+                l: 12,
+                trace_emb_dim: 6,
+                trace_input_mode: TraceInputMode::Dual,
+                use_coelution_head: true,
+                use_transition_interaction: true,
+                transition_interaction_dim: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = TopazBagRanker::new(vb.pp("topaz"), &cfg)?;
+
+        let (b, k, d) = (2usize, 3usize, cfg.feat_dim);
+        let xb = Tensor::zeros((b, k, d), DType::F32, &device)?;
+        let tb = Tensor::zeros(
+            (b, k, cfg.ms1_cmax + cfg.ms2_cmax, cfg.l),
+            DType::F32,
+            &device,
+        )?;
+        let xim_cfg = cfg.xim.as_ref().expect("xim branch should be present");
+        let xim = Tensor::zeros(
+            (b, k, xim_cfg.ms1_cmax + xim_cfg.ms2_cmax, xim_cfg.l),
+            DType::F32,
+            &device,
+        )?;
+        let mask = Tensor::ones((b, k), DType::U8, &device)?;
+
+        let (cand, bag, win) = model.forward_bags_with_hidden_aux(&xb, &tb, &mask, Some(&xim))?;
+        assert_eq!(cand.dims2()?, (b, k));
+        assert_eq!(bag.dims1()?, b);
+        assert_eq!(win.dims2()?.0, b);
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_bags_with_residual_xim_gate_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TopazConfig {
+            feat_dim: 4,
+            ms2_cmax: 3,
+            ms1_cmax: 2,
+            l: 10,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: TraceInputMode::Dual,
+            use_heuristic_features: true,
+            use_coelution_head: true,
+            use_transition_interaction: true,
+            transition_interaction_dim: 6,
+            use_modality_gated_fusion: true,
+            modality_gate_hidden: vec![8],
+            modality_gate_mode: ModalityGateMode::ResidualXim,
+            xim: Some(TopazXimConfig {
+                ms2_cmax: 4,
+                ms1_cmax: 2,
+                l: 12,
+                trace_emb_dim: 6,
+                trace_input_mode: TraceInputMode::Dual,
+                use_coelution_head: true,
+                use_transition_interaction: true,
+                transition_interaction_dim: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = TopazBagRanker::new(vb.pp("topaz"), &cfg)?;
+
+        let (b, k, d) = (2usize, 3usize, cfg.feat_dim);
+        let xb = Tensor::zeros((b, k, d), DType::F32, &device)?;
+        let tb = Tensor::zeros(
+            (b, k, cfg.ms1_cmax + cfg.ms2_cmax, cfg.l),
+            DType::F32,
+            &device,
+        )?;
+        let xim_cfg = cfg.xim.as_ref().expect("xim branch should be present");
+        let xim = Tensor::zeros(
+            (b, k, xim_cfg.ms1_cmax + xim_cfg.ms2_cmax, xim_cfg.l),
+            DType::F32,
+            &device,
+        )?;
+        let mask = Tensor::ones((b, k), DType::U8, &device)?;
+
+        let (cand, bag, win) = model.forward_bags_with_hidden_aux(&xb, &tb, &mask, Some(&xim))?;
+        assert_eq!(cand.dims2()?, (b, k));
+        assert_eq!(bag.dims1()?, b);
+        assert_eq!(win.dims2()?.0, b);
+        Ok(())
+    }
+
+    #[test]
     fn test_xim_config_deserializes_legacy_field_names() {
         let cfg: TopazConfig = serde_json::from_value(json!({
             "feat_dim": 7,
+            "use_modality_gated_fusion": true,
+            "modality_gate_hidden": [32],
+            "modality_gate_dropout": 0.1,
+            "modality_gate_mode": "residual_xim",
             "xim": {
                 "ms2_cmax": 6,
                 "ms1_cmax": 4,
@@ -691,5 +988,9 @@ mod tests {
         assert_eq!(xim.coelution_sim_emb_dim, 16);
         assert_eq!(xim.trace_input_mode, TraceInputMode::Dual);
         assert_eq!(xim.coelution_beta, TopazXimConfig::default().coelution_beta);
+        assert!(cfg.use_modality_gated_fusion);
+        assert_eq!(cfg.modality_gate_hidden, vec![32]);
+        assert_eq!(cfg.modality_gate_dropout, 0.1);
+        assert_eq!(cfg.modality_gate_mode, ModalityGateMode::ResidualXim);
     }
 }
