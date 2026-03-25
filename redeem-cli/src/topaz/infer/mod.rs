@@ -19,6 +19,12 @@ pub fn run(cfg: &TopazInferConfig) -> Result<()> {
                 "fast_inference=true: skipping automatic TOPAZ report generation during main inference run"
             );
         }
+    } else if !cfg.inner.auto_report {
+        if cfg.inner.diagnostics.save_head_embeddings {
+            log::info!(
+                "auto_report=false: skipping automatic TOPAZ report generation; run `topaz report` later if needed"
+            );
+        }
     } else if cfg.inner.diagnostics.save_head_embeddings {
         let report_osw = cfg
             .inner

@@ -429,6 +429,13 @@ pub struct InferRunConfig {
     /// the primary goal is to materialize score tables quickly and defer
     /// diagnostics to a later `topaz report` command.
     pub fast_inference: bool,
+    /// If `true`, automatically build the HTML TOPAZ report after inference.
+    ///
+    /// This only affects the `redeem-cli topaz infer` wrapper. When `false`,
+    /// inference can still export head embeddings and write score tables, but
+    /// the expensive report-generation step is skipped so users can run
+    /// `topaz report` manually later.
+    pub auto_report: bool,
     /// XRUN loading/application settings.
     pub xrun: XrunRunConfig,
 }
@@ -477,6 +484,7 @@ impl Default for InferRunConfig {
             prefetch_traces_once: false,
             stream_inference: false,
             fast_inference: false,
+            auto_report: true,
             xrun: XrunRunConfig::default(),
         }
     }
