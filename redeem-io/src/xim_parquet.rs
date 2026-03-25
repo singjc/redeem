@@ -28,7 +28,6 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 #[cfg(feature = "parquet")]
 use parquet::record::{Row, RowAccessor};
 
-#[cfg(feature = "parquet")]
 const MAX_XIM_DECODE_ISSUE_SAMPLES: usize = 8192;
 
 /// Diagnostic record emitted when one mobilogram row cannot be decoded.
