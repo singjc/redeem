@@ -52,7 +52,19 @@ pub fn decoy_tail_pvalues(scores: &[f32], is_decoy: &[bool]) -> Vec<f32> {
     let mut out = vec![1.0f32; n];
     for i in 0..n {
         let s = scores[i];
-        let cnt = decoy_scores.iter().take_while(|&&d| d >= s).count() as f32;
+        // `decoy_scores` is sorted descending. Find the first index whose value
+        // falls below `s`; that index is the count of decoys with score >= `s`.
+        let mut lo = 0usize;
+        let mut hi = m;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if decoy_scores[mid] >= s {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let cnt = lo as f32;
         out[i] = (cnt / m as f32).max(1.0 / (m as f32 + 1.0));
     }
     out
@@ -159,5 +171,27 @@ pub fn tdc_summary(scores: &[f32], is_decoy: &[bool], q: f32) -> TdcSummary {
         cutoff,
         n_targets,
         n_decoys,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decoy_tail_pvalues;
+
+    #[test]
+    fn decoy_tail_pvalues_match_expected_counts() {
+        let scores = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let is_decoy = vec![false, true, false, true, true];
+        let got = decoy_tail_pvalues(&scores, &is_decoy);
+        let expected = vec![
+            1.0 / 4.0, // no decoys >= 5, clamped to 1/(m+1)
+            1.0 / 3.0, // decoys >= 4 -> [4]
+            1.0 / 3.0, // decoys >= 3 -> [4]
+            2.0 / 3.0, // decoys >= 2 -> [4,2]
+            1.0,       // decoys >= 1 -> [4,2,1]
+        ];
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} != {b}");
+        }
     }
 }
