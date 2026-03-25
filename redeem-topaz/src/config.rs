@@ -56,6 +56,23 @@ impl Default for EarlyStopMetric {
     }
 }
 
+/// Training-time bag pooling used by the main bag-level objectives.
+///
+/// Inference remains hard masked-max. This only affects how the trainer
+/// aggregates candidate logits into a bag logit for optimization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainBagPoolMode {
+    Max,
+    SoftmaxMean,
+}
+
+impl Default for TrainBagPoolMode {
+    fn default() -> Self {
+        Self::Max
+    }
+}
+
 /// Base-model optimization and auxiliary-loss configuration.
 ///
 /// This struct intentionally excludes data-loading and trace extraction
@@ -83,6 +100,8 @@ pub struct Config {
     pub lambda_topk_runner: f32,
     pub topk_runner_margin: f32,
     pub topk_runner_k: usize,
+    pub bag_pool: TrainBagPoolMode,
+    pub bag_pool_temp: f32,
     pub max_grad_norm: f32,
     pub patience: usize,
     pub eval_every: usize,
@@ -116,6 +135,8 @@ impl Default for Config {
             lambda_topk_runner: 0.0,
             topk_runner_margin: 1.0,
             topk_runner_k: 3,
+            bag_pool: TrainBagPoolMode::Max,
+            bag_pool_temp: 1.0,
             max_grad_norm: 5.0,
             patience: 3,
             eval_every: 1,
