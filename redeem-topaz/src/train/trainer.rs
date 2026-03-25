@@ -1,6 +1,6 @@
 //! Base TOPAZ trainer, early stopping, and optimizer setup.
 
-use crate::config::{Config, EarlyStopMetric};
+use crate::config::{Config, EarlyStopMetric, TrainBagPoolMode};
 use crate::infer::{TdcSummary, tdc_summary};
 use crate::model::topaz::{TopazBagRanker, TopazConfig};
 use crate::train::losses;
@@ -255,6 +255,32 @@ impl Trainer {
         cand_masked.max(1)
     }
 
+    fn masked_softmax_mean_bag_logits(cand: &Tensor, mask: &Tensor, temp: f32) -> Result<Tensor> {
+        let (b, k) = cand.dims2()?;
+        let m = mask.to_dtype(DType::F32)?;
+        let neg_big = Tensor::full(-1e9f32, (b, k), cand.device())?;
+        let ones = m.ones_like()?;
+        let cand_masked = (cand.broadcast_mul(&m)? + neg_big.broadcast_mul(&(ones - &m)?)?)?;
+        let t = temp.max(1e-3) as f64;
+        let logits = (&cand_masked / t)?;
+        let mut w = candle_nn::ops::softmax(&logits, 1)?;
+        w = w.broadcast_mul(&m)?;
+        let denom = w.sum_keepdim(1)?.maximum(1e-12f32)?;
+        let w = w.broadcast_div(&denom)?;
+        let bag = cand.broadcast_mul(&w)?.sum(1)?;
+        let has = m.sum(1)?.gt(0.0f32)?.to_dtype(DType::F32)?;
+        bag.broadcast_mul(&has)
+    }
+
+    fn training_bag_logits(&self, cand: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        match self.config.bag_pool {
+            TrainBagPoolMode::Max => Self::masked_max_bag_logits(cand, mask),
+            TrainBagPoolMode::SoftmaxMean => {
+                Self::masked_softmax_mean_bag_logits(cand, mask, self.config.bag_pool_temp)
+            }
+        }
+    }
+
     fn zero_xim_input(&self, n: usize, device: &Device, dtype: DType) -> Result<Option<Tensor>> {
         let Some(cfg) = &self.model.xim_cfg else {
             return Ok(None);
@@ -430,9 +456,12 @@ impl Trainer {
             coe_xim.as_ref(),
             true,
         )?;
-        let logits = self.model.scorer.forward(&xf, &emb, &coe)?;
+        let (xf_ctx, emb_ctx, coe_ctx) =
+            self.model
+                .scorer_inputs_with_context(&xf, &emb, &coe, Some(&batch.mask))?;
+        let logits = self.model.scorer.forward(&xf_ctx, &emb_ctx, &coe_ctx)?;
         let cand = logits.reshape((b, k))?;
-        let bag = Self::masked_max_bag_logits(&cand, &batch.mask)?;
+        let bag = self.training_bag_logits(&cand, &batch.mask)?;
 
         let loss_bag = losses::bce_with_logits_weighted(&bag, &batch.yb, self.pos_weight)?;
 
@@ -508,7 +537,7 @@ impl Trainer {
             let xic_repr = Tensor::cat(&[emb_xic.clone(), coe_xic.clone()], 1)?;
             let xic_logits = head.forward(&xic_repr, true)?.squeeze(1)?;
             let xic_cand = xic_logits.reshape((b, k))?;
-            let xic_bag = Self::masked_max_bag_logits(&xic_cand, &batch.mask)?;
+            let xic_bag = self.training_bag_logits(&xic_cand, &batch.mask)?;
             loss_xic_bag = losses::bce_with_logits_weighted(&xic_bag, &batch.yb, self.pos_weight)?;
             loss = (loss + (loss_xic_bag.clone() * self.config.lambda_xic_bag as f64)?)?;
         }
@@ -520,7 +549,7 @@ impl Trainer {
             let xim_repr = Tensor::cat(&[emb_xim.clone(), coe_xim.clone()], 1)?;
             let xim_logits = head.forward(&xim_repr, true)?.squeeze(1)?;
             let xim_cand = xim_logits.reshape((b, k))?;
-            let xim_bag = Self::masked_max_bag_logits(&xim_cand, &batch.mask)?;
+            let xim_bag = self.training_bag_logits(&xim_cand, &batch.mask)?;
             loss_xim_bag = losses::bce_with_logits_weighted(&xim_bag, &batch.yb, self.pos_weight)?;
             loss = (loss + (loss_xim_bag.clone() * self.config.lambda_xim_bag as f64)?)?;
         }
@@ -566,22 +595,13 @@ impl Trainer {
     }
 
     fn bag_logits(&self, batch: &TrainBatch) -> Result<Tensor> {
-        let (b, k, d) = batch.xb.dims3()?;
-        let (_, _, c, l) = batch.tb.dims4()?;
-
-        let xf = batch.xb.reshape((b * k, d))?;
-        let tf = batch.tb.reshape((b * k, c, l))?;
-        let tf_aux = if let Some(tb_aux) = batch.tb_aux.as_ref() {
-            let (_, _, c_aux, l_aux) = tb_aux.dims4()?;
-            Some(tb_aux.reshape((b * k, c_aux, l_aux))?)
-        } else {
-            None
-        };
-
-        let (emb, coe, _coe_ms12) = self.model.encode_inputs(&tf, tf_aux.as_ref())?;
-        let logits = self.model.scorer.forward_eval(&xf, &emb, &coe)?;
-        let cand = logits.reshape((b, k))?;
-        Self::masked_max_bag_logits(&cand, &batch.mask)
+        let (_cand, bag) = self.model.forward_bags_aux(
+            &batch.xb,
+            &batch.tb,
+            &batch.mask,
+            batch.tb_aux.as_ref(),
+        )?;
+        Ok(bag)
     }
 
     fn eval_bag_stats(
@@ -1042,6 +1062,69 @@ mod tests {
             .count();
         assert_eq!(no_freeze.len(), total - freeze_expected);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_backward_softmax_mean_pool_smoke() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = Config::default();
+        cfg.learning_rate = 1e-2;
+        cfg.lambda_pair = 0.0;
+        cfg.lambda_inbag = 0.0;
+        cfg.lambda_winner_margin = 0.0;
+        cfg.bag_pool = TrainBagPoolMode::SoftmaxMean;
+        cfg.bag_pool_temp = 0.5;
+
+        let model_cfg = TopazConfig {
+            feat_dim: 0,
+            ms2_cmax: 4,
+            ms1_cmax: 0,
+            l: 8,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: crate::building_blocks::trace_input::TraceInputMode::Single,
+            use_heuristic_features: true,
+            use_coelution_head: false,
+            use_bag_interaction: true,
+            bag_interaction_hidden: 8,
+            bag_interaction_dim: 4,
+            ..Default::default()
+        };
+
+        let mut trainer = Trainer::new(cfg, &model_cfg, &device)?;
+
+        let (b, k, d) = (4usize, 3usize, model_cfg.feat_dim);
+        let (c, l) = (model_cfg.ms2_cmax, model_cfg.l);
+
+        let xb = Tensor::zeros((b, k, d), DType::F32, &device)?;
+        let tb = Tensor::rand(0f32, 1f32, (b, k, c, l), &device)?;
+        let mask = Tensor::new(
+            vec![
+                1u8, 1, 0, //
+                1, 1, 1, //
+                1, 0, 0, //
+                1, 1, 0,
+            ],
+            &device,
+        )?
+        .reshape((b, k))?;
+        let yb = Tensor::new(vec![1f32, 0.0, 1.0, 0.0], &device)?;
+
+        let batch = TrainBatch {
+            xb,
+            tb,
+            tb_aux: None,
+            mask,
+            yb,
+            distill_targets: None,
+            distill_mask: None,
+        };
+
+        let m = trainer.train_step(&batch)?;
+        assert!(m.loss.is_finite());
+        assert!(m.loss_bag.is_finite());
         Ok(())
     }
 }

@@ -129,6 +129,12 @@ pub struct TopazConfig {
     pub transition_interaction_dim: usize,
     /// Whether to learn per-candidate XIC/XIM fusion weights before final scoring.
     pub use_modality_gated_fusion: bool,
+    /// Whether to compare the `K` candidates in each bag before final scoring.
+    pub use_bag_interaction: bool,
+    /// Hidden width of the within-bag candidate interaction block.
+    pub bag_interaction_hidden: usize,
+    /// Output width of the within-bag candidate interaction block.
+    pub bag_interaction_dim: usize,
     /// Hidden layer widths for the modality gate MLP.
     pub modality_gate_hidden: Vec<usize>,
     /// Dropout applied inside the modality gate.
@@ -158,6 +164,9 @@ impl Default for TopazConfig {
             use_transition_interaction: false,
             transition_interaction_dim: 16,
             use_modality_gated_fusion: false,
+            use_bag_interaction: false,
+            bag_interaction_hidden: 64,
+            bag_interaction_dim: 16,
             modality_gate_hidden: Vec::new(),
             modality_gate_dropout: 0.0,
             modality_gate_mode: ModalityGateMode::default(),
@@ -288,6 +297,8 @@ pub struct TopazBagRanker {
     pub xim_cfg: Option<TopazXimConfig>,
     /// Optional learned gate that reweights XIC vs XIM evidence per candidate.
     modality_gate: Option<ModalityGate>,
+    /// Optional learned context block that compares candidates within each bag.
+    bag_interaction: Option<crate::building_blocks::bag_interaction::BagInteractionBlock>,
     /// Candidate-level MLP scorer operating on heuristic features plus trace
     /// embeddings.
     pub scorer: crate::building_blocks::mlp::CandidateScorer,
@@ -327,6 +338,9 @@ impl TopazBagRanker {
             use_transition_interaction: cfg.use_transition_interaction,
             transition_interaction_dim: cfg.transition_interaction_dim,
             use_modality_gated_fusion: false,
+            use_bag_interaction: false,
+            bag_interaction_hidden: 0,
+            bag_interaction_dim: 0,
             modality_gate_hidden: Vec::new(),
             modality_gate_dropout: 0.0,
             modality_gate_mode: ModalityGateMode::default(),
@@ -398,6 +412,53 @@ impl TopazBagRanker {
         }
     }
 
+    pub(crate) fn scorer_inputs_with_context(
+        &self,
+        x_feat: &Tensor,
+        emb: &Tensor,
+        coe: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let Some(bag_interaction) = &self.bag_interaction else {
+            return Ok((x_feat.clone(), emb.clone(), coe.clone()));
+        };
+
+        let ctx = if let Some(mask) = mask {
+            let (b, k) = mask.dims2()?;
+            let (n, d_feat) = x_feat.dims2()?;
+            let (_, d_emb) = emb.dims2()?;
+            let (_, d_coe) = coe.dims2()?;
+            if b * k != n {
+                candle_core::bail!(
+                    "bag interaction shape mismatch: mask expects {} rows but got {} scorer rows",
+                    b * k,
+                    n
+                );
+            }
+            let feat_bk = x_feat.reshape((b, k, d_feat))?;
+            let emb_bk = emb.reshape((b, k, d_emb))?;
+            let coe_bk = coe.reshape((b, k, d_coe))?;
+            let repr = match (d_feat > 0, d_coe > 0) {
+                (true, true) => Tensor::cat(&[feat_bk, emb_bk, coe_bk], 2)?,
+                (true, false) => Tensor::cat(&[feat_bk, emb_bk], 2)?,
+                (false, true) => Tensor::cat(&[emb_bk, coe_bk], 2)?,
+                (false, false) => emb_bk,
+            };
+            bag_interaction
+                .forward(&repr, mask)?
+                .reshape((n, bag_interaction.out_dim()))?
+        } else {
+            let (n, _) = emb.dims2()?;
+            Tensor::zeros((n, bag_interaction.out_dim()), DType::F32, emb.device())?
+        };
+
+        Ok((
+            x_feat.clone(),
+            emb.clone(),
+            Tensor::cat(&[coe.clone(), ctx], 1)?,
+        ))
+    }
+
     /// Construct a TOPAZ scorer under the provided variable scope.
     ///
     /// All parameters are created beneath the supplied `vb` subtree so they can
@@ -430,21 +491,39 @@ impl TopazBagRanker {
         } else {
             None
         };
+        let feat_dim_used = if cfg.use_heuristic_features {
+            cfg.feat_dim
+        } else {
+            0
+        };
         let total_emb_dim =
             trace_enc.emb_out_dim() + xim_enc.as_ref().map(|enc| enc.emb_out_dim()).unwrap_or(0);
         let total_coe_dim = trace_enc.coelution_dim()
             + xim_enc.as_ref().map(|enc| enc.coelution_dim()).unwrap_or(0);
+        let bag_interaction = if cfg.use_bag_interaction && cfg.bag_interaction_dim > 0 {
+            Some(
+                crate::building_blocks::bag_interaction::BagInteractionBlock::new(
+                    vb.pp("bag_interaction"),
+                    feat_dim_used + total_emb_dim + total_coe_dim,
+                    cfg.bag_interaction_hidden,
+                    cfg.bag_interaction_dim,
+                )?,
+            )
+        } else {
+            None
+        };
         let scorer = crate::building_blocks::mlp::CandidateScorer::new(
             vb.pp("candidate_scorer"),
             cfg,
             total_emb_dim,
-            total_coe_dim,
+            total_coe_dim + bag_interaction.as_ref().map(|b| b.out_dim()).unwrap_or(0),
         )?;
         Ok(Self {
             trace_enc,
             xim_enc,
             xim_cfg: cfg.xim.clone(),
             modality_gate,
+            bag_interaction,
             scorer,
         })
     }
@@ -490,7 +569,9 @@ impl TopazBagRanker {
         };
 
         let (emb, coe, _coe_ms12) = self.encode_inputs(&tf, tf_aux.as_ref())?;
-        let logits = self.scorer.forward_eval(&xf, &emb, &coe)?; // (B*K,)
+        let (xf_ctx, emb_ctx, coe_ctx) =
+            self.scorer_inputs_with_context(&xf, &emb, &coe, Some(mask))?;
+        let logits = self.scorer.forward_eval(&xf_ctx, &emb_ctx, &coe_ctx)?; // (B*K,)
         let cand = logits.reshape((b, k))?;
 
         // masked max over K (avoid -inf with float mask)
@@ -539,7 +620,11 @@ impl TopazBagRanker {
         };
 
         let (emb, coe, _coe_ms12) = self.encode_inputs(&tf, tf_aux.as_ref())?;
-        let (logits, hidden) = self.scorer.forward_with_hidden_eval(&xf, &emb, &coe)?;
+        let (xf_ctx, emb_ctx, coe_ctx) =
+            self.scorer_inputs_with_context(&xf, &emb, &coe, Some(mask))?;
+        let (logits, hidden) = self
+            .scorer
+            .forward_with_hidden_eval(&xf_ctx, &emb_ctx, &coe_ctx)?;
         let cand = logits.reshape((b, k))?;
         let hidden = hidden.reshape((b, k, self.scorer.hidden_dim()))?;
 
@@ -614,9 +699,11 @@ impl TopazBagRanker {
             comps.emb_all = emb_all.clone();
             comps.coe_all = coe_all.clone();
         }
+        let (xf_ctx, emb_ctx, coe_ctx) =
+            self.scorer_inputs_with_context(&xf, &emb_all, &coe_all, Some(mask))?;
         let (logits, hidden) = self
             .scorer
-            .forward_with_hidden_eval(&xf, &emb_all, &coe_all)?;
+            .forward_with_hidden_eval(&xf_ctx, &emb_ctx, &coe_ctx)?;
         let cand = logits.reshape((b, k))?;
         let hidden = hidden.reshape((b, k, self.scorer.hidden_dim()))?;
 
@@ -694,7 +781,8 @@ impl CandidateScorerInterface for TopazBagRanker {
         x_aux: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (emb, coe, _coe_ms12) = self.encode_inputs(x_trace, x_aux)?;
-        self.scorer.forward_eval(x_feat, &emb, &coe)
+        let (x_feat, emb, coe) = self.scorer_inputs_with_context(x_feat, &emb, &coe, None)?;
+        self.scorer.forward_eval(&x_feat, &emb, &coe)
     }
 }
 
@@ -963,10 +1051,47 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_candidates_with_bag_interaction_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = TopazConfig {
+            feat_dim: 0,
+            ms2_cmax: 3,
+            ms1_cmax: 2,
+            l: 10,
+            trace_emb_dim: 8,
+            mlp_hidden: vec![8],
+            dropout: 0.0,
+            trace_input_mode: TraceInputMode::Dual,
+            use_heuristic_features: true,
+            use_coelution_head: true,
+            use_transition_interaction: true,
+            transition_interaction_dim: 6,
+            use_bag_interaction: true,
+            bag_interaction_hidden: 16,
+            bag_interaction_dim: 8,
+            ..Default::default()
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = TopazBagRanker::new(vb.pp("topaz"), &cfg)?;
+
+        let n = 5usize;
+        let x_feat = Tensor::zeros((n, cfg.feat_dim), DType::F32, &device)?;
+        let x_trace = Tensor::zeros((n, cfg.ms1_cmax + cfg.ms2_cmax, cfg.l), DType::F32, &device)?;
+
+        let logits = model.forward_candidates_aux(&x_feat, &x_trace, None)?;
+        assert_eq!(logits.dims1()?, n);
+        Ok(())
+    }
+
+    #[test]
     fn test_xim_config_deserializes_legacy_field_names() {
         let cfg: TopazConfig = serde_json::from_value(json!({
             "feat_dim": 7,
             "use_modality_gated_fusion": true,
+            "use_bag_interaction": true,
+            "bag_interaction_hidden": 48,
+            "bag_interaction_dim": 12,
             "modality_gate_hidden": [32],
             "modality_gate_dropout": 0.1,
             "modality_gate_mode": "residual_xim",
@@ -989,6 +1114,9 @@ mod tests {
         assert_eq!(xim.trace_input_mode, TraceInputMode::Dual);
         assert_eq!(xim.coelution_beta, TopazXimConfig::default().coelution_beta);
         assert!(cfg.use_modality_gated_fusion);
+        assert!(cfg.use_bag_interaction);
+        assert_eq!(cfg.bag_interaction_hidden, 48);
+        assert_eq!(cfg.bag_interaction_dim, 12);
         assert_eq!(cfg.modality_gate_hidden, vec![32]);
         assert_eq!(cfg.modality_gate_dropout, 0.1);
         assert_eq!(cfg.modality_gate_mode, ModalityGateMode::ResidualXim);
