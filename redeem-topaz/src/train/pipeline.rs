@@ -75,6 +75,35 @@ fn limit_precursors(
         .collect()
 }
 
+/// Sample up to `max_precursors` unique precursors from a row slice while
+/// keeping all rows belonging to each selected precursor.
+pub fn sample_rows_by_precursor(
+    rows: &[FeatureRow],
+    max_precursors: usize,
+    seed: u64,
+) -> Vec<FeatureRow> {
+    if max_precursors == 0 || rows.is_empty() {
+        return Vec::new();
+    }
+    let mut precs: Vec<u64> = rows.iter().map(|r| r.precursor_id).collect();
+    precs.sort_unstable();
+    precs.dedup();
+    if precs.len() <= max_precursors {
+        return rows.to_vec();
+    }
+    let mut idxs: Vec<usize> = (0..precs.len()).collect();
+    shuffle_indices(&mut idxs, seed);
+    let keep: HashSet<u64> = idxs
+        .into_iter()
+        .take(max_precursors)
+        .map(|i| precs[i])
+        .collect();
+    rows.iter()
+        .filter(|r| keep.contains(&r.precursor_id))
+        .cloned()
+        .collect()
+}
+
 fn limit_precursors_per_run(
     rows: Vec<FeatureRow>,
     max_precursors_per_run: Option<usize>,
@@ -396,4 +425,59 @@ pub fn build_train_batches_from_osw_xic(
     );
 
     bags_to_train_batches(bags, device, batch_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn row(
+        feature_id: u64,
+        precursor_id: u64,
+        run_id: u64,
+        suffix: &str,
+        is_decoy: bool,
+    ) -> FeatureRow {
+        FeatureRow {
+            feature_id,
+            precursor_id,
+            run_id,
+            group_id: format!("{run_id}_{precursor_id}_{suffix}"),
+            exp_rt: 0.0,
+            rt_left_width: None,
+            rt_right_width: None,
+            exp_im: None,
+            exp_im_left_width: None,
+            exp_im_right_width: None,
+            is_decoy,
+            features: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_sample_rows_by_precursor_keeps_all_rows_for_selected_precursors() {
+        let rows = vec![
+            row(1, 10, 1, "a", false),
+            row(2, 10, 1, "b", false),
+            row(3, 11, 1, "a", true),
+            row(4, 11, 2, "b", true),
+            row(5, 12, 2, "a", false),
+        ];
+
+        let sampled = sample_rows_by_precursor(&rows, 2, 0);
+        let sampled_precursors: HashSet<u64> = sampled.iter().map(|r| r.precursor_id).collect();
+        assert_eq!(sampled_precursors.len(), 2);
+        for precursor_id in &sampled_precursors {
+            let expected = rows
+                .iter()
+                .filter(|r| &r.precursor_id == precursor_id)
+                .count();
+            let observed = sampled
+                .iter()
+                .filter(|r| &r.precursor_id == precursor_id)
+                .count();
+            assert_eq!(observed, expected);
+        }
+    }
 }

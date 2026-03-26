@@ -66,8 +66,8 @@ use crate::model::topaz::TopazBagRanker;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::{
     Trainer, bags_to_train_batches, bags_to_train_batches_with_aux_and_distill,
-    filter_training_rows, fit_preprocessor_from_rows_with_cols, split_rows_by_precursor,
-    subsample_train_rows_by_bag,
+    filter_training_rows, fit_preprocessor_from_rows_with_cols, sample_rows_by_precursor,
+    split_rows_by_precursor, subsample_train_rows_by_bag,
 };
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::pipeline::{XrunPredictConfig, apply_xrun_deltas, apply_xrun_deltas_to_rows};
@@ -235,6 +235,15 @@ pub struct TrainRunConfig {
     pub train_frac: f32,
     /// Whether the train/validation split should preserve run balance.
     pub train_stratify_run: bool,
+    /// Optional per-epoch precursor budget sampled from the fixed training pool.
+    ///
+    /// When set, TOPAZ keeps the train/validation split fixed but rebuilds the
+    /// training batches every epoch from a fresh precursor subset sampled from
+    /// the post-split training pool. This is intended for faster low-data
+    /// experiments without changing the model architecture.
+    pub epoch_max_precursors: Option<usize>,
+    /// Seed increment applied between epoch-wise precursor resamples.
+    pub epoch_resample_seed_stride: u64,
     /// Global RNG seed used for splitting, subsampling, and shuffling.
     pub seed: u64,
     /// Neural-network architecture and feature-fusion settings.
@@ -300,6 +309,8 @@ impl Default for TrainRunConfig {
             val_frac: 0.1,
             train_frac: 1.0,
             train_stratify_run: false,
+            epoch_max_precursors: None,
+            epoch_resample_seed_stride: 1,
             seed: 0,
             model: TopazConfig::default(),
             train: TrainConfig::default(),
@@ -787,8 +798,6 @@ struct DistillPrepared {
     cols: Vec<String>,
     train_targets: Vec<f32>,
     train_mask: Vec<f32>,
-    val_targets: Vec<f32>,
-    val_mask: Vec<f32>,
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -905,7 +914,7 @@ fn standardize_distill_targets(
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 fn prepare_distill_targets(
     rows_tr: &[crate::io::osw::FeatureRow],
-    rows_va: &[crate::io::osw::FeatureRow],
+    _rows_va: &[crate::io::osw::FeatureRow],
     osw_cols: &[String],
     cfg: &TrainConfig,
 ) -> Option<DistillPrepared> {
@@ -924,15 +933,8 @@ fn prepare_distill_targets(
         log::warn!("distillation requested but all target columns were dropped");
         return None;
     }
-    let raw_va = if rows_va.is_empty() {
-        Vec::new()
-    } else {
-        rows_to_feature_matrix_with_cols(rows_va, osw_cols, &resolved, None)
-    };
     let (train_targets, train_mask) =
         standardize_distill_targets(&raw_tr, rows_tr.len(), &keep_idx, &means, &scales);
-    let (val_targets, val_mask) =
-        standardize_distill_targets(&raw_va, rows_va.len(), &keep_idx, &means, &scales);
     log::info!(
         "Enabled distillation over {} target columns: {}",
         keep_cols.len(),
@@ -942,8 +944,6 @@ fn prepare_distill_targets(
         cols: keep_cols,
         train_targets,
         train_mask,
-        val_targets,
-        val_mask,
     })
 }
 
@@ -1266,6 +1266,121 @@ fn gather_row_aligned_tensor_by_feature_id(
         out.extend_from_slice(&tensor[start..end]);
     }
     Ok(out)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn count_bag_labels(rows: &[FeatureRow]) -> (usize, usize) {
+    let mut seen = HashSet::new();
+    let mut n_pos = 0usize;
+    let mut n_neg = 0usize;
+    for row in rows {
+        if seen.insert(row.group_id.clone()) {
+            if row.is_decoy {
+                n_neg += 1;
+            } else {
+                n_pos += 1;
+            }
+        }
+    }
+    (n_pos, n_neg)
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn count_unique_precursors(rows: &[FeatureRow]) -> usize {
+    rows.iter()
+        .map(|r| r.precursor_id)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
+fn build_train_batches_from_rows_with_trace_pool(
+    rows: &[FeatureRow],
+    x_trace: &[f32],
+    x_xim: Option<(&[f32], &TraceBuildConfig)>,
+    osw_cols: &[String],
+    selected_cols: &[String],
+    train_cfg: &TrainConfig,
+    model_cfg: &TopazConfig,
+    trace_cfg: &TraceBuildConfig,
+    bag_k: usize,
+    batch_size: usize,
+    device: &Device,
+    pre: Option<&crate::Preprocessor>,
+) -> Result<Vec<crate::train::TrainBatch>> {
+    let x_feat = if model_cfg.use_heuristic_features {
+        rows_to_feature_matrix_with_cols(rows, osw_cols, selected_cols, pre)
+    } else {
+        Vec::new()
+    };
+    let y_rows: Vec<u8> = rows
+        .iter()
+        .map(|r| if r.is_decoy { 1 } else { 0 })
+        .collect();
+    let pid_rows: Vec<String> = rows.iter().map(|r| r.group_id.clone()).collect();
+    let bags = make_bags_with_traces(
+        &x_feat,
+        rows.len(),
+        model_cfg.feat_dim,
+        x_trace,
+        trace_cfg.total_c(),
+        trace_cfg.l,
+        &y_rows,
+        &pid_rows,
+        bag_k,
+    );
+    let distill_train = prepare_distill_targets(rows, &[], osw_cols, train_cfg).map(|dist| {
+        let dist_bags = bag_row_matrix(
+            &dist.train_targets,
+            rows.len(),
+            dist.cols.len(),
+            &y_rows,
+            &pid_rows,
+            bag_k,
+        );
+        let mask_bags = bag_row_matrix(
+            &dist.train_mask,
+            rows.len(),
+            dist.cols.len(),
+            &y_rows,
+            &pid_rows,
+            bag_k,
+        );
+        debug_assert_eq!(dist_bags.bag_pid, bags.bag_pid);
+        debug_assert_eq!(mask_bags.bag_pid, bags.bag_pid);
+        (dist_bags.x_bag, mask_bags.x_bag, dist.cols.len())
+    });
+
+    if let Some((x_xim, xim_cfg)) = x_xim {
+        let aux_bags = make_bags_with_traces(
+            &x_feat,
+            rows.len(),
+            model_cfg.feat_dim,
+            x_xim,
+            xim_cfg.total_c(),
+            xim_cfg.l,
+            &y_rows,
+            &pid_rows,
+            bag_k,
+        );
+        bags_to_train_batches_with_aux_and_distill(
+            bags,
+            Some((aux_bags.t_bag, xim_cfg.total_c(), xim_cfg.l)),
+            distill_train,
+            device,
+            batch_size,
+        )
+    } else if let Some(distill_train) = distill_train {
+        bags_to_train_batches_with_aux_and_distill(
+            bags,
+            None,
+            Some(distill_train),
+            device,
+            batch_size,
+        )
+    } else {
+        bags_to_train_batches(bags, device, batch_size)
+    }
 }
 
 fn collect_preprocess_provenance(
@@ -4381,118 +4496,36 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
         }
     }
 
-    let x_feat = if model_cfg.use_heuristic_features {
-        rows_to_feature_matrix_with_cols(
-            &rows_tr,
-            &bundle_feature_cols,
-            &selected_cols,
-            pre.as_ref(),
-        )
-    } else {
-        Vec::new()
-    };
-    let x_feat_va = if model_cfg.use_heuristic_features && !rows_va.is_empty() {
-        rows_to_feature_matrix_with_cols(
-            &rows_va,
-            &bundle_feature_cols,
-            &selected_cols,
-            pre.as_ref(),
-        )
-    } else {
-        Vec::new()
-    };
-    let distill = prepare_distill_targets(&rows_tr, &rows_va, &bundle_feature_cols, &cfg.train);
-
-    let y_rows: Vec<u8> = rows_tr
-        .iter()
-        .map(|r| if r.is_decoy { 1 } else { 0 })
-        .collect();
-    let pid_rows: Vec<String> = rows_tr.iter().map(|r| r.group_id.clone()).collect();
-    let bags = crate::building_blocks::bagging::make_bags_with_traces(
-        &x_feat,
-        rows_tr.len(),
-        model_cfg.feat_dim,
-        &x_tr,
-        cfg.trace.total_c(),
-        cfg.trace.l,
-        &y_rows,
-        &pid_rows,
-        cfg.bag_k,
-    );
-    let (mut n_pos, mut n_neg) = (0usize, 0usize);
-    for &y in &bags.y_bag {
-        if y > 0.5 {
-            n_pos += 1;
-        } else {
-            n_neg += 1;
-        }
-    }
+    let (n_pos, n_neg) = count_bag_labels(&rows_tr);
     let pos_weight = if n_pos > 0 {
         n_neg as f32 / n_pos as f32
     } else {
         1.0
     };
-    let distill_train = distill.as_ref().map(|dist| {
-        let dist_bags = bag_row_matrix(
-            &dist.train_targets,
-            rows_tr.len(),
-            dist.cols.len(),
-            &y_rows,
-            &pid_rows,
-            cfg.bag_k,
-        );
-        let mask_bags = bag_row_matrix(
-            &dist.train_mask,
-            rows_tr.len(),
-            dist.cols.len(),
-            &y_rows,
-            &pid_rows,
-            cfg.bag_k,
-        );
-        debug_assert_eq!(dist_bags.bag_pid, bags.bag_pid);
-        debug_assert_eq!(mask_bags.bag_pid, bags.bag_pid);
-        (dist_bags.x_bag, mask_bags.x_bag, dist.cols.len())
-    });
-    let batches =
-        if let (Some(x_tr_xim), Some(xim_cfg)) = (x_tr_xim.as_ref(), xim_trace_cfg.as_ref()) {
-            let aux_bags = crate::building_blocks::bagging::make_bags_with_traces(
-                &x_feat,
-                rows_tr.len(),
-                model_cfg.feat_dim,
-                x_tr_xim,
-                xim_cfg.total_c(),
-                xim_cfg.l,
-                &y_rows,
-                &pid_rows,
-                cfg.bag_k,
-            );
-            bags_to_train_batches_with_aux_and_distill(
-                bags,
-                Some((aux_bags.t_bag, xim_cfg.total_c(), xim_cfg.l)),
-                distill_train,
-                device,
-                cfg.batch_size,
-            )?
-        } else if let Some(distill_train) = distill_train {
-            bags_to_train_batches_with_aux_and_distill(
-                bags,
-                None,
-                Some(distill_train),
-                device,
-                cfg.batch_size,
-            )?
-        } else {
-            bags_to_train_batches(bags, device, cfg.batch_size)?
-        };
-
     let mut train_cfg = cfg.train.clone();
-    if let Some(distill) = distill.as_ref() {
-        train_cfg.distill.cols = distill.cols.clone();
+    if train_cfg.distill.is_enabled() {
+        let resolved = resolve_distill_cols(&bundle_feature_cols, &train_cfg.distill.cols);
+        if resolved.is_empty() {
+            train_cfg.distill.cols.clear();
+            train_cfg.distill.lambda = 0.0;
+        } else {
+            let raw_tr =
+                rows_to_feature_matrix_with_cols(&rows_tr, &bundle_feature_cols, &resolved, None);
+            let (_keep_idx, keep_cols, _means, _scales) =
+                fit_distill_stats(&raw_tr, rows_tr.len(), &resolved, train_cfg.distill.min_std);
+            if keep_cols.is_empty() {
+                train_cfg.distill.cols.clear();
+                train_cfg.distill.lambda = 0.0;
+            } else {
+                train_cfg.distill.cols = keep_cols;
+            }
+        }
     } else {
         train_cfg.distill.cols.clear();
         train_cfg.distill.lambda = 0.0;
     }
     let mut trainer = Trainer::new(train_cfg, &model_cfg, device)?;
+    let batch_build_cfg = trainer.config.clone();
     if let Some(base) = init_base.as_ref() {
         let (_meta, report) = load_checkpoint_partial(base, &mut trainer.varmap)?;
         if report.loaded == 0 {
@@ -4520,85 +4553,131 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
         n_neg
     );
     let val_batches = if !rows_va.is_empty() {
-        let y_rows_va: Vec<u8> = rows_va
-            .iter()
-            .map(|r| if r.is_decoy { 1 } else { 0 })
-            .collect();
-        let pid_rows_va: Vec<String> = rows_va.iter().map(|r| r.group_id.clone()).collect();
-        let bags_va = crate::building_blocks::bagging::make_bags_with_traces(
-            &x_feat_va,
-            rows_va.len(),
-            model_cfg.feat_dim,
+        build_train_batches_from_rows_with_trace_pool(
+            &rows_va,
             &x_va,
-            cfg.trace.total_c(),
-            cfg.trace.l,
-            &y_rows_va,
-            &pid_rows_va,
+            x_va_xim
+                .as_ref()
+                .zip(xim_trace_cfg.as_ref())
+                .map(|(x, cfg)| (x.as_slice(), cfg)),
+            &bundle_feature_cols,
+            &selected_cols,
+            &batch_build_cfg,
+            &model_cfg,
+            &cfg.trace,
             cfg.bag_k,
-        );
-        let distill_val = distill.as_ref().map(|dist| {
-            let dist_bags = bag_row_matrix(
-                &dist.val_targets,
-                rows_va.len(),
-                dist.cols.len(),
-                &y_rows_va,
-                &pid_rows_va,
-                cfg.bag_k,
-            );
-            let mask_bags = bag_row_matrix(
-                &dist.val_mask,
-                rows_va.len(),
-                dist.cols.len(),
-                &y_rows_va,
-                &pid_rows_va,
-                cfg.bag_k,
-            );
-            debug_assert_eq!(dist_bags.bag_pid, bags_va.bag_pid);
-            debug_assert_eq!(mask_bags.bag_pid, bags_va.bag_pid);
-            (dist_bags.x_bag, mask_bags.x_bag, dist.cols.len())
-        });
-        if let (Some(x_va_xim), Some(xim_cfg)) = (x_va_xim.as_ref(), xim_trace_cfg.as_ref()) {
-            let aux_bags_va = crate::building_blocks::bagging::make_bags_with_traces(
-                &x_feat_va,
-                rows_va.len(),
-                model_cfg.feat_dim,
-                x_va_xim,
-                xim_cfg.total_c(),
-                xim_cfg.l,
-                &y_rows_va,
-                &pid_rows_va,
-                cfg.bag_k,
-            );
-            bags_to_train_batches_with_aux_and_distill(
-                bags_va,
-                Some((aux_bags_va.t_bag, xim_cfg.total_c(), xim_cfg.l)),
-                distill_val,
-                device,
-                cfg.batch_size,
-            )?
-        } else if let Some(distill_val) = distill_val {
-            bags_to_train_batches_with_aux_and_distill(
-                bags_va,
-                None,
-                Some(distill_val),
-                device,
-                cfg.batch_size,
-            )?
-        } else {
-            bags_to_train_batches(bags_va, device, cfg.batch_size)?
-        }
+            cfg.batch_size,
+            device,
+            pre.as_ref(),
+        )?
     } else {
         Vec::new()
     };
     let base_train_started = Instant::now();
-    let _history = trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
+    let epoch_max_precursors = cfg.epoch_max_precursors.filter(|&v| v > 0);
+    if let Some(epoch_max_precursors) = epoch_max_precursors {
+        let train_pool_precursors = count_unique_precursors(&rows_tr);
+        let seed_stride = cfg.epoch_resample_seed_stride.max(1);
+        if train_pool_precursors <= epoch_max_precursors {
+            log::info!(
+                "Epoch-wise precursor resampling requested (epoch_max_precursors={}) but training pool only has {} precursors; reusing full pool each epoch",
+                epoch_max_precursors,
+                train_pool_precursors
+            );
+        } else {
+            log::info!(
+                "Enabled epoch-wise precursor resampling (epoch_max_precursors={}, pool_precursors={}, pool_rows={}, seed_stride={})",
+                epoch_max_precursors,
+                train_pool_precursors,
+                rows_tr.len(),
+                seed_stride
+            );
+        }
+        let train_row_index = build_feature_row_index(&rows_tr);
+        let trace_span = cfg.trace.total_c() * cfg.trace.l;
+        let xim_span = xim_trace_cfg
+            .as_ref()
+            .map(|xim_cfg| xim_cfg.total_c() * xim_cfg.l);
+        let _history = trainer.train_epochs_early_stop_resampled(
+            &val_batches,
+            cfg.max_epochs,
+            None,
+            |epoch| {
+                let epoch_seed = cfg
+                    .seed
+                    .wrapping_add((epoch as u64).wrapping_sub(1).wrapping_mul(seed_stride));
+                let rows_epoch = if train_pool_precursors <= epoch_max_precursors {
+                    rows_tr.clone()
+                } else {
+                    sample_rows_by_precursor(&rows_tr, epoch_max_precursors, epoch_seed)
+                };
+                let x_epoch = gather_row_aligned_tensor_by_feature_id(
+                    &rows_epoch,
+                    &train_row_index,
+                    &x_tr,
+                    trace_span,
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+                let x_epoch_xim = if let (Some(x_tr_xim), Some(xim_cfg), Some(xim_span)) =
+                    (x_tr_xim.as_ref(), xim_trace_cfg.as_ref(), xim_span)
+                {
+                    Some((
+                        gather_row_aligned_tensor_by_feature_id(
+                            &rows_epoch,
+                            &train_row_index,
+                            x_tr_xim,
+                            xim_span,
+                        )
+                        .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?,
+                        xim_cfg,
+                    ))
+                } else {
+                    None
+                };
+                build_train_batches_from_rows_with_trace_pool(
+                    &rows_epoch,
+                    &x_epoch,
+                    x_epoch_xim.as_ref().map(|(x, cfg)| (x.as_slice(), *cfg)),
+                    &bundle_feature_cols,
+                    &selected_cols,
+                    &batch_build_cfg,
+                    &model_cfg,
+                    &cfg.trace,
+                    cfg.bag_k,
+                    cfg.batch_size,
+                    device,
+                    pre.as_ref(),
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))
+            },
+        )?;
+    } else {
+        let batches = build_train_batches_from_rows_with_trace_pool(
+            &rows_tr,
+            &x_tr,
+            x_tr_xim
+                .as_ref()
+                .zip(xim_trace_cfg.as_ref())
+                .map(|(x, cfg)| (x.as_slice(), cfg)),
+            &bundle_feature_cols,
+            &selected_cols,
+            &batch_build_cfg,
+            &model_cfg,
+            &cfg.trace,
+            cfg.bag_k,
+            cfg.batch_size,
+            device,
+            pre.as_ref(),
+        )?;
+        let _history =
+            trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
+    }
     log_elapsed("Base TOPAZ training stage", base_train_started);
 
     // Training batches keep the full bag tensors resident on the device via
     // `narrow` views. Release them before any post-training scoring so
     // validation summaries, diagnostics, and XRUN preparation do not stack
     // extra inference allocations on top of the training set footprint.
-    drop(batches);
     drop(val_batches);
 
     if !rows_va.is_empty() {
@@ -5486,119 +5565,36 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         }
     }
 
-    let x_feat = if model_cfg.use_heuristic_features {
-        rows_to_feature_matrix_with_cols(
-            &rows_tr,
-            &table.feature_cols,
-            &selected_cols,
-            pre.as_ref(),
-        )
-    } else {
-        Vec::new()
-    };
-    let x_feat_va = if model_cfg.use_heuristic_features && !rows_va.is_empty() {
-        rows_to_feature_matrix_with_cols(
-            &rows_va,
-            &table.feature_cols,
-            &selected_cols,
-            pre.as_ref(),
-        )
-    } else {
-        Vec::new()
-    };
-    let distill = prepare_distill_targets(&rows_tr, &rows_va, &table.feature_cols, &cfg.train);
-
-    let y_rows: Vec<u8> = rows_tr
-        .iter()
-        .map(|r| if r.is_decoy { 1 } else { 0 })
-        .collect();
-    let pid_rows: Vec<String> = rows_tr.iter().map(|r| r.group_id.clone()).collect();
-
-    let bags = crate::building_blocks::bagging::make_bags_with_traces(
-        &x_feat,
-        rows_tr.len(),
-        model_cfg.feat_dim,
-        &x_tr,
-        cfg.trace.total_c(),
-        cfg.trace.l,
-        &y_rows,
-        &pid_rows,
-        cfg.bag_k,
-    );
-    let (mut n_pos, mut n_neg) = (0usize, 0usize);
-    for &y in &bags.y_bag {
-        if y > 0.5 {
-            n_pos += 1;
-        } else {
-            n_neg += 1;
-        }
-    }
+    let (n_pos, n_neg) = count_bag_labels(&rows_tr);
     let pos_weight = if n_pos > 0 {
         n_neg as f32 / n_pos as f32
     } else {
         1.0
     };
-    let distill_train = distill.as_ref().map(|dist| {
-        let dist_bags = bag_row_matrix(
-            &dist.train_targets,
-            rows_tr.len(),
-            dist.cols.len(),
-            &y_rows,
-            &pid_rows,
-            cfg.bag_k,
-        );
-        let mask_bags = bag_row_matrix(
-            &dist.train_mask,
-            rows_tr.len(),
-            dist.cols.len(),
-            &y_rows,
-            &pid_rows,
-            cfg.bag_k,
-        );
-        debug_assert_eq!(dist_bags.bag_pid, bags.bag_pid);
-        debug_assert_eq!(mask_bags.bag_pid, bags.bag_pid);
-        (dist_bags.x_bag, mask_bags.x_bag, dist.cols.len())
-    });
-    let batches =
-        if let (Some(x_tr_xim), Some(xim_cfg)) = (x_tr_xim.as_ref(), xim_trace_cfg.as_ref()) {
-            let aux_bags = crate::building_blocks::bagging::make_bags_with_traces(
-                &x_feat,
-                rows_tr.len(),
-                model_cfg.feat_dim,
-                x_tr_xim,
-                xim_cfg.total_c(),
-                xim_cfg.l,
-                &y_rows,
-                &pid_rows,
-                cfg.bag_k,
-            );
-            bags_to_train_batches_with_aux_and_distill(
-                bags,
-                Some((aux_bags.t_bag, xim_cfg.total_c(), xim_cfg.l)),
-                distill_train,
-                &device,
-                cfg.batch_size,
-            )?
-        } else if let Some(distill_train) = distill_train {
-            bags_to_train_batches_with_aux_and_distill(
-                bags,
-                None,
-                Some(distill_train),
-                &device,
-                cfg.batch_size,
-            )?
-        } else {
-            bags_to_train_batches(bags, &device, cfg.batch_size)?
-        };
-
     let mut train_cfg = cfg.train.clone();
-    if let Some(distill) = distill.as_ref() {
-        train_cfg.distill.cols = distill.cols.clone();
+    if train_cfg.distill.is_enabled() {
+        let resolved = resolve_distill_cols(&table.feature_cols, &train_cfg.distill.cols);
+        if resolved.is_empty() {
+            train_cfg.distill.cols.clear();
+            train_cfg.distill.lambda = 0.0;
+        } else {
+            let raw_tr =
+                rows_to_feature_matrix_with_cols(&rows_tr, &table.feature_cols, &resolved, None);
+            let (_keep_idx, keep_cols, _means, _scales) =
+                fit_distill_stats(&raw_tr, rows_tr.len(), &resolved, train_cfg.distill.min_std);
+            if keep_cols.is_empty() {
+                train_cfg.distill.cols.clear();
+                train_cfg.distill.lambda = 0.0;
+            } else {
+                train_cfg.distill.cols = keep_cols;
+            }
+        }
     } else {
         train_cfg.distill.cols.clear();
         train_cfg.distill.lambda = 0.0;
     }
     let mut trainer = Trainer::new(train_cfg, &model_cfg, &device)?;
+    let batch_build_cfg = trainer.config.clone();
     if let Some(base) = init_base.as_ref() {
         let (_meta, report) = load_checkpoint_partial(base, &mut trainer.varmap)?;
         if report.loaded == 0 {
@@ -5644,85 +5640,131 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
         n_neg
     );
     let val_batches = if !rows_va.is_empty() {
-        let y_rows_va: Vec<u8> = rows_va
-            .iter()
-            .map(|r| if r.is_decoy { 1 } else { 0 })
-            .collect();
-        let pid_rows_va: Vec<String> = rows_va.iter().map(|r| r.group_id.clone()).collect();
-        let bags_va = crate::building_blocks::bagging::make_bags_with_traces(
-            &x_feat_va,
-            rows_va.len(),
-            model_cfg.feat_dim,
+        build_train_batches_from_rows_with_trace_pool(
+            &rows_va,
             &x_va,
-            cfg.trace.total_c(),
-            cfg.trace.l,
-            &y_rows_va,
-            &pid_rows_va,
+            x_va_xim
+                .as_ref()
+                .zip(xim_trace_cfg.as_ref())
+                .map(|(x, cfg)| (x.as_slice(), cfg)),
+            &table.feature_cols,
+            &selected_cols,
+            &batch_build_cfg,
+            &model_cfg,
+            &cfg.trace,
             cfg.bag_k,
-        );
-        let distill_val = distill.as_ref().map(|dist| {
-            let dist_bags = bag_row_matrix(
-                &dist.val_targets,
-                rows_va.len(),
-                dist.cols.len(),
-                &y_rows_va,
-                &pid_rows_va,
-                cfg.bag_k,
-            );
-            let mask_bags = bag_row_matrix(
-                &dist.val_mask,
-                rows_va.len(),
-                dist.cols.len(),
-                &y_rows_va,
-                &pid_rows_va,
-                cfg.bag_k,
-            );
-            debug_assert_eq!(dist_bags.bag_pid, bags_va.bag_pid);
-            debug_assert_eq!(mask_bags.bag_pid, bags_va.bag_pid);
-            (dist_bags.x_bag, mask_bags.x_bag, dist.cols.len())
-        });
-        if let (Some(x_va_xim), Some(xim_cfg)) = (x_va_xim.as_ref(), xim_trace_cfg.as_ref()) {
-            let aux_bags_va = crate::building_blocks::bagging::make_bags_with_traces(
-                &x_feat_va,
-                rows_va.len(),
-                model_cfg.feat_dim,
-                x_va_xim,
-                xim_cfg.total_c(),
-                xim_cfg.l,
-                &y_rows_va,
-                &pid_rows_va,
-                cfg.bag_k,
-            );
-            bags_to_train_batches_with_aux_and_distill(
-                bags_va,
-                Some((aux_bags_va.t_bag, xim_cfg.total_c(), xim_cfg.l)),
-                distill_val,
-                &device,
-                cfg.batch_size,
-            )?
-        } else if let Some(distill_val) = distill_val {
-            bags_to_train_batches_with_aux_and_distill(
-                bags_va,
-                None,
-                Some(distill_val),
-                &device,
-                cfg.batch_size,
-            )?
-        } else {
-            bags_to_train_batches(bags_va, &device, cfg.batch_size)?
-        }
+            cfg.batch_size,
+            &device,
+            pre.as_ref(),
+        )?
     } else {
         Vec::new()
     };
     let base_train_started = Instant::now();
-    let _history = trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
+    let epoch_max_precursors = cfg.epoch_max_precursors.filter(|&v| v > 0);
+    if let Some(epoch_max_precursors) = epoch_max_precursors {
+        let train_pool_precursors = count_unique_precursors(&rows_tr);
+        let seed_stride = cfg.epoch_resample_seed_stride.max(1);
+        if train_pool_precursors <= epoch_max_precursors {
+            log::info!(
+                "Epoch-wise precursor resampling requested (epoch_max_precursors={}) but training pool only has {} precursors; reusing full pool each epoch",
+                epoch_max_precursors,
+                train_pool_precursors
+            );
+        } else {
+            log::info!(
+                "Enabled epoch-wise precursor resampling (epoch_max_precursors={}, pool_precursors={}, pool_rows={}, seed_stride={})",
+                epoch_max_precursors,
+                train_pool_precursors,
+                rows_tr.len(),
+                seed_stride
+            );
+        }
+        let train_row_index = build_feature_row_index(&rows_tr);
+        let trace_span = cfg.trace.total_c() * cfg.trace.l;
+        let xim_span = xim_trace_cfg
+            .as_ref()
+            .map(|xim_cfg| xim_cfg.total_c() * xim_cfg.l);
+        let _history = trainer.train_epochs_early_stop_resampled(
+            &val_batches,
+            cfg.max_epochs,
+            None,
+            |epoch| {
+                let epoch_seed = cfg
+                    .seed
+                    .wrapping_add((epoch as u64).wrapping_sub(1).wrapping_mul(seed_stride));
+                let rows_epoch = if train_pool_precursors <= epoch_max_precursors {
+                    rows_tr.clone()
+                } else {
+                    sample_rows_by_precursor(&rows_tr, epoch_max_precursors, epoch_seed)
+                };
+                let x_epoch = gather_row_aligned_tensor_by_feature_id(
+                    &rows_epoch,
+                    &train_row_index,
+                    &x_tr,
+                    trace_span,
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+                let x_epoch_xim = if let (Some(x_tr_xim), Some(xim_cfg), Some(xim_span)) =
+                    (x_tr_xim.as_ref(), xim_trace_cfg.as_ref(), xim_span)
+                {
+                    Some((
+                        gather_row_aligned_tensor_by_feature_id(
+                            &rows_epoch,
+                            &train_row_index,
+                            x_tr_xim,
+                            xim_span,
+                        )
+                        .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?,
+                        xim_cfg,
+                    ))
+                } else {
+                    None
+                };
+                build_train_batches_from_rows_with_trace_pool(
+                    &rows_epoch,
+                    &x_epoch,
+                    x_epoch_xim.as_ref().map(|(x, cfg)| (x.as_slice(), *cfg)),
+                    &table.feature_cols,
+                    &selected_cols,
+                    &batch_build_cfg,
+                    &model_cfg,
+                    &cfg.trace,
+                    cfg.bag_k,
+                    cfg.batch_size,
+                    &device,
+                    pre.as_ref(),
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))
+            },
+        )?;
+    } else {
+        let batches = build_train_batches_from_rows_with_trace_pool(
+            &rows_tr,
+            &x_tr,
+            x_tr_xim
+                .as_ref()
+                .zip(xim_trace_cfg.as_ref())
+                .map(|(x, cfg)| (x.as_slice(), cfg)),
+            &table.feature_cols,
+            &selected_cols,
+            &batch_build_cfg,
+            &model_cfg,
+            &cfg.trace,
+            cfg.bag_k,
+            cfg.batch_size,
+            &device,
+            pre.as_ref(),
+        )?;
+        let _history =
+            trainer.train_epochs_early_stop(&batches, &val_batches, cfg.max_epochs, None)?;
+    }
     log_elapsed("Base TOPAZ training stage", base_train_started);
 
     // Training batches keep the full bag tensors resident on the device via
     // `narrow` views. Release them before any post-training scoring so
     // validation summaries, diagnostics, and XRUN preparation do not stack
     // extra inference allocations on top of the training set footprint.
-    drop(batches);
     drop(val_batches);
 
     if !rows_va.is_empty() {

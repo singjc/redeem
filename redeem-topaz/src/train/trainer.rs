@@ -943,6 +943,257 @@ impl Trainer {
             best_val_targets,
         })
     }
+
+    /// Train with early stopping while rebuilding the training batches each
+    /// epoch from a dynamic sampler.
+    pub fn train_epochs_early_stop_resampled<F>(
+        &mut self,
+        val_batches: &[TrainBatch],
+        max_epochs: usize,
+        scheduler: Option<&CosineWarmupScheduler>,
+        mut build_epoch_batches: F,
+    ) -> Result<TrainHistory>
+    where
+        F: FnMut(usize) -> Result<Vec<TrainBatch>>,
+    {
+        let mut first_epoch_batches = build_epoch_batches(1)?;
+        if first_epoch_batches.is_empty() {
+            return Ok(TrainHistory {
+                epochs_ran: 0,
+                best_epoch: 0,
+                best_val: f32::INFINITY,
+                best_val_targets: None,
+            });
+        }
+
+        let expected_batches_per_epoch = first_epoch_batches.len().max(1);
+        let total_steps = max_epochs.max(1) * expected_batches_per_epoch;
+        let sched = scheduler.cloned().unwrap_or_else(|| {
+            CosineWarmupScheduler::new(
+                self.config.learning_rate as f64,
+                total_steps,
+                self.config.warmup_frac as f64,
+                self.config.warmup_steps,
+                self.config.min_lr_ratio as f64,
+            )
+        });
+
+        let mut best_val = f32::INFINITY;
+        let mut best_epoch = 0usize;
+        let mut best_val_targets = None;
+        let mut bad = 0usize;
+        let min_delta = 1e-4f32;
+        let patience = self.config.patience.max(1);
+        let eval_every = self.config.eval_every.max(1);
+        let early_stop_q = self.config.early_stop_qvalue.clamp(0.0, 1.0);
+
+        let mut best_path = None;
+        if !val_batches.is_empty() {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "redeem_topaz_best_{}_{}.safetensors",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            best_path = Some(p);
+        }
+
+        let epochs = max_epochs.max(1);
+        let mut progress = TrainingProgressLogger::new(epochs, expected_batches_per_epoch);
+        let mut epochs_ran = 0usize;
+        let mut step = 0usize;
+
+        for epoch in 1..=epochs {
+            let train_batches = if epoch == 1 {
+                std::mem::take(&mut first_epoch_batches)
+            } else {
+                build_epoch_batches(epoch)?
+            };
+            if train_batches.is_empty() {
+                log::warn!(
+                    "Epoch {:02} skipped because dynamic train resampling produced no batches",
+                    epoch
+                );
+                continue;
+            }
+
+            let mut train_sum = 0f32;
+            let mut train_batches_done = 0usize;
+            let mut order: Vec<usize> = (0..train_batches.len()).collect();
+            if train_batches.len() > 1 {
+                let seed = self.shuffle_seed.unwrap_or(0).wrapping_add(epoch as u64);
+                shuffle_indices(&mut order, seed);
+            }
+            for &bi in &order {
+                let batch = &train_batches[bi];
+                if self.config.use_lr_scheduler {
+                    let lr = sched.lr_at_step(step);
+                    self.opt.set_learning_rate(lr);
+                }
+                let metrics = self.train_step(batch)?;
+                train_sum += metrics.loss;
+                train_batches_done += 1;
+                progress.maybe_log(
+                    epoch,
+                    train_batches_done,
+                    train_sum / train_batches_done as f32,
+                    self.opt.learning_rate(),
+                );
+                step += 1;
+            }
+            epochs_ran = epoch;
+            let train_loss = train_sum / train_batches.len() as f32;
+            drop(train_batches);
+
+            if val_batches.is_empty() {
+                if self.config.use_lr_scheduler {
+                    log::info!(
+                        "Epoch {:02} train={:.4} lr={:.3e}",
+                        epoch,
+                        train_loss,
+                        self.opt.learning_rate()
+                    );
+                } else {
+                    log::info!("Epoch {:02} train={:.4}", epoch, train_loss);
+                }
+                continue;
+            }
+
+            if epoch % eval_every != 0 && epoch != epochs {
+                if self.config.use_lr_scheduler {
+                    log::info!(
+                        "Epoch {:02} train={:.4} lr={:.3e} val=skipped(eval_every={})",
+                        epoch,
+                        train_loss,
+                        self.opt.learning_rate(),
+                        eval_every
+                    );
+                } else {
+                    log::info!(
+                        "Epoch {:02} train={:.4} val=skipped(eval_every={})",
+                        epoch,
+                        train_loss,
+                        eval_every
+                    );
+                }
+                continue;
+            }
+
+            let need_tdc = matches!(
+                self.config.early_stop_metric,
+                EarlyStopMetric::ValTdcTargets
+            );
+            let (val_loss, val_tdc) =
+                self.eval_bag_stats(val_batches, need_tdc.then_some(early_stop_q))?;
+            if let Some(summ) = val_tdc.as_ref() {
+                if self.config.use_lr_scheduler {
+                    log::info!(
+                        "Epoch {:02} train={:.4} val_loss={:.4} val_tdc_targets@q={}/{} val_tdc_decoys={} val_tdc_cutoff={:.4} lr={:.3e}",
+                        epoch,
+                        train_loss,
+                        val_loss,
+                        early_stop_q,
+                        summ.n_targets,
+                        summ.n_decoys,
+                        summ.cutoff,
+                        self.opt.learning_rate()
+                    );
+                } else {
+                    log::info!(
+                        "Epoch {:02} train={:.4} val_loss={:.4} val_tdc_targets@q={}/{} val_tdc_decoys={} val_tdc_cutoff={:.4}",
+                        epoch,
+                        train_loss,
+                        val_loss,
+                        early_stop_q,
+                        summ.n_targets,
+                        summ.n_decoys,
+                        summ.cutoff
+                    );
+                }
+            } else if self.config.use_lr_scheduler {
+                log::info!(
+                    "Epoch {:02} train={:.4} val={:.4} lr={:.3e}",
+                    epoch,
+                    train_loss,
+                    val_loss,
+                    self.opt.learning_rate()
+                );
+            } else {
+                log::info!(
+                    "Epoch {:02} train={:.4} val={:.4}",
+                    epoch,
+                    train_loss,
+                    val_loss
+                );
+            }
+
+            let improved = match self.config.early_stop_metric {
+                EarlyStopMetric::ValLoss => val_loss + min_delta < best_val,
+                EarlyStopMetric::ValTdcTargets => {
+                    let summ = val_tdc
+                        .as_ref()
+                        .expect("TDC summary missing for early-stop metric");
+                    match best_val_targets {
+                        None => true,
+                        Some(best_targets) => {
+                            summ.n_targets > best_targets
+                                || (summ.n_targets == best_targets
+                                    && val_loss + min_delta < best_val)
+                        }
+                    }
+                }
+            };
+
+            if improved {
+                best_val = val_loss;
+                best_epoch = epoch;
+                best_val_targets = val_tdc.as_ref().map(|summ| summ.n_targets);
+                bad = 0;
+                if let Some(path) = &best_path {
+                    if let Err(err) = self.varmap.save(path) {
+                        log::warn!("Failed to save best checkpoint snapshot: {err}");
+                    }
+                }
+            } else {
+                bad += 1;
+                if bad >= patience {
+                    match self.config.early_stop_metric {
+                        EarlyStopMetric::ValLoss => {
+                            log::info!("Early stopping (best val={:.4})", best_val);
+                        }
+                        EarlyStopMetric::ValTdcTargets => {
+                            log::info!(
+                                "Early stopping (best val_tdc_targets@q={:.2}={} tie_break_val_loss={:.4})",
+                                early_stop_q,
+                                best_val_targets.unwrap_or(0),
+                                best_val
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some(path) = &best_path {
+            if best_epoch > 0 {
+                if let Err(err) = self.varmap.load(path) {
+                    log::warn!("Failed to restore best checkpoint snapshot: {err}");
+                }
+            }
+            let _ = std::fs::remove_file(path);
+        }
+
+        Ok(TrainHistory {
+            epochs_ran,
+            best_epoch,
+            best_val,
+            best_val_targets,
+        })
+    }
 }
 
 fn shuffle_indices(idxs: &mut [usize], seed: u64) {
