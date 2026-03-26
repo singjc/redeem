@@ -65,9 +65,9 @@ use crate::io::osw::read_feature_rows;
 use crate::model::topaz::TopazBagRanker;
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::train::{
-    Trainer, bags_to_train_batches, bags_to_train_batches_with_aux_and_distill,
-    filter_training_rows, fit_preprocessor_from_rows_with_cols, sample_rows_by_precursor,
-    split_rows_by_precursor, subsample_train_rows_by_bag,
+    Trainer, bags_to_train_batches, bags_to_train_batches_with_aux, filter_training_rows,
+    fit_preprocessor_from_rows_with_cols, sample_rows_by_precursor, split_rows_by_precursor,
+    subsample_train_rows_by_bag,
 };
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
 use crate::xrun::pipeline::{XrunPredictConfig, apply_xrun_deltas, apply_xrun_deltas_to_rows};
@@ -792,174 +792,6 @@ fn resolve_feature_cols(osw_cols: &[String], cfg: &FeatureSelectConfig) -> Vec<S
     out
 }
 
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-#[derive(Debug, Clone)]
-struct DistillPrepared {
-    cols: Vec<String>,
-    train_targets: Vec<f32>,
-    train_mask: Vec<f32>,
-}
-
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn resolve_distill_cols(osw_cols: &[String], requested: &[String]) -> Vec<String> {
-    let osw_set: HashSet<String> = osw_cols.iter().map(|c| c.to_lowercase()).collect();
-    let mut out = Vec::new();
-    let mut missing = Vec::new();
-    for c in requested {
-        let lc = c.to_lowercase();
-        if out.iter().any(|x| x == &lc) {
-            continue;
-        }
-        if osw_set.contains(&lc) {
-            out.push(lc);
-        } else {
-            missing.push(lc);
-        }
-    }
-    if !missing.is_empty() {
-        log::warn!(
-            "distill target columns not found in OSW/preprocessed bundle: {}",
-            missing.join(", ")
-        );
-    }
-    out
-}
-
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn fit_distill_stats(
-    raw: &[f32],
-    n_rows: usize,
-    cols: &[String],
-    min_std: f32,
-) -> (Vec<usize>, Vec<String>, Vec<f32>, Vec<f32>) {
-    if cols.is_empty() {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    }
-    let d = cols.len();
-    let mut keep_idx = Vec::new();
-    let mut keep_cols = Vec::new();
-    let mut means = Vec::new();
-    let mut scales = Vec::new();
-    let mut dropped = Vec::new();
-
-    for j in 0..d {
-        let mut count = 0usize;
-        let mut sum = 0.0f64;
-        for i in 0..n_rows {
-            let v = raw[i * d + j];
-            if v.is_finite() {
-                count += 1;
-                sum += v as f64;
-            }
-        }
-        if count < 2 {
-            dropped.push(format!("{} (finite={count})", cols[j]));
-            continue;
-        }
-        let mean = (sum / count as f64) as f32;
-        let mut sq = 0.0f64;
-        for i in 0..n_rows {
-            let v = raw[i * d + j];
-            if v.is_finite() {
-                let dv = v as f64 - mean as f64;
-                sq += dv * dv;
-            }
-        }
-        let std = (sq / (count.saturating_sub(1).max(1) as f64)).sqrt() as f32;
-        if !std.is_finite() || std < min_std {
-            dropped.push(format!("{} (std={std:.3e})", cols[j]));
-            continue;
-        }
-        keep_idx.push(j);
-        keep_cols.push(cols[j].clone());
-        means.push(mean);
-        scales.push(std);
-    }
-
-    if !dropped.is_empty() {
-        log::warn!(
-            "dropping distill targets with insufficient variance/coverage: {}",
-            dropped.join(", ")
-        );
-    }
-
-    (keep_idx, keep_cols, means, scales)
-}
-
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn standardize_distill_targets(
-    raw: &[f32],
-    n_rows: usize,
-    cols: &[usize],
-    means: &[f32],
-    scales: &[f32],
-) -> (Vec<f32>, Vec<f32>) {
-    let d_in = if n_rows > 0 { raw.len() / n_rows } else { 0 };
-    let d_out = cols.len();
-    let mut out = vec![0f32; n_rows * d_out];
-    let mut mask = vec![0f32; n_rows * d_out];
-    for i in 0..n_rows {
-        for (j_out, &j_in) in cols.iter().enumerate() {
-            let v = raw[i * d_in + j_in];
-            let dst = i * d_out + j_out;
-            if v.is_finite() {
-                out[dst] = (v - means[j_out]) / scales[j_out];
-                mask[dst] = 1.0;
-            }
-        }
-    }
-    (out, mask)
-}
-
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn prepare_distill_targets(
-    rows_tr: &[crate::io::osw::FeatureRow],
-    _rows_va: &[crate::io::osw::FeatureRow],
-    osw_cols: &[String],
-    cfg: &TrainConfig,
-) -> Option<DistillPrepared> {
-    if !cfg.distill.is_enabled() {
-        return None;
-    }
-    let resolved = resolve_distill_cols(osw_cols, &cfg.distill.cols);
-    if resolved.is_empty() {
-        log::warn!("distillation requested but no usable target columns remained");
-        return None;
-    }
-    let raw_tr = rows_to_feature_matrix_with_cols(rows_tr, osw_cols, &resolved, None);
-    let (keep_idx, keep_cols, means, scales) =
-        fit_distill_stats(&raw_tr, rows_tr.len(), &resolved, cfg.distill.min_std);
-    if keep_cols.is_empty() {
-        log::warn!("distillation requested but all target columns were dropped");
-        return None;
-    }
-    let (train_targets, train_mask) =
-        standardize_distill_targets(&raw_tr, rows_tr.len(), &keep_idx, &means, &scales);
-    log::info!(
-        "Enabled distillation over {} target columns: {}",
-        keep_cols.len(),
-        keep_cols.join(", ")
-    );
-    Some(DistillPrepared {
-        cols: keep_cols,
-        train_targets,
-        train_mask,
-    })
-}
-
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-fn bag_row_matrix(
-    x_rows: &[f32],
-    n: usize,
-    d: usize,
-    y_rows: &[u8],
-    pid_rows: &[String],
-    k: usize,
-) -> crate::building_blocks::bagging::Bags {
-    let dummy_trace = vec![0f32; n];
-    make_bags_with_traces(x_rows, n, d, &dummy_trace, 1, 1, y_rows, pid_rows, k)
-}
-
 fn align_rows_to_cols(
     rows: &[crate::io::osw::FeatureRow],
     osw_cols: &[String],
@@ -1300,7 +1132,6 @@ fn build_train_batches_from_rows_with_trace_pool(
     x_xim: Option<(&[f32], &TraceBuildConfig)>,
     osw_cols: &[String],
     selected_cols: &[String],
-    train_cfg: &TrainConfig,
     model_cfg: &TopazConfig,
     trace_cfg: &TraceBuildConfig,
     bag_k: usize,
@@ -1329,27 +1160,6 @@ fn build_train_batches_from_rows_with_trace_pool(
         &pid_rows,
         bag_k,
     );
-    let distill_train = prepare_distill_targets(rows, &[], osw_cols, train_cfg).map(|dist| {
-        let dist_bags = bag_row_matrix(
-            &dist.train_targets,
-            rows.len(),
-            dist.cols.len(),
-            &y_rows,
-            &pid_rows,
-            bag_k,
-        );
-        let mask_bags = bag_row_matrix(
-            &dist.train_mask,
-            rows.len(),
-            dist.cols.len(),
-            &y_rows,
-            &pid_rows,
-            bag_k,
-        );
-        debug_assert_eq!(dist_bags.bag_pid, bags.bag_pid);
-        debug_assert_eq!(mask_bags.bag_pid, bags.bag_pid);
-        (dist_bags.x_bag, mask_bags.x_bag, dist.cols.len())
-    });
 
     if let Some((x_xim, xim_cfg)) = x_xim {
         let aux_bags = make_bags_with_traces(
@@ -1363,18 +1173,9 @@ fn build_train_batches_from_rows_with_trace_pool(
             &pid_rows,
             bag_k,
         );
-        bags_to_train_batches_with_aux_and_distill(
+        bags_to_train_batches_with_aux(
             bags,
             Some((aux_bags.t_bag, xim_cfg.total_c(), xim_cfg.l)),
-            distill_train,
-            device,
-            batch_size,
-        )
-    } else if let Some(distill_train) = distill_train {
-        bags_to_train_batches_with_aux_and_distill(
-            bags,
-            None,
-            Some(distill_train),
             device,
             batch_size,
         )
@@ -4502,30 +4303,8 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
     } else {
         1.0
     };
-    let mut train_cfg = cfg.train.clone();
-    if train_cfg.distill.is_enabled() {
-        let resolved = resolve_distill_cols(&bundle_feature_cols, &train_cfg.distill.cols);
-        if resolved.is_empty() {
-            train_cfg.distill.cols.clear();
-            train_cfg.distill.lambda = 0.0;
-        } else {
-            let raw_tr =
-                rows_to_feature_matrix_with_cols(&rows_tr, &bundle_feature_cols, &resolved, None);
-            let (_keep_idx, keep_cols, _means, _scales) =
-                fit_distill_stats(&raw_tr, rows_tr.len(), &resolved, train_cfg.distill.min_std);
-            if keep_cols.is_empty() {
-                train_cfg.distill.cols.clear();
-                train_cfg.distill.lambda = 0.0;
-            } else {
-                train_cfg.distill.cols = keep_cols;
-            }
-        }
-    } else {
-        train_cfg.distill.cols.clear();
-        train_cfg.distill.lambda = 0.0;
-    }
+    let train_cfg = cfg.train.clone();
     let mut trainer = Trainer::new(train_cfg, &model_cfg, device)?;
-    let batch_build_cfg = trainer.config.clone();
     if let Some(base) = init_base.as_ref() {
         let (_meta, report) = load_checkpoint_partial(base, &mut trainer.varmap)?;
         if report.loaded == 0 {
@@ -4562,7 +4341,6 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
                 .map(|(x, cfg)| (x.as_slice(), cfg)),
             &bundle_feature_cols,
             &selected_cols,
-            &batch_build_cfg,
             &model_cfg,
             &cfg.trace,
             cfg.bag_k,
@@ -4640,7 +4418,6 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
                     x_epoch_xim.as_ref().map(|(x, cfg)| (x.as_slice(), *cfg)),
                     &bundle_feature_cols,
                     &selected_cols,
-                    &batch_build_cfg,
                     &model_cfg,
                     &cfg.trace,
                     cfg.bag_k,
@@ -4661,7 +4438,6 @@ fn run_training_with_preprocessed(cfg: &TrainRunConfig, device: &Device) -> Resu
                 .map(|(x, cfg)| (x.as_slice(), cfg)),
             &bundle_feature_cols,
             &selected_cols,
-            &batch_build_cfg,
             &model_cfg,
             &cfg.trace,
             cfg.bag_k,
@@ -5571,30 +5347,8 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
     } else {
         1.0
     };
-    let mut train_cfg = cfg.train.clone();
-    if train_cfg.distill.is_enabled() {
-        let resolved = resolve_distill_cols(&table.feature_cols, &train_cfg.distill.cols);
-        if resolved.is_empty() {
-            train_cfg.distill.cols.clear();
-            train_cfg.distill.lambda = 0.0;
-        } else {
-            let raw_tr =
-                rows_to_feature_matrix_with_cols(&rows_tr, &table.feature_cols, &resolved, None);
-            let (_keep_idx, keep_cols, _means, _scales) =
-                fit_distill_stats(&raw_tr, rows_tr.len(), &resolved, train_cfg.distill.min_std);
-            if keep_cols.is_empty() {
-                train_cfg.distill.cols.clear();
-                train_cfg.distill.lambda = 0.0;
-            } else {
-                train_cfg.distill.cols = keep_cols;
-            }
-        }
-    } else {
-        train_cfg.distill.cols.clear();
-        train_cfg.distill.lambda = 0.0;
-    }
+    let train_cfg = cfg.train.clone();
     let mut trainer = Trainer::new(train_cfg, &model_cfg, &device)?;
-    let batch_build_cfg = trainer.config.clone();
     if let Some(base) = init_base.as_ref() {
         let (_meta, report) = load_checkpoint_partial(base, &mut trainer.varmap)?;
         if report.loaded == 0 {
@@ -5649,7 +5403,6 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
                 .map(|(x, cfg)| (x.as_slice(), cfg)),
             &table.feature_cols,
             &selected_cols,
-            &batch_build_cfg,
             &model_cfg,
             &cfg.trace,
             cfg.bag_k,
@@ -5727,7 +5480,6 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
                     x_epoch_xim.as_ref().map(|(x, cfg)| (x.as_slice(), *cfg)),
                     &table.feature_cols,
                     &selected_cols,
-                    &batch_build_cfg,
                     &model_cfg,
                     &cfg.trace,
                     cfg.bag_k,
@@ -5748,7 +5500,6 @@ pub fn run_training(cfg: &TrainRunConfig) -> Result<TrainRunOutput> {
                 .map(|(x, cfg)| (x.as_slice(), cfg)),
             &table.feature_cols,
             &selected_cols,
-            &batch_build_cfg,
             &model_cfg,
             &cfg.trace,
             cfg.bag_k,

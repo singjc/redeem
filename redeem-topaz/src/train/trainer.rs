@@ -23,10 +23,6 @@ pub struct TrainBatch {
     pub mask: Tensor,
     /// (B,)
     pub yb: Tensor,
-    /// Optional auxiliary regression targets with shape `(B, K, T_distill)`.
-    pub distill_targets: Option<Tensor>,
-    /// Optional mask aligned to `distill_targets`, with `1` for valid targets.
-    pub distill_mask: Option<Tensor>,
 }
 
 /// Scalar losses returned after one optimization step.
@@ -37,66 +33,7 @@ pub struct TrainMetrics {
     pub loss_pair: f32,
     pub loss_inbag: f32,
     pub loss_winner_margin: f32,
-    pub loss_topk_runner: f32,
     pub loss_ms12: f32,
-    pub loss_xic_bag: f32,
-    pub loss_xim_bag: f32,
-    pub loss_distill: f32,
-}
-
-#[derive(Clone, Debug)]
-struct AuxLayerBlock {
-    lin: nn::Linear,
-    dropout: Option<nn::Dropout>,
-}
-
-impl AuxLayerBlock {
-    fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        let h = xs.apply(&self.lin)?.apply(&nn::Activation::Relu)?;
-        if let Some(d) = &self.dropout {
-            d.forward(&h, train)
-        } else {
-            Ok(h)
-        }
-    }
-}
-
-struct MlpHead {
-    layers: Vec<AuxLayerBlock>,
-    head: nn::Linear,
-}
-
-impl MlpHead {
-    fn new(
-        vb: VarBuilder,
-        in_dim: usize,
-        out_dim: usize,
-        hidden: &[usize],
-        dropout: f64,
-    ) -> Result<Self> {
-        let mut layers = Vec::with_capacity(hidden.len());
-        let mut d = in_dim;
-        for (i, &h) in hidden.iter().enumerate() {
-            let lin = nn::linear(d, h, vb.pp(format!("lin{i}")))?;
-            let dropout = if dropout > 0.0 {
-                Some(nn::Dropout::new(dropout as f32))
-            } else {
-                None
-            };
-            layers.push(AuxLayerBlock { lin, dropout });
-            d = h;
-        }
-        let head = nn::linear(d, out_dim, vb.pp("head"))?;
-        Ok(Self { layers, head })
-    }
-
-    fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        let mut h = xs.clone();
-        for layer in &self.layers {
-            h = layer.forward(&h, train)?;
-        }
-        h.apply(&self.head)
-    }
 }
 
 /// Summary of an early-stopped training run.
@@ -192,9 +129,6 @@ pub struct Trainer {
     pub model: TopazBagRanker,
     pub opt: AdamW,
     pub ms12_head: Option<nn::Linear>,
-    xic_bag_head: Option<MlpHead>,
-    xim_bag_head: Option<MlpHead>,
-    distill_head: Option<MlpHead>,
     pub pos_weight: Option<f32>,
     pub shuffle_seed: Option<u64>,
 }
@@ -300,63 +234,6 @@ impl Trainer {
             } else {
                 None
             };
-        let trace_repr_dim = model.trace_enc.emb_out_dim()
-            + model
-                .xim_enc
-                .as_ref()
-                .map(|enc| enc.emb_out_dim())
-                .unwrap_or(0)
-            + model.trace_enc.coelution_dim()
-            + model
-                .xim_enc
-                .as_ref()
-                .map(|enc| enc.coelution_dim())
-                .unwrap_or(0);
-        let xic_repr_dim = model.trace_enc.emb_out_dim() + model.trace_enc.coelution_dim();
-        let xic_bag_head = if cfg.lambda_xic_bag > 0.0 {
-            Some(MlpHead::new(
-                vb.pp("xic_bag_head"),
-                xic_repr_dim,
-                1,
-                &cfg.branch_aux_hidden,
-                cfg.branch_aux_dropout,
-            )?)
-        } else {
-            None
-        };
-        let xim_repr_dim = model
-            .xim_enc
-            .as_ref()
-            .map(|enc| enc.emb_out_dim() + enc.coelution_dim());
-        let xim_bag_head = if cfg.lambda_xim_bag > 0.0 {
-            if let Some(in_dim) = xim_repr_dim {
-                Some(MlpHead::new(
-                    vb.pp("xim_bag_head"),
-                    in_dim,
-                    1,
-                    &cfg.branch_aux_hidden,
-                    cfg.branch_aux_dropout,
-                )?)
-            } else {
-                log::warn!(
-                    "lambda_xim_bag > 0 but model has no XIM branch; disabling XIM auxiliary bag head"
-                );
-                None
-            }
-        } else {
-            None
-        };
-        let distill_head = if cfg.distill.is_enabled() {
-            Some(MlpHead::new(
-                vb.pp("distill_head"),
-                trace_repr_dim,
-                cfg.distill.cols.len(),
-                &cfg.distill.hidden,
-                cfg.distill.dropout,
-            )?)
-        } else {
-            None
-        };
 
         let params = nn::optim::ParamsAdamW {
             lr: cfg.learning_rate as f64,
@@ -372,9 +249,6 @@ impl Trainer {
             model,
             opt,
             ms12_head,
-            xic_bag_head,
-            xim_bag_head,
-            distill_head,
             pos_weight: None,
             shuffle_seed: None,
         })
@@ -456,10 +330,7 @@ impl Trainer {
             coe_xim.as_ref(),
             true,
         )?;
-        let (xf_ctx, emb_ctx, coe_ctx) =
-            self.model
-                .scorer_inputs_with_context(&xf, &emb, &coe, Some(&batch.mask))?;
-        let logits = self.model.scorer.forward(&xf_ctx, &emb_ctx, &coe_ctx)?;
+        let logits = self.model.scorer.forward(&xf, &emb, &coe)?;
         let cand = logits.reshape((b, k))?;
         let bag = self.training_bag_logits(&cand, &batch.mask)?;
 
@@ -498,18 +369,6 @@ impl Trainer {
             loss = (loss + (loss_wm.clone() * self.config.lambda_winner_margin as f64)?)?;
         }
 
-        let mut loss_topk_runner = Tensor::zeros((), DType::F32, bag.device())?;
-        if self.config.lambda_topk_runner > 0.0 {
-            loss_topk_runner = losses::topk_runner_margin_loss(
-                &cand,
-                &batch.mask,
-                &batch.yb,
-                self.config.topk_runner_margin,
-                self.config.topk_runner_k,
-            )?;
-            loss = (loss + (loss_topk_runner.clone() * self.config.lambda_topk_runner as f64)?)?;
-        }
-
         let mut loss_ms12 = Tensor::zeros((), DType::F32, bag.device())?;
         if let Some(head) = &self.ms12_head {
             if coe_ms12.elem_count() > 0 {
@@ -532,50 +391,6 @@ impl Trainer {
             }
         }
 
-        let mut loss_xic_bag = Tensor::zeros((), DType::F32, bag.device())?;
-        if let Some(head) = &self.xic_bag_head {
-            let xic_repr = Tensor::cat(&[emb_xic.clone(), coe_xic.clone()], 1)?;
-            let xic_logits = head.forward(&xic_repr, true)?.squeeze(1)?;
-            let xic_cand = xic_logits.reshape((b, k))?;
-            let xic_bag = self.training_bag_logits(&xic_cand, &batch.mask)?;
-            loss_xic_bag = losses::bce_with_logits_weighted(&xic_bag, &batch.yb, self.pos_weight)?;
-            loss = (loss + (loss_xic_bag.clone() * self.config.lambda_xic_bag as f64)?)?;
-        }
-
-        let mut loss_xim_bag = Tensor::zeros((), DType::F32, bag.device())?;
-        if let (Some(head), Some(emb_xim), Some(coe_xim)) =
-            (&self.xim_bag_head, emb_xim.as_ref(), coe_xim.as_ref())
-        {
-            let xim_repr = Tensor::cat(&[emb_xim.clone(), coe_xim.clone()], 1)?;
-            let xim_logits = head.forward(&xim_repr, true)?.squeeze(1)?;
-            let xim_cand = xim_logits.reshape((b, k))?;
-            let xim_bag = self.training_bag_logits(&xim_cand, &batch.mask)?;
-            loss_xim_bag = losses::bce_with_logits_weighted(&xim_bag, &batch.yb, self.pos_weight)?;
-            loss = (loss + (loss_xim_bag.clone() * self.config.lambda_xim_bag as f64)?)?;
-        }
-
-        let mut loss_distill = Tensor::zeros((), DType::F32, bag.device())?;
-        if let (Some(head), Some(targets), Some(mask)) = (
-            self.distill_head.as_ref(),
-            batch.distill_targets.as_ref(),
-            batch.distill_mask.as_ref(),
-        ) {
-            let (_, _, n_targets) = targets.dims3()?;
-            if n_targets > 0 {
-                let trace_repr = Tensor::cat(&[emb.clone(), coe.clone()], 1)?;
-                let pred = head.forward(&trace_repr, true)?;
-                let target_flat = targets.reshape((b * k, n_targets))?;
-                let mask_flat = mask.reshape((b * k, n_targets))?;
-                loss_distill = losses::masked_huber_loss(
-                    &pred,
-                    &target_flat,
-                    &mask_flat,
-                    self.config.distill.huber_delta,
-                )?;
-                loss = (loss + (loss_distill.clone() * self.config.distill.lambda as f64)?)?;
-            }
-        }
-
         let mut grads = loss.backward()?;
         self.clip_grad_norm(&mut grads)?;
         self.opt.step(&grads)?;
@@ -586,11 +401,7 @@ impl Trainer {
             loss_pair: loss_pair.to_scalar::<f32>()?,
             loss_inbag: loss_inbag.to_scalar::<f32>()?,
             loss_winner_margin: loss_wm.to_scalar::<f32>()?,
-            loss_topk_runner: loss_topk_runner.to_scalar::<f32>()?,
             loss_ms12: loss_ms12.to_scalar::<f32>()?,
-            loss_xic_bag: loss_xic_bag.to_scalar::<f32>()?,
-            loss_xim_bag: loss_xim_bag.to_scalar::<f32>()?,
-            loss_distill: loss_distill.to_scalar::<f32>()?,
         })
     }
 
@@ -1266,8 +1077,6 @@ mod tests {
             tb_aux: None,
             mask,
             yb,
-            distill_targets: None,
-            distill_mask: None,
         };
 
         let m1 = trainer.train_step(&batch)?;
@@ -1338,9 +1147,6 @@ mod tests {
             trace_input_mode: crate::building_blocks::trace_input::TraceInputMode::Single,
             use_heuristic_features: true,
             use_coelution_head: false,
-            use_bag_interaction: true,
-            bag_interaction_hidden: 8,
-            bag_interaction_dim: 4,
             ..Default::default()
         };
 
@@ -1369,8 +1175,6 @@ mod tests {
             tb_aux: None,
             mask,
             yb,
-            distill_targets: None,
-            distill_mask: None,
         };
 
         let m = trainer.train_step(&batch)?;

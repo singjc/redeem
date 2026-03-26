@@ -4,7 +4,6 @@
 //! DIA scorers can reuse the same trace extraction, bagging, encoding, and MLP
 //! utilities without depending on the concrete `TopazBagRanker`.
 
-pub mod bag_interaction;
 pub mod bagging;
 pub mod coelution;
 pub mod conv_encoder;

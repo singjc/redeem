@@ -288,7 +288,7 @@ pub fn bags_to_train_batches(
     device: &Device,
     batch_size: usize,
 ) -> Result<Vec<TrainBatch>> {
-    bags_to_train_batches_with_aux_and_distill(bags, None, None, device, batch_size)
+    bags_to_train_batches_with_aux(bags, None, device, batch_size)
 }
 
 #[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
@@ -297,19 +297,6 @@ pub fn bags_to_train_batches(
 pub fn bags_to_train_batches_with_aux(
     bags: Bags,
     aux: Option<(Vec<f32>, usize, usize)>,
-    device: &Device,
-    batch_size: usize,
-) -> Result<Vec<TrainBatch>> {
-    bags_to_train_batches_with_aux_and_distill(bags, aux, None, device, batch_size)
-}
-
-#[cfg(all(feature = "io-sqlite", feature = "io-parquet"))]
-/// Convert flattened bag buffers, an optional auxiliary tensor, and optional
-/// distillation targets into a vector of tensor mini-batches.
-pub fn bags_to_train_batches_with_aux_and_distill(
-    bags: Bags,
-    aux: Option<(Vec<f32>, usize, usize)>,
-    distill: Option<(Vec<f32>, Vec<f32>, usize)>,
     device: &Device,
     batch_size: usize,
 ) -> Result<Vec<TrainBatch>> {
@@ -324,18 +311,6 @@ pub fn bags_to_train_batches_with_aux_and_distill(
         )?)
     } else {
         None
-    };
-    let (distill_targets, distill_mask) = if let Some((targets, mask, d_distill)) = distill {
-        (
-            Some(Tensor::from_vec(
-                targets,
-                (bags.b, bags.k, d_distill),
-                device,
-            )?),
-            Some(Tensor::from_vec(mask, (bags.b, bags.k, d_distill), device)?),
-        )
-    } else {
-        (None, None)
     };
     let mask_u8: Vec<u8> = bags.mask.iter().map(|&v| if v { 1 } else { 0 }).collect();
     let mask = Tensor::from_vec(mask_u8, (bags.b, bags.k), device)?;
@@ -353,16 +328,6 @@ pub fn bags_to_train_batches_with_aux_and_distill(
         } else {
             None
         };
-        let distill_targets_i = if let Some(targets) = distill_targets.as_ref() {
-            Some(targets.narrow(0, i, take)?)
-        } else {
-            None
-        };
-        let distill_mask_i = if let Some(mask) = distill_mask.as_ref() {
-            Some(mask.narrow(0, i, take)?)
-        } else {
-            None
-        };
         let m_i = mask.narrow(0, i, take)?;
         let yb_i = yb.narrow(0, i, take)?;
         out.push(TrainBatch {
@@ -371,8 +336,6 @@ pub fn bags_to_train_batches_with_aux_and_distill(
             tb_aux: tb_aux_i,
             mask: m_i,
             yb: yb_i,
-            distill_targets: distill_targets_i,
-            distill_mask: distill_mask_i,
         });
         i += take;
     }

@@ -2,46 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Auxiliary trace-only distillation settings.
-///
-/// These targets are used only as supervision during training. They are not
-/// concatenated into the scorer inputs at inference time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DistillConfig {
-    /// Heuristic columns to predict from the learned trace representation.
-    pub cols: Vec<String>,
-    /// Global loss weight applied to the masked regression objective.
-    pub lambda: f32,
-    /// Hidden layer widths for the auxiliary regressor.
-    pub hidden: Vec<usize>,
-    /// Dropout applied inside the auxiliary regressor.
-    pub dropout: f64,
-    /// Huber transition point used by the masked regression loss.
-    pub huber_delta: f32,
-    /// Minimum per-column standard deviation before a target is kept.
-    pub min_std: f32,
-}
-
-impl DistillConfig {
-    pub fn is_enabled(&self) -> bool {
-        self.lambda > 0.0 && !self.cols.is_empty()
-    }
-}
-
-impl Default for DistillConfig {
-    fn default() -> Self {
-        Self {
-            cols: Vec::new(),
-            lambda: 0.0,
-            hidden: vec![128, 64],
-            dropout: 0.1,
-            huber_delta: 1.0,
-            min_std: 1e-3,
-        }
-    }
-}
-
 /// Validation metric used for checkpoint selection and early stopping.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -93,13 +53,6 @@ pub struct Config {
     pub winner_margin: f32,
     pub lambda_ms12: f32,
     pub ms12_soft_temp: f32,
-    pub lambda_xic_bag: f32,
-    pub lambda_xim_bag: f32,
-    pub branch_aux_hidden: Vec<usize>,
-    pub branch_aux_dropout: f64,
-    pub lambda_topk_runner: f32,
-    pub topk_runner_margin: f32,
-    pub topk_runner_k: usize,
     pub bag_pool: TrainBagPoolMode,
     pub bag_pool_temp: f32,
     pub max_grad_norm: f32,
@@ -107,7 +60,6 @@ pub struct Config {
     pub eval_every: usize,
     pub early_stop_metric: EarlyStopMetric,
     pub early_stop_qvalue: f32,
-    pub distill: DistillConfig,
     pub trainable_prefixes: Vec<String>,
     pub frozen_prefixes: Vec<String>,
 }
@@ -128,13 +80,6 @@ impl Default for Config {
             winner_margin: 1.0,
             lambda_ms12: 0.0,
             ms12_soft_temp: 1.0,
-            lambda_xic_bag: 0.0,
-            lambda_xim_bag: 0.0,
-            branch_aux_hidden: vec![64],
-            branch_aux_dropout: 0.1,
-            lambda_topk_runner: 0.0,
-            topk_runner_margin: 1.0,
-            topk_runner_k: 3,
             bag_pool: TrainBagPoolMode::Max,
             bag_pool_temp: 1.0,
             max_grad_norm: 5.0,
@@ -142,7 +87,6 @@ impl Default for Config {
             eval_every: 1,
             early_stop_metric: EarlyStopMetric::ValLoss,
             early_stop_qvalue: 0.01,
-            distill: DistillConfig::default(),
             trainable_prefixes: Vec::new(),
             frozen_prefixes: Vec::new(),
         }
