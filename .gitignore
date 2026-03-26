@@ -43,4 +43,4 @@ tools/*
 scratch/*
 examples/*
 
-sandbox/*
+**/sandbox/**
