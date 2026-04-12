@@ -1687,30 +1687,36 @@ impl Encoder26aaModChargeCnnTransformerAttnSum {
 
 #[cfg(test)]
 mod tests {
+    use crate::pretrained::{locate_pretrained_model, PretrainedModel};
     use candle_core::Device;
     use candle_nn::VarBuilder;
     use std::path::PathBuf;
 
     use super::*;
 
-    /// Ensure pretrained models are downloaded before tests that need them.
     fn ensure_models() {
         crate::utils::peptdeep_utils::download_pretrained_models_exist()
             .expect("Failed to download pretrained models");
     }
 
+    fn resolved_model_and_constants(pm: PretrainedModel) -> (PathBuf, PathBuf) {
+        let model_path = locate_pretrained_model(pm).expect("Failed to locate pretrained model");
+        let ext = model_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .expect("Pretrained model path has no extension");
+        let constants_path = model_path.with_extension(format!("{}.model_const.yaml", ext));
+        (model_path, constants_path)
+    }
+
     #[test]
     fn test_decoder_linear_new() -> Result<()> {
-        // Set up the device and random seed
         let device = Device::Cpu;
-
-        // Create an instance of DecoderLinear
         let in_features = 10;
         let out_features = 5;
         let vb = VarBuilder::zeros(DType::F32, &device);
         let decoder_linear = DecoderLinear::new(in_features, out_features, &vb.pp("output_nn"))?;
 
-        // Create the input tensor
         let x = Tensor::new(
             &[
                 [
@@ -1730,22 +1736,11 @@ mod tests {
         )?
         .to_dtype(DType::F32)?;
 
-        // Perform forward pass
         let output = decoder_linear.forward(&x)?;
-
-        println!("Output:\n{}", output);
-
-        // With VarBuilder::zeros, all weights and biases are zero, so the output should be all zeros
         let expected_output = Tensor::zeros((3, out_features), DType::F32, &device)?;
 
-        // Check output shape
-        assert_eq!(
-            output.shape(),
-            expected_output.shape(),
-            "Output shape mismatch"
-        );
+        assert_eq!(output.shape(), expected_output.shape(), "Output shape mismatch");
 
-        // Check output values are all zero (since weights are zero)
         let output_vec = output.to_vec2::<f32>()?;
         for row in &output_vec {
             for &val in row {
@@ -1757,26 +1752,17 @@ mod tests {
             }
         }
 
-        // Print shapes for verification
-        println!("Input shape: {:?}", x.shape());
-        println!("Output shape: {:?}", output.shape());
-        println!("Output:\n{}", output);
-
         Ok(())
     }
 
     #[test]
     fn test_decoder_linear() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1800,15 +1786,11 @@ mod tests {
     #[test]
     fn test_mod_embedding_fix_first_k() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1827,15 +1809,11 @@ mod tests {
     #[test]
     fn test_aa_embedding() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1848,15 +1826,11 @@ mod tests {
     #[test]
     fn test_positional_encoding() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1871,15 +1845,11 @@ mod tests {
     #[test]
     fn test_input_26aa_mod_positional_encoding() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1902,16 +1872,11 @@ mod tests {
     #[test]
     fn test_meta_embedding() {
         ensure_models();
-
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1929,15 +1894,11 @@ mod tests {
     #[test]
     fn test_hidden_hface_transformer() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1959,15 +1920,11 @@ mod tests {
     #[test]
     fn test_mod_loss_nn() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ms2.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1997,15 +1954,11 @@ mod tests {
     #[test]
     fn test_seq_cnn() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepCcsCnnLstm);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -2032,15 +1985,11 @@ mod tests {
     #[test]
     fn test_seq_lstm() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepCcsCnnLstm);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -2054,15 +2003,11 @@ mod tests {
     #[test]
     fn test_seq_attention_sum() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth.model_const.yaml");
+        let (model_path, constants_path) =
+            resolved_model_and_constants(PretrainedModel::AlphapeptdeepCcsCnnLstm);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(
-            constants_path.exists(),
-            "Test constants file does not exist"
-        );
+        assert!(constants_path.exists(), "Test constants file does not exist");
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();

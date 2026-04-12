@@ -302,6 +302,7 @@ mod tests {
     use super::*;
     use crate::models::ccs_cnn_lstm_model::CCSCNNLSTMModel;
     use crate::models::model_interface::ModelInterface;
+    use crate::pretrained::{locate_pretrained_model, PretrainedModel};
     use candle_core::Device;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -312,12 +313,17 @@ mod tests {
             .expect("Failed to download pretrained models");
     }
 
+    fn resolved_model_and_constants() -> (PathBuf, PathBuf) {
+        let model_path = locate_pretrained_model(PretrainedModel::AlphapeptdeepCcsCnnLstm)
+            .expect("Failed to locate CCS pretrained model");
+        let constants_path = model_path.with_extension("pth.model_const.yaml");
+        (model_path, constants_path)
+    }
+
     #[test]
     fn test_load_pretrained_ccs_cnn_lstm_model() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth.model_const.yaml");
+        let (model_path, constants_path) = resolved_model_and_constants();
         let device = Device::Cpu;
         let model =
             CCSCNNLSTMModel::new(model_path, Some(constants_path), 0, 8, 4, true, device).unwrap();
@@ -328,9 +334,7 @@ mod tests {
     #[test]
     fn test_encode_peptides() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth.model_const.yaml");
+        let (model_path, constants_path) = resolved_model_and_constants();
         let device = Device::Cpu;
         let model =
             CCSCNNLSTMModel::new(model_path, Some(constants_path), 0, 8, 4, true, device).unwrap();
@@ -366,9 +370,7 @@ mod tests {
     #[test]
     fn test_predict() {
         ensure_models();
-        let model_path = PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth");
-        let constants_path =
-            PathBuf::from("data/pretrained_models/alphapeptdeep/generic/ccs.pth.model_const.yaml");
+        let (model_path, constants_path) = resolved_model_and_constants();
         let device = Device::Cpu;
 
         let model =

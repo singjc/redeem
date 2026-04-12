@@ -2,11 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [0.1.1] - 2026-03-16
+
+### 🚀 Features
+
+- Add version detection for redeem_properties package
+- Refactor tests to use locate_pretrained_model for model paths
+- Implement configured pretrained-models directory resolution
+
+### 💼 Other
+
+- Add support for x86_64-unknown-linux-musl target in release workflow
+
+### 🚜 Refactor
+
+- Update pretrained model directory handling for cross-platform compatibility
 
 ### ⚙️ Miscellaneous Tasks
 
 - Enhance CHANGELOG update process with branch detection and push handling
+- Update CHANGELOG.md
 
 ## [0.1.0] - 2026-02-22
 
