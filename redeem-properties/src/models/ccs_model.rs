@@ -195,15 +195,28 @@ impl CCSModelWrapper {
         entries.sort_by_key(|e| std::cmp::Reverse(e.2));
 
         let mut s = String::new();
-        s.push_str(&format!("{} total_params={} groups={}\n", arch, total, groups_vec.len()));
-        s.push_str(&format!("{:<24} {:>8} {:>12}\n", "component", "tensors", "params"));
+        s.push_str(&format!(
+            "{} total_params={} groups={}\n",
+            arch,
+            total,
+            groups_vec.len()
+        ));
+        s.push_str(&format!(
+            "{:<24} {:>8} {:>12}\n",
+            "component", "tensors", "params"
+        ));
         for (name, (count, params)) in groups_vec.iter().take(20) {
             s.push_str(&format!("{:<24} {:>8} {:>12}\n", name, count, params));
         }
 
         s.push_str("\nTop tensors:\n");
         for (name, shape, numel) in entries.iter().take(20) {
-            s.push_str(&format!("{:<40} {:<20} {:>12}\n", name, format!("{:?}", shape), numel));
+            s.push_str(&format!(
+                "{:<40} {:<20} {:>12}\n",
+                name,
+                format!("{:?}", shape),
+                numel
+            ));
         }
 
         s
@@ -232,12 +245,16 @@ impl CCSModelWrapper {
             for p in &parts[..parts.len().saturating_sub(1)] {
                 node = node.children.entry(p.to_string()).or_default();
             }
-            node.tensors.push((parts.last().unwrap().to_string(), shape, numel));
+            node.tensors
+                .push((parts.last().unwrap().to_string(), shape, numel));
         }
 
         fn fmt_tensor(name: &str, shape: &[usize]) -> String {
             if name.ends_with("weight") && shape.len() == 2 {
-                return format!("Linear(in_features={}, out_features={})", shape[1], shape[0]);
+                return format!(
+                    "Linear(in_features={}, out_features={})",
+                    shape[1], shape[0]
+                );
             }
             if name.ends_with("bias") && shape.len() == 1 {
                 return format!("bias[{}]", shape[0]);
@@ -251,10 +268,16 @@ impl CCSModelWrapper {
                 s.push_str(&format!("{}{}(\n", pad, n));
             }
             for (tname, shape, _numel) in &node.tensors {
-                s.push_str(&format!("{}  ({}): {}\n", pad, tname, fmt_tensor(tname, shape)));
+                s.push_str(&format!(
+                    "{}  ({}): {}\n",
+                    pad,
+                    tname,
+                    fmt_tensor(tname, shape)
+                ));
             }
             let mut numeric_keys: Vec<usize> = vec![];
-            let mut numeric_map: std::collections::BTreeMap<usize, &Node> = std::collections::BTreeMap::new();
+            let mut numeric_map: std::collections::BTreeMap<usize, &Node> =
+                std::collections::BTreeMap::new();
             let mut non_numeric: Vec<(&String, &Node)> = vec![];
             for (k, v) in &node.children {
                 if let Ok(idx) = k.parse::<usize>() {
@@ -299,7 +322,7 @@ impl CCSModelWrapper {
             }
         }
 
-    let mut out = String::new();
+        let mut out = String::new();
         out.push_str(&format!("{}(\n", arch));
         write_node(&mut out, &root, 1, None);
         out.push_str(")\n");

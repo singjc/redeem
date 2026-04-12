@@ -31,6 +31,7 @@ pub fn write_peptide_data<P: AsRef<Path>>(
 
     let (target_col, pred_col) = match normalize_field {
         "ccs" => ("target_ccs", "predicted_ccs"),
+        "ms2_intensities" => ("target_ms2_intensities", "predicted_ms2_intensities"),
         _ => ("target_retention_time", "predicted_retention_time"),
     };
 
@@ -54,23 +55,6 @@ pub fn write_peptide_data<P: AsRef<Path>>(
     writer.write_record(&headers)?;
 
     for (predicted_entry, original_entry) in predicted.iter().zip(originals.iter()) {
-        let ms2_str = predicted_entry
-            .ms2_intensities
-            .as_ref()
-            .map(|intensities| {
-                intensities
-                    .iter()
-                    .map(|v| {
-                        v.iter()
-                            .map(|f| f.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("|")
-            })
-            .unwrap_or_default();
-
         // Denormalize the original target so we can persist the true value alongside predictions.
         let denorm = |v: Option<f32>| -> Option<f32> {
             let val = v?;
@@ -81,11 +65,59 @@ pub fn write_peptide_data<P: AsRef<Path>>(
             }
         };
 
-        let (target_val, predicted_val) = match normalize_field {
-            "ccs" => (denorm(original_entry.ccs), predicted_entry.ccs),
+        let matrix_to_string = |matrix: Option<&Vec<Vec<f32>>>, denormalize: bool| -> String {
+            matrix
+                .map(|intensities| {
+                    intensities
+                        .iter()
+                        .map(|v| {
+                            v.iter()
+                                .map(|f| {
+                                    let value = if denormalize {
+                                        match norm {
+                                            TargetNormalization::ZScore(mean, std) => {
+                                                f * std + mean
+                                            }
+                                            TargetNormalization::MinMax(min, max) => {
+                                                f * (max - min) + min
+                                            }
+                                            TargetNormalization::None => *f,
+                                        }
+                                    } else {
+                                        *f
+                                    };
+                                    value.to_string()
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .unwrap_or_default()
+        };
+
+        let predicted_ms2_str = matrix_to_string(predicted_entry.ms2_intensities.as_ref(), false);
+        let target_ms2_str = matrix_to_string(original_entry.ms2_intensities.as_ref(), true);
+
+        let (target_val, predicted_val, target_text, predicted_text) = match normalize_field {
+            "ccs" => (
+                denorm(original_entry.ccs),
+                predicted_entry.ccs,
+                String::new(),
+                String::new(),
+            ),
+            "ms2_intensities" => (
+                None,
+                None,
+                target_ms2_str.clone(),
+                predicted_ms2_str.clone(),
+            ),
             _ => (
                 denorm(original_entry.retention_time),
                 predicted_entry.retention_time,
+                String::new(),
+                String::new(),
             ),
         };
 
@@ -115,9 +147,9 @@ pub fn write_peptide_data<P: AsRef<Path>>(
             &predicted_entry
                 .ccs
                 .map_or(String::new(), |c| format!("{:.4}", c)),
-            &ms2_str,
-            &target_val.map_or(String::new(), |t| format!("{:.4}", t)),
-            &predicted_val.map_or(String::new(), |p| format!("{:.4}", p)),
+            &predicted_ms2_str,
+            &target_val.map_or(target_text, |t| format!("{:.4}", t)),
+            &predicted_val.map_or(predicted_text, |p| format!("{:.4}", p)),
         ])?;
     }
 

@@ -1,6 +1,7 @@
+use numpy::{PyArray1, PyArray2};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use pyo3::exceptions::PyRuntimeError;
 use redeem_properties::models::{
     ccs_model::CCSModelWrapper,
     model_interface::{ModelInterface, PredictionResult},
@@ -10,17 +11,19 @@ use redeem_properties::models::{
 use redeem_properties::pretrained::{locate_pretrained_model, PretrainedModel};
 use redeem_properties::utils::mz_utils;
 use redeem_properties::utils::peptdeep_utils::{
-    ccs_to_mobility_bruker, get_modification_indices, get_modification_string,
-    remove_mass_shift, MODIFICATION_MAP,
+    ccs_to_mobility_bruker, get_modification_indices, get_modification_string, remove_mass_shift,
+    MODIFICATION_MAP,
 };
 use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use numpy::{PyArray1, PyArray2};
 
 fn strings_to_arcs(strings: Vec<String>) -> Vec<Arc<[u8]>> {
-    strings.into_iter().map(|s| Arc::from(s.into_bytes())).collect()
+    strings
+        .into_iter()
+        .map(|s| Arc::from(s.into_bytes()))
+        .collect()
 }
 
 fn opt_strings_to_arcs(strings: Vec<Option<String>>) -> Vec<Option<Arc<[u8]>>> {
@@ -58,8 +61,7 @@ fn parse_peptides(peptides: &[String]) -> (Vec<String>, Vec<String>, Vec<String>
 /// Returns `(arch_str, model_path)` on success.  The `family` argument is one of
 /// `"rt"`, `"ccs"`, or `"ms2"` and is used only for the error message.
 fn resolve_pretrained(name: &str, family: &str) -> PyResult<(String, PathBuf)> {
-    let pm = PretrainedModel::from_str(name)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let pm = PretrainedModel::from_str(name).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let arch = pm.arch();
     if !arch.starts_with(family) && !arch.contains(family) {
@@ -70,8 +72,8 @@ fn resolve_pretrained(name: &str, family: &str) -> PyResult<(String, PathBuf)> {
         )));
     }
 
-    let model_path = locate_pretrained_model(pm)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let model_path =
+        locate_pretrained_model(pm).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     Ok((arch.to_string(), model_path))
 }
@@ -111,7 +113,8 @@ fn locate_pretrained(name: &str) -> PyResult<String> {
 #[pyfunction]
 fn validate_pretrained(py: Python, name: &str) -> PyResult<PyObject> {
     let pm = PretrainedModel::from_str(name).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let model_path = locate_pretrained_model(pm).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let model_path =
+        locate_pretrained_model(pm).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let ext = model_path
         .extension()
@@ -191,12 +194,12 @@ fn validate_pretrained(py: Python, name: &str) -> PyResult<PyObject> {
 fn download_pretrained_models() -> PyResult<String> {
     use redeem_properties::utils::peptdeep_utils::download_pretrained_models_exist;
 
-    let path = download_pretrained_models_exist()
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to download pretrained models: {}", e)))?;
+    let path = download_pretrained_models_exist().map_err(|e| {
+        PyRuntimeError::new_err(format!("Failed to download pretrained models: {}", e))
+    })?;
 
     // Return the absolute path as a string
-    let abs_path = std::fs::canonicalize(&path)
-        .unwrap_or(path);
+    let abs_path = std::fs::canonicalize(&path).unwrap_or(path);
 
     Ok(abs_path.to_string_lossy().into_owned())
 }
@@ -259,13 +262,21 @@ impl RTModel {
         let (arch, model_path) = resolve_pretrained(&name, "rt")?;
         let device = get_device(use_cuda)?;
         let wrapper = {
-            let call = || RTModelWrapper::new(&model_path, None::<std::path::PathBuf>.as_ref(), &arch, device);
+            let call = || {
+                RTModelWrapper::new(
+                    &model_path,
+                    None::<std::path::PathBuf>.as_ref(),
+                    &arch,
+                    device,
+                )
+            };
             match std::panic::catch_unwind(call) {
                 Ok(Ok(w)) => w,
                 Ok(Err(e)) => return Err(PyRuntimeError::new_err(e.to_string())),
                 Err(payload) => {
                     return Err(PyRuntimeError::new_err(format!(
-                        "panic while loading pretrained RT model: {:?}", payload
+                        "panic while loading pretrained RT model: {:?}",
+                        payload
                     )))
                 }
             }
@@ -309,9 +320,7 @@ impl RTModel {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         match result {
-            PredictionResult::RTResult(values) => {
-                Ok(PyArray1::from_slice_bound(py, &values))
-            }
+            PredictionResult::RTResult(values) => Ok(PyArray1::from_slice_bound(py, &values)),
             _ => Err(PyRuntimeError::new_err("Unexpected prediction result type")),
         }
     }
@@ -366,15 +375,11 @@ impl CCSModel {
     ) -> PyResult<Self> {
         let device = get_device(use_cuda)?;
         let model_path_arg = std::path::Path::new(&model_path);
-        let cpath_buf_opt: Option<std::path::PathBuf> = constants_path.map(|s| std::path::PathBuf::from(s));
+        let cpath_buf_opt: Option<std::path::PathBuf> =
+            constants_path.map(|s| std::path::PathBuf::from(s));
         let cpath_arg_opt: Option<&std::path::Path> = cpath_buf_opt.as_ref().map(|p| p.as_path());
 
-        let wrapper = CCSModelWrapper::new(
-            model_path_arg,
-            cpath_arg_opt,
-            &arch,
-            device,
-        )
+        let wrapper = CCSModelWrapper::new(model_path_arg, cpath_arg_opt, &arch, device)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner: wrapper })
     }
@@ -408,10 +413,10 @@ impl CCSModel {
 
         // Build the wrapper while catching panics so we return a Python error
         let wrapper = {
-            let call = || {
-                match constants_candidate.as_ref() {
-                    Some(cpath) => CCSModelWrapper::new(&model_path, Some(cpath), &arch, device),
-                    None => CCSModelWrapper::new(&model_path, None::<&std::path::PathBuf>, &arch, device),
+            let call = || match constants_candidate.as_ref() {
+                Some(cpath) => CCSModelWrapper::new(&model_path, Some(cpath), &arch, device),
+                None => {
+                    CCSModelWrapper::new(&model_path, None::<&std::path::PathBuf>, &arch, device)
                 }
             };
 
@@ -420,7 +425,8 @@ impl CCSModel {
                 Ok(Err(e)) => return Err(PyRuntimeError::new_err(e.to_string())),
                 Err(payload) => {
                     return Err(PyRuntimeError::new_err(format!(
-                        "panic while loading pretrained CCS model: {:?}", payload
+                        "panic while loading pretrained CCS model: {:?}",
+                        payload
                     )))
                 }
             }
@@ -541,15 +547,11 @@ impl MS2Model {
     ) -> PyResult<Self> {
         let device = get_device(use_cuda)?;
         let model_path_arg = std::path::Path::new(&model_path);
-        let cpath_buf_opt: Option<std::path::PathBuf> = constants_path.map(|s| std::path::PathBuf::from(s));
+        let cpath_buf_opt: Option<std::path::PathBuf> =
+            constants_path.map(|s| std::path::PathBuf::from(s));
         let cpath_arg_opt: Option<&std::path::Path> = cpath_buf_opt.as_ref().map(|p| p.as_path());
 
-        let wrapper = MS2ModelWrapper::new(
-            model_path_arg,
-            cpath_arg_opt,
-            &arch,
-            device,
-        )
+        let wrapper = MS2ModelWrapper::new(model_path_arg, cpath_arg_opt, &arch, device)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner: wrapper })
     }
@@ -581,10 +583,10 @@ impl MS2Model {
             .and_then(|cand| if cand.exists() { Some(cand) } else { None });
 
         let wrapper = {
-            let call = || {
-                match constants_candidate.as_ref() {
-                    Some(cpath) => MS2ModelWrapper::new(&model_path, Some(cpath), &arch, device),
-                    None => MS2ModelWrapper::new(&model_path, None::<&std::path::PathBuf>, &arch, device),
+            let call = || match constants_candidate.as_ref() {
+                Some(cpath) => MS2ModelWrapper::new(&model_path, Some(cpath), &arch, device),
+                None => {
+                    MS2ModelWrapper::new(&model_path, None::<&std::path::PathBuf>, &arch, device)
                 }
             };
 
@@ -593,7 +595,8 @@ impl MS2Model {
                 Ok(Err(e)) => return Err(PyRuntimeError::new_err(e.to_string())),
                 Err(payload) => {
                     return Err(PyRuntimeError::new_err(format!(
-                        "panic while loading pretrained MS2 model: {:?}", payload
+                        "panic while loading pretrained MS2 model: {:?}",
+                        payload
                     )))
                 }
             }
@@ -705,8 +708,12 @@ impl MS2Model {
                     let y_ords: Vec<i32> = (1..=(n_pos as i32)).rev().collect();
 
                     let d = PyDict::new_bound(py);
-                    let intensities = PyArray2::from_vec2_bound(py, &matrix)
-                        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create intensities array: {}", e)))?;
+                    let intensities = PyArray2::from_vec2_bound(py, &matrix).map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "Failed to create intensities array: {}",
+                            e
+                        ))
+                    })?;
                     d.set_item("intensities", intensities)?;
                     d.set_item("ion_types", ion_types.to_vec())?;
                     d.set_item("ion_charges", ion_charges.to_vec())?;
@@ -747,8 +754,7 @@ impl MS2Model {
 #[cfg(feature = "cuda")]
 fn get_device(use_cuda: bool) -> PyResult<candle_core::Device> {
     if use_cuda {
-        candle_core::Device::new_cuda(0)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        candle_core::Device::new_cuda(0).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     } else {
         Ok(candle_core::Device::Cpu)
     }
@@ -856,7 +862,11 @@ fn compute_peptide_mz_info<'py>(
     let info = mz_utils::compute_peptide_mz_info(proforma_sequence, charge, max_fragment_charge)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let ion_types: Vec<String> = info.product_ions.iter().map(|i| i.ion_type.clone()).collect();
+    let ion_types: Vec<String> = info
+        .product_ions
+        .iter()
+        .map(|i| i.ion_type.clone())
+        .collect();
     let charges: Vec<i32> = info.product_ions.iter().map(|i| i.charge).collect();
     let ordinals: Vec<usize> = info.product_ions.iter().map(|i| i.ordinal).collect();
     let mzs: Vec<f64> = info.product_ions.iter().map(|i| i.mz).collect();

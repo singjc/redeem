@@ -5,10 +5,7 @@ use redeem_properties::{
         ccs_cnn_tf_model::CCSCNNTFModel,
         model_interface::{ModelInterface, PredictionResult},
     },
-    utils::{
-        data_handling::PeptideData,
-        peptdeep_utils::ion_mobility_to_ccs_bruker,
-    },
+    utils::{data_handling::PeptideData, peptdeep_utils::ion_mobility_to_ccs_bruker},
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -63,7 +60,12 @@ fn run_prediction(model: &mut CCSCNNTFModel, ctx: &PredictionContext) -> Result<
                 .map(|(pred, obs)| (pred - obs).abs())
                 .sum();
 
-            for ((pep, pred), obs) in ctx.peptides.iter().zip(preds.clone()).zip(&ctx.observed_ccs) {
+            for ((pep, pred), obs) in ctx
+                .peptides
+                .iter()
+                .zip(preds.clone())
+                .zip(&ctx.observed_ccs)
+            {
                 println!(
                     "Peptide: {}, Predicted CCS: {:.6}, Observed CCS: {:.6}",
                     std::str::from_utf8(pep).unwrap_or(""),
@@ -72,7 +74,10 @@ fn run_prediction(model: &mut CCSCNNTFModel, ctx: &PredictionContext) -> Result<
                 );
             }
 
-            println!("Mean Absolute Error: {:.6}", total_error / preds.len() as f32);
+            println!(
+                "Mean Absolute Error: {:.6}",
+                total_error / preds.len() as f32
+            );
         }
         _ => println!("Unexpected prediction result type."),
     }
@@ -88,15 +93,8 @@ fn main() -> Result<()> {
     let constants_path: Option<PathBuf> = None;
     let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
 
-    let mut model = CCSCNNTFModel::new(
-        &model_path,
-        constants_path.as_ref(),
-        0,
-        8,
-        4,
-        true,
-        device,
-    )?;
+    let mut model =
+        CCSCNNTFModel::new(&model_path, constants_path.as_ref(), 0, 8, 4, true, device)?;
 
     let test_peptides = vec![
         (

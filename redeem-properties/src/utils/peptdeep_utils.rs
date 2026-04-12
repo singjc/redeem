@@ -19,7 +19,8 @@ const MODIFICATIONS_TSV_BYTES: &[u8] = include_bytes!(concat!(
     "/assets/modification.tsv"
 ));
 
-const PRETRAINED_MODELS_URL: &str = "https://github.com/singjc/redeem/releases/download/v0.1.0-alpha/pretrained_models.zip";
+const PRETRAINED_MODELS_URL: &str =
+    "https://github.com/singjc/redeem/releases/download/v0.1.0-alpha/pretrained_models.zip";
 const PRETRAINED_MODELS_ZIP: &str = "data/pretrained_models.zip";
 const PRETRAINED_MODELS_PATH: &str = "data/pretrained_models";
 
@@ -502,8 +503,7 @@ pub fn get_modification_string(
                     .iter()
                     .filter_map(|((k, _), v)| {
                         if k == &key
-                            && (v.name.contains("Protein_N-term")
-                                || v.name.contains("Any_N-term"))
+                            && (v.name.contains("Protein_N-term") || v.name.contains("Any_N-term"))
                         {
                             Some(v.name.clone())
                         } else {
@@ -535,9 +535,8 @@ pub fn download_pretrained_models_exist() -> Result<PathBuf, io::Error> {
     use std::sync::OnceLock;
     static MODELS: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-    let result = MODELS.get_or_init(|| {
-        download_pretrained_models_inner().map_err(|e| e.to_string())
-    });
+    let result =
+        MODELS.get_or_init(|| download_pretrained_models_inner().map_err(|e| e.to_string()));
 
     match result {
         Ok(path) => Ok(path.clone()),
@@ -561,7 +560,10 @@ fn download_pretrained_models_inner() -> Result<PathBuf, io::Error> {
 
     // Download the zip file if it doesn't exist
     if !zip_path.exists() {
-        info!("Downloading pretrained models from {} ...", PRETRAINED_MODELS_URL);
+        info!(
+            "Downloading pretrained models from {} ...",
+            PRETRAINED_MODELS_URL
+        );
 
         // Use a temporary file so concurrent readers never see a partial zip
         let tmp_path = zip_path.with_extension("zip.tmp");
@@ -717,21 +719,32 @@ mod tests {
     #[test]
     fn test_download_pretrained_models_exist_returns_valid_path() {
         let result = download_pretrained_models_exist();
-        
+
         // Should return Ok with a valid path
-        assert!(result.is_ok(), "Failed to download/extract pretrained models");
-        
+        assert!(
+            result.is_ok(),
+            "Failed to download/extract pretrained models"
+        );
+
         let path = result.unwrap();
-        
+
         // Path should exist
-        assert!(path.exists(), "Pretrained models path does not exist: {:?}", path);
-        
+        assert!(
+            path.exists(),
+            "Pretrained models path does not exist: {:?}",
+            path
+        );
+
         // Path should be a directory
-        assert!(path.is_dir(), "Pretrained models path is not a directory: {:?}", path);
-        
+        assert!(
+            path.is_dir(),
+            "Pretrained models path is not a directory: {:?}",
+            path
+        );
+
         // Check that the path matches expected location
         assert_eq!(path, PathBuf::from(PRETRAINED_MODELS_PATH));
-        
+
         println!("Pretrained models successfully available at: {:?}", path);
     }
 

@@ -185,6 +185,10 @@ impl ModelInterface for RTCNNLSTMModel {
         )
     }
 
+    fn get_varmap(&self) -> &VarMap {
+        &self.varmap
+    }
+
     fn get_mut_varmap(&mut self) -> &mut VarMap {
         &mut self.varmap
     }

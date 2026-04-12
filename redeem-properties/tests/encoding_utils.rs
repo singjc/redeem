@@ -7,8 +7,8 @@ use redeem_properties::building_blocks::featurize::{
     aa_indices_tensor, aa_indices_tensor_from_arc,
 };
 use redeem_properties::utils::peptdeep_utils::{
-    ccs_to_mobility_bruker, get_modification_indices, get_modification_string,
-    remove_mass_shift, MODIFICATION_MAP,
+    ccs_to_mobility_bruker, get_modification_indices, get_modification_string, remove_mass_shift,
+    MODIFICATION_MAP,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,10 @@ fn aa_indices_tensor_from_arc_matches_str_version() {
 
     let v1 = t_str.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let v2 = t_arc.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    assert_eq!(v1, v2, "str and arc versions should produce identical tensors");
+    assert_eq!(
+        v1, v2,
+        "str and arc versions should produce identical tensors"
+    );
 }
 
 #[test]
@@ -121,7 +124,11 @@ fn get_modification_string_with_mod() {
 #[test]
 fn ccs_to_mobility_positive_values() {
     let mobility = ccs_to_mobility_bruker(400.0, 2.0, 500.0);
-    assert!(mobility > 0.0, "mobility should be positive, got {}", mobility);
+    assert!(
+        mobility > 0.0,
+        "mobility should be positive, got {}",
+        mobility
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::fmt;
 #[derive(Debug)]
 pub enum ExperimentError {
     DimensionMismatch(usize, usize), // (expected, actual)
-    SingleClass(bool), // true if only targets, false if only decoys
+    SingleClass(bool),               // true if only targets, false if only decoys
 }
 
 impl fmt::Display for ExperimentError {
@@ -37,7 +37,9 @@ impl fmt::Display for TdcError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             TdcError::NaNFound(count) => write!(f, "Found {} NaN values in scores array", count),
-            TdcError::LengthMismatch => write!(f, "Scores and target arrays must have equal length"),
+            TdcError::LengthMismatch => {
+                write!(f, "Scores and target arrays must have equal length")
+            }
         }
     }
 }

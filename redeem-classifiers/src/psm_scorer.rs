@@ -565,13 +565,12 @@ impl SemiSupervisedLearner {
         let has_pos = train_exp.y.iter().any(|&v| v == 1);
         let has_neg = train_exp.y.iter().any(|&v| v == -1);
         if !(has_pos && has_neg) {
-            log::warn!(
-                "Final model training skipped; requires both target and decoy examples."
-            );
+            log::warn!("Final model training skipped; requires both target and decoy examples.");
             return None;
         }
 
-        self.model.fit(&train_exp.x, train_exp.y.as_slice(), None, None);
+        self.model
+            .fit(&train_exp.x, train_exp.y.as_slice(), None, None);
         self.model.feature_weights()
     }
 }
@@ -603,10 +602,10 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
+    use super::SemiSupervisedLearner;
     use crate::config::ModelType;
     use crate::data_handling::RankGrouping;
     use crate::math::{Array1, Array2};
-    use super::SemiSupervisedLearner;
 
     #[allow(dead_code)]
     fn read_features_tsv(path: &str) -> Result<Array2<f32>, Box<dyn Error>> {

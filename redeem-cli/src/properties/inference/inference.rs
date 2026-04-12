@@ -6,6 +6,7 @@ use maud::{PreEscaped, html};
 use redeem_properties::models::ccs_cnn_lstm_model::CCSCNNLSTMModel;
 use redeem_properties::models::ccs_cnn_tf_model::CCSCNNTFModel;
 use redeem_properties::models::model_interface::ModelInterface;
+use redeem_properties::models::ms2_bert_model::MS2BertModel;
 use redeem_properties::models::rt_cnn_lstm_model::RTCNNLSTMModel;
 use redeem_properties::models::rt_cnn_transformer_model::RTCNNTFModel;
 use redeem_properties::utils::data_handling::{PeptideData, TargetNormalization};
@@ -149,9 +150,18 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
             true,
             device.clone(),
         )?),
+        "ms2_bert" => Box::new(MS2BertModel::new(
+            &config.model_path,
+            None,
+            0,
+            8,
+            4,
+            true,
+            device.clone(),
+        )?),
         _ => {
             return Err(anyhow::anyhow!(
-                "Unsupported RT model architecture: {}",
+                "Unsupported property model architecture: {}",
                 model_arch
             ));
         }
@@ -250,7 +260,9 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
     log::info!("Inference completed in {:?}", start_time.elapsed());
 
     log::info!("Predictions saved to: {}", config.output_file);
-    let normalize_field = if config.model_arch.contains("ccs") {
+    let normalize_field = if config.model_arch == "ms2_bert" {
+        "ms2_intensities"
+    } else if config.model_arch.contains("ccs") {
         "ccs"
     } else {
         "retention time"
@@ -301,8 +313,8 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
                             TargetNormalization::ZScore(mean, std) => {
                                 t as f64 * std as f64 + mean as f64
                             }
-                            TargetNormalization::MinMax(min, range) => {
-                                t as f64 * range as f64 + min as f64
+                            TargetNormalization::MinMax(min, max) => {
+                                t as f64 * (max - min) as f64 + min as f64
                             }
                             TargetNormalization::None => t as f64,
                         };
@@ -316,8 +328,8 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
                             TargetNormalization::ZScore(mean, std) => {
                                 t as f64 * std as f64 + mean as f64
                             }
-                            TargetNormalization::MinMax(min, range) => {
-                                t as f64 * range as f64 + min as f64
+                            TargetNormalization::MinMax(min, max) => {
+                                t as f64 * (max - min) as f64 + min as f64
                             }
                             TargetNormalization::None => t as f64,
                         };
@@ -406,8 +418,8 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
                             TargetNormalization::ZScore(mean, std) => {
                                 t as f64 * std as f64 + mean as f64
                             }
-                            TargetNormalization::MinMax(min, range) => {
-                                t as f64 * range as f64 + min as f64
+                            TargetNormalization::MinMax(min, max) => {
+                                t as f64 * (max - min) as f64 + min as f64
                             }
                             TargetNormalization::None => t as f64,
                         };
@@ -424,8 +436,8 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
                             TargetNormalization::ZScore(mean, std) => {
                                 t as f64 * std as f64 + mean as f64
                             }
-                            TargetNormalization::MinMax(min, range) => {
-                                t as f64 * range as f64 + min as f64
+                            TargetNormalization::MinMax(min, max) => {
+                                t as f64 * (max - min) as f64 + min as f64
                             }
                             TargetNormalization::None => t as f64,
                         };

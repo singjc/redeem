@@ -6,10 +6,10 @@
 
 use anyhow::{Context, Result};
 use rustyms::{
-    prelude::*,
-    system::{isize::Charge, e},
     chemistry::MassMode,
     fragment::FragmentKind,
+    prelude::*,
+    system::{e, isize::Charge},
 };
 
 /// Represents a single product (fragment) ion with its m/z and metadata.
@@ -50,8 +50,13 @@ pub fn compute_precursor_mz(proforma_sequence: &str, charge: i32) -> Result<f64>
         anyhow::bail!("Charge must be positive, got {}", charge);
     }
 
-    let peptide = CompoundPeptidoformIon::pro_forma(proforma_sequence, None)
-        .map_err(|err| anyhow::anyhow!("Failed to parse ProForma sequence '{}': {}", proforma_sequence, err))?;
+    let peptide = CompoundPeptidoformIon::pro_forma(proforma_sequence, None).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to parse ProForma sequence '{}': {}",
+            proforma_sequence,
+            err
+        )
+    })?;
 
     // Get the molecular formula(s) for the peptide
     let formulas = peptide.formulas();
@@ -89,18 +94,24 @@ pub fn compute_product_mzs(
     max_fragment_charge: i32,
 ) -> Result<Vec<ProductIon>> {
     if max_fragment_charge <= 0 {
-        anyhow::bail!("max_fragment_charge must be positive, got {}", max_fragment_charge);
+        anyhow::bail!(
+            "max_fragment_charge must be positive, got {}",
+            max_fragment_charge
+        );
     }
 
-    let peptide = CompoundPeptidoformIon::pro_forma(proforma_sequence, None)
-        .map_err(|err| anyhow::anyhow!("Failed to parse ProForma sequence '{}': {}", proforma_sequence, err))?;
+    let peptide = CompoundPeptidoformIon::pro_forma(proforma_sequence, None).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to parse ProForma sequence '{}': {}",
+            proforma_sequence,
+            err
+        )
+    })?;
 
     // Generate theoretical fragments up to the specified charge
     let model = FragmentationModel::all();
-    let fragments = peptide.generate_theoretical_fragments(
-        Charge::new::<e>(max_fragment_charge as isize),
-        model,
-    );
+    let fragments = peptide
+        .generate_theoretical_fragments(Charge::new::<e>(max_fragment_charge as isize), model);
 
     let mut product_ions = Vec::new();
 
@@ -283,7 +294,12 @@ mod tests {
         let predicted_charges = vec![1, 1];
         let predicted_ordinals = vec![1, 1];
 
-        let mzs = match_product_mzs(&ions, &predicted_types, &predicted_charges, &predicted_ordinals);
+        let mzs = match_product_mzs(
+            &ions,
+            &predicted_types,
+            &predicted_charges,
+            &predicted_ordinals,
+        );
         assert_eq!(mzs.len(), 2);
         // b1 and y1 should both have valid m/z values
         assert!(!mzs[0].is_nan(), "b1+1 should have a match");

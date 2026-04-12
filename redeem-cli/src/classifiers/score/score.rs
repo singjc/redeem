@@ -1,11 +1,11 @@
 //! CLI scoring helpers for redeem-classifiers.
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow};
 use plotly::layout::BarMode;
 use plotly::{Histogram, Layout, Plot};
 use report_builder::{Report, ReportSection};
+use serde::{Deserialize, Serialize};
 
 use redeem_classifiers::config::ModelConfig;
 use redeem_classifiers::data_handling::{PsmMetadata, RankGrouping};
@@ -104,14 +104,7 @@ pub fn score_pin<P: AsRef<Path>>(pin_path: P, config: &ScoreConfig) -> Result<Sc
             Some(mapping),
         )
     } else {
-        (
-            predictions,
-            ranks,
-            targets,
-            labels,
-            pin_data.metadata,
-            None,
-        )
+        (predictions, ranks, targets, labels, pin_data.metadata, None)
     };
 
     let qvalues = tdc(&predictions, &targets, true);
@@ -176,7 +169,9 @@ pub fn write_score_output<P: AsRef<Path>>(
         }
         None => Box::new(std::io::stdout()),
     };
-    let mut writer = csv::WriterBuilder::new().delimiter(b'\t').from_writer(writer);
+    let mut writer = csv::WriterBuilder::new()
+        .delimiter(b'\t')
+        .from_writer(writer);
 
     let mut out_headers = headers.clone();
     out_headers.push_field("d_score");
@@ -388,7 +383,8 @@ fn dedup_keep_mask(
     scores: &Array1<f32>,
     grouping: RankGrouping,
 ) -> Vec<bool> {
-    let mut best: std::collections::HashMap<DedupKey, (usize, f32)> = std::collections::HashMap::new();
+    let mut best: std::collections::HashMap<DedupKey, (usize, f32)> =
+        std::collections::HashMap::new();
     for idx in 0..scores.len() {
         let scan_value = metadata
             .scan_nr
@@ -400,7 +396,13 @@ fn dedup_keep_mask(
             .as_ref()
             .and_then(|values| values.get(idx).copied())
             .flatten()
-            .and_then(|value| if value.is_finite() { Some(value.to_bits()) } else { None });
+            .and_then(|value| {
+                if value.is_finite() {
+                    Some(value.to_bits())
+                } else {
+                    None
+                }
+            });
         let scan_or_spec = match grouping {
             RankGrouping::SpecId => DedupScanOrSpec::Spec(metadata.spec_id[idx].clone()),
             RankGrouping::Percolator => match scan_value {

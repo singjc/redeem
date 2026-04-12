@@ -49,6 +49,102 @@ pub struct MS2BertModel {
     modloss_nn: ModLossNN,
 }
 
+impl MS2BertModel {
+    fn from_varmap(
+        varmap: VarMap,
+        constants: ModelConstants,
+        fixed_sequence_len: usize,
+        num_frag_types: usize,
+        num_modloss_types: usize,
+        mask_modloss: bool,
+        device: Device,
+        is_training: bool,
+    ) -> Result<Self> {
+        let var_store = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mod_to_feature = load_mod_to_feature_arc(&constants)?;
+        let dropout = Dropout::new(0.1);
+
+        let meta_dim = 8;
+        let input_nn = Input26aaModPositionalEncoding::from_varstore(
+            &var_store,
+            256 - meta_dim,
+            200,
+            vec![
+                "input_nn.mod_nn.nn.weight",
+                "input_nn.aa_emb.weight",
+                "input_nn.pos_encoder.pe",
+            ],
+        )?;
+
+        let meta_nn = MetaEmbedding::from_varstore(
+            &var_store,
+            meta_dim,
+            vec!["meta_nn.nn.weight", "meta_nn.nn.bias"],
+        )?;
+
+        let hidden_nn = HiddenHfaceTransformer::from_varstore(
+            var_store.pp("hidden_nn.bert"),
+            256,
+            4,
+            8,
+            4,
+            0.1,
+            false,
+        )?;
+
+        let output_frag_types = num_frag_types.saturating_sub(num_modloss_types);
+        let output_nn = DecoderLinear::from_varstore(
+            &var_store,
+            256,
+            output_frag_types,
+            vec![
+                "output_nn.nn.0.weight",
+                "output_nn.nn.1.weight",
+                "output_nn.nn.2.weight",
+            ],
+            vec!["output_nn.nn.0.bias", "output_nn.nn.2.bias"],
+        )?;
+
+        let modloss_nn = ModLossNN::from_varstore(
+            var_store.clone(),
+            256,
+            4,
+            8,
+            1,
+            0.1,
+            false,
+            num_modloss_types,
+            "modloss_nn.0.bert",
+            vec![
+                "modloss_nn.1.nn.0.weight",
+                "modloss_nn.1.nn.1.weight",
+                "modloss_nn.1.nn.2.weight",
+            ],
+            vec!["modloss_nn.1.nn.0.bias", "modloss_nn.1.nn.2.bias"],
+        )?;
+
+        Ok(Self {
+            var_store,
+            varmap,
+            constants,
+            mod_to_feature,
+            fixed_sequence_len,
+            num_frag_types,
+            num_modloss_types,
+            mask_modloss,
+            min_inten: 1e-4,
+            device,
+            is_training,
+            dropout,
+            input_nn,
+            meta_nn,
+            hidden_nn,
+            output_nn,
+            modloss_nn,
+        })
+    }
+}
+
 // Automatically implement Send and Sync if all fields are Send and Sync
 unsafe impl Send for MS2BertModel {}
 unsafe impl Sync for MS2BertModel {}
@@ -63,8 +159,17 @@ impl ModelInterface for MS2BertModel {
         "ms2_bert"
     }
 
-    fn new_untrained(_device: Device) -> Result<Self> {
-        unimplemented!("Untrained model creation is not implemented for this architecture.");
+    fn new_untrained(device: Device) -> Result<Self> {
+        Self::from_varmap(
+            VarMap::new(),
+            ModelConstants::default(),
+            0,
+            8,
+            4,
+            true,
+            device,
+            true,
+        )
     }
 
     /// Create a new MS2BERT model from the given model and constants files.
@@ -82,100 +187,21 @@ impl ModelInterface for MS2BertModel {
         let mut varmap = VarMap::new();
         create_var_map(&mut varmap, tensor_data, &device)?;
 
-        let var_store = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-
         let constants = match constants_path {
             Some(path) => parse_model_constants(path.as_ref().to_str().unwrap())?,
             None => ModelConstants::default(),
         };
 
-        // Load the mod_to_feature mapping
-        let mod_to_feature = load_mod_to_feature_arc(&constants)?;
-
-        let dropout = Dropout::new(0.1);
-
-        let meta_dim = 8;
-        let input_nn = Input26aaModPositionalEncoding::from_varstore(
-            &var_store,
-            256 - 8,
-            200,
-            vec![
-                "input_nn.mod_nn.nn.weight",
-                "input_nn.aa_emb.weight",
-                "input_nn.pos_encoder.pe",
-            ],
-        )
-        .unwrap();
-
-        let meta_nn = MetaEmbedding::from_varstore(
-            &var_store,
-            8,
-            vec!["meta_nn.nn.weight", "meta_nn.nn.bias"],
-        )
-        .unwrap();
-
-        let hidden_nn = HiddenHfaceTransformer::from_varstore(
-            var_store.pp("hidden_nn.bert"),
-            256,
-            4,
-            8,
-            4,
-            0.1,
-            false,
-        )
-        .unwrap();
-
-        let output_nn = DecoderLinear::from_varstore(
-            &var_store,
-            256,
-            4,
-            vec![
-                "output_nn.nn.0.weight",
-                "output_nn.nn.1.weight",
-                "output_nn.nn.2.weight",
-            ],
-            vec!["output_nn.nn.0.bias", "output_nn.nn.2.bias"],
-        )
-        .unwrap();
-
-        let modloss_nn = ModLossNN::from_varstore(
-            var_store.clone(),
-            256,
-            4,
-            8,
-            1,
-            0.1,
-            false,
-            4,
-            "modloss_nn.0.bert",
-            vec![
-                "modloss_nn.1.nn.0.weight",
-                "modloss_nn.1.nn.1.weight",
-                "modloss_nn.1.nn.2.weight",
-            ],
-            vec!["modloss_nn.1.nn.0.bias", "modloss_nn.1.nn.2.bias"],
-        )
-        .unwrap();
-
-        Ok(Self {
-            var_store: var_store,
-            varmap: varmap,
-            constants: constants,
-            mod_to_feature: mod_to_feature,
-            fixed_sequence_len: fixed_sequence_len,
-            num_frag_types: num_frag_types,
-            num_modloss_types: num_modloss_types,
-            mask_modloss: mask_modloss,
-            min_inten: 1e-4,
+        Self::from_varmap(
+            varmap,
+            constants,
+            fixed_sequence_len,
+            num_frag_types,
+            num_modloss_types,
+            mask_modloss,
             device,
-            is_training: false,
-            dropout: dropout,
-            input_nn: input_nn,
-            meta_nn: meta_nn,
-            hidden_nn: hidden_nn,
-            output_nn: output_nn,
-            modloss_nn: modloss_nn,
-        })
+            false,
+        )
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
@@ -278,7 +304,7 @@ impl ModelInterface for MS2BertModel {
 
         // Apply dropout and combine with input
         let x_tmp = (hidden_x + combined_input * 0.2)?;
-        let hidden_output = self.dropout.forward(&x_tmp, true)?;
+        let hidden_output = self.dropout.forward(&x_tmp, self.is_training)?;
         log::trace!(
             "[MS2BertModel::forward] hidden_output shape: {:?}, device: {:?}",
             hidden_output.shape(),
@@ -365,6 +391,10 @@ impl ModelInterface for MS2BertModel {
 
     fn get_min_pred_intensity(&self) -> f32 {
         self.min_inten
+    }
+
+    fn get_varmap(&self) -> &VarMap {
+        &self.varmap
     }
 
     fn get_mut_varmap(&mut self) -> &mut VarMap {

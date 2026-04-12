@@ -32,6 +32,9 @@ use std::{
 // Constants
 const CHARGE_FACTOR: f64 = 0.1;
 const NCE_FACTOR: f64 = 0.01;
+const REDEEM_METADATA_PREFIX: &str = "__redeem_metadata.";
+const OUTPUT_NORM_KIND_TENSOR: &str = "__redeem_metadata.output_normalization.kind";
+const OUTPUT_NORM_VALUES_TENSOR: &str = "__redeem_metadata.output_normalization.values";
 
 /// Load tensors from a model file.
 ///
@@ -177,11 +180,98 @@ pub fn create_var_map(
 ) -> Result<()> {
     let mut ws = var_map.data().lock().unwrap();
 
-        for (name, tensor) in tensor_data {
-            ws.insert(name, Var::from_tensor(&tensor.to_device(device)?)?);
-        }
+    for (name, tensor) in tensor_data {
+        ws.insert(name, Var::from_tensor(&tensor.to_device(device)?)?);
+    }
 
     Ok(())
+}
+
+fn is_redeem_metadata_tensor(name: &str) -> bool {
+    name.starts_with(REDEEM_METADATA_PREFIX)
+}
+
+fn normalization_kind(norm: TargetNormalization) -> f32 {
+    match norm {
+        TargetNormalization::None => 0.0,
+        TargetNormalization::MinMax(_, _) => 1.0,
+        TargetNormalization::ZScore(_, _) => 2.0,
+    }
+}
+
+fn normalization_values(norm: TargetNormalization) -> [f32; 2] {
+    match norm {
+        TargetNormalization::None => [0.0, 0.0],
+        TargetNormalization::MinMax(min, max) => [min, max],
+        TargetNormalization::ZScore(mean, std) => [mean, std],
+    }
+}
+
+pub fn write_output_normalization_to_varmap(
+    varmap: &mut VarMap,
+    device: &Device,
+    norm: TargetNormalization,
+) -> Result<()> {
+    let kind_tensor = Tensor::from_slice(&[normalization_kind(norm)], (1,), device)?;
+    let values_tensor = Tensor::from_slice(&normalization_values(norm), (2,), device)?;
+    let kind_var = Var::from_tensor(&kind_tensor)?;
+    let values_var = Var::from_tensor(&values_tensor)?;
+
+    let mut ws = varmap.data().lock().unwrap();
+    ws.insert(OUTPUT_NORM_KIND_TENSOR.to_string(), kind_var);
+    ws.insert(OUTPUT_NORM_VALUES_TENSOR.to_string(), values_var);
+    Ok(())
+}
+
+pub fn read_output_normalization_from_varmap(varmap: &VarMap) -> Option<TargetNormalization> {
+    let ws = varmap.data().lock().unwrap();
+    let kind = ws
+        .get(OUTPUT_NORM_KIND_TENSOR)?
+        .flatten_all()
+        .ok()?
+        .to_vec1::<f32>()
+        .ok()?
+        .first()
+        .copied()?;
+    let values = ws
+        .get(OUTPUT_NORM_VALUES_TENSOR)?
+        .flatten_all()
+        .ok()?
+        .to_vec1::<f32>()
+        .ok()?;
+    let a = *values.get(0).unwrap_or(&0.0);
+    let b = *values.get(1).unwrap_or(&0.0);
+
+    match kind.round() as i32 {
+        0 => Some(TargetNormalization::None),
+        1 => Some(TargetNormalization::MinMax(a, b)),
+        2 => Some(TargetNormalization::ZScore(a, b)),
+        _ => None,
+    }
+}
+
+fn denormalize_scalar(value: f32, norm: TargetNormalization) -> f32 {
+    match norm {
+        TargetNormalization::ZScore(mean, std) => value * std + mean,
+        TargetNormalization::MinMax(min, max) => value * (max - min) + min,
+        TargetNormalization::None => value,
+    }
+}
+
+fn denormalize_tensor(tensor: &Tensor, norm: TargetNormalization) -> Result<Tensor> {
+    match norm {
+        TargetNormalization::None => Ok(tensor.clone()),
+        TargetNormalization::ZScore(mean, std) => {
+            let std_t = Tensor::new(std, tensor.device())?.broadcast_as(tensor.shape())?;
+            let mean_t = Tensor::new(mean, tensor.device())?.broadcast_as(tensor.shape())?;
+            Ok(tensor.broadcast_mul(&std_t)?.broadcast_add(&mean_t)?)
+        }
+        TargetNormalization::MinMax(min, max) => {
+            let range_t = Tensor::new(max - min, tensor.device())?.broadcast_as(tensor.shape())?;
+            let min_t = Tensor::new(min, tensor.device())?.broadcast_as(tensor.shape())?;
+            Ok(tensor.broadcast_mul(&range_t)?.broadcast_add(&min_t)?)
+        }
+    }
 }
 
 /// Hyperparameters inferred from a loaded checkpoint's tensor shapes.
@@ -212,9 +302,9 @@ pub fn infer_cnn_tf_hyperparams(
 
     // Helper to get shape dims for a tensor name
     let get_dims = |name: &str| -> Result<Vec<usize>> {
-        let var = data.get(name).ok_or_else(|| {
-            anyhow::anyhow!("Tensor '{}' not found in checkpoint", name)
-        })?;
+        let var = data
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Tensor '{}' not found in checkpoint", name))?;
         Ok(var.shape().dims().to_vec())
     };
 
@@ -223,24 +313,40 @@ pub fn infer_cnn_tf_hyperparams(
     let mod_nn_name = format!("{}.mod_nn.nn.weight", encoder_prefix);
     let mod_dims = get_dims(&mod_nn_name)?;
     let mod_hidden_dim = mod_dims[0] + 6; // add back the k=6 fixed features
-    log::debug!("[infer_cnn_tf_hyperparams] mod_hidden_dim = {} (from {} shape {:?}, +k=6)", mod_hidden_dim, mod_nn_name, mod_dims);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] mod_hidden_dim = {} (from {} shape {:?}, +k=6)",
+        mod_hidden_dim,
+        mod_nn_name,
+        mod_dims
+    );
 
     // 2. hidden_dim from proj_q.weight of layer 0: [hidden_dim, hidden_dim]
     let proj_q_name = format!("{}.input_transformer.layer_0.proj_q.weight", encoder_prefix);
     let proj_q_dims = get_dims(&proj_q_name)?;
     let hidden_dim = proj_q_dims[0];
-    log::debug!("[infer_cnn_tf_hyperparams] hidden_dim = {} (from {})", hidden_dim, proj_q_name);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] hidden_dim = {} (from {})",
+        hidden_dim,
+        proj_q_name
+    );
 
     // 3. ff_dim from lin1.weight of layer 0: [ff_dim, hidden_dim]
     let lin1_name = format!("{}.input_transformer.layer_0.lin1.weight", encoder_prefix);
     let lin1_dims = get_dims(&lin1_name)?;
     let ff_dim = lin1_dims[0];
-    log::debug!("[infer_cnn_tf_hyperparams] ff_dim = {} (from {})", ff_dim, lin1_name);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] ff_dim = {} (from {})",
+        ff_dim,
+        lin1_name
+    );
 
     // 4. Count transformer layers
     let mut num_layers = 0usize;
     loop {
-        let layer_name = format!("{}.input_transformer.layer_{}.proj_q.weight", encoder_prefix, num_layers);
+        let layer_name = format!(
+            "{}.input_transformer.layer_{}.proj_q.weight",
+            encoder_prefix, num_layers
+        );
         if data.contains_key(&layer_name) {
             num_layers += 1;
         } else {
@@ -268,7 +374,11 @@ pub fn infer_cnn_tf_hyperparams(
     } else {
         1
     };
-    log::debug!("[infer_cnn_tf_hyperparams] num_heads = {} (inferred, head_dim={})", num_heads, hidden_dim / num_heads);
+    log::debug!(
+        "[infer_cnn_tf_hyperparams] num_heads = {} (inferred, head_dim={})",
+        num_heads,
+        hidden_dim / num_heads
+    );
 
     Ok(InferredHyperparams {
         mod_hidden_dim,
@@ -379,11 +489,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                 if let Some(norm) = denorm {
                     predictions = predictions
                         .into_iter()
-                        .map(|pred| match norm {
-                            TargetNormalization::ZScore(mean, std) => pred * std + mean,
-                            TargetNormalization::MinMax(min, max) => pred * (max - min) + min,
-                            TargetNormalization::None => pred,
-                        })
+                        .map(|pred| denormalize_scalar(pred, norm))
                         .collect();
                 }
                 Ok(PredictionResult::RTResult(predictions))
@@ -393,17 +499,16 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                 if let Some(norm) = denorm {
                     predictions = predictions
                         .into_iter()
-                        .map(|pred| match norm {
-                            TargetNormalization::ZScore(mean, std) => pred * std + mean,
-                            TargetNormalization::MinMax(min, max) => pred * (max - min) + min,
-                            TargetNormalization::None => pred,
-                        })
+                        .map(|pred| denormalize_scalar(pred, norm))
                         .collect();
                 }
                 Ok(PredictionResult::CCSResult(predictions))
             }
             PropertyType::MS2 => {
-                let out = self.process_predictions(&output, self.get_min_pred_intensity())?;
+                let mut out = self.process_predictions(&output, self.get_min_pred_intensity())?;
+                if let Some(norm) = denorm {
+                    out = denormalize_tensor(&out, norm)?;
+                }
                 let predictions: Vec<Vec<Vec<f32>>> = out.to_vec3()?;
                 Ok(PredictionResult::MS2Result(predictions))
             }
@@ -658,6 +763,9 @@ pub trait ModelInterface: Send + Sync + ModelClone {
         let mut step_idx = 0;
         let mut val_step_idx = 0;
 
+        self.set_output_normalization(target_norm)?;
+        self.set_training_mode();
+
         let params = candle_nn::ParamsAdamW {
             lr: learning_rate,
             ..Default::default()
@@ -665,26 +773,43 @@ pub trait ModelInterface: Send + Sync + ModelClone {
         // If the caller specified prefixes to train, select only those vars from the VarMap.
         // If the list is empty or omitted, train all variables.
         let mut opt = {
-            if let Some(prefixes) = &train_var_prefixes {
-                if prefixes.is_empty() {
-                    candle_nn::AdamW::new(self.get_mut_varmap().all_vars(), params)?
-                } else {
-                    let selected: Vec<Var> = {
-                        let ws = self.get_mut_varmap().data().lock().unwrap();
-                        ws.iter()
-                            .filter(|(name, _)| prefixes.iter().any(|p| name.starts_with(p)))
-                            .map(|(_, v)| v.clone())
-                            .collect()
-                    };
-                    if selected.is_empty() {
-                        candle_nn::AdamW::new(self.get_mut_varmap().all_vars(), params)?
-                    } else {
-                        candle_nn::AdamW::new(selected, params)?
-                    }
-                }
+            let selected: Vec<Var> = {
+                let ws = self.get_mut_varmap().data().lock().unwrap();
+                ws.iter()
+                    .filter(|(name, _)| !is_redeem_metadata_tensor(name))
+                    .filter(|(name, _)| {
+                        train_var_prefixes
+                            .as_ref()
+                            .filter(|prefixes| !prefixes.is_empty())
+                            .map(|prefixes| prefixes.iter().any(|p| name.starts_with(p)))
+                            .unwrap_or(true)
+                    })
+                    .map(|(_, v)| v.clone())
+                    .collect()
+            };
+
+            let vars = if selected.is_empty()
+                && train_var_prefixes
+                    .as_ref()
+                    .map(|prefixes| !prefixes.is_empty())
+                    .unwrap_or(false)
+            {
+                let ws = self.get_mut_varmap().data().lock().unwrap();
+                ws.iter()
+                    .filter(|(name, _)| !is_redeem_metadata_tensor(name))
+                    .map(|(_, v)| v.clone())
+                    .collect::<Vec<_>>()
             } else {
-                candle_nn::AdamW::new(self.get_mut_varmap().all_vars(), params)?
+                selected
+            };
+
+            if vars.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "No trainable model variables found for {}",
+                    self.get_model_arch()
+                ));
             }
+            candle_nn::AdamW::new(vars, params)?
         };
         let mut lr_scheduler = CosineWithWarmup::new(
             learning_rate,
@@ -918,8 +1043,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                     .par_chunks(validation_batch_size)
                     .enumerate()
                     .map(|(idx, batch_data)| {
-                        
-
                         let (input_val, target_val) =
                             self.prepare_batch_inputs(batch_data, &modifications)?;
                         let predicted = self.forward(&input_val)?;
@@ -1129,8 +1252,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
 
         let progress = Progress::new(inference_data.len(), "[inference] Batch:");
         let mut result: Vec<Option<PeptideData>> = vec![None; inference_data.len()];
-
-
+        let output_norm = self.get_output_denormalization().unwrap_or(target_norm);
 
         inference_data
             .par_chunks(batch_size)
@@ -1138,34 +1260,78 @@ pub trait ModelInterface: Send + Sync + ModelClone {
             .map(|(batch_idx, batch_data)| {
                 let start_idx = batch_idx * batch_size;
 
-                // Extract input features only (ignore targets)
-                let (input_tensor, _) = self.prepare_batch_inputs(batch_data, &modifications)?;
+                let batch: PeptideBatchData = batch_data.into();
+                let charges = if batch.charges.iter().all(|c| c.is_some()) {
+                    Some(batch.charges.iter().map(|c| c.unwrap()).collect::<Vec<_>>())
+                } else {
+                    None
+                };
+                let nces = if batch.nces.iter().all(|n| n.is_some()) {
+                    Some(batch.nces.iter().map(|n| n.unwrap()).collect::<Vec<_>>())
+                } else {
+                    None
+                };
+                let instruments = if batch.instruments.iter().all(|i| i.is_some()) {
+                    Some(batch.instruments.clone())
+                } else {
+                    None
+                };
 
-                // Now run model forward.
+                let input_tensor = self
+                    .encode_peptides(
+                        &batch.naked_sequence,
+                        &batch.mods,
+                        &batch.mod_sites,
+                        charges,
+                        nces,
+                        instruments,
+                    )?
+                    .to_device(self.get_device())?;
                 let predicted = self.forward(&input_tensor)?;
 
-
-                let predictions = predicted.to_vec1::<f32>()?;
-
-
-                let updated = predictions
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, pred)| {
-                        let mut peptide = batch_data[i].clone();
-                        let value = match target_norm {
-                            TargetNormalization::ZScore(mean, std) => pred * std + mean,
-                            TargetNormalization::MinMax(min, max) => pred * (max - min) + min,
-                            TargetNormalization::None => pred,
-                        };
-                        match self.property_type() {
-                            PropertyType::RT => peptide.retention_time = Some(value),
-                            PropertyType::CCS => peptide.ccs = Some(value),
-                            _ => {}
-                        }
-                        (start_idx + i, peptide)
-                    })
-                    .collect::<Vec<_>>();
+                let updated = match self.property_type() {
+                    PropertyType::RT => predicted
+                        .to_vec1::<f32>()?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, pred)| {
+                            let mut peptide = batch_data[i].clone();
+                            peptide.retention_time = Some(denormalize_scalar(pred, output_norm));
+                            (start_idx + i, peptide)
+                        })
+                        .collect::<Vec<_>>(),
+                    PropertyType::CCS => predicted
+                        .to_vec1::<f32>()?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, pred)| {
+                            let mut peptide = batch_data[i].clone();
+                            peptide.ccs = Some(denormalize_scalar(pred, output_norm));
+                            (start_idx + i, peptide)
+                        })
+                        .collect::<Vec<_>>(),
+                    PropertyType::MS2 => {
+                        let processed =
+                            self.process_predictions(&predicted, self.get_min_pred_intensity())?;
+                        let processed = denormalize_tensor(&processed, output_norm)?;
+                        let predictions = processed.to_vec3::<f32>()?;
+                        predictions
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, mut pred)| {
+                                let mut peptide = batch_data[i].clone();
+                                let frag_len = peptide
+                                    .naked_sequence
+                                    .len()
+                                    .saturating_sub(1)
+                                    .min(pred.len());
+                                pred.truncate(frag_len);
+                                peptide.ms2_intensities = Some(pred);
+                                (start_idx + i, peptide)
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                };
 
                 Ok(updated)
             })
@@ -1290,11 +1456,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                     }
                 }
 
-                Tensor::from_vec(
-                    targets,
-                    (batch_size, max_frag_len, 8),
-                    &self.get_device(),
-                )?
+                Tensor::from_vec(targets, (batch_size, max_frag_len, 8), &self.get_device())?
             }
         };
 
@@ -1321,6 +1483,10 @@ pub trait ModelInterface: Send + Sync + ModelClone {
     /// known CNN-Transformer pretrained models; this can be replaced later by
     /// storing the params in the pretrained artifact (recommended).
     fn get_output_denormalization(&self) -> Option<TargetNormalization> {
+        if let Some(norm) = read_output_normalization_from_varmap(self.get_varmap()) {
+            return Some(norm);
+        }
+
         match self.get_model_arch().as_str() {
             // Redeem CNN-Transformer models were trained with min-max normalization
             // using these ranges (hard-coded until we store them in the model files):
@@ -1340,7 +1506,14 @@ pub trait ModelInterface: Send + Sync + ModelClone {
 
     fn get_min_pred_intensity(&self) -> f32;
 
+    fn get_varmap(&self) -> &VarMap;
+
     fn get_mut_varmap(&mut self) -> &mut VarMap;
+
+    fn set_output_normalization(&mut self, norm: TargetNormalization) -> Result<()> {
+        let device = self.get_device().clone();
+        write_output_normalization_to_varmap(self.get_mut_varmap(), &device, norm)
+    }
 
     fn print_summary(&self);
     fn print_weights(&self);
@@ -1349,7 +1522,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
     fn save(&mut self, path: &str) -> Result<()> {
         let p = PathBuf::from(path);
         info!("Saving {} model weights to: {:?}", self.get_model_arch(), p);
-    self.get_mut_varmap().save(&p)?;
+        self.get_mut_varmap().save(&p)?;
         Ok(())
     }
 
@@ -1392,15 +1565,15 @@ pub trait ModelInterface: Send + Sync + ModelClone {
 
     // TODO: Maybe move to ms2_bert_model, since it's specific to that model
     fn process_predictions(&self, predicts: &Tensor, min_inten: f32) -> Result<Tensor> {
-
         // Reshape and get max
         let (batch_size, seq_len, feature_size) = predicts.shape().dims3()?;
         let reshaped = predicts.reshape((batch_size, ()))?;
         let apex_intens = reshaped.max(1)?;
 
-        // Replace values <= 0 with 1
-        // let ones = Tensor::ones_like(&apex_intens)?;
-        let apex_intens = apex_intens.maximum(&apex_intens)?;
+        // Avoid division by zero or by a negative maximum without changing
+        // normal positive apex scaling.
+        let eps = Tensor::full(1e-12f32, apex_intens.shape(), apex_intens.device())?;
+        let apex_intens = apex_intens.maximum(&eps)?;
 
         // Reshape apex_intens for broadcasting
         let apex_intens_reshaped = apex_intens.reshape(((), 1, 1))?;
@@ -1410,7 +1583,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
 
         // Divide predicts by broadcasted apex_intens
         let normalized = predicts.div(&broadcasted_apex_intens)?;
-
 
         // Replace values < min_inten with 0.0
         let zeros = Tensor::zeros_like(&normalized)?;
