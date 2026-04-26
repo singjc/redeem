@@ -113,20 +113,25 @@ impl RTModelWrapper {
     pub fn fine_tune(
         &mut self,
         training_data: &Vec<PeptideData>,
+        validation_data: Option<&Vec<PeptideData>>,
         modifications: HashMap<(String, Option<char>), ModificationMap>,
         batch_size: usize,
         learning_rate: f64,
         epochs: usize,
+        early_stopping_patience: Option<usize>,
         target_norm: TargetNormalization,
+        warmup_fraction: Option<f64>,
     ) -> Result<()> {
         self.model.fine_tune(
             training_data,
+            validation_data,
             modifications,
             batch_size,
             learning_rate,
             epochs,
+            early_stopping_patience,
             target_norm,
-            None,
+            warmup_fraction,
         )
     }
 

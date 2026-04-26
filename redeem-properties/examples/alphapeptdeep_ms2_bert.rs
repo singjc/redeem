@@ -160,10 +160,12 @@ fn main() -> Result<()> {
 
     model.fine_tune(
         &training_data,
+        None,
         modifications,
         3,
         0.001,
         5,
+        None,
         TargetNormalization::None,
         None,
     )?;

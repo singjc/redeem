@@ -1198,10 +1198,11 @@ pub trait ModelInterface: Send + Sync + ModelClone {
     }
 
     /// Fine-tune the model on new data using the main [`ModelInterface::train`] method.
-    /// This is a wrapper that disables validation and early stopping.
+    /// Validation and early stopping are optional and disabled by default.
     fn fine_tune(
         &mut self,
         training_data: &Vec<PeptideData>,
+        validation_data: Option<&Vec<PeptideData>>,
         modifications: HashMap<
             (String, Option<char>),
             crate::utils::peptdeep_utils::ModificationMap,
@@ -1209,18 +1210,19 @@ pub trait ModelInterface: Send + Sync + ModelClone {
         batch_size: usize,
         learning_rate: f64,
         epochs: usize,
+        early_stopping_patience: Option<usize>,
         target_norm: TargetNormalization,
         warmup_fraction: Option<f64>,
     ) -> Result<()> {
         let _metrics = self.train(
             training_data,
-            None, // No validation data
+            validation_data,
             modifications,
             batch_size,
-            batch_size, // Validation batch size is same but unused
+            batch_size,
             learning_rate,
             epochs,
-            usize::MAX, // Disable early stopping
+            early_stopping_patience.unwrap_or(usize::MAX),
             "fine-tuning",
             false, // No checkpoints
             false, // No metrics
