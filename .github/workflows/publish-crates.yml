@@ -1,0 +1,72 @@
+name: Publish Crates to crates.io
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      crates:
+        description: 'Comma-separated crate names to publish (e.g., "redeem-properties,redeem-classifiers")'
+        required: false
+        default: 'redeem-properties'
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Set crates to publish
+        id: crates
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            # On release, publish redeem-properties by default
+            CRATES="redeem-properties"
+          else
+            # On manual trigger, use the input or default
+            CRATES="${{ github.event.inputs.crates }}"
+          fi
+          echo "list=$CRATES" >> $GITHUB_OUTPUT
+          echo "Publishing crates: $CRATES"
+
+      - name: Publish crate to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          IFS=',' read -ra CRATE_ARRAY <<< "${{ steps.crates.outputs.list }}"
+          
+          for crate in "${CRATE_ARRAY[@]}"; do
+            crate=$(echo "$crate" | xargs)  # Trim whitespace
+            
+            if [ -d "$crate" ] && [ -f "$crate/Cargo.toml" ]; then
+              echo "Publishing $crate..."
+              cd "$crate"
+              cargo publish --token "${CARGO_REGISTRY_TOKEN}"
+              cd ..
+              
+              # Wait a bit between crates to ensure they're indexed
+              sleep 10
+            else
+              echo "⚠️  Crate directory $crate not found or missing Cargo.toml"
+              exit 1
+            fi
+          done
+
+      - name: Create GitHub release summary
+        if: github.event_name == 'release'
+        run: |
+          echo "## 📦 Published to crates.io" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          IFS=',' read -ra CRATE_ARRAY <<< "${{ steps.crates.outputs.list }}"
+          for crate in "${CRATE_ARRAY[@]}"; do
+            crate=$(echo "$crate" | xargs)
+            echo "- [$crate](https://crates.io/crates/$crate)" >> $GITHUB_STEP_SUMMARY
+          done
