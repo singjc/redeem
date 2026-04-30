@@ -23,7 +23,16 @@ Add `redeem-properties` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-redeem-properties = { git = "https://github.com/singjc/redeem.git", branch = "master" }
+redeem-properties = "0.1"
+```
+
+### From source (development)
+
+To build from the latest development version with all features:
+
+```toml
+[dependencies]
+redeem-properties = { git = "https://github.com/singjc/redeem.git", branch = "develop" }
 ```
 
 ### Feature flags
@@ -31,11 +40,18 @@ redeem-properties = { git = "https://github.com/singjc/redeem.git", branch = "ma
 | Feature | Description |
 |---------|-------------|
 | `cuda` | Enable CUDA GPU acceleration via candle |
-| `embed-pretrained` | Embed pretrained model weights into the binary at compile time (requires model files on disk) |
+| `embed-pretrained` | Embed pretrained model weights into the binary at compile time (requires model files on disk; only works when building from source) |
 
 ```toml
 [dependencies]
-redeem-properties = { git = "https://github.com/singjc/redeem.git", branch = "master", features = ["cuda"] }
+redeem-properties = { version = "0.1", features = ["cuda"] }
+```
+
+Or with git source:
+
+```toml
+[dependencies]
+redeem-properties = { git = "https://github.com/singjc/redeem.git", branch = "develop", features = ["cuda"] }
 ```
 
 ## Quick Start
@@ -196,9 +212,9 @@ The `pretrained` module provides a registry of bundled model identifiers:
 Model files are searched in order:
 
 1. `$REDEEM_PRETRAINED_MODELS_DIR/<path>`
-2. `$CARGO_MANIFEST_DIR/data/pretrained_models/<path>` (development)
-3. `./data/pretrained_models/<path>` (working directory)
-4. `$HOME/.local/share/redeem/models/<path>` (user cache)
+2. User-local models directory (platform-dependent; see `default_pretrained_models_dir()`)
+3. `$CARGO_MANIFEST_DIR/assets/pretrained_models/<path>` (development/local builds)
+4. `./assets/pretrained_models/<path>` (current working directory)
 
 ## Crate Structure
 
@@ -232,7 +248,9 @@ redeem-properties/
 │       ├── logging.rs            #   Progress bar wrapper
 │       └── utils.rs              #   LR schedulers, tensor utilities
 ├── examples/                     # Runnable examples
-└── data/                         # Local model & asset storage
+└── assets/                       # Static assets and models
+    ├── modification.tsv          #   Modification metadata
+    └── pretrained_models/        #   Optional embedded models (dev/binary)
 ```
 
 ## Model Formats
