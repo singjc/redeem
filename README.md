@@ -18,24 +18,23 @@ ReDeeM is a Rust workspace for mass spectrometry proteomics, providing deep lear
 
 ## Crates
 
-| Crate | Description | Docs |
-|-------|-------------|------|
-| [`redeem-cli`](redeem-cli/) | Command-line interface for ReDeeM | [README](redeem-cli/) |
-| [`redeem-classifiers`](redeem-classifiers/) | Semi-supervised PSM rescoring (GBDT, XGBoost, SVM) | [README](redeem-classifiers/) |
-| [`redeem-properties`](redeem-properties/) | Peptide property prediction (RT, CCS, MS2) using candle | [README](redeem-properties/) |
-| [`redeem-properties-py`](redeem-properties-py/) | Python bindings for `redeem-properties` via PyO3 | [README](redeem-properties-py/) · [Docs](https://redeem-properties.readthedocs.io/) |
+| Crate | Description | Status | Docs |
+|-------|-------------|--------|------|
+| [`redeem-cli`](redeem-cli/) | Command-line interface for ReDeeM | *Not published* | [README](redeem-cli/) |
+| [`redeem-classifiers`](redeem-classifiers/) | Semi-supervised PSM rescoring (GBDT, XGBoost, SVM) | *Not published* | [README](redeem-classifiers/) |
+| [`redeem-properties`](redeem-properties/) | Peptide property prediction (RT, CCS, MS2) using candle | [![Crates.io](https://img.shields.io/crates/v/redeem-properties.svg)](https://crates.io/crates/redeem-properties) | [README](redeem-properties/) |
+| [`redeem-properties-py`](redeem-properties-py/) | Python bindings for `redeem-properties` via PyO3 | [![PyPI](https://img.shields.io/pypi/v/redeem_properties.svg)](https://pypi.org/project/redeem_properties/) | [README](redeem-properties-py/) · [Docs](https://redeem-properties.readthedocs.io/) |
 
 ## Installation
 
 ### Rust
 
-> [!NOTE]
-> The ReDeeM crates are still under development and are not yet available on crates.io.
+`redeem-properties` is available on crates.io. Other crates are still in development.
 
 ```toml
 [dependencies]
-redeem-properties = { git = "https://github.com/singjc/redeem.git", branch = "master" }
-redeem-classifiers = { git = "https://github.com/singjc/redeem.git", branch = "master" }
+redeem-properties = "0.1"
+redeem-classifiers = { git = "https://github.com/singjc/redeem.git", branch = "develop" }
 ```
 
 ### Python
