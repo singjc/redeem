@@ -20,7 +20,7 @@ itertools = "0.14.0"
 zip = "2.2.2"
 csv = "1.1"
 regex = "1.6"
-tqdm = {git = "https://github.com/singjc/tqdm.git", branch = "add/update_desc"}
+tqdm = "0.8.0"
 rayon = "1.5"
 sysinfo = "0.33.1"
 rustyms = { version = "0.11", default-features = false }

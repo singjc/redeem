@@ -1,32 +1,34 @@
 use candle_core::{Result, Tensor};
-use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use sysinfo::System;
-use tqdm::tqdm;
-use tqdm::Tqdm;
+use tqdm::pbar;
+
+/// Message type for progress bar updates
+enum ProgressMessage {
+    Increment,
+    SetDescription(String),
+}
 
 /// A thread-safe progress bar implementation using `tqdm`.
 ///
 /// This struct manages a progress bar that updates asynchronously in a separate thread.
 /// It ensures safe concurrent updates by using an atomic counter and a message-passing
-/// channel to send update signals.
+/// channel to send update signals and description updates.
 ///
 /// # Fields
 /// * `total` - The total number of steps in the progress bar.
-/// * `progress` - A shared, mutex-protected `tqdm` progress bar.
 /// * `count` - An atomic counter to track progress updates.
-/// * `sender` - A channel sender to send progress update messages.
+/// * `sender` - A channel sender to send update messages.
 /// * `progress_thread` - An optional handle for the background progress update thread.
 /// * `description` - A description displayed alongside the progress bar.
 pub struct Progress {
     total: usize,
-    progress: Arc<Mutex<Tqdm<Range<usize>>>>,
-    count: AtomicUsize,          // Atomic counter for tracking progress
-    sender: mpsc::Sender<usize>, // Channel to send updates
+    count: AtomicUsize,                          // Atomic counter for tracking progress
+    sender: mpsc::Sender<ProgressMessage>,       // Channel to send updates and descriptions
     progress_thread: Option<thread::JoinHandle<()>>, // Background thread to update tqdm
-    description: String,         // Description for the progress bar
+    description: String,                         // Description for the progress bar
 }
 
 impl Progress {
@@ -48,22 +50,30 @@ impl Progress {
     /// let progress = Progress::new(100, "Processing data");
     /// ```
     pub fn new(total: usize, description: &str) -> Self {
-        let progress = Arc::new(Mutex::new(tqdm(0..total).desc(Some(description)))); // Initialize Tqdm
+        let mut progress = pbar(Some(total));
+        progress.set_desc(Some(description));
+        
         let count = AtomicUsize::new(0);
-
         let (tx, rx) = mpsc::channel();
-        let progress_clone = Arc::clone(&progress);
 
-        // Spawn a thread to handle progress updates
+        // Spawn a thread to handle progress updates and description changes
         let handle = thread::spawn(move || {
-            for _ in rx {
-                let _ = progress_clone.lock().unwrap().pbar.update(1); // Always update by 1
+            let mut current = 0usize;
+            for msg in rx {
+                match msg {
+                    ProgressMessage::Increment => {
+                        current += 1;
+                        let _ = progress.update(current);
+                    }
+                    ProgressMessage::SetDescription(desc) => {
+                        progress.set_desc(Some(&desc));
+                    }
+                }
             }
         });
 
         Self {
             total,
-            progress,
             count,
             sender: tx,
             progress_thread: Some(handle),
@@ -92,13 +102,12 @@ impl Progress {
             return; // Prevent overflow
         }
 
-        let _ = self.sender.send(1); // Always send 1 instead of new_count
+        let _ = self.sender.send(ProgressMessage::Increment);
     }
 
-    /// Updates the progress bar's description.
+    /// Updates the progress bar's description dynamically.
     pub fn update_description(&self, new_desc: &str) {
-        let mut progress = self.progress.lock().unwrap();
-        progress.set_desc(Some(new_desc)); // Update the description dynamically
+        let _ = self.sender.send(ProgressMessage::SetDescription(new_desc.to_string()));
     }
 
     /// Finalizes the progress bar by ensuring all updates are completed.
