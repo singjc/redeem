@@ -6,10 +6,10 @@ use std::{env, fs};
 #[cfg(feature = "embed-pretrained")]
 use include_dir::{include_dir, Dir};
 
-// When embedding, prefer the workspace-level `data/pretrained_models` if present.
+// When embedding, use the slim models directory with only essential models for publication.
 // Use a compile-time path anchored at the crate manifest to reach the workspace data dir.
 #[cfg(feature = "embed-pretrained")]
-static EMBEDDED_PRETRAINED_DIR: Dir = include_dir!("data/pretrained_models");
+static EMBEDDED_PRETRAINED_DIR: Dir = include_dir!("assets/pretrained_models");
 
 /// Enum of known pretrained model identifiers supported by the library.
 #[derive(Debug, Clone, PartialEq, Eq)]
