@@ -14,7 +14,7 @@ include = [
     "src/",
     "examples/",
     "tests/",
-    "assets/",
+    "assets/modification.tsv",
     "Cargo.toml",
     "README.md",
     "LICENSE",
