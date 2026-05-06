@@ -1485,7 +1485,7 @@ mod tests {
     use redeem_properties::utils::peptdeep_utils::download_pretrained_models_exist;
     use std::ffi::CString;
     use std::fs;
-    use std::io::{self, BufRead, BufReader, Write};
+    use std::io::{self, Write};
     use std::sync::OnceLock;
     use zip::ZipArchive;
 
@@ -1642,29 +1642,37 @@ mod tests {
         (input, peptide, instrument)
     }
 
-    fn finetune_example_tsv() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../pxd017703_predlib/openswath_results_finetuning.tsv")
-    }
-
-    fn write_finetune_subset(max_rows: usize) -> PathBuf {
-        let source = finetune_example_tsv();
-        assert!(
-            source.exists(),
-            "missing fine-tuning example TSV at {}",
-            source.display()
-        );
-
-        let destination = std::env::temp_dir().join("redeem-openms-ffi-finetune-subset.tsv");
-        let reader =
-            BufReader::new(fs::File::open(&source).expect("failed to open fine-tuning TSV"));
+    fn write_finetune_fixture() -> PathBuf {
+        let destination = std::env::temp_dir().join("redeem-openms-ffi-finetune-fixture.tsv");
         let mut writer =
-            fs::File::create(&destination).expect("failed to create fine-tuning subset TSV");
+            fs::File::create(&destination).expect("failed to create fine-tuning fixture TSV");
 
-        for (index, line) in reader.lines().enumerate() {
-            let line = line.expect("failed to read fine-tuning TSV line");
-            if index == 0 || index <= max_rows {
-                writeln!(writer, "{line}").expect("failed to write fine-tuning subset line");
+        writeln!(
+            writer,
+            "sequence\tprecursor_mz\tprecursor_charge\tfragment_type\tfragment_series_number\tproduct_charge\tretention_time\tintensity"
+        )
+        .expect("failed to write fine-tuning fixture header");
+
+        let rows = [
+            (".(UniMod:1)PEPTIDE", 400.6873_f32, 2_i32, 32.5_f32),
+            ("MGC(UniMod:4)AAR", 289.4681_f32, 3_i32, 18.2_f32),
+            ("PEPC(UniMod:4)PEPR", 478.2192_f32, 2_i32, 41.7_f32),
+            ("ACDEFGHIK", 510.2424_f32, 2_i32, 55.3_f32),
+            ("VVTADK", 316.6762_f32, 2_i32, 24.1_f32),
+            ("LGGNEQVTR", 487.2588_f32, 2_i32, 47.9_f32),
+        ];
+
+        for (sequence, precursor_mz, precursor_charge, retention_time) in rows {
+            for (fragment_type, series_number, product_charge, intensity) in [
+                ("b", 1_usize, 1_i32, 1200.0_f32),
+                ("y", 1_usize, 1_i32, 950.0_f32),
+                ("b", 2_usize, 1_i32, 700.0_f32),
+            ] {
+                writeln!(
+                    writer,
+                    "{sequence}\t{precursor_mz}\t{precursor_charge}\t{fragment_type}\t{series_number}\t{product_charge}\t{retention_time}\t{intensity}"
+                )
+                .expect("failed to write fine-tuning fixture row");
             }
         }
 
@@ -1770,7 +1778,7 @@ mod tests {
         let predictor = openms_redeem_predictor_create(&config);
         assert!(!predictor.is_null(), "{}", unsafe { last_error_string() });
 
-        let training_tsv = write_finetune_subset(300);
+        let training_tsv = write_finetune_fixture();
         let output_model =
             std::env::temp_dir().join("redeem-openms-ffi-finetuned-rt.safetensors");
         let output_constants =
