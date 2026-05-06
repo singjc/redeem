@@ -602,6 +602,7 @@ pub extern "C" fn openms_redeem_last_error() -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redeem_properties::utils::peptdeep_utils::download_pretrained_models_exist;
     use std::ffi::CString;
     use std::fs;
     use std::io;
@@ -617,16 +618,57 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn required_model_relpaths() -> [&'static str; 3] {
+        [
+            "redeem/20251205_100_epochs_min_max_rt_cnn_tf.safetensors",
+            "redeem/20251205_500_epochs_early_stopped_100_min_max_ccs_cnn_tf.safetensors",
+            "alphapeptdeep/generic/ms2.pth",
+        ]
+    }
+
+    fn all_models_exist(root: &Path, required: &[&str]) -> bool {
+        required.iter().all(|relative| root.join(relative).exists())
+    }
+
+    fn extract_models_from_archive(archive_path: &Path, output_dir: &Path, required: &[&str]) {
+        fs::create_dir_all(output_dir).expect("failed to create extracted model directory");
+        let archive_file =
+            fs::File::open(archive_path).expect("failed to open pretrained_models.zip");
+        let mut archive =
+            ZipArchive::new(archive_file).expect("failed to read pretrained_models.zip");
+
+        for relative in required {
+            let archive_name = format!("pretrained_models/{relative}");
+            let mut entry = archive
+                .by_name(&archive_name)
+                .unwrap_or_else(|_| panic!("missing {archive_name} in pretrained_models.zip"));
+            let destination = output_dir.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
+            }
+            let mut out = fs::File::create(&destination).unwrap_or_else(|e| {
+                panic!(
+                    "failed to create extracted model {}: {e}",
+                    destination.display()
+                )
+            });
+            io::copy(&mut entry, &mut out).unwrap_or_else(|e| {
+                panic!(
+                    "failed to extract {} to {}: {e}",
+                    archive_name,
+                    destination.display()
+                )
+            });
+        }
+    }
+
     fn extract_required_models() -> &'static PathBuf {
         EXTRACTED_MODELS_DIR.get_or_init(|| {
-            let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../redeem-properties/data/pretrained_models.zip");
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let archive_path = manifest_dir.join("../redeem-properties/data/pretrained_models.zip");
             let output_dir = std::env::temp_dir().join("redeem-openms-ffi-test-models");
-            let required = [
-                "redeem/20251205_100_epochs_min_max_rt_cnn_tf.safetensors",
-                "redeem/20251205_500_epochs_early_stopped_100_min_max_ccs_cnn_tf.safetensors",
-                "alphapeptdeep/generic/ms2.pth",
-            ];
+            let required = required_model_relpaths();
 
             let rt_path = output_dir.join(required[0]);
             let ccs_path = output_dir.join(required[1]);
@@ -635,35 +677,27 @@ mod tests {
                 return output_dir;
             }
 
-            fs::create_dir_all(&output_dir).expect("failed to create extracted model directory");
-            let archive_file =
-                fs::File::open(&archive_path).expect("failed to open pretrained_models.zip");
-            let mut archive =
-                ZipArchive::new(archive_file).expect("failed to read pretrained_models.zip");
-
-            for relative in required {
-                let archive_name = format!("pretrained_models/{relative}");
-                let mut entry = archive
-                    .by_name(&archive_name)
-                    .unwrap_or_else(|_| panic!("missing {archive_name} in pretrained_models.zip"));
-                let destination = output_dir.join(relative);
-                if let Some(parent) = destination.parent() {
-                    fs::create_dir_all(parent)
-                        .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
-                }
-                let mut out = fs::File::create(&destination).unwrap_or_else(|e| {
-                    panic!("failed to create extracted model {}: {e}", destination.display())
-                });
-                io::copy(&mut entry, &mut out).unwrap_or_else(|e| {
-                    panic!(
-                        "failed to extract {} to {}: {e}",
-                        archive_name,
-                        destination.display()
-                    )
-                });
+            if archive_path.exists() {
+                extract_models_from_archive(&archive_path, &output_dir, &required);
+                return output_dir;
             }
 
-            output_dir
+            let downloaded_dir = download_pretrained_models_exist().unwrap_or_else(|error| {
+                panic!(
+                    "failed to provision pretrained models for FFI tests; \
+                     repo archive missing at {} and download failed: {error}",
+                    archive_path.display()
+                )
+            });
+
+            if all_models_exist(&downloaded_dir, &required) {
+                return downloaded_dir;
+            }
+
+            panic!(
+                "missing required pretrained models for FFI tests under {}",
+                downloaded_dir.display()
+            );
         })
     }
 
