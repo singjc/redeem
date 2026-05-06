@@ -7,6 +7,21 @@ dependency inside the OpenMS build. OpenMS can either download the matching
 prebuilt bundle automatically or use a manual archive path through the
 `REDEEM_FFI_LIBRARY` CMake cache variable.
 
+## OpenMS integration scope
+
+The OpenMS build uses the minimal `redeem-properties` feature set:
+
+- RT inference via `rt_cnn_tf`
+- CCS inference via `ccs_cnn_tf`
+- MS2 intensity inference via `ms2_bert`
+- local-file model loading only
+
+That means the prebuilt OpenMS FFI bundle intentionally excludes the
+pretrained-model download helpers and the legacy RT/CCS LSTM variants.
+
+Fine-tuning and transfer learning remain available on the Rust side through
+`redeem-properties`, but they are not exposed through the current C ABI.
+
 ## Prebuilt bundle layout
 
 OpenMS expects a prebuilt static library:
