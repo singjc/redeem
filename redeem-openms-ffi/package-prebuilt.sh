@@ -18,18 +18,20 @@ fi
 
 mkdir -p "${out_dir}/lib"
 
-cargo build --release --package redeem-openms-ffi --target "${target}"
+profile="openms-ffi-release"
+
+cargo build --profile "${profile}" --package redeem-openms-ffi --target "${target}"
 
 native_static_libs="$(
-  cargo rustc --release --package redeem-openms-ffi --target "${target}" -- --print native-static-libs 2>&1 \
+  cargo rustc --profile "${profile}" --package redeem-openms-ffi --target "${target}" -- --print native-static-libs 2>&1 \
     | sed -n 's/^note: native-static-libs: //p' \
     | tail -n 1
 )"
 
 if [[ "${target}" == *windows-msvc ]]; then
-  built_lib="${repo_root}/target/${target}/release/redeem_openms_ffi.lib"
+  built_lib="${repo_root}/target/${target}/${profile}/redeem_openms_ffi.lib"
 else
-  built_lib="${repo_root}/target/${target}/release/libredeem_openms_ffi.a"
+  built_lib="${repo_root}/target/${target}/${profile}/libredeem_openms_ffi.a"
 fi
 
 if [[ ! -f "${built_lib}" ]]; then

@@ -17,3 +17,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = true
+
+[profile.openms-ffi-release]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false
+strip = "debuginfo"
