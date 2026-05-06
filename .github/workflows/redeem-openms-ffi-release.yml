@@ -23,6 +23,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FFI_PROFILE: openms-ffi-release
 
 jobs:
   build:
@@ -123,15 +124,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo build --release --package redeem-openms-ffi --target "${{ matrix.target }}"
-          $native = cargo rustc --release --package redeem-openms-ffi --target "${{ matrix.target }}" -- --print native-static-libs 2>&1 |
+          cargo build --profile "${env:FFI_PROFILE}" --package redeem-openms-ffi --target "${{ matrix.target }}"
+          $native = cargo rustc --profile "${env:FFI_PROFILE}" --package redeem-openms-ffi --target "${{ matrix.target }}" -- --print native-static-libs 2>&1 |
             Select-String "native-static-libs:" |
             Select-Object -Last 1 |
             ForEach-Object { $_.ToString().Replace("note: native-static-libs: ", "").Trim() }
           $bundleRoot = "redeem-openms-ffi-${{ matrix.target }}"
           $libDir = Join-Path $bundleRoot "lib"
           New-Item -ItemType Directory -Force -Path $libDir | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/redeem_openms_ffi.lib" "$libDir/"
+          Copy-Item "target/${{ matrix.target }}/${env:FFI_PROFILE}/redeem_openms_ffi.lib" "$libDir/"
           Set-Content -Path "$libDir/redeem-openms-ffi.native-static-libs.txt" -Value $native
           Copy-Item "redeem-openms-ffi/README.md" "$bundleRoot/README.md"
           Copy-Item "LICENSE" "$bundleRoot/LICENSE"
