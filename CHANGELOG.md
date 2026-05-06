@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-05-06
+
+### 🚀 Features
+
+- Enhance fine-tuning functionality with optional validation data and early stopping
+- Update tqdm dependency and enhance progress bar implementation with dynamic description updates
+- Update project metadata in Cargo.toml, add LICENSE file, and include pretrained models
+- Add GitHub Actions workflow for publishing crates to crates.io
+- Add initial implementation of redeem-openms-ffi with Cargo.toml and README.md
+- Add package-prebuilt.sh script for building and bundling redeem-openms-ffi
+- Update Cargo.toml and README.md to include redeem-openms-ffi crate
+- Add GitHub Actions workflow for releasing OpenMS FFI
+- Enhance FFI tests by adding model extraction and validation functions
+- Update build profile for redeem-openms-ffi and adjust packaging script
+- Update FFI build process to use custom profile for improved packaging
+- Add optional legacy model support and update dependencies in Cargo.toml
+- Update README.md to clarify OpenMS integration scope and feature set
+- Add fine-tuning support for RT, CCS, and MS2 models with new configuration struct
+- Bump version to 0.1.2 for multiple packages in the project
+- Update fine-tuning fixture generation in tests with structured data
+
+### 🐛 Bug Fixes
+
+- Update include path in Cargo.toml to specify modification.tsv file
+- Update README.md for dependency specifications and asset directory structure
+- Update crate status and installation instructions in README.md
+- Update crate status for redeem-cli and redeem-openms-ffi in README.md
+
+### ⚙️ Miscellaneous Tasks
+
+- Update CHANGELOG.md
+
 ## [0.1.1] - 2026-03-16
 
 ### 🚀 Features
