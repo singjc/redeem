@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "redeem-openms-ffi",
     "redeem-classifiers",
     "redeem-cli",
     "redeem-properties",
@@ -7,6 +8,9 @@ members = [
 ]
 
 resolver = "2"
+
+[patch.crates-io]
+redeem-properties = { path = "redeem-properties" }
 
 [profile.release]
 lto = "fat"

@@ -22,6 +22,7 @@ ReDeeM is a Rust workspace for mass spectrometry proteomics, providing deep lear
 |-------|-------------|--------|------|
 | [`redeem-cli`](redeem-cli/) | Command-line interface for ReDeeM | *Not published* | [README](redeem-cli/) |
 | [`redeem-classifiers`](redeem-classifiers/) | Semi-supervised PSM rescoring (GBDT, XGBoost, SVM) | *Not published* | [README](redeem-classifiers/) |
+| [`redeem-openms-ffi`](redeem-openms-ffi/) | Prebuilt C ABI bridge for OpenMS integration | *Not published* | [README](redeem-openms-ffi/) |
 | [`redeem-properties`](redeem-properties/) | Peptide property prediction (RT, CCS, MS2) using candle | [![Crates.io](https://img.shields.io/crates/v/redeem-properties.svg)](https://crates.io/crates/redeem-properties) | [README](redeem-properties/) |
 | [`redeem-properties-py`](redeem-properties-py/) | Python bindings for `redeem-properties` via PyO3 | [![PyPI](https://img.shields.io/pypi/v/redeem_properties.svg)](https://pypi.org/project/redeem_properties/) | [README](redeem-properties-py/) · [Docs](https://redeem-properties.readthedocs.io/) |
 
@@ -48,6 +49,22 @@ For DataFrame output support:
 ```bash
 pip install "redeem_properties[pandas]"   # or [polars]
 ```
+
+### OpenMS FFI bundles
+
+Prebuilt `redeem-openms-ffi` static-library bundles are published as GitHub
+release assets for supported OpenMS target platforms. OpenMS consumes those
+artifacts automatically by platform when `WITH_REDEEM=ON`:
+
+```bash
+cmake -S /path/to/OpenMS -B build \
+  -DWITH_REDEEM=ON
+```
+
+You can pin a specific release with `-DREDEEM_FFI_VERSION=v0.1.0`, or override
+the download entirely with `-DREDEEM_FFI_LIBRARY=/path/to/libredeem_openms_ffi.a`.
+See [redeem-openms-ffi/README.md](redeem-openms-ffi/README.md) for bundle
+contents, workflow-dispatch testing, and manual packaging instructions.
 
 ## Quick Example
 
@@ -105,4 +122,3 @@ let result = model.predict(&sequences, &mods, &mod_sites)?;
 ```
 
 See each crate's README for detailed API documentation and examples.
-
