@@ -14,13 +14,17 @@ The OpenMS build uses the minimal `redeem-properties` feature set:
 - RT inference via `rt_cnn_tf`
 - CCS inference via `ccs_cnn_tf`
 - MS2 intensity inference via `ms2_bert`
+- optional fine-tuning from local TSV data via the same three model families
 - local-file model loading only
 
 That means the prebuilt OpenMS FFI bundle intentionally excludes the
 pretrained-model download helpers and the legacy RT/CCS LSTM variants.
 
-Fine-tuning and transfer learning remain available on the Rust side through
-`redeem-properties`, but they are not exposed through the current C ABI.
+The C ABI now exposes two main workflows:
+
+- batch prediction for RT, CCS, and MS2 intensities
+- optional fine-tuning from a local TSV before prediction, with per-model
+  enable flags and optional `.safetensors` output checkpoints
 
 ## Prebuilt bundle layout
 
