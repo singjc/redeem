@@ -31,7 +31,6 @@ WORKDIR /app
 
 # Copy source files
 COPY Cargo.toml ./
-COPY Cargo.lock ./
 COPY redeem-openms-ffi ./redeem-openms-ffi
 COPY redeem-classifiers ./redeem-classifiers
 COPY redeem-cli ./redeem-cli
