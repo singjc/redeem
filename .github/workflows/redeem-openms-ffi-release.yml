@@ -1,0 +1,159 @@
+name: Release OpenMS FFI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (tag, branch, or commit). Defaults to the triggering ref."
+        required: false
+        type: string
+      release_tag:
+        description: "Optional existing release tag to upload assets to. Use 'latest' to target the latest published release. Leave empty to upload workflow artifacts only."
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive_ext: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive_ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Resolve release tag
+        id: resolve_release_tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName;
+            const requested = `${{ github.event.inputs.release_tag || '' }}`.trim();
+
+            if (eventName === 'release') {
+              const tag = context.payload.release?.tag_name || '';
+              core.setOutput('tag', tag);
+              core.setOutput('should_upload', tag ? 'true' : 'false');
+              return;
+            }
+
+            if (!requested) {
+              core.setOutput('tag', '');
+              core.setOutput('should_upload', 'false');
+              return;
+            }
+
+            if (requested === 'latest') {
+              const latest = await github.rest.repos.getLatestRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              core.setOutput('tag', latest.data.tag_name);
+              core.setOutput('should_upload', 'true');
+              return;
+            }
+
+            core.setOutput('tag', requested);
+            core.setOutput('should_upload', 'true');
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux cross toolchain
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build Unix bundle
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x redeem-openms-ffi/package-prebuilt.sh
+          ./redeem-openms-ffi/package-prebuilt.sh "${{ matrix.target }}" "${{ runner.temp }}/bundle"
+
+      - name: Archive Unix bundle
+        if: runner.os != 'Windows'
+        run: |
+          archive_root="redeem-openms-ffi-${{ matrix.target }}"
+          mv "${{ runner.temp }}/bundle" "${archive_root}"
+          tar czf "${archive_root}.tar.gz" "${archive_root}"
+          echo "ASSET=${archive_root}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Build Windows bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --package redeem-openms-ffi --target "${{ matrix.target }}"
+          $native = cargo rustc --release --package redeem-openms-ffi --target "${{ matrix.target }}" -- --print native-static-libs 2>&1 |
+            Select-String "native-static-libs:" |
+            Select-Object -Last 1 |
+            ForEach-Object { $_.ToString().Replace("note: native-static-libs: ", "").Trim() }
+          $bundleRoot = "redeem-openms-ffi-${{ matrix.target }}"
+          $libDir = Join-Path $bundleRoot "lib"
+          New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/redeem_openms_ffi.lib" "$libDir/"
+          Set-Content -Path "$libDir/redeem-openms-ffi.native-static-libs.txt" -Value $native
+          Copy-Item "redeem-openms-ffi/README.md" "$bundleRoot/README.md"
+          Copy-Item "LICENSE" "$bundleRoot/LICENSE"
+          @(
+            "crate=redeem-openms-ffi",
+            "target=${{ matrix.target }}",
+            "library=redeem_openms_ffi.lib",
+            "native_static_libs=$native"
+          ) | Set-Content -Path "$bundleRoot/manifest.txt"
+          Compress-Archive -Path "$bundleRoot/*" -DestinationPath "$bundleRoot.zip"
+          echo "ASSET=$bundleRoot.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redeem-openms-ffi-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+      - name: Upload release asset
+        if: steps.resolve_release_tag.outputs.should_upload == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve_release_tag.outputs.tag }}
+          files: ${{ env.ASSET }}
+          overwrite_files: true
