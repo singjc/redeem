@@ -27,9 +27,9 @@ log = "0.4.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 once_cell = "1.8"
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
 itertools = "0.14.0"
-zip = "2.2.2"
+zip = { version = "2.2.2", optional = true }
 csv = "1.1"
 regex = "1.6"
 tqdm = "0.8.0"
@@ -58,9 +58,11 @@ default-features = false
 features = []
 
 [features]
-default = []
+default = ["legacy-peptdeep-models", "pretrained-download"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 embed-pretrained = ["include_dir"]
+legacy-peptdeep-models = []
+pretrained-download = ["dep:reqwest", "dep:zip"]
 
 
 [lib]

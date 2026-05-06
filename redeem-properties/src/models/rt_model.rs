@@ -1,7 +1,6 @@
 // rt_model.rs
 
 use crate::models::model_interface::{ModelInterface, PredictionResult};
-use crate::models::rt_cnn_lstm_model::RTCNNLSTMModel;
 use crate::models::rt_cnn_transformer_model::RTCNNTFModel;
 use crate::utils::data_handling::{PeptideData, TargetNormalization};
 use crate::utils::peptdeep_utils::ModificationMap;
@@ -14,14 +13,22 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "legacy-peptdeep-models")]
+use crate::models::rt_cnn_lstm_model::RTCNNLSTMModel;
+
 // Enum for different types of retention time models
 pub enum RTModelArch {
+    #[cfg(feature = "legacy-peptdeep-models")]
     RTCNNLSTM,
     RTCNNTF,
 }
 
 // Constants for different types of retention time models
+#[cfg(feature = "legacy-peptdeep-models")]
 pub const RTMODEL_ARCHS: &[&str] = &["rt_cnn_lstm", "rt_cnn_tf"];
+
+#[cfg(not(feature = "legacy-peptdeep-models"))]
+pub const RTMODEL_ARCHS: &[&str] = &["rt_cnn_tf"];
 
 // A wrapper struct for RT models
 pub struct RTModelWrapper {
@@ -44,6 +51,7 @@ impl RTModelWrapper {
         device: Device,
     ) -> Result<Self> {
         let model: Box<dyn ModelInterface> = match arch {
+            #[cfg(feature = "legacy-peptdeep-models")]
             "rt_cnn_lstm" => Box::new(RTCNNLSTMModel::new(
                 model_path,
                 constants_path,

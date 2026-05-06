@@ -14,7 +14,9 @@ static EMBEDDED_PRETRAINED_DIR: Dir = include_dir!("assets/pretrained_models");
 /// Enum of known pretrained model identifiers supported by the library.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PretrainedModel {
+    #[cfg(feature = "legacy-peptdeep-models")]
     AlphapeptdeepRtCnnLstm,
+    #[cfg(feature = "legacy-peptdeep-models")]
     AlphapeptdeepCcsCnnLstm,
     AlphapeptdeepMs2Bert,
     RedeemRtCnnTf,
@@ -24,7 +26,9 @@ pub enum PretrainedModel {
 impl std::fmt::Display for PretrainedModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            #[cfg(feature = "legacy-peptdeep-models")]
             PretrainedModel::AlphapeptdeepRtCnnLstm => "alphapeptdeep-rt-cnn-lstm",
+            #[cfg(feature = "legacy-peptdeep-models")]
             PretrainedModel::AlphapeptdeepCcsCnnLstm => "alphapeptdeep-ccs-cnn-lstm",
             PretrainedModel::AlphapeptdeepMs2Bert => "alphapeptdeep-ms2-bert",
             PretrainedModel::RedeemRtCnnTf => "redeem-rt-cnn-tf",
@@ -39,7 +43,9 @@ impl PretrainedModel {
     /// (e.g. `RTModelWrapper::new`, `CCSModelWrapper::new`).
     pub fn arch(&self) -> &'static str {
         match self {
+            #[cfg(feature = "legacy-peptdeep-models")]
             PretrainedModel::AlphapeptdeepRtCnnLstm => "rt_cnn_lstm",
+            #[cfg(feature = "legacy-peptdeep-models")]
             PretrainedModel::AlphapeptdeepCcsCnnLstm => "ccs_cnn_lstm",
             PretrainedModel::AlphapeptdeepMs2Bert => "ms2_bert",
             PretrainedModel::RedeemRtCnnTf => "rt_cnn_tf",
@@ -110,9 +116,11 @@ impl std::str::FromStr for PretrainedModel {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            #[cfg(feature = "legacy-peptdeep-models")]
             "peptdeep-rt" | "alphapeptdeep-rt" | "alphapeptdeep-rt-cnn-lstm" => {
                 Ok(PretrainedModel::AlphapeptdeepRtCnnLstm)
             }
+            #[cfg(feature = "legacy-peptdeep-models")]
             "peptdeep-ccs" | "alphapeptdeep-ccs" | "alphapeptdeep-ccs-cnn-lstm" => {
                 Ok(PretrainedModel::AlphapeptdeepCcsCnnLstm)
             }
@@ -141,6 +149,7 @@ pub fn load_pretrained_model(
 
     use crate::models::model_interface::ModelInterface as _ModelInterface;
     match model {
+        #[cfg(feature = "legacy-peptdeep-models")]
         PretrainedModel::AlphapeptdeepRtCnnLstm => {
             let m =
                 <crate::models::rt_cnn_transformer_model::RTCNNTFModel as _ModelInterface>::new(
@@ -154,6 +163,7 @@ pub fn load_pretrained_model(
                 )?;
             Ok(Box::new(m))
         }
+        #[cfg(feature = "legacy-peptdeep-models")]
         PretrainedModel::AlphapeptdeepCcsCnnLstm => {
             let m = <crate::models::ccs_cnn_tf_model::CCSCNNTFModel as _ModelInterface>::new(
                 cached.clone(),
@@ -210,7 +220,9 @@ impl PretrainedModel {
     /// Return the canonical filename (or subpath) for the given pretrained model.
     pub fn filename(&self) -> &'static str {
         match self {
+            #[cfg(feature = "legacy-peptdeep-models")]
             PretrainedModel::AlphapeptdeepRtCnnLstm => "alphapeptdeep/generic/rt.pth",
+            #[cfg(feature = "legacy-peptdeep-models")]
             PretrainedModel::AlphapeptdeepCcsCnnLstm => "alphapeptdeep/generic/ccs.pth",
             PretrainedModel::AlphapeptdeepMs2Bert => "alphapeptdeep/generic/ms2.pth",
             PretrainedModel::RedeemRtCnnTf => {

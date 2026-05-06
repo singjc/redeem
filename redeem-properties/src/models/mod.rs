@@ -1,9 +1,11 @@
+#[cfg(feature = "legacy-peptdeep-models")]
 pub mod ccs_cnn_lstm_model;
 pub mod ccs_cnn_tf_model;
 pub mod ccs_model;
 pub mod model_interface;
 pub mod ms2_bert_model;
 pub mod ms2_model;
+#[cfg(feature = "legacy-peptdeep-models")]
 pub mod rt_cnn_lstm_model;
 pub mod rt_cnn_transformer_model;
 pub mod rt_model;

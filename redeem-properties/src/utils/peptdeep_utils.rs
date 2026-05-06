@@ -1,17 +1,20 @@
 use anyhow::{Error, Result};
 use csv::ReaderBuilder;
+#[cfg(feature = "pretrained-download")]
 use log::info;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+#[cfg(feature = "pretrained-download")]
 use std::fs::File;
 use std::io;
 use std::ops::Index;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(feature = "pretrained-download")]
 use zip::ZipArchive;
 
 const MODIFICATIONS_TSV_BYTES: &[u8] = include_bytes!(concat!(
@@ -19,10 +22,9 @@ const MODIFICATIONS_TSV_BYTES: &[u8] = include_bytes!(concat!(
     "/assets/modification.tsv"
 ));
 
+#[cfg(feature = "pretrained-download")]
 const PRETRAINED_MODELS_URL: &str =
     "https://github.com/singjc/redeem/releases/download/v0.1.0-alpha/pretrained_models.zip";
-const PRETRAINED_MODELS_ZIP: &str = "data/pretrained_models.zip";
-const PRETRAINED_MODELS_PATH: &str = "data/pretrained_models";
 
 // Constants and Utility Structs
 
@@ -531,6 +533,7 @@ pub fn get_modification_string(
 /// Uses a global `OnceLock` so that even when many tests run in parallel
 /// the download + unzip happens exactly once.  Subsequent callers just
 /// get the cached path.
+#[cfg(feature = "pretrained-download")]
 pub fn download_pretrained_models_exist() -> Result<PathBuf, io::Error> {
     use std::sync::OnceLock;
     static MODELS: OnceLock<Result<PathBuf, String>> = OnceLock::new();
@@ -544,6 +547,15 @@ pub fn download_pretrained_models_exist() -> Result<PathBuf, io::Error> {
     }
 }
 
+#[cfg(not(feature = "pretrained-download"))]
+pub fn download_pretrained_models_exist() -> Result<PathBuf, io::Error> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pretrained model download support is disabled for this build",
+    ))
+}
+
+#[cfg(feature = "pretrained-download")]
 fn download_pretrained_models_inner() -> Result<PathBuf, io::Error> {
     let extract_dir = if let Ok(dir) = std::env::var("REDEEM_PRETRAINED_MODELS_DIR") {
         PathBuf::from(dir)
@@ -723,12 +735,14 @@ mod tests {
     use regex::Regex;
 
     #[test]
+    #[cfg(feature = "pretrained-download")]
     fn test_ensure_pretrained_models_exist() {
         let result = download_pretrained_models_exist();
         assert!(result.is_ok());
     }
 
     #[test]
+    #[cfg(feature = "pretrained-download")]
     fn test_download_pretrained_models_exist_returns_valid_path() {
         let result = download_pretrained_models_exist();
 

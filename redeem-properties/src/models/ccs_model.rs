@@ -1,4 +1,3 @@
-use crate::models::ccs_cnn_lstm_model::CCSCNNLSTMModel;
 use crate::models::ccs_cnn_tf_model::CCSCNNTFModel;
 use crate::models::model_interface::{ModelInterface, PredictionResult};
 use crate::utils::data_handling::{PeptideData, TargetNormalization};
@@ -10,14 +9,22 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "legacy-peptdeep-models")]
+use crate::models::ccs_cnn_lstm_model::CCSCNNLSTMModel;
+
 // Enum for different types of CCS models
 pub enum CCSModelArch {
+    #[cfg(feature = "legacy-peptdeep-models")]
     CCSCNNLSTM,
     CCSCNNTF,
 }
 
 // Constants for different types of CCS models
+#[cfg(feature = "legacy-peptdeep-models")]
 pub const CCSMODEL_ARCHS: &[&str] = &["ccs_cnn_lstm", "ccs_cnn_tf"];
+
+#[cfg(not(feature = "legacy-peptdeep-models"))]
+pub const CCSMODEL_ARCHS: &[&str] = &["ccs_cnn_tf"];
 
 // A wrapper struct for CCS models
 pub struct CCSModelWrapper {
@@ -40,6 +47,7 @@ impl CCSModelWrapper {
         device: Device,
     ) -> Result<Self> {
         let model: Box<dyn ModelInterface> = match arch {
+            #[cfg(feature = "legacy-peptdeep-models")]
             "ccs_cnn_lstm" => Box::new(CCSCNNLSTMModel::new(
                 model_path,
                 constants_path,
