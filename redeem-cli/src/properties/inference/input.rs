@@ -107,8 +107,8 @@ impl PropertyInferenceConfig {
         load_or_default!(head_type);
 
         // Apply CLI overrides
-        if let Some(model_path) = matches.get_one::<String>("model_path") {
-            config.model_path = model_path.clone();
+        if let Some(model_path) = matches.get_one::<PathBuf>("model_path") {
+            config.model_path = model_path.to_string_lossy().into_owned();
         }
         // If a pretrained shorthand is provided, resolve it to a cached model path and override model_path
         if let Some(pre) = matches.get_one::<String>("pretrained") {
@@ -132,14 +132,15 @@ impl PropertyInferenceConfig {
                 }
             }
         }
-        if let Some(inference_data) = matches.get_one::<String>("inference_data") {
-            validate_tsv_or_csv_file(inference_data)?;
-            config.inference_data = inference_data.clone();
+        if let Some(inference_data) = matches.get_one::<PathBuf>("inference_data") {
+            let inference_data = inference_data.to_string_lossy().into_owned();
+            validate_tsv_or_csv_file(&inference_data)?;
+            config.inference_data = inference_data;
         } else {
             validate_tsv_or_csv_file(&config.inference_data)?;
         }
-        if let Some(output_file) = matches.get_one::<String>("output_file") {
-            config.output_file = output_file.clone();
+        if let Some(output_file) = matches.get_one::<PathBuf>("output_file") {
+            config.output_file = output_file.to_string_lossy().into_owned();
         }
         // Note: the inference subcommand does not define a `model_arch` CLI arg (it's defined
         // for `train`). We intentionally skip attempting to read a CLI override here to
