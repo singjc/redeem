@@ -88,7 +88,7 @@ redeem properties inference <CONFIG> \
 | Argument | Description |
 |----------|-------------|
 | `CONFIG` | Path to a JSON inference configuration file (required) |
-| `--pretrained` | Use a pretrained model by name (e.g. `redeem-rt`, `redeem-ccs`, `alphapeptdeep-ccs`) |
+| `--pretrained` | Use a pretrained model by name (e.g. `redeem-rt`, `redeem-ccs`, `alphapeptdeep-ccs`). This also overrides `model_arch` to the matching architecture. |
 | `-m`, `--model` | Path to a custom trained `.safetensors` model |
 | `-d`, `--inference_data` | Override the input data path from the config |
 | `-o`, `--output_file` | Override the output prediction file path (`.tsv` or `.csv`) |

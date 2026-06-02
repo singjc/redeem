@@ -1,11 +1,43 @@
 //! Integration tests for CLI config parsing, util helpers, and score config.
 
 use clap::{Arg, Command};
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 
 use redeem_cli::classifiers::score::score::ScoreConfig;
 use redeem_cli::properties::inference::input::PropertyInferenceConfig;
 use redeem_cli::properties::util::validate_tsv_or_csv_file;
+
+static PRETRAINED_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => unsafe {
+                std::env::set_var(self.key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(self.key);
+            },
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // validate_tsv_or_csv_file
@@ -175,4 +207,60 @@ fn inference_config_accepts_pathbuf_cli_overrides() {
     assert_eq!(config.model_path, model_path.to_string_lossy());
     assert_eq!(config.inference_data, inference_data.to_string_lossy());
     assert_eq!(config.output_file, output_file.to_string_lossy());
+}
+
+#[test]
+fn inference_config_pretrained_overrides_model_arch() {
+    let _guard = PRETRAINED_ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pretrained_root = dir.path().join("pretrained");
+    let pretrained_model = pretrained_root.join("alphapeptdeep/generic/rt.pth");
+    std::fs::create_dir_all(pretrained_model.parent().unwrap()).unwrap();
+    std::fs::write(&pretrained_model, b"fake model weights").unwrap();
+    let _env_guard = EnvVarGuard::set("REDEEM_PRETRAINED_MODELS_DIR", &pretrained_root);
+
+    let config_path = dir.path().join("inference_config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"model_arch":"rt_cnn_tf","inference_data":"ignored.csv"}"#,
+    )
+    .unwrap();
+
+    let inference_data = dir.path().join("input.csv");
+    std::fs::File::create(&inference_data).unwrap();
+
+    let matches = Command::new("redeem")
+        .arg(Arg::new("pretrained").long("pretrained"))
+        .arg(
+            Arg::new("model_path")
+                .short('m')
+                .long("model")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("inference_data")
+                .short('d')
+                .long("inference_data")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output_file")
+                .short('o')
+                .long("output_file")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .try_get_matches_from([
+            "redeem",
+            "--pretrained",
+            "alphapeptdeep-rt",
+            "--inference_data",
+            inference_data.to_str().unwrap(),
+        ])
+        .unwrap();
+
+    let config = PropertyInferenceConfig::from_arguments(&config_path, &matches).unwrap();
+
+    assert_eq!(config.model_arch, "rt_cnn_lstm");
+    assert!(config.model_path.ends_with("rt.pth"));
+    assert_eq!(config.inference_data, inference_data.to_string_lossy());
 }

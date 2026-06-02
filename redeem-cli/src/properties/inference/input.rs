@@ -113,16 +113,27 @@ impl PropertyInferenceConfig {
         // If a pretrained shorthand is provided, resolve it to a cached model path and override model_path
         if let Some(pre) = matches.get_one::<String>("pretrained") {
             match pre.parse::<PretrainedModel>() {
-                Ok(pm) => match redeem_properties::pretrained::cache_pretrained_model(pm) {
-                    Ok(p) => config.model_path = p.to_string_lossy().into_owned(),
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "Failed to resolve pretrained model '{}': {}",
-                            pre,
-                            e
-                        ));
+                Ok(pm) => {
+                    let pretrained_arch = pm.arch().to_string();
+                    if config.model_arch != pretrained_arch {
+                        log::info!(
+                            "Overriding model_arch '{}' with pretrained architecture '{}'",
+                            config.model_arch,
+                            pretrained_arch
+                        );
+                        config.model_arch = pretrained_arch;
                     }
-                },
+                    match redeem_properties::pretrained::cache_pretrained_model(pm) {
+                        Ok(p) => config.model_path = p.to_string_lossy().into_owned(),
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "Failed to resolve pretrained model '{}': {}",
+                                pre,
+                                e
+                            ));
+                        }
+                    }
+                }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
                         "Invalid pretrained model name '{}': {}",

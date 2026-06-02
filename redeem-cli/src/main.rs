@@ -7,7 +7,7 @@ use std::str::FromStr;
 use redeem_classifiers::config::ModelType;
 use redeem_classifiers::data_handling::RankGrouping;
 use redeem_cli::classifiers::score::score::{
-    ScoreConfig, load_score_config, score_pin, write_score_output, write_score_report,
+    load_score_config, score_pin, write_score_output, write_score_report, ScoreConfig,
 };
 use redeem_cli::properties::inference::inference;
 use redeem_cli::properties::inference::input::PropertyInferenceConfig;
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
                     .arg(
                         Arg::new("pretrained")
                             .long("pretrained")
-                            .help("Name of a known pretrained model to use instead of passing --model. Examples: 'redeem-ccs', 'redeem-rt', 'alphapeptdeep-ccs'")
+                            .help("Name of a known pretrained model to use instead of passing --model. Also overrides model_arch to the matching architecture. Examples: 'redeem-ccs', 'redeem-rt', 'alphapeptdeep-ccs'")
                             .value_parser(clap::builder::NonEmptyStringValueParser::new())
                             .value_hint(ValueHint::Other),
                     )
