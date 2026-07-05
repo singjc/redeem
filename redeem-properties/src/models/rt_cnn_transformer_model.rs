@@ -392,3 +392,19 @@ impl ModelInterface for RTCNNTFModel {
         todo!("Implement print_weights for RTCNNTFModel");
     }
 }
+
+#[cfg(feature = "onnx-export")]
+impl candle_onnx_export::ToOnnx for RTCNNTFModel {
+    fn to_onnx(
+        &self,
+        ctx: &mut candle_onnx_export::ExportContext<'_>,
+        inputs: &[candle_onnx_export::Value],
+    ) -> candle_onnx_export::Result<Vec<candle_onnx_export::Value>> {
+        let input = inputs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::onnx_export::add_rt_cnn_tf_input(ctx.graph, "input"));
+        let output = crate::onnx_export::export_rt_cnn_tf(&self.varmap, ctx, input)?;
+        Ok(vec![output])
+    }
+}

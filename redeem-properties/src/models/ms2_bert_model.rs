@@ -410,6 +410,19 @@ impl ModelInterface for MS2BertModel {
     }
 }
 
+#[cfg(feature = "onnx-export")]
+impl candle_onnx_export::ToOnnx for MS2BertModel {
+    fn to_onnx(
+        &self,
+        _ctx: &mut candle_onnx_export::ExportContext<'_>,
+        _inputs: &[candle_onnx_export::Value],
+    ) -> candle_onnx_export::Result<Vec<candle_onnx_export::Value>> {
+        Err(candle_onnx_export::Error::UnsupportedTensor(
+            "full ONNX export for ms2_bert is not implemented yet".to_string(),
+        ))
+    }
+}
+
 // // Module Trait Implementation
 // impl Module for MS2BertModel {
 //     fn forward(&self, input: &Tensor) -> Result<Tensor, candle_core::Error> {
