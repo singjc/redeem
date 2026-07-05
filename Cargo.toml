@@ -11,6 +11,9 @@ resolver = "2"
 
 [patch.crates-io]
 redeem-properties = { path = "redeem-properties" }
+candle-core = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
+candle-nn = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
+candle-transformers = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
 
 [profile.release]
 lto = "fat"
