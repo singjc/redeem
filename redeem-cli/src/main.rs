@@ -11,6 +11,7 @@ use redeem_cli::classifiers::score::score::{
 };
 use redeem_cli::properties::inference::inference;
 use redeem_cli::properties::inference::input::PropertyInferenceConfig;
+use redeem_cli::properties::onnx;
 use redeem_cli::properties::train::input::PropertyTrainConfig;
 use redeem_cli::properties::train::trainer;
 
@@ -140,6 +141,84 @@ fn main() -> Result<()> {
                             .value_parser(clap::value_parser!(PathBuf))
                             .value_hint(ValueHint::FilePath),
                     )
+                )
+                .subcommand(
+                    Command::new("to-onnx")
+                        .visible_alias("to_onnx")
+                        .about("Export a supported property model to ONNX")
+                        .arg(
+                            Arg::new("model_path")
+                                .short('m')
+                                .long("model")
+                                .help("Path to the trained model file (*.safetensors, *.pt, *.pth, or *.pkl)")
+                                .required(true)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("model_arch")
+                                .short('a')
+                                .long("model_arch")
+                                .help("Model architecture to export")
+                                .value_parser([
+                                    "rt_cnn_lstm",
+                                    "rt_cnn_tf",
+                                    "ccs_cnn_lstm",
+                                    "ccs_cnn_tf",
+                                    "ms2_bert",
+                                ])
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("output_file")
+                                .short('o')
+                                .long("output")
+                                .help("Path to the output ONNX model (*.onnx)")
+                                .required(true)
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("constants")
+                                .long("constants")
+                                .help("Optional PeptDeep/Redeem model constants YAML")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        )
+                        .arg(
+                            Arg::new("component")
+                                .long("component")
+                                .help("Model component to export. Full export is supported for rt_cnn_tf and ccs_cnn_tf; decoder keeps the legacy head-only export.")
+                                .value_parser(["full", "decoder"])
+                                .default_value("full"),
+                        )
+                        .arg(
+                            Arg::new("device")
+                                .long("device")
+                                .help("Device used to load model tensors")
+                                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                                .default_value("cpu"),
+                        )
+                        .arg(
+                            Arg::new("opset")
+                                .long("opset")
+                                .help("ONNX opset version")
+                                .value_parser(clap::value_parser!(u32))
+                                .default_value("18"),
+                        )
+                        .arg(
+                            Arg::new("external_data")
+                                .long("external-data")
+                                .help("Write initializer tensor bytes to a sidecar .onnx.data file")
+                                .action(ArgAction::SetTrue),
+                        )
+                        .arg(
+                            Arg::new("data_file")
+                                .long("data-file")
+                                .help("External data file name to record in the ONNX model")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .value_hint(ValueHint::FilePath),
+                        ),
                 ),
         )
         .subcommand(
@@ -290,6 +369,15 @@ fn handle_properties(matches: &ArgMatches) -> Result<()> {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     log::error!("Inference failed: {:#}", e);
+                    std::process::exit(1)
+                }
+            }
+        }
+        Some(("to-onnx", onnx_matches)) | Some(("to_onnx", onnx_matches)) => {
+            match onnx::run_to_onnx(onnx_matches) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    log::error!("ONNX export failed: {:#}", e);
                     std::process::exit(1)
                 }
             }

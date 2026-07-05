@@ -10,8 +10,11 @@ name = "redeem"
 path = "src/main.rs"
 
 [dependencies]
-redeem-properties = { path = "../redeem-properties" }
+redeem-properties = { path = "../redeem-properties", features = ["onnx-export"] }
 redeem-classifiers = { path = "../redeem-classifiers" }
+candle-core = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
+candle-nn = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
+candle-onnx-export = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
 env_logger = "0.11.8"
 log = "0.4"
 clap = { version="4.0", features = ["cargo", "unicode"] }
@@ -24,19 +27,19 @@ maud = "0.27.0"
 plotly = "0.12.1"
 rand = "0.8"
 
-[dependencies.candle-core]
-version = "0.8.4"
-default-features = false
-features = []
+# [dependencies.candle-core]
+# version = "0.11.0"
+# default-features = false
+# features = []
 
-[dependencies.candle-nn]
-version = "0.8.4"
-default-features = false
-features = []
+# [dependencies.candle-nn]
+# version = "0.11.0"
+# default-features = false
+# features = []
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "redeem-properties/cuda"]
 svm = ["redeem-classifiers/svm"]
 xgboost = ["redeem-classifiers/xgboost"]
 
