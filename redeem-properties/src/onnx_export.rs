@@ -23,6 +23,7 @@ pub const CCS_TF_INPUT_FEATURES: i64 = 1 + MOD_FEATURE_SIZE as i64 + 1;
 
 /// Adds a complete `rt_cnn_tf` graph body.
 pub fn export_rt_cnn_tf(varmap: &VarMap, ctx: &mut ExportContext<'_>, input: Value) -> OnnxResult<Value> {
+    let input = limit_transformer_input_seq(ctx.graph, input, "rt_input_max_len")?;
     let aa_indices = slice_feature(ctx.graph, input.clone(), 0, 1, "rt_aa_index")?;
     let aa_indices = ops::squeeze_axes(ctx.graph, aa_indices, &[2], "rt_aa_indices")?;
     let mod_x = slice_feature(
@@ -64,6 +65,7 @@ pub fn export_ccs_cnn_tf(
     ctx: &mut ExportContext<'_>,
     input: Value,
 ) -> OnnxResult<Value> {
+    let input = limit_transformer_input_seq(ctx.graph, input, "ccs_input_max_len")?;
     let aa_indices = slice_feature(ctx.graph, input.clone(), 0, 1, "ccs_aa_index")?;
     let aa_indices = ops::squeeze_axes(ctx.graph, aa_indices, &[2], "ccs_aa_indices")?;
     let mod_x = slice_feature(
@@ -241,6 +243,21 @@ fn export_mod_embedding_fix_first_k(
     output_prefix: &str,
 ) -> OnnxResult<Value> {
     let k = 6_i64;
+    if mod_hidden_dim as i64 <= k {
+        return Err(OnnxError::InvalidGraph(format!(
+            "mod embedding hidden dimension {mod_hidden_dim} must be greater than fixed prefix width {k}"
+        )));
+    }
+    let transformed_width = mod_hidden_dim as i64 - k;
+    let weight_name = format!("{prefix}.nn.weight");
+    let weight = tensor_from_varmap(varmap, &weight_name)?;
+    let weight_dims = weight.shape().dims();
+    if weight_dims.len() != 2 || weight_dims[0] as i64 != transformed_width {
+        return Err(OnnxError::InvalidGraph(format!(
+            "expected {weight_name} to have output width {transformed_width}, got shape {:?}",
+            weight_dims
+        )));
+    }
     let first_k = ops::slice_i64(
         graph,
         mod_x.clone(),
@@ -262,16 +279,12 @@ fn export_mod_embedding_fix_first_k(
     let transformed = linear_last_dim_with_names(
         graph,
         varmap,
-        &format!("{prefix}.nn.weight"),
+        &weight_name,
         None,
         rest,
         &format!("{output_prefix}_transformed"),
     )?;
     let output = ops::concat(graph, &[first_k, transformed], -1, output_prefix)?;
-    let expected = mod_hidden_dim as i64;
-    if expected != k + (mod_hidden_dim as i64 - k) {
-        return Err(OnnxError::InvalidGraph("invalid mod embedding hidden dimension".into()));
-    }
     Ok(output)
 }
 
@@ -479,6 +492,22 @@ fn sequence_length_vector(
         &[1],
         &[2],
         Some(&[0_i64][..]),
+        None,
+        output_name,
+    )
+}
+
+fn limit_transformer_input_seq(
+    graph: &mut OnnxGraph,
+    input: Value,
+    output_name: &str,
+) -> OnnxResult<Value> {
+    ops::slice_i64(
+        graph,
+        input,
+        &[0],
+        &[TF_MAX_LEN],
+        Some(&[1_i64][..]),
         None,
         output_name,
     )

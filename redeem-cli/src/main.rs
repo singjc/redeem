@@ -213,6 +213,13 @@ fn main() -> Result<()> {
                                 .action(ArgAction::SetTrue),
                         )
                         .arg(
+                            Arg::new("external_data_threshold")
+                                .long("external-data-threshold")
+                                .help("Minimum initializer byte size to write to external data when --external-data is set")
+                                .value_parser(clap::value_parser!(usize))
+                                .default_value("1024"),
+                        )
+                        .arg(
                             Arg::new("data_file")
                                 .long("data-file")
                                 .help("External data file name to record in the ONNX model")
