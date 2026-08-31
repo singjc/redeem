@@ -14,9 +14,14 @@ use super::collate::{FoundationCollator, FoundationCollatorConfig, FoundationTra
 use super::config::FoundationConfig;
 use super::control::{FoundationFitConfig, FoundationLearningRateSchedule, FoundationSplitMix64};
 use super::corpus::FoundationRecordProvenance;
-use super::data::FoundationTrainingRecord;
+use super::data::{FoundationTrainingRecord, TrainingContext};
+use super::featurize::PeptidoformInput;
 use super::loss::{
     contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,
+};
+use super::model::FoundationMultiTaskOutput;
+use super::normalization::{
+    FoundationRegressionNormalization, FoundationTargetNormalizationConfig,
 };
 use super::optimizer::{FoundationAdamW, FoundationAdamWConfig};
 use super::sampling::{
@@ -56,6 +61,9 @@ pub struct FoundationTrainerConfig {
     pub loss_weights: FoundationLossWeights,
     /// Label/corruption collation settings.
     pub collator: FoundationCollatorConfig,
+    /// Train-partition-only scaling for continuous property targets. Resolved
+    /// statistics are persisted in checkpoint trainer configuration.
+    pub target_normalization: FoundationTargetNormalizationConfig,
     /// Large-corpus/source-aware sampling controls.
     pub sampling: FoundationSamplingConfig,
     /// Base seed for deterministic view corruption and epoch shuffling.
@@ -76,6 +84,7 @@ impl Default for FoundationTrainerConfig {
             contrastive_temperature: 0.10,
             loss_weights: FoundationLossWeights::default(),
             collator: FoundationCollatorConfig::default(),
+            target_normalization: FoundationTargetNormalizationConfig::default(),
             sampling: FoundationSamplingConfig::default(),
             seed: 20260831,
         }
@@ -99,6 +108,7 @@ impl FoundationTrainerConfig {
         if !(self.contrastive_temperature > 0.0 && self.contrastive_temperature.is_finite()) {
             candle_core::bail!("foundation contrastive_temperature must be positive and finite");
         }
+        self.target_normalization.validate()?;
         self.sampling
             .validate()
             .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
@@ -121,10 +131,18 @@ impl FoundationTrainerConfig {
 pub struct FoundationStepMetrics {
     /// Weighted total loss including contrastive alignment.
     pub total_loss: f32,
-    /// Single-view RT loss.
+    /// Single-view RT loss in the regression space used for optimization.
     pub rt_loss: Option<f32>,
-    /// Single-view CCS loss.
+    /// RT mean absolute error in native target units.
+    pub rt_mae_native: Option<f32>,
+    /// RT root mean squared error in native target units.
+    pub rt_rmse_native: Option<f32>,
+    /// Single-view CCS loss in the regression space used for optimization.
     pub ccs_loss: Option<f32>,
+    /// CCS mean absolute error in native target units.
+    pub ccs_mae_native: Option<f32>,
+    /// CCS root mean squared error in native target units.
+    pub ccs_rmse_native: Option<f32>,
     /// Single-view MS2 loss.
     pub ms2_loss: Option<f32>,
     /// Masked residue-token reconstruction loss.
@@ -148,10 +166,18 @@ pub struct FoundationEpochMetrics {
     pub steps: usize,
     /// Mean total loss across batches.
     pub mean_total_loss: f32,
-    /// Mean RT loss across batches where RT labels were present.
+    /// Mean RT loss across batches where RT labels were present, in normalized regression space.
     pub mean_rt_loss: Option<f32>,
-    /// Mean CCS loss across batches where CCS labels were present.
+    /// Mean per-batch RT MAE in native target units.
+    pub mean_rt_mae_native: Option<f32>,
+    /// Mean per-batch RT RMSE in native target units.
+    pub mean_rt_rmse_native: Option<f32>,
+    /// Mean CCS loss across batches where CCS labels were present, in normalized regression space.
     pub mean_ccs_loss: Option<f32>,
+    /// Mean per-batch CCS MAE in native target units.
+    pub mean_ccs_mae_native: Option<f32>,
+    /// Mean per-batch CCS RMSE in native target units.
+    pub mean_ccs_rmse_native: Option<f32>,
     /// Mean MS2 loss across batches where fragment labels were present.
     pub mean_ms2_loss: Option<f32>,
     /// Mean masked-residue reconstruction loss when active.
@@ -313,10 +339,11 @@ impl FoundationTrainer {
         self.optimizer.set_learning_rate(scheduled_lr)?;
 
         let seed = self.config.seed.wrapping_add(self.global_step);
-        let views = self
+        let mut views = self
             .collator
             .collate_views(records, self.wrapper.device(), seed)?;
-        let (total, losses, contrastive) = self.loss_for_views(&views, true)?;
+        self.normalize_regression_targets(&mut views)?;
+        let (total, losses, contrastive, regression) = self.loss_for_views(&views, true)?;
         let optimizer_metrics = self
             .optimizer
             .backward_step(&total, self.config.max_gradient_norm)?;
@@ -325,6 +352,7 @@ impl FoundationTrainer {
             &total,
             &losses,
             contrastive.as_ref(),
+            regression,
             Some((
                 optimizer_metrics.learning_rate,
                 optimizer_metrics.gradient_norm,
@@ -445,14 +473,16 @@ impl FoundationTrainer {
                 .seed
                 .wrapping_add(0x4556_494e_4445_5800)
                 .wrapping_add(batch_index as u64);
-            let views = self
+            let mut views = self
                 .collator
                 .collate_views(&batch, self.wrapper.device(), seed)?;
-            let (total, losses, contrastive) = self.loss_for_views(&views, false)?;
+            self.normalize_regression_targets(&mut views)?;
+            let (total, losses, contrastive, regression) = self.loss_for_views(&views, false)?;
             accumulator.push(metrics_from_tensors(
                 &total,
                 &losses,
                 contrastive.as_ref(),
+                regression,
                 None,
             )?);
         }
@@ -475,14 +505,16 @@ impl FoundationTrainer {
                 .seed
                 .wrapping_add(0x4556_414c_0000_0000)
                 .wrapping_add(batch_index as u64);
-            let views = self
+            let mut views = self
                 .collator
                 .collate_views(batch, self.wrapper.device(), seed)?;
-            let (total, losses, contrastive) = self.loss_for_views(&views, false)?;
+            self.normalize_regression_targets(&mut views)?;
+            let (total, losses, contrastive, regression) = self.loss_for_views(&views, false)?;
             accumulator.push(metrics_from_tensors(
                 &total,
                 &losses,
                 contrastive.as_ref(),
+                regression,
                 None,
             )?);
         }
@@ -754,6 +786,48 @@ impl FoundationTrainer {
         })
     }
 
+    /// Predict property heads and return continuous regression outputs in their
+    /// native target units. The underlying model head itself operates in the
+    /// standardized training space when normalization is active.
+    pub fn predict_native(
+        &self,
+        peptides: &[PeptidoformInput],
+        context: &[TrainingContext],
+    ) -> Result<FoundationMultiTaskOutput> {
+        let mut output = self.wrapper.predict(peptides, context)?;
+        output.rt = self
+            .config
+            .target_normalization
+            .rt
+            .denormalize_tensor(&output.rt)?;
+        output.ccs = self
+            .config
+            .target_normalization
+            .ccs
+            .denormalize_tensor(&output.ccs)?;
+        Ok(output)
+    }
+
+    /// Predict native-unit properties when acquisition context is completely
+    /// unavailable.
+    pub fn predict_unknown_context_native(
+        &self,
+        peptides: &[PeptidoformInput],
+    ) -> Result<FoundationMultiTaskOutput> {
+        let mut output = self.wrapper.predict_unknown_context(peptides)?;
+        output.rt = self
+            .config
+            .target_normalization
+            .rt
+            .denormalize_tensor(&output.rt)?;
+        output.ccs = self
+            .config
+            .target_normalization
+            .ccs
+            .denormalize_tensor(&output.ccs)?;
+        Ok(output)
+    }
+
     /// Access the high-level model wrapper for embedding/evaluation/checkpointing.
     pub fn model(&self) -> &FoundationModelWrapper {
         &self.wrapper
@@ -774,11 +848,33 @@ impl FoundationTrainer {
         self.optimizer.step_count()
     }
 
+    fn normalize_regression_targets(&self, views: &mut FoundationTrainingViews) -> Result<()> {
+        for batch in [&mut views.first, &mut views.second] {
+            if let Some(rt) = batch.targets.rt.take() {
+                batch.targets.rt = Some(self.config.target_normalization.rt.normalize_tensor(&rt)?);
+            }
+            if let Some(ccs) = batch.targets.ccs.take() {
+                batch.targets.ccs = Some(
+                    self.config
+                        .target_normalization
+                        .ccs
+                        .normalize_tensor(&ccs)?,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn loss_for_views(
         &self,
         views: &FoundationTrainingViews,
         train: bool,
-    ) -> Result<(Tensor, FoundationLosses, Option<Tensor>)> {
+    ) -> Result<(
+        Tensor,
+        FoundationLosses,
+        Option<Tensor>,
+        RegressionDiagnostics,
+    )> {
         let first =
             self.wrapper
                 .model()
@@ -787,6 +883,20 @@ impl FoundationTrainer {
             self.wrapper
                 .model()
                 .forward_t(&views.second.input, &views.second.context, train)?;
+        let regression = RegressionDiagnostics {
+            rt: regression_native_metrics(
+                &first.rt,
+                views.first.targets.rt.as_ref(),
+                views.first.targets.rt_mask.as_ref(),
+                &self.config.target_normalization.rt,
+            )?,
+            ccs: regression_native_metrics(
+                &first.ccs,
+                views.first.targets.ccs.as_ref(),
+                views.first.targets.ccs_mask.as_ref(),
+                &self.config.target_normalization.ccs,
+            )?,
+        };
         let losses = multi_task_loss(&first, &views.first.targets, self.config.loss_weights)?;
         let contrastive = if views.first.input.residue_ids.dims2()?.0 > 1
             && self.config.loss_weights.contrastive > 0.0
@@ -805,8 +915,46 @@ impl FoundationTrainer {
         } else {
             losses.total.clone()
         };
-        Ok((total, losses, contrastive))
+        Ok((total, losses, contrastive, regression))
     }
+}
+
+#[derive(Default)]
+struct RegressionDiagnostics {
+    rt: Option<(Tensor, Tensor)>,
+    ccs: Option<(Tensor, Tensor)>,
+}
+
+fn regression_native_metrics(
+    prediction: &Tensor,
+    target: Option<&Tensor>,
+    mask: Option<&Tensor>,
+    normalization: &FoundationRegressionNormalization,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let (Some(target), Some(mask)) = (target, mask) else {
+        if target.is_some() || mask.is_some() {
+            candle_core::bail!("foundation regression target and mask must be supplied together");
+        }
+        return Ok(None);
+    };
+    let prediction = normalization.denormalize_tensor(prediction)?;
+    let target = normalization.denormalize_tensor(target)?;
+    let mask = mask.broadcast_as(prediction.dims())?;
+    let difference = (&prediction - &target)?;
+    let denominator = mask.sum_all()?.clamp(1.0, f64::INFINITY)?;
+    let mae = difference
+        .sqr()?
+        .sqrt()?
+        .broadcast_mul(&mask)?
+        .sum_all()?
+        .broadcast_div(&denominator)?;
+    let rmse = difference
+        .sqr()?
+        .broadcast_mul(&mask)?
+        .sum_all()?
+        .broadcast_div(&denominator)?
+        .sqrt()?;
+    Ok(Some((mae, rmse)))
 }
 
 #[derive(Default)]
@@ -814,7 +962,11 @@ struct EpochAccumulator {
     steps: usize,
     total: f64,
     rt: OptionalMean,
+    rt_mae_native: OptionalMean,
+    rt_rmse_native: OptionalMean,
     ccs: OptionalMean,
+    ccs_mae_native: OptionalMean,
+    ccs_rmse_native: OptionalMean,
     ms2: OptionalMean,
     masked_residue: OptionalMean,
     chemistry: OptionalMean,
@@ -830,7 +982,11 @@ impl EpochAccumulator {
         self.steps += 1;
         self.total += f64::from(metrics.total_loss);
         self.rt.push(metrics.rt_loss);
+        self.rt_mae_native.push(metrics.rt_mae_native);
+        self.rt_rmse_native.push(metrics.rt_rmse_native);
         self.ccs.push(metrics.ccs_loss);
+        self.ccs_mae_native.push(metrics.ccs_mae_native);
+        self.ccs_rmse_native.push(metrics.ccs_rmse_native);
         self.ms2.push(metrics.ms2_loss);
         self.masked_residue.push(metrics.masked_residue_loss);
         self.chemistry.push(metrics.chemistry_loss);
@@ -854,7 +1010,11 @@ impl EpochAccumulator {
                 (self.total / self.steps as f64) as f32
             },
             mean_rt_loss: self.rt.mean(),
+            mean_rt_mae_native: self.rt_mae_native.mean(),
+            mean_rt_rmse_native: self.rt_rmse_native.mean(),
             mean_ccs_loss: self.ccs.mean(),
+            mean_ccs_mae_native: self.ccs_mae_native.mean(),
+            mean_ccs_rmse_native: self.ccs_rmse_native.mean(),
             mean_ms2_loss: self.ms2.mean(),
             mean_masked_residue_loss: self.masked_residue.mean(),
             mean_chemistry_loss: self.chemistry.mean(),
@@ -911,13 +1071,18 @@ fn metrics_from_tensors(
     total: &Tensor,
     losses: &FoundationLosses,
     contrastive: Option<&Tensor>,
+    regression: RegressionDiagnostics,
     optimizer: Option<(f64, f64, f64)>,
 ) -> Result<FoundationStepMetrics> {
     let (learning_rate, gradient_norm, gradient_scale) = optimizer.unwrap_or((0.0, 0.0, 1.0));
     Ok(FoundationStepMetrics {
         total_loss: total.to_scalar::<f32>()?,
         rt_loss: scalar_option(losses.rt.as_ref())?,
+        rt_mae_native: scalar_pair_option(regression.rt.as_ref(), 0)?,
+        rt_rmse_native: scalar_pair_option(regression.rt.as_ref(), 1)?,
         ccs_loss: scalar_option(losses.ccs.as_ref())?,
+        ccs_mae_native: scalar_pair_option(regression.ccs.as_ref(), 0)?,
+        ccs_rmse_native: scalar_pair_option(regression.ccs.as_ref(), 1)?,
         ms2_loss: scalar_option(losses.ms2.as_ref())?,
         masked_residue_loss: scalar_option(losses.masked_residue.as_ref())?,
         chemistry_loss: scalar_option(losses.chemistry.as_ref())?,
@@ -930,6 +1095,13 @@ fn metrics_from_tensors(
 
 fn scalar_option(value: Option<&Tensor>) -> Result<Option<f32>> {
     value.map(|value| value.to_scalar::<f32>()).transpose()
+}
+
+fn scalar_pair_option(value: Option<&(Tensor, Tensor)>, index: usize) -> Result<Option<f32>> {
+    value
+        .map(|pair| if index == 0 { &pair.0 } else { &pair.1 })
+        .map(|value| value.to_scalar::<f32>())
+        .transpose()
 }
 
 #[cfg(test)]

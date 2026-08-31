@@ -25,6 +25,7 @@ pub mod layers;
 pub mod loss;
 pub mod metadata;
 pub mod model;
+pub mod normalization;
 pub mod optimizer;
 pub mod run;
 pub mod sampling;
@@ -81,6 +82,10 @@ pub use metadata::{
 pub use model::{
     FoundationMultiTaskOutput, FoundationOutput, PeptideFoundationEncoder,
     PeptideFoundationMultiTaskModel, PrecursorContextBatch,
+};
+pub use normalization::{
+    FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
+    FoundationTargetNormalizationConfig,
 };
 pub use optimizer::{FoundationAdamW, FoundationAdamWConfig, FoundationOptimizerStep};
 pub use run::{

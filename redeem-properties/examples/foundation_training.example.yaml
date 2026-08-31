@@ -15,6 +15,13 @@ trainer:
     warmup_steps: 1000
     total_steps: 100000
     min_lr_ratio: 0.05
+  # Fit continuous target scaling strictly from the materialized training
+  # partition. Missing labels leave the corresponding transform inactive.
+  target_normalization:
+    rt:
+      strategy: train-standardize
+    ccs:
+      strategy: train-standardize
   # Full production training defaults to one pass over every training record.
   # For bounded CPU smoke tests set train_steps_per_epoch / validation_steps
   # and optionally increase representation of a small source.

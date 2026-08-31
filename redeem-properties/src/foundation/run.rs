@@ -8,6 +8,7 @@ use super::checkpoint::{FoundationCheckpointMetadata, FoundationCheckpointProven
 use super::control::FoundationFitConfig;
 use super::corpus::{load_foundation_corpus, FoundationCorpusConfig};
 use super::experiment::{FoundationBenchmarkManifest, FoundationPartition};
+use super::normalization::FoundationTargetNormalizationConfig;
 use super::sampling::{
     sample_foundation_training_indices, sample_foundation_validation_indices, FoundationSamplePlan,
 };
@@ -107,6 +108,8 @@ pub struct FoundationTrainingRunSummary {
     /// Optional final validation diagnostics evaluated separately by source.
     /// These do not affect checkpoint selection or early stopping.
     pub validation_by_source: BTreeMap<String, FoundationEpochMetrics>,
+    /// Train-partition-only regression normalization actually used by the run.
+    pub target_normalization: FoundationTargetNormalizationConfig,
     /// Completed fit summary.
     pub fit: FoundationFitSummary,
 }
@@ -132,11 +135,25 @@ pub fn run_foundation_pretraining(
         );
     }
 
+    let mut resolved_trainer_config = config.trainer.clone();
+    resolved_trainer_config
+        .target_normalization
+        .resolve_from_training_partition(
+            &corpus.records,
+            &train_indices,
+            resolved_trainer_config.collator.retention_time_objective,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    resolved_trainer_config
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
     let latest = config.checkpoint_root.join("latest");
     let (mut trainer, progress, resume_metadata, resumed) = if config.resume && latest.exists() {
         let (trainer, metadata) = FoundationTrainer::from_checkpoint(&latest, device)?;
         validate_resume_config(
-            config,
+            &config.model,
+            &resolved_trainer_config,
             &metadata,
             corpus.corpus_fingerprint,
             benchmark.dataset_fingerprint,
@@ -146,7 +163,11 @@ pub fn run_foundation_pretraining(
         (trainer, progress, Some(metadata), true)
     } else {
         (
-            FoundationTrainer::new(config.model.clone(), config.trainer.clone(), device)?,
+            FoundationTrainer::new(
+                config.model.clone(),
+                resolved_trainer_config.clone(),
+                device,
+            )?,
             Default::default(),
             None,
             false,
@@ -163,19 +184,19 @@ pub fn run_foundation_pretraining(
         &corpus.records,
         &corpus.provenance,
         &train_indices,
-        config.trainer.batch_size,
+        resolved_trainer_config.batch_size,
         progress.completed_epochs,
-        config.trainer.seed,
+        resolved_trainer_config.seed,
         config.fit.shuffle_each_epoch,
-        &config.trainer.sampling,
+        &resolved_trainer_config.sampling,
     )?;
     let validation_sampling = sample_foundation_validation_indices(
         &corpus.records,
         &corpus.provenance,
         &validation_indices,
-        config.trainer.batch_size,
-        config.trainer.seed,
-        &config.trainer.sampling,
+        resolved_trainer_config.batch_size,
+        resolved_trainer_config.seed,
+        &resolved_trainer_config.sampling,
     )?;
 
     let provenance = FoundationCheckpointProvenance {
@@ -197,7 +218,7 @@ pub fn run_foundation_pretraining(
     )?;
 
     let mut validation_by_source = BTreeMap::new();
-    if config.trainer.sampling.report_validation_by_source {
+    if resolved_trainer_config.sampling.report_validation_by_source {
         let mut by_source = BTreeMap::<String, Vec<usize>>::new();
         for &index in &validation_sampling.indices {
             let source = corpus.provenance.get(index).ok_or_else(|| {
@@ -225,21 +246,23 @@ pub fn run_foundation_pretraining(
         train_sampling_preview,
         validation_sampling,
         validation_by_source,
+        target_normalization: trainer.config().target_normalization,
         fit,
     })
 }
 
 fn validate_resume_config(
-    requested: &FoundationTrainingRunConfig,
+    requested_model: &FoundationConfig,
+    requested_trainer: &FoundationTrainerConfig,
     checkpoint: &FoundationCheckpointMetadata,
     corpus_fingerprint: u64,
     benchmark_dataset_fingerprint: u64,
     benchmark_manifest_fingerprint: u64,
 ) -> Result<()> {
-    if checkpoint.model_config != requested.model {
+    if checkpoint.model_config != *requested_model {
         anyhow::bail!("foundation resume model configuration differs from checkpoint");
     }
-    let requested_trainer = serde_yaml::to_string(&requested.trainer)?;
+    let requested_trainer = serde_yaml::to_string(requested_trainer)?;
     let checkpoint_trainer = serde_yaml::to_string(&checkpoint.trainer_config)?;
     if requested_trainer != checkpoint_trainer {
         anyhow::bail!("foundation resume trainer configuration differs from checkpoint");

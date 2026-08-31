@@ -5,9 +5,10 @@ use redeem_properties::foundation::{
     FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter,
     FoundationCorpusSourceSpec, FoundationCorruptionConfig, FoundationDatasetLoader,
     FoundationLearningRateSchedule, FoundationPartition, FoundationRecordProvenance,
+    FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
     FoundationSamplingConfig, FoundationSamplingStrategy, FoundationSplitConfig,
-    FoundationTableLoaderConfig, FoundationTrainer, FoundationTrainerConfig,
-    FoundationTrainingProgress,
+    FoundationTableLoaderConfig, FoundationTargetNormalizationConfig, FoundationTrainer,
+    FoundationTrainerConfig, FoundationTrainingProgress, RetentionTimeObjective,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -388,4 +389,61 @@ fn epoch_metrics_report_gradient_clipping_frequency_and_scale() {
     assert!(metrics
         .mean_gradient_scale
         .is_some_and(|value| value > 0.0 && value < 1.0));
+}
+
+#[test]
+fn regression_normalization_uses_train_partition_only() {
+    let mut records = records();
+    let mut validation_only = records[0].clone();
+    validation_only.retention_time.normalized = Some(10_000.0);
+    validation_only.ccs = Some(9_999.0);
+    records.push(validation_only);
+
+    let mut normalization = FoundationTargetNormalizationConfig {
+        rt: FoundationRegressionNormalization {
+            strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
+            ..FoundationRegressionNormalization::default()
+        },
+        ccs: FoundationRegressionNormalization {
+            strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
+            ..FoundationRegressionNormalization::default()
+        },
+    };
+    normalization
+        .resolve_from_training_partition(&records, &[0, 1], RetentionTimeObjective::Normalized)
+        .unwrap();
+
+    assert_eq!(normalization.rt.label_count, 2);
+    assert_eq!(normalization.ccs.label_count, 2);
+    assert!((normalization.rt.mean.unwrap() - 39.25).abs() < 1e-6);
+    assert!((normalization.ccs.mean.unwrap() - 432.5).abs() < 1e-6);
+    assert!(normalization.rt.standard_deviation.unwrap() > 0.0);
+    assert!(normalization.ccs.standard_deviation.unwrap() > 0.0);
+}
+
+#[test]
+fn normalized_regression_reports_native_unit_errors() {
+    let records = records();
+    let mut normalization = FoundationTargetNormalizationConfig {
+        rt: FoundationRegressionNormalization {
+            strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
+            ..FoundationRegressionNormalization::default()
+        },
+        ccs: FoundationRegressionNormalization {
+            strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
+            ..FoundationRegressionNormalization::default()
+        },
+    };
+    normalization
+        .resolve_from_training_partition(&records, &[0, 1], RetentionTimeObjective::Normalized)
+        .unwrap();
+    let mut config = trainer_config();
+    config.target_normalization = normalization;
+    let mut trainer = FoundationTrainer::new(tiny_config(), config, Device::Cpu).unwrap();
+    let metrics = trainer.train_step(&records).unwrap();
+    assert!(metrics.rt_loss.is_some_and(f32::is_finite));
+    assert!(metrics.rt_mae_native.is_some_and(f32::is_finite));
+    assert!(metrics.rt_rmse_native.is_some_and(f32::is_finite));
+    assert!(metrics.ccs_mae_native.is_some_and(f32::is_finite));
+    assert!(metrics.ccs_rmse_native.is_some_and(f32::is_finite));
 }

@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 use candle_core::Device;
 use redeem_properties::foundation::{
     read_foundation_training_run_config, run_foundation_pretraining, FoundationEpochMetrics,
+    FoundationRegressionNormalization,
 };
 use std::env;
 
@@ -25,6 +26,8 @@ fn main() -> Result<()> {
     println!("validation_records\t{}", summary.validation_records);
     println!("test_records\t{}", summary.test_records);
     println!("resumed\t{}", summary.resumed);
+    print_normalization("rt", &summary.target_normalization.rt);
+    print_normalization("ccs", &summary.target_normalization.ccs);
     println!(
         "train_sampling_records\t{}",
         summary.train_sampling_preview.indices.len()
@@ -107,7 +110,23 @@ fn main() -> Result<()> {
 fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
     println!("{prefix}_loss\t{}", metrics.mean_total_loss);
     print_optional_f32(&format!("{prefix}_rt_loss"), metrics.mean_rt_loss);
+    print_optional_f32(
+        &format!("{prefix}_rt_mae_native"),
+        metrics.mean_rt_mae_native,
+    );
+    print_optional_f32(
+        &format!("{prefix}_rt_rmse_native"),
+        metrics.mean_rt_rmse_native,
+    );
     print_optional_f32(&format!("{prefix}_ccs_loss"), metrics.mean_ccs_loss);
+    print_optional_f32(
+        &format!("{prefix}_ccs_mae_native"),
+        metrics.mean_ccs_mae_native,
+    );
+    print_optional_f32(
+        &format!("{prefix}_ccs_rmse_native"),
+        metrics.mean_ccs_rmse_native,
+    );
     print_optional_f32(&format!("{prefix}_ms2_loss"), metrics.mean_ms2_loss);
     print_optional_f32(
         &format!("{prefix}_masked_residue_loss"),
@@ -142,7 +161,11 @@ fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
         metrics.mean_total_loss
     );
     print_source_optional(source, "rt_loss", metrics.mean_rt_loss);
+    print_source_optional(source, "rt_mae_native", metrics.mean_rt_mae_native);
+    print_source_optional(source, "rt_rmse_native", metrics.mean_rt_rmse_native);
     print_source_optional(source, "ccs_loss", metrics.mean_ccs_loss);
+    print_source_optional(source, "ccs_mae_native", metrics.mean_ccs_mae_native);
+    print_source_optional(source, "ccs_rmse_native", metrics.mean_ccs_rmse_native);
     print_source_optional(source, "ms2_loss", metrics.mean_ms2_loss);
     print_source_optional(
         source,
@@ -151,6 +174,29 @@ fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
     );
     print_source_optional(source, "chemistry_loss", metrics.mean_chemistry_loss);
     print_source_optional(source, "contrastive_loss", metrics.mean_contrastive_loss);
+}
+
+fn print_normalization(label: &str, normalization: &FoundationRegressionNormalization) {
+    println!(
+        "{label}_normalization_strategy\t{:?}",
+        normalization.strategy
+    );
+    println!(
+        "{label}_normalization_labels\t{}",
+        normalization.label_count
+    );
+    match normalization.mean {
+        Some(value) => println!("{label}_normalization_mean\t{value}"),
+        None => println!("{label}_normalization_mean\tNA"),
+    }
+    match normalization.standard_deviation {
+        Some(value) => println!("{label}_normalization_std\t{value}"),
+        None => println!("{label}_normalization_std\tNA"),
+    }
+    println!(
+        "{label}_normalization_active\t{}",
+        normalization.is_active()
+    );
 }
 
 fn print_optional_f32(label: &str, value: Option<f32>) {
