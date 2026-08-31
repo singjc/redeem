@@ -238,3 +238,96 @@ fn modification_family_split_rejects_numeric_only_open_modifications() {
     .unwrap_err();
     assert!(error.to_string().contains("canonical UniMod identity"));
 }
+
+#[test]
+fn exact_graph_templates_cover_the_real_high_frequency_ptm_sites() {
+    use redeem_properties::foundation::chemistry::{residue_graph, Element};
+    use redeem_properties::foundation::{
+        exact_graph_modification_for, parse_modified_peptide, FoundationModification,
+        FoundationModificationSite,
+    };
+
+    let cases = [
+        ("AC(UniMod:4)DEFGK", 'C'),
+        ("PEPM(UniMod:35)IDEK", 'M'),
+        ("PEPN(UniMod:7)IDEK", 'N'),
+        ("PEPQ(UniMod:7)IDEK", 'Q'),
+    ];
+    for (modified, residue) in cases {
+        let peptide = parse_modified_peptide(modified).unwrap();
+        let modification = &peptide.modifications[0];
+        let kind = exact_graph_modification_for(residue, modification).unwrap();
+        let mut graph = residue_graph(residue).unwrap();
+        assert!(graph.apply_exact_modification(kind));
+        assert!(graph
+            .atoms
+            .iter()
+            .all(|atom| atom.element != Element::Pseudo));
+    }
+
+    let n_term = parse_modified_peptide(".(UniMod:1)PEPTIDEK").unwrap();
+    assert!(exact_graph_modification_for('P', &n_term.modifications[0]).is_some());
+
+    let lysine_acetyl =
+        FoundationModification::unimod(FoundationModificationSite::Residue(0), 0, 1, 42.010565);
+    assert!(exact_graph_modification_for('K', &lysine_acetyl).is_some());
+
+    let unsupported_site =
+        FoundationModification::unimod(FoundationModificationSite::Residue(0), 0, 35, 15.994915);
+    assert!(exact_graph_modification_for('W', &unsupported_site).is_none());
+}
+
+#[test]
+fn table_report_quantifies_exact_graph_and_fallback_ptms() {
+    let table = concat!(
+        "ModifiedPeptide\tPrecursorCharge\n",
+        "AC(UniMod:4)DEFGK\t2\n",
+        "PEPM(UniMod:35)IDEK\t2\n",
+        "PEPN(UniMod:7)IDEK\t2\n",
+        ".(UniMod:1)PEPTIDEK\t2\n",
+        "PEPS(UniMod:21)IDEK\t2\n",
+    );
+    let mut loader = FoundationDatasetLoader::new(16);
+    let report = loader
+        .load_reader_with_report(
+            table.as_bytes(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.stats.modification_occurrences, 5);
+    assert_eq!(report.stats.exact_graph_modification_occurrences, 4);
+    assert_eq!(
+        report.stats.pseudo_graph_fallback_modification_occurrences,
+        1
+    );
+    assert_eq!(
+        report
+            .stats
+            .exact_graph_unimod_occurrences
+            .get("UniMod:4 Carbamidomethyl"),
+        Some(&1)
+    );
+    assert_eq!(
+        report
+            .stats
+            .exact_graph_unimod_occurrences
+            .get("UniMod:35 Oxidation"),
+        Some(&1)
+    );
+    assert_eq!(
+        report
+            .stats
+            .exact_graph_unimod_occurrences
+            .get("UniMod:7 Deamidated"),
+        Some(&1)
+    );
+    assert_eq!(
+        report
+            .stats
+            .exact_graph_unimod_occurrences
+            .get("UniMod:1 Acetyl"),
+        Some(&1)
+    );
+}

@@ -25,7 +25,8 @@ pub mod trainer;
 pub mod wrapper;
 
 pub use chemistry::{
-    common_unimod_definition, ElementalComposition, FoundationModificationDefinition,
+    common_unimod_definition, exact_graph_modification, ElementalComposition,
+    ExactGraphModification, FoundationModificationDefinition, ModificationAttachmentSite,
 };
 pub use collate::{
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
@@ -43,8 +44,8 @@ pub use dataset::{
     InstrumentVocabulary,
 };
 pub use featurize::{
-    FoundationBatch, FoundationModification, FoundationModificationSite, PeptideGraphFeaturizer,
-    PeptidoformInput,
+    exact_graph_modification_for, FoundationBatch, FoundationModification,
+    FoundationModificationSite, PeptideGraphFeaturizer, PeptidoformInput,
 };
 pub use loss::{
     contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,

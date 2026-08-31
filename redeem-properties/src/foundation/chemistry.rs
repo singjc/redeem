@@ -1,9 +1,10 @@
 //! Lightweight molecular-graph chemistry used by the peptide foundation model.
 //!
-//! The first implementation intentionally models heavy atoms plus modification
-//! pseudo-atoms.  Hydrogens are represented through atom descriptors rather
-//! than explicit graph nodes.  This keeps graph sizes small while preserving
-//! the residue connectivity required for message passing.
+//! The foundation chemistry layer models residue-local heavy-atom graphs.
+//! High-frequency canonical PTMs can apply explicit local graph transformations,
+//! while unknown or unsupported modification/site combinations retain a
+//! pseudo-mass node fallback. Hydrogens remain implicit to keep graph sizes
+//! compact for message passing.
 
 /// Number of raw features emitted for each atom.
 pub const ATOM_FEATURE_DIM: usize = 12;
@@ -33,11 +34,68 @@ pub struct ElementalComposition {
     pub phosphorus: i16,
 }
 
+/// Coarse attachment scope used when deciding whether a canonical PTM can be
+/// represented by an exact local heavy-atom graph transformation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModificationAttachmentSite {
+    /// Modification is attached to the residue side chain/backbone atom.
+    Residue,
+    /// Modification is attached to the peptide N terminus.
+    NTerm,
+    /// Modification is attached to the peptide C terminus.
+    CTerm,
+}
+
+/// Canonical PTM transformations for which the current residue-local graph has
+/// an explicit heavy-atom topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactGraphModification {
+    /// Cysteine S-carbamidomethylation: `S-CH2-C(=O)-NH2`.
+    CarbamidomethylCysteine,
+    /// Methionine sulfoxide represented by an oxygen attached to sulfur.
+    MethionineOxidation,
+    /// Asparagine/glutamine deamidation represented by amide N -> O.
+    AsparagineGlutamineDeamidation,
+    /// Peptide N-terminal acetylation: `N-C(=O)-CH3`.
+    NTerminalAcetylation,
+    /// Lysine epsilon-amino acetylation: `N-C(=O)-CH3`.
+    LysineAcetylation,
+}
+
+/// Resolve whether a canonical UniMod annotation can be represented exactly by
+/// the current local heavy-atom graph.
+///
+/// Unsupported sites deliberately return `None` so callers retain the generic
+/// pseudo-mass fallback rather than inventing chemistry.
+pub fn exact_graph_modification(
+    unimod_id: u32,
+    residue: char,
+    site: ModificationAttachmentSite,
+) -> Option<ExactGraphModification> {
+    match (unimod_id, residue, site) {
+        (4, 'C', ModificationAttachmentSite::Residue) => {
+            Some(ExactGraphModification::CarbamidomethylCysteine)
+        }
+        (35, 'M', ModificationAttachmentSite::Residue) => {
+            Some(ExactGraphModification::MethionineOxidation)
+        }
+        (7, 'N' | 'Q', ModificationAttachmentSite::Residue) => {
+            Some(ExactGraphModification::AsparagineGlutamineDeamidation)
+        }
+        (1, _, ModificationAttachmentSite::NTerm) => {
+            Some(ExactGraphModification::NTerminalAcetylation)
+        }
+        (1, 'K', ModificationAttachmentSite::Residue) => {
+            Some(ExactGraphModification::LysineAcetylation)
+        }
+        _ => None,
+    }
+}
+
 /// Canonical metadata retained for a supported UniMod modification.
 ///
-/// This registry is intentionally small and explicit.  It provides stable
-/// modification identity and elemental composition now; structural graph
-/// templates can then be added one family at a time without losing provenance.
+/// This registry is intentionally small and explicit. It provides stable
+/// modification identity and elemental composition alongside graph templates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FoundationModificationDefinition {
     /// UniMod accession.
@@ -301,6 +359,96 @@ impl ResidueChemicalGraph {
 
     fn connect(&mut self, source: usize, target: usize, order: f32) {
         self.bonds.push(bond(source, target, order));
+    }
+
+    /// Apply one exact canonical PTM heavy-atom transformation.
+    ///
+    /// Returns `false` if the current residue graph does not contain the anchor
+    /// atom expected by the transformation. Callers should then use the generic
+    /// pseudo-mass fallback rather than silently dropping the PTM.
+    pub fn apply_exact_modification(&mut self, modification: ExactGraphModification) -> bool {
+        match modification {
+            ExactGraphModification::CarbamidomethylCysteine => {
+                let Some(sulfur) = self
+                    .atoms
+                    .iter()
+                    .position(|atom| atom.element == Element::S && !atom.is_backbone)
+                else {
+                    return false;
+                };
+                let methylene = self.add_atom(Element::C, false, false, false);
+                let carbonyl = self.add_atom(Element::C, false, false, false);
+                let oxygen = self.add_atom(Element::O, false, false, true);
+                let amide_n = self.add_atom(Element::N, false, true, false);
+                self.connect(sulfur, methylene, 1.0);
+                self.connect(methylene, carbonyl, 1.0);
+                self.connect(carbonyl, oxygen, 2.0);
+                self.connect(carbonyl, amide_n, 1.0);
+                true
+            }
+            ExactGraphModification::MethionineOxidation => {
+                let Some(sulfur) = self
+                    .atoms
+                    .iter()
+                    .position(|atom| atom.element == Element::S && !atom.is_backbone)
+                else {
+                    return false;
+                };
+                let oxygen = self.add_atom(Element::O, false, false, true);
+                self.connect(sulfur, oxygen, 1.0);
+                true
+            }
+            ExactGraphModification::AsparagineGlutamineDeamidation => {
+                let Some(amide_n) = self
+                    .atoms
+                    .iter()
+                    .position(|atom| atom.element == Element::N && !atom.is_backbone)
+                else {
+                    return false;
+                };
+                let atom = &mut self.atoms[amide_n];
+                atom.element = Element::O;
+                atom.is_aromatic = false;
+                atom.is_donor = false;
+                atom.is_acceptor = true;
+                atom.formal_charge = 0;
+                atom.pseudo_mass_delta = 0.0;
+                true
+            }
+            ExactGraphModification::NTerminalAcetylation => {
+                if self.atoms.is_empty() || self.atoms[0].element != Element::N {
+                    return false;
+                }
+                self.add_acetyl_to_nitrogen(0);
+                true
+            }
+            ExactGraphModification::LysineAcetylation => {
+                let Some(side_chain_n) =
+                    self.atoms
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, atom)| {
+                            (atom.element == Element::N && !atom.is_backbone).then_some(index)
+                        })
+                else {
+                    return false;
+                };
+                self.add_acetyl_to_nitrogen(side_chain_n);
+                true
+            }
+        }
+    }
+
+    fn add_acetyl_to_nitrogen(&mut self, nitrogen: usize) {
+        // Acetylation converts an amine into an amide-like nitrogen.
+        self.atoms[nitrogen].is_acceptor = false;
+        let carbonyl = self.add_atom(Element::C, false, false, false);
+        let oxygen = self.add_atom(Element::O, false, false, true);
+        let methyl = self.add_atom(Element::C, false, false, false);
+        self.connect(nitrogen, carbonyl, 1.0);
+        self.connect(carbonyl, oxygen, 2.0);
+        self.connect(carbonyl, methyl, 1.0);
     }
 
     /// Attach a pseudo atom to C-alpha for a modification whose detailed
@@ -591,5 +739,83 @@ mod tests {
         let tmtpro = common_unimod_definition(2016).unwrap();
         assert_eq!(tmtpro.composition.carbon_13, 7);
         assert_eq!(tmtpro.composition.nitrogen_15, 2);
+    }
+    #[test]
+    fn exact_ptm_graphs_use_real_atoms_not_pseudo_nodes() {
+        let mut cysteine = residue_graph('C').unwrap();
+        let before_c = cysteine.atoms.len();
+        assert!(cysteine.apply_exact_modification(ExactGraphModification::CarbamidomethylCysteine));
+        assert_eq!(cysteine.atoms.len(), before_c + 4);
+        assert!(cysteine
+            .atoms
+            .iter()
+            .all(|atom| atom.element != Element::Pseudo));
+
+        let mut methionine = residue_graph('M').unwrap();
+        let before_m = methionine.atoms.len();
+        assert!(methionine.apply_exact_modification(ExactGraphModification::MethionineOxidation));
+        assert_eq!(methionine.atoms.len(), before_m + 1);
+        assert_eq!(methionine.atoms.last().unwrap().element, Element::O);
+    }
+
+    #[test]
+    fn deamidation_replaces_side_chain_nitrogen_with_oxygen() {
+        let mut asparagine = residue_graph('N').unwrap();
+        let before_n = asparagine
+            .atoms
+            .iter()
+            .filter(|atom| atom.element == Element::N)
+            .count();
+        let before_o = asparagine
+            .atoms
+            .iter()
+            .filter(|atom| atom.element == Element::O)
+            .count();
+        assert!(asparagine
+            .apply_exact_modification(ExactGraphModification::AsparagineGlutamineDeamidation));
+        assert_eq!(
+            asparagine
+                .atoms
+                .iter()
+                .filter(|atom| atom.element == Element::N)
+                .count(),
+            before_n - 1
+        );
+        assert_eq!(
+            asparagine
+                .atoms
+                .iter()
+                .filter(|atom| atom.element == Element::O)
+                .count(),
+            before_o + 1
+        );
+    }
+
+    #[test]
+    fn exact_modification_support_is_site_specific() {
+        assert_eq!(
+            exact_graph_modification(4, 'C', ModificationAttachmentSite::Residue),
+            Some(ExactGraphModification::CarbamidomethylCysteine)
+        );
+        assert_eq!(
+            exact_graph_modification(35, 'M', ModificationAttachmentSite::Residue),
+            Some(ExactGraphModification::MethionineOxidation)
+        );
+        assert_eq!(
+            exact_graph_modification(7, 'Q', ModificationAttachmentSite::Residue),
+            Some(ExactGraphModification::AsparagineGlutamineDeamidation)
+        );
+        assert_eq!(
+            exact_graph_modification(1, 'A', ModificationAttachmentSite::NTerm),
+            Some(ExactGraphModification::NTerminalAcetylation)
+        );
+        assert_eq!(
+            exact_graph_modification(1, 'K', ModificationAttachmentSite::Residue),
+            Some(ExactGraphModification::LysineAcetylation)
+        );
+        assert_eq!(
+            exact_graph_modification(35, 'W', ModificationAttachmentSite::Residue),
+            None
+        );
     }
 }

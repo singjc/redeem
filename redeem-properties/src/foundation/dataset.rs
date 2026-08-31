@@ -14,7 +14,10 @@
 
 use super::chemistry::common_unimod_definition;
 use super::data::{FoundationTrainingRecord, FragmentTarget, RetentionTimeLabels, TrainingContext};
-use super::featurize::{FoundationModification, FoundationModificationSite, PeptidoformInput};
+use super::featurize::{
+    exact_graph_modification_for, FoundationModification, FoundationModificationSite,
+    PeptidoformInput,
+};
 use anyhow::{anyhow, Context, Result};
 use csv::{ReaderBuilder, StringRecord};
 use serde::{Deserialize, Serialize};
@@ -209,6 +212,14 @@ pub struct FoundationTableLoadStats {
     pub unresolved_modification_records: usize,
     /// Total modification occurrences across grouped precursor records.
     pub modification_occurrences: usize,
+    /// Modification occurrences that can use an explicit local heavy-atom PTM
+    /// transformation in the current graph featurizer.
+    pub exact_graph_modification_occurrences: usize,
+    /// Modification occurrences that still require the pseudo-mass graph
+    /// fallback because their chemistry/site is not explicitly implemented.
+    pub pseudo_graph_fallback_modification_occurrences: usize,
+    /// Exact-graph occurrences grouped by canonical UniMod family.
+    pub exact_graph_unimod_occurrences: BTreeMap<String, usize>,
     /// Modification occurrences carrying a canonical UniMod id, keyed by
     /// `UniMod:<id> <name>`.
     pub unimod_occurrences: BTreeMap<String, usize>,
@@ -871,6 +882,7 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
 
     for record in records {
         let sequence_len = record.peptidoform.sequence.len();
+        let residues: Vec<char> = record.peptidoform.sequence.chars().collect();
         total_sequence_len += sequence_len;
         stats.min_sequence_len = Some(
             stats
@@ -890,6 +902,24 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
             let mut has_unresolved = false;
             for modification in &record.peptidoform.modifications {
                 stats.modification_occurrences += 1;
+                let residue = residues
+                    .get(modification.residue_index)
+                    .copied()
+                    .unwrap_or('X');
+                if exact_graph_modification_for(residue, modification).is_some() {
+                    stats.exact_graph_modification_occurrences += 1;
+                    if let Some(id) = modification.unimod_id {
+                        let label = common_unimod_definition(id)
+                            .map(|definition| format!("UniMod:{id} {}", definition.name))
+                            .unwrap_or_else(|| format!("UniMod:{id}"));
+                        *stats
+                            .exact_graph_unimod_occurrences
+                            .entry(label)
+                            .or_insert(0) += 1;
+                    }
+                } else {
+                    stats.pseudo_graph_fallback_modification_occurrences += 1;
+                }
                 match modification.unimod_id {
                     Some(id) => {
                         let label = common_unimod_definition(id)

@@ -1,6 +1,9 @@
 //! Conversion of peptide sequences into batched hierarchical molecular graphs.
 
-use super::chemistry::{residue_graph, ATOM_FEATURE_DIM};
+use super::chemistry::{
+    exact_graph_modification, residue_graph, ExactGraphModification, ModificationAttachmentSite,
+    ATOM_FEATURE_DIM,
+};
 use super::config::FoundationConfig;
 use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
@@ -83,6 +86,23 @@ impl FoundationModification {
             None => format!("Mass:{:+.4}", self.mass_delta),
         }
     }
+}
+
+/// Resolve the exact local graph transformation for one canonical modification.
+///
+/// Returning `None` is intentional: unsupported UniMod/site combinations and
+/// open mass shifts retain the generic pseudo-mass representation.
+pub fn exact_graph_modification_for(
+    residue: char,
+    modification: &FoundationModification,
+) -> Option<ExactGraphModification> {
+    let unimod_id = modification.unimod_id?;
+    let site = match modification.site {
+        FoundationModificationSite::Residue(_) => ModificationAttachmentSite::Residue,
+        FoundationModificationSite::NTerm => ModificationAttachmentSite::NTerm,
+        FoundationModificationSite::CTerm => ModificationAttachmentSite::CTerm,
+    };
+    exact_graph_modification(unimod_id, residue, site)
 }
 
 /// Input peptidoform consumed by the foundation featurizer.
@@ -169,7 +189,11 @@ impl PeptideGraphFeaturizer {
                     .iter()
                     .filter(|m| m.residue_index == residue_idx)
                 {
-                    graph.add_mass_delta_modification(modification.mass_delta);
+                    let applied_exactly = exact_graph_modification_for(residue, modification)
+                        .is_some_and(|kind| graph.apply_exact_modification(kind));
+                    if !applied_exactly {
+                        graph.add_mass_delta_modification(modification.mass_delta);
+                    }
                 }
                 if graph.atoms.len() > a {
                     candle_core::bail!(
