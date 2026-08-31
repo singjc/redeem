@@ -289,8 +289,34 @@ impl PeptideFoundationMultiTaskModel {
         context: &PrecursorContextBatch,
         train: bool,
     ) -> Result<FoundationMultiTaskOutput> {
+        self.forward_t_with_rt_encoder_gradient_scale(batch, context, train, 1.0)
+    }
+
+    /// Forward pass with independent control over the RT gradient entering the shared encoder.
+    ///
+    /// The forward value supplied to the RT head is unchanged. During backpropagation,
+    /// `rt_encoder_gradient_scale` multiplies only the gradient flowing from the RT head
+    /// into the shared peptide embedding. Gradients for the RT head parameters themselves
+    /// remain unscaled. A value of `1` reproduces the ordinary forward pass; `0` trains the
+    /// RT head on a detached foundation embedding.
+    pub fn forward_t_with_rt_encoder_gradient_scale(
+        &self,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+        rt_encoder_gradient_scale: f64,
+    ) -> Result<FoundationMultiTaskOutput> {
+        if !(0.0..=1.0).contains(&rt_encoder_gradient_scale)
+            || !rt_encoder_gradient_scale.is_finite()
+        {
+            candle_core::bail!(
+                "RT encoder gradient scale must be finite and within [0, 1], got {rt_encoder_gradient_scale}"
+            );
+        }
         let foundation = self.encoder.forward_t(batch, train)?;
-        let rt = self.rt_head.forward(&foundation.peptide_embedding)?;
+        let rt_features =
+            gradient_scaled_identity(&foundation.peptide_embedding, rt_encoder_gradient_scale)?;
+        let rt = self.rt_head.forward(&rt_features)?;
 
         let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
         let charge_present = context.charge_present.unsqueeze(1)?;
@@ -372,4 +398,18 @@ impl PeptideFoundationMultiTaskModel {
     pub fn config(&self) -> &FoundationConfig {
         &self.config
     }
+}
+
+/// Identity in the forward pass with a configurable gradient multiplier.
+///
+/// `detached + scale * (input - detached)` is numerically equal to `input`, while
+/// only the second term participates in backpropagation to `input`.
+fn gradient_scaled_identity(input: &Tensor, scale: f64) -> Result<Tensor> {
+    if scale == 1.0 {
+        return Ok(input.clone());
+    }
+    let detached = input.detach();
+    let residual = (input - &detached)?;
+    let scaled_residual = residual.affine(scale, 0.0)?;
+    (&detached + &scaled_residual)
 }
