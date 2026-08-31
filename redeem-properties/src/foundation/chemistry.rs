@@ -1,0 +1,449 @@
+//! Lightweight molecular-graph chemistry used by the peptide foundation model.
+//!
+//! The first implementation intentionally models heavy atoms plus modification
+//! pseudo-atoms.  Hydrogens are represented through atom descriptors rather
+//! than explicit graph nodes.  This keeps graph sizes small while preserving
+//! the residue connectivity required for message passing.
+
+/// Number of raw features emitted for each atom.
+pub const ATOM_FEATURE_DIM: usize = 12;
+
+/// Chemical element represented in a residue graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Element {
+    C,
+    N,
+    O,
+    S,
+    Se,
+    P,
+    /// Generic pseudo atom used when only a modification mass delta is known.
+    Pseudo,
+}
+
+impl Element {
+    fn atomic_number(self) -> f32 {
+        match self {
+            Self::C => 6.0,
+            Self::N => 7.0,
+            Self::O => 8.0,
+            Self::S => 16.0,
+            Self::Se => 34.0,
+            Self::P => 15.0,
+            Self::Pseudo => 0.0,
+        }
+    }
+
+    fn atomic_mass(self) -> f32 {
+        match self {
+            Self::C => 12.011,
+            Self::N => 14.007,
+            Self::O => 15.999,
+            Self::S => 32.06,
+            Self::Se => 78.971,
+            Self::P => 30.974,
+            Self::Pseudo => 0.0,
+        }
+    }
+
+    fn electronegativity(self) -> f32 {
+        match self {
+            Self::C => 2.55,
+            Self::N => 3.04,
+            Self::O => 3.44,
+            Self::S => 2.58,
+            Self::Se => 2.55,
+            Self::P => 2.19,
+            Self::Pseudo => 0.0,
+        }
+    }
+
+    fn typical_valence(self) -> f32 {
+        match self {
+            Self::C => 4.0,
+            Self::N => 3.0,
+            Self::O => 2.0,
+            Self::S => 2.0,
+            Self::Se => 2.0,
+            Self::P => 5.0,
+            Self::Pseudo => 1.0,
+        }
+    }
+}
+
+/// One atom in a residue-level molecular graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtomNode {
+    /// Chemical element.
+    pub element: Element,
+    /// Whether the atom belongs to the peptide backbone.
+    pub is_backbone: bool,
+    /// Whether the atom is aromatic in the residue template.
+    pub is_aromatic: bool,
+    /// Whether the atom can act as a coarse hydrogen-bond donor.
+    pub is_donor: bool,
+    /// Whether the atom can act as a coarse hydrogen-bond acceptor.
+    pub is_acceptor: bool,
+    /// Formal charge used by the canonical graph template.
+    pub formal_charge: i8,
+    /// Optional mass delta for a pseudo atom representing an unresolved PTM.
+    pub pseudo_mass_delta: f32,
+}
+
+impl AtomNode {
+    /// Convert this atom into the normalized feature vector consumed by Candle.
+    pub fn features(&self, is_n_terminal: bool, is_c_terminal: bool) -> [f32; ATOM_FEATURE_DIM] {
+        [
+            self.element.atomic_number() / 34.0,
+            self.element.atomic_mass() / 80.0,
+            self.element.electronegativity() / 4.0,
+            self.element.typical_valence() / 5.0,
+            self.formal_charge as f32 / 2.0,
+            if self.is_aromatic { 1.0 } else { 0.0 },
+            if self.is_donor { 1.0 } else { 0.0 },
+            if self.is_acceptor { 1.0 } else { 0.0 },
+            if self.is_backbone { 1.0 } else { 0.0 },
+            if self.is_backbone { 0.0 } else { 1.0 },
+            if self.element == Element::Pseudo {
+                (self.pseudo_mass_delta / 200.0).clamp(-2.0, 2.0)
+            } else {
+                0.0
+            },
+            if is_n_terminal {
+                1.0
+            } else if is_c_terminal {
+                -1.0
+            } else {
+                0.0
+            },
+        ]
+    }
+}
+
+/// One undirected bond in a residue-level molecular graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BondEdge {
+    /// Index of the first atom.
+    pub source: usize,
+    /// Index of the second atom.
+    pub target: usize,
+    /// Continuous bond order (1, 1.5, 2, ...).
+    pub order: f32,
+}
+
+/// Canonical heavy-atom graph for one amino-acid residue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidueChemicalGraph {
+    /// Amino-acid one-letter code.
+    pub residue: char,
+    /// Atoms retained for the residue.
+    pub atoms: Vec<AtomNode>,
+    /// Undirected bonds between atoms.
+    pub bonds: Vec<BondEdge>,
+}
+
+impl ResidueChemicalGraph {
+    fn base(residue: char) -> Self {
+        let atoms = vec![
+            atom(Element::N, true, false, true, true),
+            atom(Element::C, true, false, false, false),
+            atom(Element::C, true, false, false, false),
+            atom(Element::O, true, false, false, true),
+        ];
+        let bonds = vec![bond(0, 1, 1.0), bond(1, 2, 1.0), bond(2, 3, 2.0)];
+        Self {
+            residue,
+            atoms,
+            bonds,
+        }
+    }
+
+    fn add_atom(&mut self, element: Element, aromatic: bool, donor: bool, acceptor: bool) -> usize {
+        let idx = self.atoms.len();
+        self.atoms
+            .push(atom(element, false, aromatic, donor, acceptor));
+        idx
+    }
+
+    fn connect(&mut self, source: usize, target: usize, order: f32) {
+        self.bonds.push(bond(source, target, order));
+    }
+
+    /// Attach a pseudo atom to C-alpha for a modification whose detailed
+    /// elemental structure is unavailable but whose mass delta is known.
+    pub fn add_mass_delta_modification(&mut self, mass_delta: f32) {
+        let idx = self.atoms.len();
+        self.atoms.push(AtomNode {
+            element: Element::Pseudo,
+            is_backbone: false,
+            is_aromatic: false,
+            is_donor: false,
+            is_acceptor: false,
+            formal_charge: 0,
+            pseudo_mass_delta: mass_delta,
+        });
+        self.connect(1, idx, 1.0);
+    }
+}
+
+fn atom(
+    element: Element,
+    is_backbone: bool,
+    is_aromatic: bool,
+    is_donor: bool,
+    is_acceptor: bool,
+) -> AtomNode {
+    AtomNode {
+        element,
+        is_backbone,
+        is_aromatic,
+        is_donor,
+        is_acceptor,
+        formal_charge: 0,
+        pseudo_mass_delta: 0.0,
+    }
+}
+
+fn bond(source: usize, target: usize, order: f32) -> BondEdge {
+    BondEdge {
+        source,
+        target,
+        order,
+    }
+}
+
+/// Build the canonical heavy-atom graph for a standard amino acid.
+///
+/// The graph contains a common `N-CA-C(=O)` backbone and a side-chain
+/// topology.  Peptide bonds are represented later by the sequence Transformer;
+/// atom message passing is intentionally local to each residue in this first
+/// hierarchical implementation.
+pub fn residue_graph(residue: char) -> Option<ResidueChemicalGraph> {
+    let mut g = ResidueChemicalGraph::base(residue);
+    match residue {
+        'G' => {}
+        'A' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            g.connect(1, b, 1.0);
+        }
+        'V' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c1 = g.add_atom(Element::C, false, false, false);
+            let c2 = g.add_atom(Element::C, false, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c1, 1.0);
+            g.connect(b, c2, 1.0);
+        }
+        'L' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let d1 = g.add_atom(Element::C, false, false, false);
+            let d2 = g.add_atom(Element::C, false, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, d1, 1.0);
+            g.connect(c, d2, 1.0);
+        }
+        'I' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c1 = g.add_atom(Element::C, false, false, false);
+            let c2 = g.add_atom(Element::C, false, false, false);
+            let d = g.add_atom(Element::C, false, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c1, 1.0);
+            g.connect(b, c2, 1.0);
+            g.connect(c1, d, 1.0);
+        }
+        'S' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let o = g.add_atom(Element::O, false, true, true);
+            g.connect(1, b, 1.0);
+            g.connect(b, o, 1.0);
+        }
+        'T' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let o = g.add_atom(Element::O, false, true, true);
+            let c = g.add_atom(Element::C, false, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, o, 1.0);
+            g.connect(b, c, 1.0);
+        }
+        'C' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let s = g.add_atom(Element::S, false, true, true);
+            g.connect(1, b, 1.0);
+            g.connect(b, s, 1.0);
+        }
+        'M' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let s = g.add_atom(Element::S, false, false, true);
+            let e = g.add_atom(Element::C, false, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, s, 1.0);
+            g.connect(s, e, 1.0);
+        }
+        'D' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let o1 = g.add_atom(Element::O, false, false, true);
+            let o2 = g.add_atom(Element::O, false, false, true);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, o1, 2.0);
+            g.connect(c, o2, 1.0);
+        }
+        'E' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let d = g.add_atom(Element::C, false, false, false);
+            let o1 = g.add_atom(Element::O, false, false, true);
+            let o2 = g.add_atom(Element::O, false, false, true);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, d, 1.0);
+            g.connect(d, o1, 2.0);
+            g.connect(d, o2, 1.0);
+        }
+        'N' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let o = g.add_atom(Element::O, false, false, true);
+            let n = g.add_atom(Element::N, false, true, true);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, o, 2.0);
+            g.connect(c, n, 1.0);
+        }
+        'Q' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let d = g.add_atom(Element::C, false, false, false);
+            let o = g.add_atom(Element::O, false, false, true);
+            let n = g.add_atom(Element::N, false, true, true);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, d, 1.0);
+            g.connect(d, o, 2.0);
+            g.connect(d, n, 1.0);
+        }
+        'K' => {
+            let mut prev = 1;
+            for _ in 0..4 {
+                let c = g.add_atom(Element::C, false, false, false);
+                g.connect(prev, c, 1.0);
+                prev = c;
+            }
+            let n = g.add_atom(Element::N, false, true, true);
+            g.connect(prev, n, 1.0);
+        }
+        'R' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let d = g.add_atom(Element::C, false, false, false);
+            let n1 = g.add_atom(Element::N, false, true, true);
+            let cz = g.add_atom(Element::C, false, false, false);
+            let n2 = g.add_atom(Element::N, false, true, true);
+            let n3 = g.add_atom(Element::N, false, true, true);
+            for (a, bx) in [(1, b), (b, c), (c, d), (d, n1), (n1, cz)] {
+                g.connect(a, bx, 1.0);
+            }
+            g.connect(cz, n2, 1.5);
+            g.connect(cz, n3, 1.5);
+        }
+        'H' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, true, false, false);
+            let n1 = g.add_atom(Element::N, true, true, true);
+            let c2 = g.add_atom(Element::C, true, false, false);
+            let n2 = g.add_atom(Element::N, true, true, true);
+            let c3 = g.add_atom(Element::C, true, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, n1, 1.5);
+            g.connect(n1, c2, 1.5);
+            g.connect(c2, n2, 1.5);
+            g.connect(n2, c3, 1.5);
+            g.connect(c3, c, 1.5);
+        }
+        'F' | 'Y' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c1 = g.add_atom(Element::C, true, false, false);
+            let c2 = g.add_atom(Element::C, true, false, false);
+            let c3 = g.add_atom(Element::C, true, false, false);
+            let c4 = g.add_atom(Element::C, true, false, false);
+            let c5 = g.add_atom(Element::C, true, false, false);
+            let c6 = g.add_atom(Element::C, true, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c1, 1.0);
+            for (a, bx) in [(c1, c2), (c2, c3), (c3, c4), (c4, c5), (c5, c6), (c6, c1)] {
+                g.connect(a, bx, 1.5);
+            }
+            if residue == 'Y' {
+                let o = g.add_atom(Element::O, false, true, true);
+                g.connect(c4, o, 1.0);
+            }
+        }
+        'W' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c1 = g.add_atom(Element::C, true, false, false);
+            let c2 = g.add_atom(Element::C, true, false, false);
+            let n = g.add_atom(Element::N, true, true, true);
+            let c3 = g.add_atom(Element::C, true, false, false);
+            let c4 = g.add_atom(Element::C, true, false, false);
+            let c5 = g.add_atom(Element::C, true, false, false);
+            let c6 = g.add_atom(Element::C, true, false, false);
+            let c7 = g.add_atom(Element::C, true, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c1, 1.0);
+            for (a, bx) in [
+                (c1, c2),
+                (c2, n),
+                (n, c3),
+                (c3, c4),
+                (c4, c1),
+                (c4, c5),
+                (c5, c6),
+                (c6, c7),
+                (c7, c3),
+            ] {
+                g.connect(a, bx, 1.5);
+            }
+        }
+        'P' => {
+            let b = g.add_atom(Element::C, false, false, false);
+            let c = g.add_atom(Element::C, false, false, false);
+            let d = g.add_atom(Element::C, false, false, false);
+            g.connect(1, b, 1.0);
+            g.connect(b, c, 1.0);
+            g.connect(c, d, 1.0);
+            g.connect(d, 0, 1.0);
+        }
+        _ => return None,
+    }
+    Some(g)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_standard_residues_have_graphs() {
+        for aa in "ACDEFGHIKLMNPQRSTVWY".chars() {
+            let graph = residue_graph(aa).expect("standard residue graph");
+            assert!(graph.atoms.len() >= 4);
+            assert!(graph.bonds.len() >= 3);
+        }
+    }
+
+    #[test]
+    fn unresolved_modification_adds_pseudo_atom() {
+        let mut graph = residue_graph('M').unwrap();
+        let before = graph.atoms.len();
+        graph.add_mass_delta_modification(15.9949);
+        assert_eq!(graph.atoms.len(), before + 1);
+        assert_eq!(graph.atoms.last().unwrap().element, Element::Pseudo);
+    }
+}
