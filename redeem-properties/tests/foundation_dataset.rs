@@ -24,6 +24,7 @@ fn table_report_exposes_schema_and_label_coverage() {
         )
         .unwrap();
 
+    assert_eq!(report.schema.profile, "generic");
     assert_eq!(report.schema.sequence.header, "ModifiedPeptide");
     assert_eq!(
         report.schema.normalized_rt.as_ref().unwrap().header,
@@ -93,4 +94,59 @@ fn public_run_split_keeps_complete_runs_disjoint() {
         split.summary.train_records + split.summary.validation_records + split.summary.test_records,
         records.len()
     );
+}
+
+#[test]
+fn openswath_profile_avoids_sequence_nce_collision_and_parses_terminal_modification() {
+    let table = concat!(
+        "sequence\tprecursor_mz\tprecursor_charge\tfragment_type\tfragment_series_number\tproduct_charge\tretention_time\tion_mobility\tintensity\n",
+        ".(UniMod:1)AAAAAAGAASGLPGPVAQGLK\t500.2\t2\tb\t3\t1\t1234.5\t1.05\t1000\n",
+    );
+    let mut loader = FoundationDatasetLoader::new(16);
+    let report = loader
+        .load_reader_with_report(
+            table.as_bytes(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.schema.profile, "openswath_finetuning");
+    assert_eq!(report.schema.sequence.header, "sequence");
+    assert!(report.schema.nce.is_none());
+    assert!(report.schema.collisions.is_empty());
+    assert_eq!(report.stats.parsed_rows, 1);
+    assert_eq!(report.stats.skipped_error_rows, 0);
+    assert_eq!(report.stats.modified_records, 1);
+    assert_eq!(
+        report.records[0].retention_time.observed_seconds,
+        Some(1234.5)
+    );
+    assert_eq!(report.records[0].context.nce, None);
+}
+
+#[test]
+fn ip2_profile_prefers_modified_peptide_sequence() {
+    let table = concat!(
+        "PrecursorMz\tProductMz\tAnnotation\tProteinId\tGeneName\tPeptideSequence\tModifiedPeptideSequence\tPrecursorCharge\tLibraryIntensity\tNormalizedRetentionTime\tPrecursorIonMobility\tFragmentType\tFragmentCharge\tFragmentSeriesNumber\tFragmentLossType\tDecoyMobility\n",
+        "500.2\t300.1\ty3\tP1\tGENE\tACDEFGK\tAC(UniMod:4)DEFGK\t2\t1000\t42.5\t1.02\ty\t1\t3\tnoloss\t0\n",
+    );
+    let mut loader = FoundationDatasetLoader::new(16);
+    let report = loader
+        .load_reader_with_report(
+            table.as_bytes(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.schema.profile, "ip2_bruker_spectral_library");
+    assert_eq!(report.schema.sequence.header, "ModifiedPeptideSequence");
+    assert!(report.schema.nce.is_none());
+    assert!(report.schema.collisions.is_empty());
+    assert_eq!(report.stats.modified_records, 1);
+    assert_eq!(report.records[0].peptidoform.sequence, "ACDEFGK");
+    assert_eq!(report.records[0].peptidoform.modifications.len(), 1);
+    assert!((report.records[0].peptidoform.modifications[0].mass_delta - 57.021465).abs() < 1e-5);
+    assert_eq!(report.records[0].retention_time.normalized, Some(42.5));
 }

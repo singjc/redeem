@@ -137,6 +137,11 @@ pub struct FoundationSchemaCollision {
 /// job starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoundationTableSchemaReport {
+    /// Adapter/profile selected for this header set.
+    ///
+    /// Known real-data dialects use explicit source-specific mappings; all
+    /// other tables fall back to the generic normalized-header matcher.
+    pub profile: String,
     /// All source headers in input order.
     pub headers: Vec<String>,
     /// Peptide or modified-peptide column.
@@ -495,6 +500,7 @@ struct ParsedRow {
 
 #[derive(Debug, Clone, Copy)]
 struct TableSchema {
+    profile: &'static str,
     sequence: usize,
     charge: Option<usize>,
     normalized_rt: Option<usize>,
@@ -515,9 +521,67 @@ struct TableSchema {
 
 impl TableSchema {
     fn infer(headers: &StringRecord) -> Result<Self> {
+        if is_ip2_bruker_spectral_library(headers) {
+            return Self::ip2_bruker(headers);
+        }
+        if is_openswath_finetuning_table(headers) {
+            return Self::openswath_finetuning(headers);
+        }
+        Self::generic(headers)
+    }
+
+    fn openswath_finetuning(headers: &StringRecord) -> Result<Self> {
+        Ok(Self {
+            profile: "openswath_finetuning",
+            sequence: require_header(headers, "sequence")?,
+            charge: exact_header(headers, "precursor_charge"),
+            normalized_rt: None,
+            observed_rt: exact_header(headers, "retention_time"),
+            ccs: None,
+            precursor_mz: exact_header(headers, "precursor_mz"),
+            ion_mobility: exact_header(headers, "ion_mobility"),
+            nce: None,
+            instrument: None,
+            run_id: None,
+            gradient_seconds: None,
+            fragment_type: exact_header(headers, "fragment_type"),
+            fragment_series: exact_header(headers, "fragment_series_number"),
+            fragment_charge: exact_header(headers, "product_charge"),
+            fragment_intensity: exact_header(headers, "intensity"),
+            fragment_loss: None,
+        })
+    }
+
+    fn ip2_bruker(headers: &StringRecord) -> Result<Self> {
+        Ok(Self {
+            profile: "ip2_bruker_spectral_library",
+            // This table contains both naked and modified peptide columns.
+            // Foundation chemistry must consume the modified form or PTM
+            // supervision silently disappears.
+            sequence: require_header(headers, "ModifiedPeptideSequence")?,
+            charge: exact_header(headers, "PrecursorCharge"),
+            normalized_rt: exact_header(headers, "NormalizedRetentionTime"),
+            observed_rt: None,
+            ccs: None,
+            precursor_mz: exact_header(headers, "PrecursorMz"),
+            ion_mobility: exact_header(headers, "PrecursorIonMobility"),
+            nce: None,
+            instrument: None,
+            run_id: None,
+            gradient_seconds: None,
+            fragment_type: exact_header(headers, "FragmentType"),
+            fragment_series: exact_header(headers, "FragmentSeriesNumber"),
+            fragment_charge: exact_header(headers, "FragmentCharge"),
+            fragment_intensity: exact_header(headers, "LibraryIntensity"),
+            fragment_loss: exact_header(headers, "FragmentLossType"),
+        })
+    }
+
+    fn generic(headers: &StringRecord) -> Result<Self> {
         let sequence = find_header(
             headers,
             &[
+                "modifiedpeptidesequence",
                 "modifiedpeptide",
                 "fullpeptidename",
                 "modified_sequence",
@@ -553,6 +617,7 @@ impl TableSchema {
             normalized_rt,
         );
         Ok(Self {
+            profile: "generic",
             sequence,
             charge: find_header(headers, &["precursorcharge", "precursor_charge", "charge"]),
             normalized_rt,
@@ -636,6 +701,7 @@ impl TableSchema {
 
     fn report(&self, headers: &StringRecord) -> FoundationTableSchemaReport {
         FoundationTableSchemaReport {
+            profile: self.profile.to_string(),
             headers: headers.iter().map(ToOwned::to_owned).collect(),
             sequence: FoundationSchemaField {
                 index: self.sequence,
@@ -659,6 +725,57 @@ impl TableSchema {
             collisions: schema_collisions(self, headers),
         }
     }
+}
+
+fn normalized_headers(headers: &StringRecord) -> BTreeSet<String> {
+    headers.iter().map(normalize_header).collect()
+}
+
+fn is_openswath_finetuning_table(headers: &StringRecord) -> bool {
+    let headers = normalized_headers(headers);
+    [
+        "sequence",
+        "precursormz",
+        "precursorcharge",
+        "fragmenttype",
+        "fragmentseriesnumber",
+        "productcharge",
+        "retentiontime",
+        "ionmobility",
+        "intensity",
+    ]
+    .iter()
+    .all(|header| headers.contains(*header))
+}
+
+fn is_ip2_bruker_spectral_library(headers: &StringRecord) -> bool {
+    let headers = normalized_headers(headers);
+    [
+        "peptidesequence",
+        "modifiedpeptidesequence",
+        "precursorcharge",
+        "libraryintensity",
+        "normalizedretentiontime",
+        "precursorionmobility",
+        "fragmenttype",
+        "fragmentcharge",
+        "fragmentseriesnumber",
+        "fragmentlosstype",
+    ]
+    .iter()
+    .all(|header| headers.contains(*header))
+}
+
+fn exact_header(headers: &StringRecord, name: &str) -> Option<usize> {
+    let name = normalize_header(name);
+    headers
+        .iter()
+        .position(|header| normalize_header(header) == name)
+}
+
+fn require_header(headers: &StringRecord, name: &str) -> Result<usize> {
+    exact_header(headers, name)
+        .ok_or_else(|| anyhow!("required foundation table column '{name}' was not found"))
 }
 
 fn infer_delimiter(path: &Path, config: &FoundationTableLoaderConfig) -> u8 {
@@ -834,11 +951,15 @@ fn find_header(headers: &StringRecord, aliases: &[&str]) -> Option<usize> {
             return Some(index);
         }
     }
-    for alias in &aliases {
-        if let Some(index) = headers
-            .iter()
-            .position(|header| normalize_header(header).contains(alias))
-        {
+
+    // Fuzzy substring matching is intentionally disabled for very short aliases
+    // such as "nce", "rt", and "im".  For example, "sequence" ends in "nce",
+    // which previously caused the peptide column to be misidentified as NCE.
+    for alias in aliases.iter().filter(|alias| alias.len() >= 5) {
+        if let Some(index) = headers.iter().position(|header| {
+            let header = normalize_header(header);
+            header.starts_with(alias) || header.ends_with(alias)
+        }) {
             return Some(index);
         }
     }
@@ -861,10 +982,13 @@ fn find_header_excluding(
             return Some(index);
         }
     }
-    for alias in &aliases {
+    for alias in aliases.iter().filter(|alias| alias.len() >= 5) {
         if let Some(index) = headers.iter().enumerate().find_map(|(index, header)| {
-            (Some(index) != excluded_index && normalize_header(header).contains(alias))
-                .then_some(index)
+            if Some(index) == excluded_index {
+                return None;
+            }
+            let header = normalize_header(header);
+            (header.starts_with(alias) || header.ends_with(alias)).then_some(index)
         }) {
             return Some(index);
         }
@@ -1023,6 +1147,10 @@ fn normalize_fragment_intensities(
 /// explicit error rather than silently becoming zero-mass modifications.
 pub fn parse_modified_peptide(raw: &str) -> Result<PeptidoformInput> {
     let raw = strip_flanking_residues(raw.trim());
+    // Some OpenSWATH exports use a terminal sentinel dot before an N-terminal
+    // modification, e.g. `.(UniMod:1)PEPTIDE`.  It is not a residue/flanking
+    // amino acid and should not make an otherwise valid peptidoform fail.
+    let raw = raw.trim_matches('.');
     let chars: Vec<char> = raw.chars().collect();
     let mut sequence = String::new();
     let mut modifications = Vec::new();
@@ -1132,6 +1260,15 @@ mod tests {
         assert_eq!(peptide.modifications[0].residue_index, 5);
         assert!((peptide.modifications[0].mass_delta - 79.9663).abs() < 1e-4);
         assert!((peptide.modifications[1].mass_delta - 15.994915).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parses_openswath_terminal_sentinel_modification() {
+        let peptide = parse_modified_peptide(".(UniMod:1)AAAAAAGAASGLPGPVAQGLK").unwrap();
+        assert_eq!(peptide.sequence, "AAAAAAGAASGLPGPVAQGLK");
+        assert_eq!(peptide.modifications.len(), 1);
+        assert_eq!(peptide.modifications[0].residue_index, 0);
+        assert!((peptide.modifications[0].mass_delta - 42.010567).abs() < 1e-5);
     }
 
     #[test]
