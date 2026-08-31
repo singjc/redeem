@@ -240,7 +240,7 @@ impl FoundationDatasetLoader {
         schema: &TableSchema,
         config: &FoundationTableLoaderConfig,
     ) -> Result<Option<ParsedRow>> {
-        let raw_sequence = field(row, schema.sequence).unwrap_or("").trim();
+        let raw_sequence = field(row, Some(schema.sequence)).unwrap_or("").trim();
         if raw_sequence.is_empty() {
             return Ok(None);
         }
@@ -349,31 +349,34 @@ impl TableSchema {
             ],
         )
         .ok_or_else(|| anyhow!("no peptide-sequence column found in table headers"))?;
+        let normalized_rt = find_header(
+            headers,
+            &[
+                "normalizedretentiontime",
+                "normalized_retention_time",
+                "irt",
+                "indexedretentiontime",
+                "normalizedrt",
+            ],
+        );
+        let observed_rt = find_header_excluding(
+            headers,
+            &[
+                "observedretentiontime",
+                "observed_retention_time",
+                "retention_time",
+                "retentiontime",
+                "retention time",
+                "rtseconds",
+                "rt",
+            ],
+            normalized_rt,
+        );
         Ok(Self {
             sequence,
             charge: find_header(headers, &["precursorcharge", "precursor_charge", "charge"]),
-            normalized_rt: find_header(
-                headers,
-                &[
-                    "normalizedretentiontime",
-                    "normalized_retention_time",
-                    "irt",
-                    "indexedretentiontime",
-                    "normalizedrt",
-                ],
-            ),
-            observed_rt: find_header(
-                headers,
-                &[
-                    "observedretentiontime",
-                    "observed_retention_time",
-                    "retention_time",
-                    "retentiontime",
-                    "retention time",
-                    "rtseconds",
-                    "rt",
-                ],
-            ),
+            normalized_rt,
+            observed_rt,
             ccs: find_header(headers, &["ccs", "collisioncrosssection"]),
             precursor_mz: find_header(
                 headers,
@@ -478,6 +481,33 @@ fn find_header(headers: &StringRecord, aliases: &[&str]) -> Option<usize> {
             .iter()
             .position(|header| normalize_header(header).contains(alias))
         {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn find_header_excluding(
+    headers: &StringRecord,
+    aliases: &[&str],
+    excluded_index: Option<usize>,
+) -> Option<usize> {
+    let aliases: Vec<String> = aliases
+        .iter()
+        .map(|alias| normalize_header(alias))
+        .collect();
+    for alias in &aliases {
+        if let Some(index) = headers.iter().enumerate().find_map(|(index, header)| {
+            (Some(index) != excluded_index && normalize_header(header) == *alias).then_some(index)
+        }) {
+            return Some(index);
+        }
+    }
+    for alias in &aliases {
+        if let Some(index) = headers.iter().enumerate().find_map(|(index, header)| {
+            (Some(index) != excluded_index && normalize_header(header).contains(alias))
+                .then_some(index)
+        }) {
             return Some(index);
         }
     }
@@ -769,5 +799,24 @@ mod tests {
         assert_eq!(records[0].context.charge, Some(2));
         assert_eq!(records[0].context.instrument_id, Some(1));
         assert_eq!(records[0].fragments[1].intensity, 1.0);
+    }
+
+    #[test]
+    fn keeps_normalized_and_observed_retention_time_columns_distinct() {
+        let table = concat!(
+            "ModifiedPeptide\tPrecursorCharge\tNormalizedRetentionTime\tRetentionTime\n",
+            "PEPTIDEK\t2\t31.5\t1800.0\n",
+        );
+        let mut loader = FoundationDatasetLoader::new(8);
+        let records = loader
+            .load_reader(
+                table.as_bytes(),
+                b'\t',
+                &FoundationTableLoaderConfig::default(),
+            )
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].retention_time.normalized, Some(31.5));
+        assert_eq!(records[0].retention_time.observed_seconds, Some(1800.0));
     }
 }

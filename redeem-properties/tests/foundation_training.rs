@@ -30,6 +30,14 @@ fn example_transition_table() -> &'static [u8] {
     .as_bytes()
 }
 
+fn example_transition_table_with_observed_rt() -> &'static [u8] {
+    concat!(
+        "ModifiedPeptide\tPrecursorCharge\tNormalizedRetentionTime\tRetentionTime\n",
+        "PEPTIDEK\t2\t31.5\t1800.0\n",
+    )
+    .as_bytes()
+}
+
 #[test]
 fn foundation_transition_loader_groups_rows_and_keeps_portable_rt() {
     let config = tiny_config();
@@ -50,6 +58,22 @@ fn foundation_transition_loader_groups_rows_and_keeps_portable_rt() {
         .iter()
         .all(|record| record.retention_time.observed_seconds.is_none()));
     assert_eq!(loader.instruments().names().len(), 3);
+}
+
+#[test]
+fn foundation_transition_loader_keeps_observed_rt_separate_when_present() {
+    let config = tiny_config();
+    let mut loader = FoundationDatasetLoader::new(config.instrument_vocab_size);
+    let records = loader
+        .load_reader(
+            example_transition_table_with_observed_rt(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].retention_time.normalized, Some(31.5));
+    assert_eq!(records[0].retention_time.observed_seconds, Some(1800.0));
 }
 
 #[test]
