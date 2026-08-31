@@ -16,6 +16,7 @@ pub mod collate;
 pub mod config;
 pub mod data;
 pub mod dataset;
+pub mod experiment;
 pub mod featurize;
 pub mod layers;
 pub mod loss;
@@ -44,6 +45,11 @@ pub use dataset::{
     FoundationTableLoaderConfig, FoundationTableSchemaReport, FragmentIntensityNormalization,
     InstrumentVocabulary,
 };
+pub use experiment::{
+    build_foundation_benchmark_manifest, foundation_dataset_fingerprint,
+    foundation_record_fingerprint, FoundationBenchmarkEntry, FoundationBenchmarkManifest,
+    FoundationPartition, FOUNDATION_BENCHMARK_MANIFEST_VERSION,
+};
 pub use featurize::{
     exact_graph_modification_for, FoundationBatch, FoundationModification,
     FoundationModificationSite, PeptideGraphFeaturizer, PeptidoformInput,
@@ -61,8 +67,8 @@ pub use model::{
     PeptideFoundationMultiTaskModel, PrecursorContextBatch,
 };
 pub use split::{
-    split_foundation_records, FoundationSplitConfig, FoundationSplitIndices, FoundationSplitMode,
-    FoundationSplitSummary,
+    foundation_split_group_key, split_foundation_record_indices, split_foundation_records,
+    FoundationSplitConfig, FoundationSplitIndices, FoundationSplitMode, FoundationSplitSummary,
 };
 pub use trainer::{
     FoundationEpochMetrics, FoundationStepMetrics, FoundationTrainer, FoundationTrainerConfig,

@@ -143,8 +143,22 @@ pub fn split_foundation_records(
     records: &[FoundationTrainingRecord],
     config: &FoundationSplitConfig,
 ) -> Result<FoundationSplitIndices> {
+    let indices: Vec<usize> = (0..records.len()).collect();
+    split_foundation_record_indices(records, &indices, config)
+}
+
+/// Split a selected subset of records while preserving original record indices.
+///
+/// This is useful for benchmark construction, for example a PTM-family
+/// holdout that intentionally selects only modified peptidoforms while keeping
+/// the full source dataset untouched.
+pub fn split_foundation_record_indices(
+    records: &[FoundationTrainingRecord],
+    selected_indices: &[usize],
+    config: &FoundationSplitConfig,
+) -> Result<FoundationSplitIndices> {
     config.validate()?;
-    if records.is_empty() {
+    if selected_indices.is_empty() {
         return Ok(FoundationSplitIndices {
             train: Vec::new(),
             validation: Vec::new(),
@@ -152,12 +166,25 @@ pub fn split_foundation_records(
             summary: FoundationSplitSummary::default(),
         });
     }
-
-    let mut grouped = BTreeMap::<String, Vec<usize>>::new();
-    for (index, record) in records.iter().enumerate() {
-        let key = split_key(record, config.mode, index)?;
-        grouped.entry(key).or_default().push(index);
+    for &index in selected_indices {
+        if index >= records.len() {
+            return Err(anyhow!(
+                "selected foundation record index {index} is out of bounds for {} records",
+                records.len()
+            ));
+        }
     }
+
+    let grouped = if config.mode == FoundationSplitMode::ModificationFamily {
+        modification_family_connected_groups(records, selected_indices)?
+    } else {
+        let mut grouped = BTreeMap::<String, Vec<usize>>::new();
+        for &index in selected_indices {
+            let key = foundation_split_group_key(&records[index], config.mode, index)?;
+            grouped.entry(key).or_default().push(index);
+        }
+        grouped
+    };
 
     let mut groups: Vec<SplitGroup> = grouped
         .into_iter()
@@ -176,7 +203,7 @@ pub fn split_foundation_records(
             .then_with(|| left.key.cmp(&right.key))
     });
 
-    let total = records.len() as f64;
+    let total = selected_indices.len() as f64;
     let targets = [
         total * (1.0 - config.validation_fraction - config.test_fraction),
         total * config.validation_fraction,
@@ -208,7 +235,7 @@ pub fn split_foundation_records(
 
     let [train, validation, test] = partitions;
     let summary = FoundationSplitSummary {
-        total_records: records.len(),
+        total_records: selected_indices.len(),
         total_groups: group_counts.iter().sum(),
         train_records: train.len(),
         validation_records: validation.len(),
@@ -257,7 +284,12 @@ fn best_partition(
     best
 }
 
-fn split_key(
+/// Return the stable per-record identity label used by ordinary split modes.
+///
+/// For `ModificationFamily`, this returns the canonical family combination for
+/// one record. Actual splitting uses connected components across shared PTM
+/// families so an individual UniMod family can never cross partitions.
+pub fn foundation_split_group_key(
     record: &FoundationTrainingRecord,
     mode: FoundationSplitMode,
     record_index: usize,
@@ -312,25 +344,123 @@ fn modification_signature(record: &FoundationTrainingRecord) -> String {
 }
 
 fn modification_family(record: &FoundationTrainingRecord, record_index: usize) -> Result<String> {
-    if record.peptidoform.modifications.is_empty() {
+    let families = modification_family_ids(record, record_index)?;
+    if families.is_empty() {
         return Ok("unmodified".to_string());
     }
+    Ok(families
+        .into_iter()
+        .map(|id| format!("UniMod:{id}"))
+        .collect::<Vec<_>>()
+        .join("|"))
+}
+
+fn modification_family_connected_groups(
+    records: &[FoundationTrainingRecord],
+    selected_indices: &[usize],
+) -> Result<BTreeMap<String, Vec<usize>>> {
+    let mut family_nodes = BTreeMap::<u32, usize>::new();
+    let mut parent = Vec::<usize>::new();
+    let mut rank = Vec::<u8>::new();
+
+    for &record_index in selected_indices {
+        let record = &records[record_index];
+        let mut families = modification_family_ids(record, record_index)?;
+        if families.is_empty() {
+            continue;
+        }
+        families.sort_unstable();
+        families.dedup();
+        let mut nodes = Vec::<usize>::with_capacity(families.len());
+        for family in families {
+            let node = if let Some(&node) = family_nodes.get(&family) {
+                node
+            } else {
+                let node = parent.len();
+                parent.push(node);
+                rank.push(0);
+                family_nodes.insert(family, node);
+                node
+            };
+            nodes.push(node);
+        }
+        if let Some((&first, rest)) = nodes.split_first() {
+            for &other in rest {
+                union_nodes(&mut parent, &mut rank, first, other);
+            }
+        }
+    }
+
+    let mut root_families = BTreeMap::<usize, Vec<u32>>::new();
+    for (&family, &node) in &family_nodes {
+        let root = find_root(&mut parent, node);
+        root_families.entry(root).or_default().push(family);
+    }
+    for families in root_families.values_mut() {
+        families.sort_unstable();
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<usize>>::new();
+    for &record_index in selected_indices {
+        let families = modification_family_ids(&records[record_index], record_index)?;
+        let key = if families.is_empty() {
+            "unmodified".to_string()
+        } else {
+            let first_family = families[0];
+            let node = family_nodes[&first_family];
+            let root = find_root(&mut parent, node);
+            root_families[&root]
+                .iter()
+                .map(|id| format!("UniMod:{id}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        grouped.entry(key).or_default().push(record_index);
+    }
+    Ok(grouped)
+}
+
+fn modification_family_ids(
+    record: &FoundationTrainingRecord,
+    record_index: usize,
+) -> Result<Vec<u32>> {
     let mut families = Vec::<u32>::new();
     for modification in &record.peptidoform.modifications {
         let Some(unimod_id) = modification.unimod_id else {
             return Err(anyhow!(
-                "record {record_index} contains a modification without canonical UniMod identity;                  modification-family split requires canonical PTM ids"
+                "record {record_index} contains a modification without canonical UniMod identity; modification-family split requires canonical PTM ids"
             ));
         };
         families.push(unimod_id);
     }
     families.sort_unstable();
     families.dedup();
-    Ok(families
-        .into_iter()
-        .map(|id| format!("UniMod:{id}"))
-        .collect::<Vec<_>>()
-        .join("|"))
+    Ok(families)
+}
+
+fn find_root(parent: &mut [usize], node: usize) -> usize {
+    if parent[node] != node {
+        let next = parent[node];
+        let root = find_root(parent, next);
+        parent[node] = root;
+    }
+    parent[node]
+}
+
+fn union_nodes(parent: &mut [usize], rank: &mut [u8], left: usize, right: usize) {
+    let left_root = find_root(parent, left);
+    let right_root = find_root(parent, right);
+    if left_root == right_root {
+        return;
+    }
+    if rank[left_root] < rank[right_root] {
+        parent[left_root] = right_root;
+    } else if rank[left_root] > rank[right_root] {
+        parent[right_root] = left_root;
+    } else {
+        parent[right_root] = left_root;
+        rank[left_root] = rank[left_root].saturating_add(1);
+    }
 }
 
 fn stable_group_hash(value: &str, seed: u64) -> u64 {

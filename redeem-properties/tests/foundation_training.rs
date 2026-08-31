@@ -175,3 +175,41 @@ fn missing_acquisition_metadata_is_encoded_with_presence_masks() {
         vec![0, 0]
     );
 }
+
+#[test]
+fn validation_epoch_reports_losses_without_advancing_optimizer_state() {
+    let config = tiny_config();
+    let mut loader = FoundationDatasetLoader::new(config.instrument_vocab_size);
+    let records = loader
+        .load_reader(
+            example_transition_table(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+    let trainer = FoundationTrainer::new(
+        config,
+        FoundationTrainerConfig {
+            batch_size: 2,
+            collator: FoundationCollatorConfig {
+                corruption: FoundationCorruptionConfig {
+                    residue_mask_probability: 0.25,
+                    chemistry_mask_probability: 0.25,
+                },
+                ..FoundationCollatorConfig::default()
+            },
+            ..FoundationTrainerConfig::default()
+        },
+        Device::Cpu,
+    )
+    .unwrap();
+    let before = trainer.global_step();
+    let first = trainer.evaluate_epoch(&records).unwrap();
+    let second = trainer.evaluate_epoch(&records).unwrap();
+    assert_eq!(trainer.global_step(), before);
+    assert_eq!(first.steps, 1);
+    assert!(first.mean_total_loss.is_finite());
+    assert_eq!(first.mean_total_loss, second.mean_total_loss);
+    assert!(first.mean_rt_loss.unwrap().is_finite());
+    assert!(first.mean_ms2_loss.unwrap().is_finite());
+}

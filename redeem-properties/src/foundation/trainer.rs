@@ -92,10 +92,22 @@ pub struct FoundationStepMetrics {
 /// Aggregate diagnostics for one sequential pass through a record slice.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FoundationEpochMetrics {
-    /// Number of optimizer updates.
+    /// Number of batches evaluated/optimized.
     pub steps: usize,
-    /// Mean total loss across optimizer updates.
+    /// Mean total loss across batches.
     pub mean_total_loss: f32,
+    /// Mean RT loss across batches where RT labels were present.
+    pub mean_rt_loss: Option<f32>,
+    /// Mean CCS loss across batches where CCS labels were present.
+    pub mean_ccs_loss: Option<f32>,
+    /// Mean MS2 loss across batches where fragment labels were present.
+    pub mean_ms2_loss: Option<f32>,
+    /// Mean masked-residue reconstruction loss when active.
+    pub mean_masked_residue_loss: Option<f32>,
+    /// Mean masked-chemistry reconstruction loss when active.
+    pub mean_chemistry_loss: Option<f32>,
+    /// Mean symmetric contrastive loss when batch size permitted it.
+    pub mean_contrastive_loss: Option<f32>,
 }
 
 /// Stateful foundation trainer with model, optimizer, collator, and checkpoint state.
@@ -157,7 +169,7 @@ impl FoundationTrainer {
         let views = self
             .collator
             .collate_views(records, self.wrapper.device(), seed)?;
-        let (total, losses, contrastive) = self.loss_for_views(&views)?;
+        let (total, losses, contrastive) = self.loss_for_views(&views, true)?;
         self.optimizer.backward_step(&total)?;
         self.global_step = self.global_step.wrapping_add(1);
         metrics_from_tensors(&total, &losses, contrastive.as_ref())
@@ -175,17 +187,36 @@ impl FoundationTrainer {
         if records.is_empty() {
             candle_core::bail!("cannot train a foundation epoch with zero records");
         }
-        let mut total = 0.0f32;
-        let mut steps = 0usize;
+        let mut accumulator = EpochAccumulator::default();
         for batch in records.chunks(self.config.batch_size) {
-            let metrics = self.train_step(batch)?;
-            total += metrics.total_loss;
-            steps += 1;
+            accumulator.push(self.train_step(batch)?);
         }
-        Ok(FoundationEpochMetrics {
-            steps,
-            mean_total_loss: total / steps as f32,
-        })
+        Ok(accumulator.finish())
+    }
+
+    /// Evaluate deterministic corrupted views without updating model weights or
+    /// optimizer state. Validation never increments `global_step`.
+    pub fn evaluate_epoch(
+        &self,
+        records: &[FoundationTrainingRecord],
+    ) -> Result<FoundationEpochMetrics> {
+        if records.is_empty() {
+            candle_core::bail!("cannot evaluate a foundation epoch with zero records");
+        }
+        let mut accumulator = EpochAccumulator::default();
+        for (batch_index, batch) in records.chunks(self.config.batch_size).enumerate() {
+            let seed = self
+                .config
+                .seed
+                .wrapping_add(0x4556_414c_0000_0000)
+                .wrapping_add(batch_index as u64);
+            let views = self
+                .collator
+                .collate_views(batch, self.wrapper.device(), seed)?;
+            let (total, losses, contrastive) = self.loss_for_views(&views, false)?;
+            accumulator.push(metrics_from_tensors(&total, &losses, contrastive.as_ref())?);
+        }
+        Ok(accumulator.finish())
     }
 
     /// Access the high-level model wrapper for embedding/evaluation/checkpointing.
@@ -201,15 +232,16 @@ impl FoundationTrainer {
     fn loss_for_views(
         &self,
         views: &FoundationTrainingViews,
+        train: bool,
     ) -> Result<(Tensor, FoundationLosses, Option<Tensor>)> {
         let first =
             self.wrapper
                 .model()
-                .forward_t(&views.first.input, &views.first.context, true)?;
+                .forward_t(&views.first.input, &views.first.context, train)?;
         let second =
             self.wrapper
                 .model()
-                .forward_t(&views.second.input, &views.second.context, true)?;
+                .forward_t(&views.second.input, &views.second.context, train)?;
         let losses = multi_task_loss(&first, &views.first.targets, self.config.loss_weights)?;
         let contrastive = if views.first.input.residue_ids.dims2()?.0 > 1
             && self.config.loss_weights.contrastive > 0.0
@@ -229,6 +261,67 @@ impl FoundationTrainer {
             losses.total.clone()
         };
         Ok((total, losses, contrastive))
+    }
+}
+
+#[derive(Default)]
+struct EpochAccumulator {
+    steps: usize,
+    total: f64,
+    rt: OptionalMean,
+    ccs: OptionalMean,
+    ms2: OptionalMean,
+    masked_residue: OptionalMean,
+    chemistry: OptionalMean,
+    contrastive: OptionalMean,
+}
+
+impl EpochAccumulator {
+    fn push(&mut self, metrics: FoundationStepMetrics) {
+        self.steps += 1;
+        self.total += f64::from(metrics.total_loss);
+        self.rt.push(metrics.rt_loss);
+        self.ccs.push(metrics.ccs_loss);
+        self.ms2.push(metrics.ms2_loss);
+        self.masked_residue.push(metrics.masked_residue_loss);
+        self.chemistry.push(metrics.chemistry_loss);
+        self.contrastive.push(metrics.contrastive_loss);
+    }
+
+    fn finish(self) -> FoundationEpochMetrics {
+        FoundationEpochMetrics {
+            steps: self.steps,
+            mean_total_loss: if self.steps == 0 {
+                0.0
+            } else {
+                (self.total / self.steps as f64) as f32
+            },
+            mean_rt_loss: self.rt.mean(),
+            mean_ccs_loss: self.ccs.mean(),
+            mean_ms2_loss: self.ms2.mean(),
+            mean_masked_residue_loss: self.masked_residue.mean(),
+            mean_chemistry_loss: self.chemistry.mean(),
+            mean_contrastive_loss: self.contrastive.mean(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct OptionalMean {
+    sum: f64,
+    count: usize,
+}
+
+impl OptionalMean {
+    fn push(&mut self, value: Option<f32>) {
+        if let Some(value) = value {
+            self.sum += f64::from(value);
+            self.count += 1;
+        }
+    }
+
+    fn mean(self) -> Option<f32> {
+        (self.count > 0).then(|| (self.sum / self.count as f64) as f32)
     }
 }
 
