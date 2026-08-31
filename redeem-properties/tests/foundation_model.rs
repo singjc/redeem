@@ -43,8 +43,11 @@ fn multi_task_heads_have_expected_shapes() {
         .unwrap();
     let context = PrecursorContextBatch {
         charge: Tensor::from_vec(vec![2.0f32], 1, &device).unwrap(),
+        charge_present: Tensor::from_vec(vec![1.0f32], 1, &device).unwrap(),
         nce: Tensor::from_vec(vec![27.0f32], 1, &device).unwrap(),
+        nce_present: Tensor::from_vec(vec![1.0f32], 1, &device).unwrap(),
         instrument_ids: Tensor::from_vec(vec![0u32], 1, &device).unwrap(),
+        instrument_present: Tensor::from_vec(vec![0.0f32], 1, &device).unwrap(),
     };
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -92,4 +95,33 @@ fn batched_default_length_attention_handles_contiguous_qkv() {
         output.residue_embeddings.dims(),
         &[2, config.max_sequence_len, config.model_dim]
     );
+}
+
+#[test]
+fn all_unknown_acquisition_context_is_a_valid_forward_path() {
+    let device = Device::Cpu;
+    let config = FoundationConfig {
+        max_sequence_len: 12,
+        transformer_layers: 1,
+        ..FoundationConfig::default()
+    };
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let batch = featurizer
+        .featurize(&[PeptidoformInput::unmodified("PEPTIDEK")], &device)
+        .unwrap();
+    let context = PrecursorContextBatch::unknown(1, &device).unwrap();
+    assert_eq!(context.charge_present.to_vec1::<f32>().unwrap(), vec![0.0]);
+    assert_eq!(context.nce_present.to_vec1::<f32>().unwrap(), vec![0.0]);
+    assert_eq!(
+        context.instrument_present.to_vec1::<f32>().unwrap(),
+        vec![0.0]
+    );
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultiTaskModel::new(config.clone(), vb).unwrap();
+    let output = model.forward_t(&batch, &context, false).unwrap();
+    assert_eq!(output.rt.dims(), &[1, 1]);
+    assert_eq!(output.ccs.dims(), &[1, 1]);
+    assert_eq!(output.ms2.dims(), &[1, config.max_sequence_len - 1, 8]);
 }

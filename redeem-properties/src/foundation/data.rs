@@ -28,8 +28,13 @@ pub struct FragmentTarget {
     pub intensity: f32,
 }
 
-/// Experiment context that should condition a property head rather than the
-/// intrinsic peptide embedding.
+/// Optional experiment context that may condition property-specific heads.
+///
+/// Every field is optional by design. Foundation encoding and property
+/// inference must remain valid when acquisition metadata were never curated,
+/// were lost during export, or are genuinely unknown at test time. Run/LC
+/// provenance is retained here but is not injected into the intrinsic peptide
+/// representation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrainingContext {
     /// Precursor charge.

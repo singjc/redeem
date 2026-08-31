@@ -45,12 +45,17 @@ pub struct FoundationTableLoaderConfig {
     /// Optional explicit delimiter.  When absent, `.tsv` uses tab and all other
     /// paths use comma.
     pub delimiter: Option<u8>,
-    /// NCE used when a table has no collision-energy column.
+    /// Optional NCE supplied at source level when the table has no column.
+    /// `None` is fully supported and remains explicitly unknown.
     pub default_nce: Option<f32>,
-    /// Instrument label used when a table has no instrument column.
+    /// Optional instrument label supplied at source level. `None` is valid.
     pub default_instrument: Option<String>,
     /// Optional run id assigned to every row when no run column exists.
+    /// Run id is provenance/splitting metadata and is not a learned context by default.
     pub default_run_id: Option<String>,
+    /// Optional LC gradient duration in seconds supplied at source level.
+    /// This is retained for future observed-RT conditioning and may remain unknown.
+    pub default_gradient_seconds: Option<f32>,
     /// Per-precursor fragment-intensity normalization.
     pub fragment_normalization: FragmentIntensityNormalization,
     /// When true, malformed peptide/modification annotations return an error;
@@ -65,6 +70,7 @@ impl Default for FoundationTableLoaderConfig {
             default_nce: None,
             default_instrument: None,
             default_run_id: None,
+            default_gradient_seconds: None,
             fragment_normalization: FragmentIntensityNormalization::Max,
             strict: true,
         }
@@ -229,6 +235,20 @@ pub struct FoundationTableLoadStats {
     pub n_terminal_modification_occurrences: usize,
     /// C-terminal modification occurrences.
     pub c_terminal_modification_occurrences: usize,
+    /// Records carrying precursor charge.
+    pub charge_records: usize,
+    /// Records carrying precursor m/z.
+    pub precursor_mz_records: usize,
+    /// Records carrying ion mobility.
+    pub ion_mobility_records: usize,
+    /// Records carrying normalized collision energy.
+    pub nce_records: usize,
+    /// Records carrying an explicit instrument identity.
+    pub instrument_records: usize,
+    /// Records carrying a non-empty run identifier.
+    pub run_id_records: usize,
+    /// Records carrying LC gradient duration.
+    pub gradient_seconds_records: usize,
     /// Records carrying normalized RT/iRT.
     pub normalized_rt_records: usize,
     /// Records carrying observed chromatographic RT.
@@ -468,7 +488,9 @@ impl FoundationDatasetLoader {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .or_else(|| config.default_instrument.clone());
-        let instrument_id = self.instruments.id_for(instrument_name.as_deref());
+        let instrument_id = instrument_name
+            .as_deref()
+            .map(|name| self.instruments.id_for(Some(name)));
         let run_id = field(row, schema.run_id)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -479,7 +501,8 @@ impl FoundationDatasetLoader {
         let ccs = parse_f32(field(row, schema.ccs));
         let precursor_mz = parse_f32(field(row, schema.precursor_mz));
         let ion_mobility = parse_f32(field(row, schema.ion_mobility));
-        let gradient_seconds = parse_f32(field(row, schema.gradient_seconds));
+        let gradient_seconds =
+            parse_f32(field(row, schema.gradient_seconds)).or(config.default_gradient_seconds);
 
         let fragment = parse_fragment(row, schema, peptidoform.sequence.len())?;
         let group_key = format!(
@@ -504,7 +527,7 @@ impl FoundationDatasetLoader {
                 charge,
                 precursor_mz,
                 nce,
-                instrument_id: Some(instrument_id),
+                instrument_id,
                 instrument_name,
                 ion_mobility,
                 gradient_seconds,
@@ -949,6 +972,38 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
             if has_unresolved {
                 stats.unresolved_modification_records += 1;
             }
+        }
+        if record.context.charge.is_some() {
+            stats.charge_records += 1;
+        }
+        if record.context.precursor_mz.is_some() {
+            stats.precursor_mz_records += 1;
+        }
+        if record.context.ion_mobility.is_some() {
+            stats.ion_mobility_records += 1;
+        }
+        if record.context.nce.is_some() {
+            stats.nce_records += 1;
+        }
+        if record
+            .context
+            .instrument_name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            stats.instrument_records += 1;
+        }
+        if record
+            .run_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            stats.run_id_records += 1;
+        }
+        if record.context.gradient_seconds.is_some() {
+            stats.gradient_seconds_records += 1;
         }
         if record.retention_time.normalized.is_some() {
             stats.normalized_rt_records += 1;

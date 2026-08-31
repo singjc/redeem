@@ -19,6 +19,7 @@ pub mod dataset;
 pub mod featurize;
 pub mod layers;
 pub mod loss;
+pub mod metadata;
 pub mod model;
 pub mod split;
 pub mod trainer;
@@ -50,6 +51,10 @@ pub use featurize::{
 pub use loss::{
     contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,
     FoundationTargets,
+};
+pub use metadata::{
+    apply_source_metadata, FoundationMetadataApplicationStats, FoundationMetadataMergePolicy,
+    FoundationSourceMetadata,
 };
 pub use model::{
     FoundationMultiTaskOutput, FoundationOutput, PeptideFoundationEncoder,

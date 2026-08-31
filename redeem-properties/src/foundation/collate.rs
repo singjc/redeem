@@ -263,9 +263,29 @@ impl FoundationCollator {
             .iter()
             .map(|record| record.context.charge.unwrap_or(0) as f32)
             .collect();
+        let charge_present: Vec<f32> = records
+            .iter()
+            .map(|record| {
+                if record.context.charge.is_some() {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         let nce: Vec<f32> = records
             .iter()
             .map(|record| record.context.nce.unwrap_or(0.0))
+            .collect();
+        let nce_present: Vec<f32> = records
+            .iter()
+            .map(|record| {
+                if record.context.nce.is_some() {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let instrument_ids: Vec<u32> = records
             .iter()
@@ -277,11 +297,24 @@ impl FoundationCollator {
                     .min(self.model_config.instrument_vocab_size.saturating_sub(1) as u32)
             })
             .collect();
+        let instrument_present: Vec<f32> = records
+            .iter()
+            .map(|record| {
+                if record.context.instrument_id.is_some_and(|id| id > 0) {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         Ok(PrecursorContextBatch {
             charge: Tensor::from_vec(charge, records.len(), device)?,
+            charge_present: Tensor::from_vec(charge_present, records.len(), device)?,
             nce: Tensor::from_vec(nce, records.len(), device)?,
+            nce_present: Tensor::from_vec(nce_present, records.len(), device)?,
             instrument_ids: Tensor::from_vec(instrument_ids, records.len(), device)?
                 .to_dtype(DType::U32)?,
+            instrument_present: Tensor::from_vec(instrument_present, records.len(), device)?,
         })
     }
 
@@ -471,5 +504,17 @@ mod tests {
         assert_eq!(batch.targets.ms2.as_ref().unwrap().dims(), &[2, 11, 8]);
         assert!(batch.targets.masked_residue_indices.is_some());
         assert!(batch.targets.chemistry_mask.is_some());
+        assert_eq!(
+            batch.context.charge_present.to_vec1::<f32>().unwrap(),
+            vec![1.0, 1.0]
+        );
+        assert_eq!(
+            batch.context.nce_present.to_vec1::<f32>().unwrap(),
+            vec![1.0, 0.0]
+        );
+        assert_eq!(
+            batch.context.instrument_present.to_vec1::<f32>().unwrap(),
+            vec![0.0, 0.0]
+        );
     }
 }

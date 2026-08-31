@@ -84,6 +84,21 @@ impl FoundationModelWrapper {
         self.model.forward_t(&batch, &context, false)
     }
 
+    /// Predict with acquisition context explicitly unavailable.
+    ///
+    /// The intrinsic encoder never consumes acquisition metadata. Property
+    /// heads receive the learned unknown-instrument category plus zero values
+    /// whose presence masks are also zero, so missing metadata is not confused
+    /// with a real zero-valued measurement.
+    pub fn predict_unknown_context(
+        &self,
+        peptides: &[PeptidoformInput],
+    ) -> Result<FoundationMultiTaskOutput> {
+        let batch = self.featurizer.featurize(peptides, &self.device)?;
+        let context = PrecursorContextBatch::unknown(peptides.len(), &self.device)?;
+        self.model.forward_t(&batch, &context, false)
+    }
+
     /// Foundation model configuration associated with this wrapper.
     pub fn config(&self) -> &FoundationConfig {
         &self.config
@@ -119,9 +134,17 @@ pub(crate) fn context_batch(
         .iter()
         .map(|context| context.charge.unwrap_or(0) as f32)
         .collect();
+    let charge_present: Vec<f32> = contexts
+        .iter()
+        .map(|context| if context.charge.is_some() { 1.0 } else { 0.0 })
+        .collect();
     let nce: Vec<f32> = contexts
         .iter()
         .map(|context| context.nce.unwrap_or(0.0))
+        .collect();
+    let nce_present: Vec<f32> = contexts
+        .iter()
+        .map(|context| if context.nce.is_some() { 1.0 } else { 0.0 })
         .collect();
     let instrument_ids: Vec<u32> = contexts
         .iter()
@@ -132,11 +155,24 @@ pub(crate) fn context_batch(
                 .min(instrument_vocab_size.saturating_sub(1) as u32)
         })
         .collect();
+    let instrument_present: Vec<f32> = contexts
+        .iter()
+        .map(|context| {
+            if context.instrument_id.is_some_and(|id| id > 0) {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
     Ok(PrecursorContextBatch {
         charge: Tensor::from_vec(charge, contexts.len(), device)?,
+        charge_present: Tensor::from_vec(charge_present, contexts.len(), device)?,
         nce: Tensor::from_vec(nce, contexts.len(), device)?,
+        nce_present: Tensor::from_vec(nce_present, contexts.len(), device)?,
         instrument_ids: Tensor::from_vec(instrument_ids, contexts.len(), device)?
             .to_dtype(DType::U32)?,
+        instrument_present: Tensor::from_vec(instrument_present, contexts.len(), device)?,
     })
 }
 
@@ -167,5 +203,10 @@ mod tests {
             .unwrap();
         assert_eq!(prediction.rt.dims(), &[1, 1]);
         assert_eq!(prediction.ccs.dims(), &[1, 1]);
+
+        let unknown = wrapper.predict_unknown_context(&peptides).unwrap();
+        assert_eq!(unknown.rt.dims(), &[1, 1]);
+        assert_eq!(unknown.ccs.dims(), &[1, 1]);
+        assert_eq!(unknown.ms2.dims()[0], 1);
     }
 }

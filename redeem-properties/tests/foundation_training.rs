@@ -138,3 +138,40 @@ fn foundation_trainer_performs_a_real_adamw_step() {
     assert!(metrics.total_loss.is_finite());
     assert!(metrics.contrastive_loss.unwrap().is_finite());
 }
+
+#[test]
+fn missing_acquisition_metadata_is_encoded_with_presence_masks() {
+    let table = concat!(
+        "ModifiedPeptide\tPrecursorCharge\tNormalizedRetentionTime\n",
+        "PEPTIDEK\t2\t31.5\n",
+        "AGHCEWQMK\t\t47.0\n",
+    );
+    let config = tiny_config();
+    let mut loader = FoundationDatasetLoader::new(config.instrument_vocab_size);
+    let records = loader
+        .load_reader(
+            table.as_bytes(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+    let collator = FoundationCollator::new(config, FoundationCollatorConfig::default()).unwrap();
+    let batch = collator.collate(&records, &Device::Cpu, 11).unwrap();
+
+    assert_eq!(
+        batch.context.charge_present.to_vec1::<f32>().unwrap(),
+        vec![1.0, 0.0]
+    );
+    assert_eq!(
+        batch.context.nce_present.to_vec1::<f32>().unwrap(),
+        vec![0.0, 0.0]
+    );
+    assert_eq!(
+        batch.context.instrument_present.to_vec1::<f32>().unwrap(),
+        vec![0.0, 0.0]
+    );
+    assert_eq!(
+        batch.context.instrument_ids.to_vec1::<u32>().unwrap(),
+        vec![0, 0]
+    );
+}

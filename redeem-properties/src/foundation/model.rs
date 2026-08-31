@@ -183,12 +183,36 @@ impl PeptideFoundationEncoder {
 /// Experimental context deliberately kept separate from the intrinsic peptide embedding.
 #[derive(Debug, Clone)]
 pub struct PrecursorContextBatch {
-    /// Precursor charge as `[batch]` floating-point values.
+    /// Precursor charge as `[batch]` floating-point values. Missing values are zero-filled.
     pub charge: Tensor,
-    /// Normalized collision energy as `[batch]` floating-point values.
+    /// One where precursor charge is known, zero where it is unavailable.
+    pub charge_present: Tensor,
+    /// Normalized collision energy as `[batch]` floating-point values. Missing values are zero-filled.
     pub nce: Tensor,
-    /// Integer instrument ids as `[batch]`.
+    /// One where NCE is known, zero where it is unavailable.
+    pub nce_present: Tensor,
+    /// Integer instrument ids as `[batch]`; id zero is the learned unknown category.
     pub instrument_ids: Tensor,
+    /// One where an instrument identity is known, zero for the unknown category.
+    pub instrument_present: Tensor,
+}
+
+impl PrecursorContextBatch {
+    /// Construct a fully unknown acquisition-context batch.
+    ///
+    /// This is the canonical inference path when only peptide chemistry is
+    /// available. Unknown context is represented explicitly rather than being
+    /// confused with a measured zero-valued charge/NCE.
+    pub fn unknown(batch_size: usize, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            charge: Tensor::zeros(batch_size, DType::F32, device)?,
+            charge_present: Tensor::zeros(batch_size, DType::F32, device)?,
+            nce: Tensor::zeros(batch_size, DType::F32, device)?,
+            nce_present: Tensor::zeros(batch_size, DType::F32, device)?,
+            instrument_ids: Tensor::zeros(batch_size, DType::U32, device)?,
+            instrument_present: Tensor::zeros(batch_size, DType::F32, device)?,
+        })
+    }
 }
 
 /// Outputs produced by the shared encoder and all first-generation heads.
@@ -231,14 +255,14 @@ impl PeptideFoundationMultiTaskModel {
         let encoder = PeptideFoundationEncoder::new(config.clone(), vb.pp("encoder"))?;
         Ok(Self {
             rt_head: nn::linear(config.model_dim, 1, vb.pp("heads.rt"))?,
-            ccs_head: nn::linear(config.model_dim + 1, 1, vb.pp("heads.ccs"))?,
+            ccs_head: nn::linear(config.model_dim + 2, 1, vb.pp("heads.ccs"))?,
             instrument_embedding: nn::embedding(
                 config.instrument_vocab_size,
                 16,
                 vb.pp("context.instrument"),
             )?,
             ms2_head: nn::linear(
-                config.model_dim * 2 + 18,
+                config.model_dim * 2 + 21,
                 config.ms2_fragment_channels,
                 vb.pp("heads.ms2"),
             )?,
@@ -268,8 +292,16 @@ impl PeptideFoundationMultiTaskModel {
         let foundation = self.encoder.forward_t(batch, train)?;
         let rt = self.rt_head.forward(&foundation.peptide_embedding)?;
 
-        let charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
-        let ccs_features = Tensor::cat(&[&foundation.peptide_embedding, &charge], 1)?;
+        let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
+        let charge_present = context.charge_present.unsqueeze(1)?;
+        let ccs_features = Tensor::cat(
+            &[
+                &foundation.peptide_embedding,
+                &scaled_charge,
+                &charge_present,
+            ],
+            1,
+        )?;
         let ccs = self.ccs_head.forward(&ccs_features)?;
 
         let (batch_size, sequence_len, _) = foundation.residue_embeddings.dims3()?;
@@ -282,10 +314,22 @@ impl PeptideFoundationMultiTaskModel {
         let instrument = self.instrument_embedding.forward(&context.instrument_ids)?;
         let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
         let scaled_nce = context.nce.affine(1.0 / 100.0, 0.0)?.unsqueeze(1)?;
-        let scalar_context = Tensor::cat(&[&scaled_charge, &scaled_nce], 1)?;
+        let charge_present = context.charge_present.unsqueeze(1)?;
+        let nce_present = context.nce_present.unsqueeze(1)?;
+        let instrument_present = context.instrument_present.unsqueeze(1)?;
+        let scalar_context = Tensor::cat(
+            &[
+                &scaled_charge,
+                &scaled_nce,
+                &charge_present,
+                &nce_present,
+                &instrument_present,
+            ],
+            1,
+        )?;
         let context_features = Tensor::cat(&[&instrument, &scalar_context], 1)?
             .unsqueeze(1)?
-            .broadcast_as((batch_size, sequence_len - 1, 18))?;
+            .broadcast_as((batch_size, sequence_len - 1, 21))?;
         let cleavage_features = Tensor::cat(&[&left, &right, &context_features], 2)?;
         let ms2 = self.ms2_head.forward(&cleavage_features)?.relu()?;
         let left_mask = foundation.residue_mask.narrow(1, 0, sequence_len - 1)?;

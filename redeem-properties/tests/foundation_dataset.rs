@@ -1,6 +1,7 @@
 use redeem_properties::foundation::{
-    split_foundation_records, FoundationDatasetLoader, FoundationSplitConfig, FoundationSplitMode,
-    FoundationTableLoaderConfig,
+    apply_source_metadata, split_foundation_records, FoundationDatasetLoader,
+    FoundationMetadataMergePolicy, FoundationSourceMetadata, FoundationSplitConfig,
+    FoundationSplitMode, FoundationTableLoaderConfig,
 };
 
 fn inspection_table() -> &'static [u8] {
@@ -330,4 +331,60 @@ fn table_report_quantifies_exact_graph_and_fallback_ptms() {
             .get("UniMod:1 Acetyl"),
         Some(&1)
     );
+}
+
+#[test]
+fn source_metadata_is_optional_and_fill_missing_preserves_row_values() {
+    let input = b"sequence\tprecursor_charge\tfragment_type\tfragment_series_number\tproduct_charge\tintensity\nPEPTIDEK\t2\ty\t3\t1\t100\n";
+    let config = FoundationTableLoaderConfig {
+        strict: true,
+        ..FoundationTableLoaderConfig::default()
+    };
+    let mut loader = FoundationDatasetLoader::new(16);
+    let records = loader.load_reader(&input[..], b'\t', &config).unwrap();
+    let mut dataset = loader.finish(records);
+
+    assert_eq!(dataset.records[0].context.nce, None);
+    assert_eq!(dataset.records[0].context.instrument_id, None);
+    assert_eq!(dataset.records[0].run_id, None);
+
+    let empty_stats = apply_source_metadata(
+        &mut dataset,
+        &FoundationSourceMetadata::default(),
+        FoundationMetadataMergePolicy::FillMissing,
+    );
+    assert_eq!(empty_stats.nce_assignments, 0);
+    assert_eq!(dataset.records[0].context.nce, None);
+
+    let stats = apply_source_metadata(
+        &mut dataset,
+        &FoundationSourceMetadata {
+            nce: Some(27.0),
+            instrument: Some("Orbitrap Astral".to_string()),
+            run_id: None,
+            gradient_seconds: None,
+        },
+        FoundationMetadataMergePolicy::FillMissing,
+    );
+    assert_eq!(stats.nce_assignments, 1);
+    assert_eq!(stats.instrument_assignments, 1);
+    assert_eq!(stats.run_id_assignments, 0);
+    assert_eq!(dataset.records[0].context.nce, Some(27.0));
+    assert_eq!(
+        dataset.records[0].context.instrument_name.as_deref(),
+        Some("Orbitrap Astral")
+    );
+    assert!(dataset.records[0].context.instrument_id.is_some());
+    assert_eq!(dataset.records[0].run_id, None);
+
+    dataset.records[0].context.nce = Some(30.0);
+    apply_source_metadata(
+        &mut dataset,
+        &FoundationSourceMetadata {
+            nce: Some(20.0),
+            ..FoundationSourceMetadata::default()
+        },
+        FoundationMetadataMergePolicy::FillMissing,
+    );
+    assert_eq!(dataset.records[0].context.nce, Some(30.0));
 }
