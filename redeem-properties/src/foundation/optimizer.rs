@@ -91,9 +91,10 @@ impl FoundationAdamW {
     /// Create zero-initialized AdamW moment state for all floating-point model variables.
     pub fn new(varmap: &VarMap, config: FoundationAdamWConfig) -> Result<Self> {
         let config = config.validate()?;
-        let data = varmap.data().lock().map_err(|_| {
-            candle_core::Error::Msg("foundation VarMap lock poisoned".to_string())
-        })?;
+        let data = varmap
+            .data()
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("foundation VarMap lock poisoned".to_string()))?;
         let mut named: Vec<(String, Var)> = data
             .iter()
             .filter(|(_, variable)| variable.dtype().is_float())
@@ -104,16 +105,8 @@ impl FoundationAdamW {
 
         let mut variables = Vec::with_capacity(named.len());
         for (name, variable) in named {
-            let first_moment = Var::zeros(
-                variable.shape(),
-                variable.dtype(),
-                variable.device(),
-            )?;
-            let second_moment = Var::zeros(
-                variable.shape(),
-                variable.dtype(),
-                variable.device(),
-            )?;
+            let first_moment = Var::zeros(variable.shape(), variable.dtype(), variable.device())?;
+            let second_moment = Var::zeros(variable.shape(), variable.dtype(), variable.device())?;
             variables.push(FoundationAdamWVariable {
                 name,
                 variable,
@@ -177,10 +170,10 @@ impl FoundationAdamW {
                 raw_gradient.clone()
             };
 
-            let next_first = ((state.first_moment.as_tensor() * beta1)?
-                + (&gradient * (1.0 - beta1))?)?;
-            let next_second = ((state.second_moment.as_tensor() * beta2)?
-                + (gradient.sqr()? * (1.0 - beta2))?)?;
+            let next_first =
+                ((state.first_moment.as_tensor() * beta1)? + (&gradient * (1.0 - beta1))?)?;
+            let next_second =
+                ((state.second_moment.as_tensor() * beta2)? + (gradient.sqr()? * (1.0 - beta2))?)?;
             let corrected_first = (&next_first * bias_m)?;
             let corrected_second = (&next_second * bias_v)?;
             let decayed_parameter = (state.variable.as_tensor() * (1.0 - decay))?;
