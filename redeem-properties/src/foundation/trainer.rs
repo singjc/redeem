@@ -72,6 +72,33 @@ impl FoundationGradientDiagnosticsConfig {
     }
 }
 
+/// Task-specific gradient gates applied only where supervised heads feed back into
+/// the shared foundation encoder. These are not loss weights: head-parameter
+/// gradients and forward predictions are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FoundationSharedGradientScalesConfig {
+    /// Multiplier for the RT gradient entering the shared encoder.
+    pub rt_encoder: f64,
+}
+
+impl Default for FoundationSharedGradientScalesConfig {
+    fn default() -> Self {
+        Self { rt_encoder: 1.0 }
+    }
+}
+
+impl FoundationSharedGradientScalesConfig {
+    fn validate(self) -> Result<Self> {
+        if !(0.0..=1.0).contains(&self.rt_encoder) || !self.rt_encoder.is_finite() {
+            candle_core::bail!(
+                "foundation RT encoder gradient scale must be finite and within [0, 1]"
+            );
+        }
+        Ok(self)
+    }
+}
+
 /// Training hyperparameters independent from the model architecture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -90,6 +117,8 @@ pub struct FoundationTrainerConfig {
     pub adam_epsilon: f64,
     /// Optional global L2 gradient clipping threshold.
     pub max_gradient_norm: Option<f64>,
+    /// Task-specific gradient gates into the shared foundation encoder.
+    pub shared_gradient_scales: FoundationSharedGradientScalesConfig,
     /// Sampled weighted per-task gradient diagnostics.
     pub gradient_diagnostics: FoundationGradientDiagnosticsConfig,
     /// Per-step learning-rate schedule.
@@ -119,6 +148,7 @@ impl Default for FoundationTrainerConfig {
             adam_beta2: 0.999,
             adam_epsilon: 1e-8,
             max_gradient_norm: Some(1.0),
+            shared_gradient_scales: FoundationSharedGradientScalesConfig::default(),
             gradient_diagnostics: FoundationGradientDiagnosticsConfig::default(),
             learning_rate_schedule: FoundationLearningRateSchedule::Constant,
             contrastive_temperature: 0.10,
@@ -142,6 +172,7 @@ impl FoundationTrainerConfig {
                 candle_core::bail!("foundation max_gradient_norm must be positive and finite");
             }
         }
+        let _ = self.shared_gradient_scales.validate()?;
         let _ = self.gradient_diagnostics.validate()?;
         self.learning_rate_schedule
             .validate()
@@ -208,14 +239,26 @@ pub struct FoundationStepMetrics {
     pub rt_loss: Option<f32>,
     /// RT mean absolute error in native target units.
     pub rt_mae_native: Option<f32>,
-    /// RT root mean squared error in native target units.
+    /// RT root mean squared error in native target units for this mini-batch.
     pub rt_rmse_native: Option<f32>,
+    /// Number of native-unit RT labels contributing to this mini-batch metric.
+    pub rt_native_label_count: usize,
+    /// Sum of absolute native-unit RT errors in this mini-batch.
+    pub rt_absolute_error_sum_native: f64,
+    /// Sum of squared native-unit RT errors in this mini-batch.
+    pub rt_squared_error_sum_native: f64,
     /// Single-view CCS loss in the regression space used for optimization.
     pub ccs_loss: Option<f32>,
     /// CCS mean absolute error in native target units.
     pub ccs_mae_native: Option<f32>,
-    /// CCS root mean squared error in native target units.
+    /// CCS root mean squared error in native target units for this mini-batch.
     pub ccs_rmse_native: Option<f32>,
+    /// Number of native-unit CCS labels contributing to this mini-batch metric.
+    pub ccs_native_label_count: usize,
+    /// Sum of absolute native-unit CCS errors in this mini-batch.
+    pub ccs_absolute_error_sum_native: f64,
+    /// Sum of squared native-unit CCS errors in this mini-batch.
+    pub ccs_squared_error_sum_native: f64,
     /// Single-view MS2 loss.
     pub ms2_loss: Option<f32>,
     /// Masked residue-token reconstruction loss.
@@ -243,16 +286,20 @@ pub struct FoundationEpochMetrics {
     pub mean_total_loss: f32,
     /// Mean RT loss across batches where RT labels were present, in normalized regression space.
     pub mean_rt_loss: Option<f32>,
-    /// Mean per-batch RT MAE in native target units.
+    /// Exact RT MAE in native target units across all labelled examples in the epoch.
     pub mean_rt_mae_native: Option<f32>,
-    /// Mean per-batch RT RMSE in native target units.
+    /// Exact RT RMSE in native target units across all labelled examples in the epoch.
     pub mean_rt_rmse_native: Option<f32>,
+    /// Number of RT labels contributing to the exact native-unit metrics.
+    pub rt_native_label_count: usize,
     /// Mean CCS loss across batches where CCS labels were present, in normalized regression space.
     pub mean_ccs_loss: Option<f32>,
-    /// Mean per-batch CCS MAE in native target units.
+    /// Exact CCS MAE in native target units across all labelled examples in the epoch.
     pub mean_ccs_mae_native: Option<f32>,
-    /// Mean per-batch CCS RMSE in native target units.
+    /// Exact CCS RMSE in native target units across all labelled examples in the epoch.
     pub mean_ccs_rmse_native: Option<f32>,
+    /// Number of CCS labels contributing to the exact native-unit metrics.
+    pub ccs_native_label_count: usize,
     /// Mean MS2 loss across batches where fragment labels were present.
     pub mean_ms2_loss: Option<f32>,
     /// Mean masked-residue reconstruction loss when active.
@@ -1059,22 +1106,32 @@ impl FoundationTrainer {
         Option<Tensor>,
         RegressionDiagnostics,
     )> {
-        let first =
-            self.wrapper
-                .model()
-                .forward_t(&views.first.input, &views.first.context, train)?;
-        let second =
-            self.wrapper
-                .model()
-                .forward_t(&views.second.input, &views.second.context, train)?;
+        let first = self
+            .wrapper
+            .model()
+            .forward_t_with_rt_encoder_gradient_scale(
+                &views.first.input,
+                &views.first.context,
+                train,
+                self.config.shared_gradient_scales.rt_encoder,
+            )?;
+        let second = self
+            .wrapper
+            .model()
+            .forward_t_with_rt_encoder_gradient_scale(
+                &views.second.input,
+                &views.second.context,
+                train,
+                self.config.shared_gradient_scales.rt_encoder,
+            )?;
         let regression = RegressionDiagnostics {
-            rt: regression_native_metrics(
+            rt: regression_native_sufficient_statistics(
                 &first.rt,
                 views.first.targets.rt.as_ref(),
                 views.first.targets.rt_mask.as_ref(),
                 &self.config.target_normalization.rt,
             )?,
-            ccs: regression_native_metrics(
+            ccs: regression_native_sufficient_statistics(
                 &first.ccs,
                 views.first.targets.ccs.as_ref(),
                 views.first.targets.ccs_mask.as_ref(),
@@ -1105,16 +1162,40 @@ impl FoundationTrainer {
 
 #[derive(Default)]
 struct RegressionDiagnostics {
-    rt: Option<(Tensor, Tensor)>,
-    ccs: Option<(Tensor, Tensor)>,
+    rt: Option<RegressionNativeSufficientStatistics>,
+    ccs: Option<RegressionNativeSufficientStatistics>,
 }
 
-fn regression_native_metrics(
+struct RegressionNativeSufficientStatistics {
+    absolute_error_sum: Tensor,
+    squared_error_sum: Tensor,
+    label_count: Tensor,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RegressionNativeScalars {
+    absolute_error_sum: f64,
+    squared_error_sum: f64,
+    label_count: usize,
+}
+
+impl RegressionNativeScalars {
+    fn mae(self) -> Option<f32> {
+        (self.label_count > 0).then(|| (self.absolute_error_sum / self.label_count as f64) as f32)
+    }
+
+    fn rmse(self) -> Option<f32> {
+        (self.label_count > 0)
+            .then(|| (self.squared_error_sum / self.label_count as f64).sqrt() as f32)
+    }
+}
+
+fn regression_native_sufficient_statistics(
     prediction: &Tensor,
     target: Option<&Tensor>,
     mask: Option<&Tensor>,
     normalization: &FoundationRegressionNormalization,
-) -> Result<Option<(Tensor, Tensor)>> {
+) -> Result<Option<RegressionNativeSufficientStatistics>> {
     let (Some(target), Some(mask)) = (target, mask) else {
         if target.is_some() || mask.is_some() {
             candle_core::bail!("foundation regression target and mask must be supplied together");
@@ -1125,20 +1206,32 @@ fn regression_native_metrics(
     let target = normalization.denormalize_tensor(target)?;
     let mask = mask.broadcast_as(prediction.dims())?;
     let difference = (&prediction - &target)?;
-    let denominator = mask.sum_all()?.clamp(1.0, f64::INFINITY)?;
-    let mae = difference
-        .sqr()?
-        .sqrt()?
-        .broadcast_mul(&mask)?
-        .sum_all()?
-        .broadcast_div(&denominator)?;
-    let rmse = difference
-        .sqr()?
-        .broadcast_mul(&mask)?
-        .sum_all()?
-        .broadcast_div(&denominator)?
-        .sqrt()?;
-    Ok(Some((mae, rmse)))
+    let squared = difference.sqr()?;
+    let absolute_error_sum = squared.sqrt()?.broadcast_mul(&mask)?.sum_all()?;
+    let squared_error_sum = squared.broadcast_mul(&mask)?.sum_all()?;
+    let label_count = mask.sum_all()?;
+    Ok(Some(RegressionNativeSufficientStatistics {
+        absolute_error_sum,
+        squared_error_sum,
+        label_count,
+    }))
+}
+
+fn regression_native_scalars(
+    value: Option<&RegressionNativeSufficientStatistics>,
+) -> Result<RegressionNativeScalars> {
+    let Some(value) = value else {
+        return Ok(RegressionNativeScalars::default());
+    };
+    let label_count = value.label_count.to_scalar::<f32>()?;
+    if !(label_count.is_finite() && label_count >= 0.0) {
+        candle_core::bail!("foundation regression native label count is invalid: {label_count}");
+    }
+    Ok(RegressionNativeScalars {
+        absolute_error_sum: f64::from(value.absolute_error_sum.to_scalar::<f32>()?),
+        squared_error_sum: f64::from(value.squared_error_sum.to_scalar::<f32>()?),
+        label_count: label_count.round() as usize,
+    })
 }
 
 #[derive(Default)]
@@ -1146,11 +1239,9 @@ struct EpochAccumulator {
     steps: usize,
     total: f64,
     rt: OptionalMean,
-    rt_mae_native: OptionalMean,
-    rt_rmse_native: OptionalMean,
+    rt_native: NativeRegressionAccumulator,
     ccs: OptionalMean,
-    ccs_mae_native: OptionalMean,
-    ccs_rmse_native: OptionalMean,
+    ccs_native: NativeRegressionAccumulator,
     ms2: OptionalMean,
     masked_residue: OptionalMean,
     chemistry: OptionalMean,
@@ -1179,11 +1270,17 @@ impl EpochAccumulator {
         self.steps += 1;
         self.total += f64::from(metrics.total_loss);
         self.rt.push(metrics.rt_loss);
-        self.rt_mae_native.push(metrics.rt_mae_native);
-        self.rt_rmse_native.push(metrics.rt_rmse_native);
+        self.rt_native.push(
+            metrics.rt_absolute_error_sum_native,
+            metrics.rt_squared_error_sum_native,
+            metrics.rt_native_label_count,
+        );
         self.ccs.push(metrics.ccs_loss);
-        self.ccs_mae_native.push(metrics.ccs_mae_native);
-        self.ccs_rmse_native.push(metrics.ccs_rmse_native);
+        self.ccs_native.push(
+            metrics.ccs_absolute_error_sum_native,
+            metrics.ccs_squared_error_sum_native,
+            metrics.ccs_native_label_count,
+        );
         self.ms2.push(metrics.ms2_loss);
         self.masked_residue.push(metrics.masked_residue_loss);
         self.chemistry.push(metrics.chemistry_loss);
@@ -1228,11 +1325,13 @@ impl EpochAccumulator {
                 (self.total / self.steps as f64) as f32
             },
             mean_rt_loss: self.rt.mean(),
-            mean_rt_mae_native: self.rt_mae_native.mean(),
-            mean_rt_rmse_native: self.rt_rmse_native.mean(),
+            mean_rt_mae_native: self.rt_native.mae(),
+            mean_rt_rmse_native: self.rt_native.rmse(),
+            rt_native_label_count: self.rt_native.label_count,
             mean_ccs_loss: self.ccs.mean(),
-            mean_ccs_mae_native: self.ccs_mae_native.mean(),
-            mean_ccs_rmse_native: self.ccs_rmse_native.mean(),
+            mean_ccs_mae_native: self.ccs_native.mae(),
+            mean_ccs_rmse_native: self.ccs_native.rmse(),
+            ccs_native_label_count: self.ccs_native.label_count,
             mean_ms2_loss: self.ms2.mean(),
             mean_masked_residue_loss: self.masked_residue.mean(),
             mean_chemistry_loss: self.chemistry.mean(),
@@ -1261,6 +1360,30 @@ impl EpochAccumulator {
                 .mean(),
             final_learning_rate: self.final_learning_rate,
         }
+    }
+}
+
+#[derive(Default)]
+struct NativeRegressionAccumulator {
+    absolute_error_sum: f64,
+    squared_error_sum: f64,
+    label_count: usize,
+}
+
+impl NativeRegressionAccumulator {
+    fn push(&mut self, absolute_error_sum: f64, squared_error_sum: f64, label_count: usize) {
+        self.absolute_error_sum += absolute_error_sum;
+        self.squared_error_sum += squared_error_sum;
+        self.label_count = self.label_count.saturating_add(label_count);
+    }
+
+    fn mae(&self) -> Option<f32> {
+        (self.label_count > 0).then(|| (self.absolute_error_sum / self.label_count as f64) as f32)
+    }
+
+    fn rmse(&self) -> Option<f32> {
+        (self.label_count > 0)
+            .then(|| (self.squared_error_sum / self.label_count as f64).sqrt() as f32)
     }
 }
 
@@ -1311,14 +1434,22 @@ fn metrics_from_tensors(
     task_gradient_norms: Option<FoundationTaskGradientNorms>,
 ) -> Result<FoundationStepMetrics> {
     let (learning_rate, gradient_norm, gradient_scale) = optimizer.unwrap_or((0.0, 0.0, 1.0));
+    let rt_native = regression_native_scalars(regression.rt.as_ref())?;
+    let ccs_native = regression_native_scalars(regression.ccs.as_ref())?;
     Ok(FoundationStepMetrics {
         total_loss: total.to_scalar::<f32>()?,
         rt_loss: scalar_option(losses.rt.as_ref())?,
-        rt_mae_native: scalar_pair_option(regression.rt.as_ref(), 0)?,
-        rt_rmse_native: scalar_pair_option(regression.rt.as_ref(), 1)?,
+        rt_mae_native: rt_native.mae(),
+        rt_rmse_native: rt_native.rmse(),
+        rt_native_label_count: rt_native.label_count,
+        rt_absolute_error_sum_native: rt_native.absolute_error_sum,
+        rt_squared_error_sum_native: rt_native.squared_error_sum,
         ccs_loss: scalar_option(losses.ccs.as_ref())?,
-        ccs_mae_native: scalar_pair_option(regression.ccs.as_ref(), 0)?,
-        ccs_rmse_native: scalar_pair_option(regression.ccs.as_ref(), 1)?,
+        ccs_mae_native: ccs_native.mae(),
+        ccs_rmse_native: ccs_native.rmse(),
+        ccs_native_label_count: ccs_native.label_count,
+        ccs_absolute_error_sum_native: ccs_native.absolute_error_sum,
+        ccs_squared_error_sum_native: ccs_native.squared_error_sum,
         ms2_loss: scalar_option(losses.ms2.as_ref())?,
         masked_residue_loss: scalar_option(losses.masked_residue.as_ref())?,
         chemistry_loss: scalar_option(losses.chemistry.as_ref())?,
@@ -1332,13 +1463,6 @@ fn metrics_from_tensors(
 
 fn scalar_option(value: Option<&Tensor>) -> Result<Option<f32>> {
     value.map(|value| value.to_scalar::<f32>()).transpose()
-}
-
-fn scalar_pair_option(value: Option<&(Tensor, Tensor)>, index: usize) -> Result<Option<f32>> {
-    value
-        .map(|pair| if index == 0 { &pair.0 } else { &pair.1 })
-        .map(|value| value.to_scalar::<f32>())
-        .transpose()
 }
 
 #[cfg(test)]

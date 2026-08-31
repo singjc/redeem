@@ -445,8 +445,56 @@ fn normalized_regression_reports_native_unit_errors() {
     assert!(metrics.rt_loss.is_some_and(f32::is_finite));
     assert!(metrics.rt_mae_native.is_some_and(f32::is_finite));
     assert!(metrics.rt_rmse_native.is_some_and(f32::is_finite));
+    assert_eq!(metrics.rt_native_label_count, records.len());
     assert!(metrics.ccs_mae_native.is_some_and(f32::is_finite));
     assert!(metrics.ccs_rmse_native.is_some_and(f32::is_finite));
+    assert_eq!(metrics.ccs_native_label_count, records.len());
+}
+
+#[test]
+fn epoch_native_regression_metrics_accumulate_exact_sufficient_statistics() {
+    let mut expanded = records();
+    let mut third = expanded[0].clone();
+    third.retention_time.normalized = Some(90.0);
+    third.ccs = Some(700.0);
+    expanded.push(third);
+
+    let mut config = trainer_config();
+    config.batch_size = 2;
+    config.collator.corruption = FoundationCorruptionConfig {
+        residue_mask_probability: 0.0,
+        chemistry_mask_probability: 0.0,
+    };
+    let trainer = FoundationTrainer::new(tiny_config(), config, Device::Cpu).unwrap();
+    let epoch = trainer.evaluate_epoch(&expanded).unwrap();
+
+    let mut rt_absolute_sum = 0.0f64;
+    let mut rt_squared_sum = 0.0f64;
+    let mut ccs_absolute_sum = 0.0f64;
+    let mut ccs_squared_sum = 0.0f64;
+    for record in &expanded {
+        let single = trainer
+            .evaluate_epoch(std::slice::from_ref(record))
+            .unwrap();
+        let rt_error = f64::from(single.mean_rt_rmse_native.unwrap());
+        let ccs_error = f64::from(single.mean_ccs_rmse_native.unwrap());
+        rt_absolute_sum += f64::from(single.mean_rt_mae_native.unwrap());
+        rt_squared_sum += rt_error * rt_error;
+        ccs_absolute_sum += f64::from(single.mean_ccs_mae_native.unwrap());
+        ccs_squared_sum += ccs_error * ccs_error;
+    }
+    let count = expanded.len() as f64;
+    let expected_rt_mae = rt_absolute_sum / count;
+    let expected_rt_rmse = (rt_squared_sum / count).sqrt();
+    let expected_ccs_mae = ccs_absolute_sum / count;
+    let expected_ccs_rmse = (ccs_squared_sum / count).sqrt();
+
+    assert_eq!(epoch.rt_native_label_count, expanded.len());
+    assert_eq!(epoch.ccs_native_label_count, expanded.len());
+    assert!((f64::from(epoch.mean_rt_mae_native.unwrap()) - expected_rt_mae).abs() < 1e-4);
+    assert!((f64::from(epoch.mean_rt_rmse_native.unwrap()) - expected_rt_rmse).abs() < 1e-4);
+    assert!((f64::from(epoch.mean_ccs_mae_native.unwrap()) - expected_ccs_mae).abs() < 1e-4);
+    assert!((f64::from(epoch.mean_ccs_rmse_native.unwrap()) - expected_ccs_rmse).abs() < 1e-4);
 }
 
 #[test]

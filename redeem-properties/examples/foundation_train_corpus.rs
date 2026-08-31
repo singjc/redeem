@@ -26,6 +26,10 @@ fn main() -> Result<()> {
     println!("validation_records\t{}", summary.validation_records);
     println!("test_records\t{}", summary.test_records);
     println!("resumed\t{}", summary.resumed);
+    println!(
+        "rt_encoder_gradient_scale\t{}",
+        config.trainer.shared_gradient_scales.rt_encoder
+    );
     print_normalization("rt", &summary.target_normalization.rt);
     print_normalization("ccs", &summary.target_normalization.ccs);
     println!(
@@ -126,6 +130,10 @@ fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
         &format!("{prefix}_rt_rmse_native"),
         metrics.mean_rt_rmse_native,
     );
+    println!(
+        "{prefix}_rt_native_labels\t{}",
+        metrics.rt_native_label_count
+    );
     print_optional_f32(&format!("{prefix}_ccs_loss"), metrics.mean_ccs_loss);
     print_optional_f32(
         &format!("{prefix}_ccs_mae_native"),
@@ -134,6 +142,10 @@ fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
     print_optional_f32(
         &format!("{prefix}_ccs_rmse_native"),
         metrics.mean_ccs_rmse_native,
+    );
+    println!(
+        "{prefix}_ccs_native_labels\t{}",
+        metrics.ccs_native_label_count
     );
     print_optional_f32(&format!("{prefix}_ms2_loss"), metrics.mean_ms2_loss);
     print_optional_f32(
@@ -223,9 +235,17 @@ fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
     print_source_optional(source, "rt_loss", metrics.mean_rt_loss);
     print_source_optional(source, "rt_mae_native", metrics.mean_rt_mae_native);
     print_source_optional(source, "rt_rmse_native", metrics.mean_rt_rmse_native);
+    println!(
+        "validation_source_rt_native_labels\t{source}\t{}",
+        metrics.rt_native_label_count
+    );
     print_source_optional(source, "ccs_loss", metrics.mean_ccs_loss);
     print_source_optional(source, "ccs_mae_native", metrics.mean_ccs_mae_native);
     print_source_optional(source, "ccs_rmse_native", metrics.mean_ccs_rmse_native);
+    println!(
+        "validation_source_ccs_native_labels\t{source}\t{}",
+        metrics.ccs_native_label_count
+    );
     print_source_optional(source, "ms2_loss", metrics.mean_ms2_loss);
     print_source_optional(
         source,
