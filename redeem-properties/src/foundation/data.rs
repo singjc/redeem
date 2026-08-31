@@ -6,6 +6,7 @@
 //! an auxiliary context-conditioned target when LC metadata are available.
 
 use super::featurize::PeptidoformInput;
+use serde::{Deserialize, Serialize};
 
 /// Retention-time labels that may coexist for one peptide observation.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -33,10 +34,16 @@ pub struct FragmentTarget {
 pub struct TrainingContext {
     /// Precursor charge.
     pub charge: Option<i32>,
+    /// Precursor m/z when available.
+    pub precursor_mz: Option<f32>,
     /// Normalized collision energy.
     pub nce: Option<f32>,
     /// Stable instrument-category id assigned by the dataset adapter.
     pub instrument_id: Option<u32>,
+    /// Original instrument label retained for checkpoint metadata/debugging.
+    pub instrument_name: Option<String>,
+    /// Ion mobility value when present in the source table.
+    pub ion_mobility: Option<f32>,
     /// Optional LC gradient duration in seconds for future observed-RT heads.
     pub gradient_seconds: Option<f32>,
 }
@@ -59,7 +66,7 @@ pub struct FoundationTrainingRecord {
 }
 
 /// Which RT target a downstream training adapter should optimize.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetentionTimeObjective {
     /// Train only against normalized RT/iRT.
     Normalized,

@@ -2,33 +2,52 @@
 //!
 //! This module implements a hierarchical representation in three stages:
 //! atom-level residue graphs, residue-level fusion, and peptide-level
-//! Transformer attention.  The intrinsic peptidoform representation is kept
+//! Transformer attention. The intrinsic peptidoform representation is kept
 //! separate from experimental precursor context so the learned embedding can
 //! be reused for RT, CCS, MS2, rescoring, detectability, or future adapters.
 //!
-//! The first implementation uses canonical heavy-atom amino-acid graphs and
-//! can represent unresolved PTMs as mass-delta pseudo-atoms.  The public data
-//! structures are intentionally designed so exact modification chemistry can
-//! replace those pseudo-atoms later without changing the neural interface.
+//! The training stack supports heterogeneous public proteomics corpora: long
+//! transition tables are grouped into precursor records, missing property labels
+//! are represented with masks, and two independently corrupted graph/sequence
+//! views provide masked reconstruction plus contrastive self-supervision.
 
 pub mod chemistry;
+pub mod collate;
 pub mod config;
 pub mod data;
+pub mod dataset;
 pub mod featurize;
 pub mod layers;
 pub mod loss;
 pub mod model;
+pub mod trainer;
+pub mod wrapper;
 
+pub use collate::{
+    FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
+    FoundationTrainingBatch, FoundationTrainingViews,
+};
 pub use config::FoundationConfig;
 pub use data::{
     FoundationTrainingRecord, FragmentTarget, RetentionTimeLabels, RetentionTimeObjective,
     TrainingContext,
 };
+pub use dataset::{
+    parse_modified_peptide, FoundationDataset, FoundationDatasetLoader,
+    FoundationTableLoaderConfig, FragmentIntensityNormalization, InstrumentVocabulary,
+};
 pub use featurize::{
     FoundationBatch, FoundationModification, PeptideGraphFeaturizer, PeptidoformInput,
 };
-pub use loss::{multi_task_loss, FoundationLossWeights, FoundationLosses, FoundationTargets};
+pub use loss::{
+    contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,
+    FoundationTargets,
+};
 pub use model::{
     FoundationMultiTaskOutput, FoundationOutput, PeptideFoundationEncoder,
     PeptideFoundationMultiTaskModel, PrecursorContextBatch,
 };
+pub use trainer::{
+    FoundationEpochMetrics, FoundationStepMetrics, FoundationTrainer, FoundationTrainerConfig,
+};
+pub use wrapper::FoundationModelWrapper;
