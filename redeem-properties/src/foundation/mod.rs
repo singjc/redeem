@@ -20,6 +20,7 @@ pub mod featurize;
 pub mod layers;
 pub mod loss;
 pub mod model;
+pub mod split;
 pub mod trainer;
 pub mod wrapper;
 
@@ -33,8 +34,10 @@ pub use data::{
     TrainingContext,
 };
 pub use dataset::{
-    parse_modified_peptide, FoundationDataset, FoundationDatasetLoader,
-    FoundationTableLoaderConfig, FragmentIntensityNormalization, InstrumentVocabulary,
+    parse_modified_peptide, FoundationDataset, FoundationDatasetLoader, FoundationSchemaCollision,
+    FoundationSchemaField, FoundationTableLoadReport, FoundationTableLoadStats,
+    FoundationTableLoaderConfig, FoundationTableSchemaReport, FragmentIntensityNormalization,
+    InstrumentVocabulary,
 };
 pub use featurize::{
     FoundationBatch, FoundationModification, PeptideGraphFeaturizer, PeptidoformInput,
@@ -46,6 +49,10 @@ pub use loss::{
 pub use model::{
     FoundationMultiTaskOutput, FoundationOutput, PeptideFoundationEncoder,
     PeptideFoundationMultiTaskModel, PrecursorContextBatch,
+};
+pub use split::{
+    split_foundation_records, FoundationSplitConfig, FoundationSplitIndices, FoundationSplitMode,
+    FoundationSplitSummary,
 };
 pub use trainer::{
     FoundationEpochMetrics, FoundationStepMetrics, FoundationTrainer, FoundationTrainerConfig,

@@ -17,7 +17,7 @@ use super::featurize::{FoundationModification, PeptidoformInput};
 use anyhow::{anyhow, Context, Result};
 use csv::{ReaderBuilder, StringRecord};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -110,6 +110,129 @@ impl InstrumentVocabulary {
     }
 }
 
+/// One inferred semantic field in a transition/spectral-library table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundationSchemaField {
+    /// Zero-based source-column index.
+    pub index: usize,
+    /// Original source-column header.
+    pub header: String,
+}
+
+/// One source column claimed by more than one inferred semantic field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundationSchemaCollision {
+    /// Zero-based source-column index.
+    pub index: usize,
+    /// Original source-column header.
+    pub header: String,
+    /// Semantic fields that all resolved to this source column.
+    pub semantics: Vec<String>,
+}
+
+/// Human-readable schema inferred from a transition or spectral-library table.
+///
+/// The report intentionally preserves original header names so schema decisions
+/// made by the permissive alias matcher can be audited before a large training
+/// job starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundationTableSchemaReport {
+    /// All source headers in input order.
+    pub headers: Vec<String>,
+    /// Peptide or modified-peptide column.
+    pub sequence: FoundationSchemaField,
+    /// Precursor charge column.
+    pub charge: Option<FoundationSchemaField>,
+    /// Normalized RT/iRT column.
+    pub normalized_rt: Option<FoundationSchemaField>,
+    /// Observed chromatographic RT column.
+    pub observed_rt: Option<FoundationSchemaField>,
+    /// Collision cross section column.
+    pub ccs: Option<FoundationSchemaField>,
+    /// Precursor m/z column.
+    pub precursor_mz: Option<FoundationSchemaField>,
+    /// Ion-mobility column.
+    pub ion_mobility: Option<FoundationSchemaField>,
+    /// NCE/collision-energy column.
+    pub nce: Option<FoundationSchemaField>,
+    /// Instrument column.
+    pub instrument: Option<FoundationSchemaField>,
+    /// Run/file identifier column.
+    pub run_id: Option<FoundationSchemaField>,
+    /// LC-gradient-duration column.
+    pub gradient_seconds: Option<FoundationSchemaField>,
+    /// Fragment ion-series/type column.
+    pub fragment_type: Option<FoundationSchemaField>,
+    /// Fragment ordinal/series-number column.
+    pub fragment_series: Option<FoundationSchemaField>,
+    /// Product/fragment charge column.
+    pub fragment_charge: Option<FoundationSchemaField>,
+    /// Fragment intensity column.
+    pub fragment_intensity: Option<FoundationSchemaField>,
+    /// Fragment neutral-loss column.
+    pub fragment_loss: Option<FoundationSchemaField>,
+    /// Source columns claimed by multiple semantic fields.  Non-empty output
+    /// should be reviewed before using the table for training.
+    pub collisions: Vec<FoundationSchemaCollision>,
+}
+
+/// Parse/load statistics emitted while inspecting a real training table.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FoundationTableLoadStats {
+    /// Number of physical data rows read after the header.
+    pub input_rows: usize,
+    /// Number of rows that produced a valid precursor observation.
+    pub parsed_rows: usize,
+    /// Rows skipped because the peptide field was empty or too short.
+    pub skipped_empty_or_short_peptide_rows: usize,
+    /// Rows skipped after a parse error in non-strict mode.
+    pub skipped_error_rows: usize,
+    /// Parsed rows that mapped to a supported MS2 output channel.
+    pub supported_fragment_rows: usize,
+    /// Number of grouped precursor-level records after aggregation.
+    pub precursor_records: usize,
+    /// Number of unique unmodified peptide sequences.
+    pub unique_sequences: usize,
+    /// Number of unique peptidoforms including site-specific mass shifts.
+    pub unique_peptidoforms: usize,
+    /// Grouped records containing at least one modification.
+    pub modified_records: usize,
+    /// Records carrying normalized RT/iRT.
+    pub normalized_rt_records: usize,
+    /// Records carrying observed chromatographic RT.
+    pub observed_rt_records: usize,
+    /// Records carrying CCS.
+    pub ccs_records: usize,
+    /// Records carrying at least one supported fragment target.
+    pub ms2_records: usize,
+    /// Distinct non-empty run identifiers.
+    pub unique_runs: usize,
+    /// Distinct non-empty instrument labels.
+    pub unique_instruments: usize,
+    /// Minimum peptide length among grouped records.
+    pub min_sequence_len: Option<usize>,
+    /// Maximum peptide length among grouped records.
+    pub max_sequence_len: Option<usize>,
+    /// Mean peptide length among grouped records.
+    pub mean_sequence_len: Option<f64>,
+    /// Up to a small bounded set of parse-error examples collected in
+    /// non-strict mode.
+    pub error_examples: Vec<String>,
+}
+
+/// Auditable result of loading/inspecting one table.
+#[derive(Debug, Clone)]
+pub struct FoundationTableLoadReport {
+    /// Parsed and grouped precursor records.
+    pub records: Vec<FoundationTrainingRecord>,
+    /// Schema inferred from the original source headers.
+    pub schema: FoundationTableSchemaReport,
+    /// Input delimiter used by the CSV reader.
+    pub delimiter: u8,
+    /// Parse and label-coverage statistics.
+    pub stats: FoundationTableLoadStats,
+}
+
 /// Loaded foundation records plus the instrument vocabulary inferred from the
 /// same table(s).
 #[derive(Debug, Clone)]
@@ -142,16 +265,21 @@ impl FoundationDatasetLoader {
         path: P,
         config: &FoundationTableLoaderConfig,
     ) -> Result<Vec<FoundationTrainingRecord>> {
+        Ok(self.load_path_with_report(path, config)?.records)
+    }
+
+    /// Load a path and retain the inferred schema plus parse/coverage
+    /// statistics.  This is intended for validating unfamiliar real-data
+    /// exports before using them for pretraining.
+    pub fn load_path_with_report<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        config: &FoundationTableLoaderConfig,
+    ) -> Result<FoundationTableLoadReport> {
         let path = path.as_ref();
         let file = File::open(path).with_context(|| format!("failed to open {:?}", path))?;
-        let delimiter = config.delimiter.unwrap_or_else(|| {
-            if path.extension().and_then(|value| value.to_str()) == Some("tsv") {
-                b'\t'
-            } else {
-                b','
-            }
-        });
-        self.load_reader(BufReader::new(file), delimiter, config)
+        let delimiter = infer_delimiter(path, config);
+        self.load_reader_with_report(BufReader::new(file), delimiter, config)
             .with_context(|| format!("failed to load foundation table {:?}", path))
     }
 
@@ -163,6 +291,20 @@ impl FoundationDatasetLoader {
         delimiter: u8,
         config: &FoundationTableLoaderConfig,
     ) -> Result<Vec<FoundationTrainingRecord>> {
+        Ok(self
+            .load_reader_with_report(reader, delimiter, config)?
+            .records)
+    }
+
+    /// Load records and return an auditable schema/coverage report.
+    pub fn load_reader_with_report<R: std::io::Read>(
+        &mut self,
+        reader: R,
+        delimiter: u8,
+        config: &FoundationTableLoaderConfig,
+    ) -> Result<FoundationTableLoadReport> {
+        const MAX_ERROR_EXAMPLES: usize = 8;
+
         let mut csv = ReaderBuilder::new()
             .delimiter(delimiter)
             .has_headers(true)
@@ -170,20 +312,51 @@ impl FoundationDatasetLoader {
             .from_reader(reader);
         let headers = csv.headers()?.clone();
         let schema = TableSchema::infer(&headers)?;
+        let schema_report = schema.report(&headers);
+        if !schema_report.collisions.is_empty() {
+            log::warn!(
+                "foundation table schema has {} semantic column collision(s); inspect the schema report before training",
+                schema_report.collisions.len()
+            );
+        }
         let mut records = Vec::<FoundationTrainingRecord>::new();
         let mut group_to_index = HashMap::<String, usize>::new();
+        let mut stats = FoundationTableLoadStats::default();
 
         for row_result in csv.records() {
-            let row = row_result?;
+            stats.input_rows += 1;
+            let row = match row_result {
+                Ok(row) => row,
+                Err(error) if !config.strict => {
+                    stats.skipped_error_rows += 1;
+                    if stats.error_examples.len() < MAX_ERROR_EXAMPLES {
+                        stats.error_examples.push(error.to_string());
+                    }
+                    log::debug!("skipping malformed foundation CSV row: {error}");
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let parsed = match self.parse_row(&row, &schema, config) {
                 Ok(Some(parsed)) => parsed,
-                Ok(None) => continue,
+                Ok(None) => {
+                    stats.skipped_empty_or_short_peptide_rows += 1;
+                    continue;
+                }
                 Err(error) if !config.strict => {
+                    stats.skipped_error_rows += 1;
+                    if stats.error_examples.len() < MAX_ERROR_EXAMPLES {
+                        stats.error_examples.push(format!("{error:#}"));
+                    }
                     log::debug!("skipping foundation row: {error:#}");
                     continue;
                 }
                 Err(error) => return Err(error),
             };
+            stats.parsed_rows += 1;
+            if parsed.fragment.is_some() {
+                stats.supported_fragment_rows += 1;
+            }
 
             let ParsedRow {
                 group_key,
@@ -218,7 +391,14 @@ impl FoundationDatasetLoader {
             aggregate_duplicate_fragments(record);
             normalize_fragment_intensities(record, config.fragment_normalization);
         }
-        Ok(records)
+        finalize_load_stats(&mut stats, &records);
+
+        Ok(FoundationTableLoadReport {
+            records,
+            schema: schema_report,
+            delimiter,
+            stats,
+        })
     }
 
     /// Return the currently accumulated instrument vocabulary.
@@ -453,6 +633,184 @@ impl TableSchema {
             ),
         })
     }
+
+    fn report(&self, headers: &StringRecord) -> FoundationTableSchemaReport {
+        FoundationTableSchemaReport {
+            headers: headers.iter().map(ToOwned::to_owned).collect(),
+            sequence: FoundationSchemaField {
+                index: self.sequence,
+                header: headers.get(self.sequence).unwrap_or_default().to_string(),
+            },
+            charge: schema_field(headers, self.charge),
+            normalized_rt: schema_field(headers, self.normalized_rt),
+            observed_rt: schema_field(headers, self.observed_rt),
+            ccs: schema_field(headers, self.ccs),
+            precursor_mz: schema_field(headers, self.precursor_mz),
+            ion_mobility: schema_field(headers, self.ion_mobility),
+            nce: schema_field(headers, self.nce),
+            instrument: schema_field(headers, self.instrument),
+            run_id: schema_field(headers, self.run_id),
+            gradient_seconds: schema_field(headers, self.gradient_seconds),
+            fragment_type: schema_field(headers, self.fragment_type),
+            fragment_series: schema_field(headers, self.fragment_series),
+            fragment_charge: schema_field(headers, self.fragment_charge),
+            fragment_intensity: schema_field(headers, self.fragment_intensity),
+            fragment_loss: schema_field(headers, self.fragment_loss),
+            collisions: schema_collisions(self, headers),
+        }
+    }
+}
+
+fn infer_delimiter(path: &Path, config: &FoundationTableLoaderConfig) -> u8 {
+    config.delimiter.unwrap_or_else(|| {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if extension == "tsv" {
+            b'\t'
+        } else {
+            b','
+        }
+    })
+}
+
+fn schema_field(headers: &StringRecord, index: Option<usize>) -> Option<FoundationSchemaField> {
+    index.and_then(|index| {
+        headers.get(index).map(|header| FoundationSchemaField {
+            index,
+            header: header.to_string(),
+        })
+    })
+}
+
+fn schema_collisions(
+    schema: &TableSchema,
+    headers: &StringRecord,
+) -> Vec<FoundationSchemaCollision> {
+    let fields = [
+        ("sequence", Some(schema.sequence)),
+        ("charge", schema.charge),
+        ("normalized_rt", schema.normalized_rt),
+        ("observed_rt", schema.observed_rt),
+        ("ccs", schema.ccs),
+        ("precursor_mz", schema.precursor_mz),
+        ("ion_mobility", schema.ion_mobility),
+        ("nce", schema.nce),
+        ("instrument", schema.instrument),
+        ("run_id", schema.run_id),
+        ("gradient_seconds", schema.gradient_seconds),
+        ("fragment_type", schema.fragment_type),
+        ("fragment_series", schema.fragment_series),
+        ("fragment_charge", schema.fragment_charge),
+        ("fragment_intensity", schema.fragment_intensity),
+        ("fragment_loss", schema.fragment_loss),
+    ];
+    let mut by_index = BTreeMap::<usize, Vec<String>>::new();
+    for (semantic, index) in fields {
+        if let Some(index) = index {
+            by_index
+                .entry(index)
+                .or_default()
+                .push(semantic.to_string());
+        }
+    }
+    by_index
+        .into_iter()
+        .filter_map(|(index, semantics)| {
+            (semantics.len() > 1).then(|| FoundationSchemaCollision {
+                index,
+                header: headers.get(index).unwrap_or_default().to_string(),
+                semantics,
+            })
+        })
+        .collect()
+}
+
+fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[FoundationTrainingRecord]) {
+    stats.precursor_records = records.len();
+    let mut sequences = BTreeSet::<String>::new();
+    let mut peptidoforms = BTreeSet::<String>::new();
+    let mut runs = BTreeSet::<String>::new();
+    let mut instruments = BTreeSet::<String>::new();
+    let mut total_sequence_len = 0usize;
+
+    for record in records {
+        let sequence_len = record.peptidoform.sequence.len();
+        total_sequence_len += sequence_len;
+        stats.min_sequence_len = Some(
+            stats
+                .min_sequence_len
+                .map_or(sequence_len, |current| current.min(sequence_len)),
+        );
+        stats.max_sequence_len = Some(
+            stats
+                .max_sequence_len
+                .map_or(sequence_len, |current| current.max(sequence_len)),
+        );
+        sequences.insert(record.peptidoform.sequence.clone());
+        peptidoforms.insert(canonical_peptidoform_label(&record.peptidoform));
+        if !record.peptidoform.modifications.is_empty() {
+            stats.modified_records += 1;
+        }
+        if record.retention_time.normalized.is_some() {
+            stats.normalized_rt_records += 1;
+        }
+        if record.retention_time.observed_seconds.is_some() {
+            stats.observed_rt_records += 1;
+        }
+        if record.ccs.is_some() {
+            stats.ccs_records += 1;
+        }
+        if !record.fragments.is_empty() {
+            stats.ms2_records += 1;
+        }
+        if let Some(run_id) = record
+            .run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            runs.insert(run_id.to_string());
+        }
+        if let Some(instrument) = record
+            .context
+            .instrument_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            instruments.insert(instrument.to_ascii_lowercase());
+        }
+    }
+
+    stats.unique_sequences = sequences.len();
+    stats.unique_peptidoforms = peptidoforms.len();
+    stats.unique_runs = runs.len();
+    stats.unique_instruments = instruments.len();
+    stats.mean_sequence_len =
+        (!records.is_empty()).then_some(total_sequence_len as f64 / records.len() as f64);
+}
+
+pub(crate) fn canonical_peptidoform_label(peptidoform: &PeptidoformInput) -> String {
+    let mut modifications = peptidoform.modifications.clone();
+    modifications.sort_by(|left, right| {
+        left.residue_index.cmp(&right.residue_index).then_with(|| {
+            left.mass_delta
+                .partial_cmp(&right.mass_delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    let mut label = peptidoform.sequence.clone();
+    for modification in modifications {
+        label.push('|');
+        label.push_str(&format!(
+            "{}:{:+.4}",
+            modification.residue_index, modification.mass_delta
+        ));
+    }
+    label
 }
 
 fn normalize_header(value: &str) -> String {
