@@ -59,7 +59,7 @@ pub struct FoundationTrainingRecord {
 }
 
 /// Which RT target a downstream training adapter should optimize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RetentionTimeObjective {
     /// Train only against normalized RT/iRT.
     Normalized,
@@ -67,11 +67,6 @@ pub enum RetentionTimeObjective {
     Observed,
     /// Use normalized RT as the intrinsic task and observed RT as an auxiliary
     /// context-conditioned task when both are available.
+    #[default]
     IntrinsicAndObserved,
-}
-
-impl Default for RetentionTimeObjective {
-    fn default() -> Self {
-        Self::IntrinsicAndObserved
-    }
 }

@@ -78,26 +78,39 @@ impl MultiHeadSelfAttention {
             .query
             .forward(hidden)?
             .reshape((batch, sequence, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let k = self
             .key
             .forward(hidden)?
             .reshape((batch, sequence, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let v = self
             .value
             .forward(hidden)?
             .reshape((batch, sequence, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
 
+        // `transpose` creates a strided view. Candle's CPU batched matmul
+        // requires contiguous Q/K storage for this layout, so materialize the
+        // transposed key view before computing attention scores. This matters
+        // in particular for batch sizes greater than one.
+        let key_transposed = k.transpose(2, 3)?.contiguous()?;
         let scores = q
-            .matmul(&k.transpose(2, 3)?)?
+            .matmul(&key_transposed)?
             .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?;
+        // Candle's ordinary tensor addition requires equal shapes and does not
+        // implicitly broadcast. Expand the key mask explicitly from
+        // `[batch, 1, 1, sequence]` to the attention-score shape before
+        // applying it.
         let key_mask = residue_mask
             .affine(-1.0, 1.0)?
             .affine(-10_000.0, 0.0)?
             .unsqueeze(1)?
-            .unsqueeze(1)?;
+            .unsqueeze(1)?
+            .broadcast_as((batch, self.num_heads, sequence, sequence))?;
         let probabilities = ops::softmax(&(scores + key_mask)?, D::Minus1)?;
         let context = probabilities
             .matmul(&v)?

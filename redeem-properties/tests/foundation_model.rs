@@ -54,3 +54,36 @@ fn multi_task_heads_have_expected_shapes() {
         &[1, config.max_sequence_len - 1, config.ms2_fragment_channels]
     );
 }
+
+#[test]
+fn batched_default_length_attention_handles_contiguous_qkv() {
+    let device = Device::Cpu;
+    let mut config = FoundationConfig::default();
+    // One layer is sufficient to exercise the exact Q/K/V layout used by the
+    // default 64-residue, four-head model while keeping the regression test
+    // inexpensive. With batch size two this produces Q/K/V tensors shaped
+    // `[2, 4, 64, 48]`, matching the layout that exposed the CPU matmul bug.
+    config.transformer_layers = 1;
+
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let batch = featurizer
+        .featurize(
+            &[
+                PeptidoformInput::unmodified("PEPTIDEK"),
+                PeptidoformInput::unmodified("AGHCEWQMKYR"),
+            ],
+            &device,
+        )
+        .unwrap();
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let encoder = PeptideFoundationEncoder::new(config.clone(), vb).unwrap();
+    let output = encoder.forward_t(&batch, false).unwrap();
+
+    assert_eq!(output.peptide_embedding.dims(), &[2, config.model_dim]);
+    assert_eq!(
+        output.residue_embeddings.dims(),
+        &[2, config.max_sequence_len, config.model_dim]
+    );
+}

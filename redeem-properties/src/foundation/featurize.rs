@@ -55,8 +55,8 @@ pub struct PeptideGraphFeaturizer {
 
 impl PeptideGraphFeaturizer {
     /// Create a featurizer and validate the model configuration.
-    pub fn new(config: FoundationConfig) -> std::result::Result<Self, String> {
-        config.validate()?;
+    pub fn new(config: FoundationConfig) -> Result<Self> {
+        config.validate().map_err(candle_core::Error::Msg)?;
         Ok(Self { config })
     }
 
