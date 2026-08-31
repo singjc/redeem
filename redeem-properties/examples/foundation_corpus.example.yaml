@@ -1,0 +1,14 @@
+instrument_vocab_size: 16
+loader:
+  strict: true
+  fragment_normalization: Max
+sources:
+  # `id:` is canonical; `name:` is accepted as an alias.
+  - name: openswath
+    path: /path/to/openswath_results_finetuning.tsv
+    delimiter: tab
+    metadata: {}
+  - id: ip2-bruker
+    path: /path/to/ip2_spectral_library.tsv.zst
+    delimiter: tab
+    metadata: {}
