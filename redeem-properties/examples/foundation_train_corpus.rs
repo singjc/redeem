@@ -17,10 +17,7 @@ fn main() -> Result<()> {
     let config = read_foundation_training_run_config(&config_path)?;
     let summary = run_foundation_pretraining(&config, Device::Cpu)?;
 
-    println!(
-        "corpus_fingerprint\tfnv1a64:{:016x}",
-        summary.corpus_fingerprint
-    );
+    println!("corpus_fingerprint\tfnv1a64:{:016x}", summary.corpus_fingerprint);
     println!("corpus_records\t{}", summary.corpus_records);
     println!("train_records\t{}", summary.train_records);
     println!("validation_records\t{}", summary.validation_records);
@@ -41,10 +38,7 @@ fn main() -> Result<()> {
     }
     println!(
         "train_sampling_normalized_rt_records\t{}",
-        summary
-            .train_sampling_preview
-            .coverage
-            .normalized_rt_records
+        summary.train_sampling_preview.coverage.normalized_rt_records
     );
     println!(
         "train_sampling_observed_rt_records\t{}",
@@ -78,14 +72,8 @@ fn main() -> Result<()> {
         summary.validation_sampling.coverage.ms2_records
     );
     println!("epochs_this_invocation\t{}", summary.fit.epochs.len());
-    println!(
-        "completed_epochs\t{}",
-        summary.fit.progress.completed_epochs
-    );
-    println!(
-        "global_best_validation_loss\t{:?}",
-        summary.fit.progress.best_validation_loss
-    );
+    println!("completed_epochs\t{}", summary.fit.progress.completed_epochs);
+    println!("global_best_validation_loss\t{:?}", summary.fit.progress.best_validation_loss);
     println!("best_epoch\t{:?}", summary.fit.progress.best_epoch);
     println!("stopped_early\t{}", summary.fit.stopped_early);
     for epoch in &summary.fit.epochs {
@@ -118,23 +106,11 @@ fn main() -> Result<()> {
 fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
     println!("{prefix}_loss\t{}", metrics.mean_total_loss);
     print_optional_f32(&format!("{prefix}_rt_loss"), metrics.mean_rt_loss);
-    print_optional_f32(
-        &format!("{prefix}_rt_mae_native"),
-        metrics.mean_rt_mae_native,
-    );
-    print_optional_f32(
-        &format!("{prefix}_rt_rmse_native"),
-        metrics.mean_rt_rmse_native,
-    );
+    print_optional_f32(&format!("{prefix}_rt_mae_native"), metrics.mean_rt_mae_native);
+    print_optional_f32(&format!("{prefix}_rt_rmse_native"), metrics.mean_rt_rmse_native);
     print_optional_f32(&format!("{prefix}_ccs_loss"), metrics.mean_ccs_loss);
-    print_optional_f32(
-        &format!("{prefix}_ccs_mae_native"),
-        metrics.mean_ccs_mae_native,
-    );
-    print_optional_f32(
-        &format!("{prefix}_ccs_rmse_native"),
-        metrics.mean_ccs_rmse_native,
-    );
+    print_optional_f32(&format!("{prefix}_ccs_mae_native"), metrics.mean_ccs_mae_native);
+    print_optional_f32(&format!("{prefix}_ccs_rmse_native"), metrics.mean_ccs_rmse_native);
     print_optional_f32(&format!("{prefix}_ms2_loss"), metrics.mean_ms2_loss);
     print_optional_f32(
         &format!("{prefix}_masked_residue_loss"),
@@ -189,6 +165,30 @@ fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
         &format!("{prefix}_contrastive_gradient_norm"),
         metrics.mean_contrastive_gradient_norm,
     );
+    print_optional_f64(
+        &format!("{prefix}_rt_gradient_cosine_to_total"),
+        metrics.mean_rt_gradient_cosine_to_total,
+    );
+    print_optional_f64(
+        &format!("{prefix}_ccs_gradient_cosine_to_total"),
+        metrics.mean_ccs_gradient_cosine_to_total,
+    );
+    print_optional_f64(
+        &format!("{prefix}_ms2_gradient_cosine_to_total"),
+        metrics.mean_ms2_gradient_cosine_to_total,
+    );
+    print_optional_f64(
+        &format!("{prefix}_masked_residue_gradient_cosine_to_total"),
+        metrics.mean_masked_residue_gradient_cosine_to_total,
+    );
+    print_optional_f64(
+        &format!("{prefix}_chemistry_gradient_cosine_to_total"),
+        metrics.mean_chemistry_gradient_cosine_to_total,
+    );
+    print_optional_f64(
+        &format!("{prefix}_contrastive_gradient_cosine_to_total"),
+        metrics.mean_contrastive_gradient_cosine_to_total,
+    );
 }
 
 fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
@@ -213,14 +213,8 @@ fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
 }
 
 fn print_normalization(label: &str, normalization: &FoundationRegressionNormalization) {
-    println!(
-        "{label}_normalization_strategy\t{:?}",
-        normalization.strategy
-    );
-    println!(
-        "{label}_normalization_labels\t{}",
-        normalization.label_count
-    );
+    println!("{label}_normalization_strategy\t{:?}", normalization.strategy);
+    println!("{label}_normalization_labels\t{}", normalization.label_count);
     match normalization.mean {
         Some(value) => println!("{label}_normalization_mean\t{value}"),
         None => println!("{label}_normalization_mean\tNA"),
@@ -229,10 +223,7 @@ fn print_normalization(label: &str, normalization: &FoundationRegressionNormaliz
         Some(value) => println!("{label}_normalization_std\t{value}"),
         None => println!("{label}_normalization_std\tNA"),
     }
-    println!(
-        "{label}_normalization_active\t{}",
-        normalization.is_active()
-    );
+    println!("{label}_normalization_active\t{}", normalization.is_active());
 }
 
 fn print_optional_f32(label: &str, value: Option<f32>) {

@@ -1,15 +1,14 @@
 use candle_core::Device;
 use redeem_properties::foundation::{
-    load_foundation_corpus, sample_foundation_training_indices,
-    sample_foundation_validation_indices, FoundationCheckpointProvenance, FoundationCollatorConfig,
-    FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter,
-    FoundationCorpusSourceSpec, FoundationCorruptionConfig, FoundationDatasetLoader,
-    FoundationGradientDiagnosticsConfig, FoundationLearningRateSchedule, FoundationPartition,
-    FoundationRecordProvenance, FoundationRegressionNormalization,
-    FoundationRegressionNormalizationStrategy, FoundationSamplingConfig,
+    load_foundation_corpus, FoundationCheckpointProvenance, FoundationCollatorConfig,
+    FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter, FoundationCorpusSourceSpec,
+    FoundationCorruptionConfig, FoundationDatasetLoader, FoundationGradientDiagnosticsConfig,
+    FoundationLearningRateSchedule, FoundationPartition, FoundationRecordProvenance, FoundationSamplingConfig,
     FoundationSamplingStrategy, FoundationSplitConfig, FoundationTableLoaderConfig,
-    FoundationTargetNormalizationConfig, FoundationTrainer, FoundationTrainerConfig,
-    FoundationTrainingProgress, RetentionTimeObjective,
+    FoundationTargetNormalizationConfig, FoundationRegressionNormalization,
+    FoundationRegressionNormalizationStrategy, RetentionTimeObjective,
+    FoundationTrainer, FoundationTrainerConfig, FoundationTrainingProgress,
+    sample_foundation_training_indices, sample_foundation_validation_indices,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -85,8 +84,7 @@ fn temp_dir(label: &str) -> PathBuf {
 #[test]
 fn optimizer_checkpoint_restores_moments_and_step_for_same_continuation() {
     let records = records();
-    let mut original =
-        FoundationTrainer::new(tiny_config(), trainer_config(), Device::Cpu).unwrap();
+    let mut original = FoundationTrainer::new(tiny_config(), trainer_config(), Device::Cpu).unwrap();
     original.train_step(&records).unwrap();
 
     let root = temp_dir("resume");
@@ -263,6 +261,8 @@ sources:
     assert_eq!(config.sources[1].id, "ip2_bruker_human");
 }
 
+
+
 #[test]
 fn source_weighted_sampling_is_bounded_deterministic_and_auditable() {
     let records = records();
@@ -278,7 +278,10 @@ fn source_weighted_sampling_is_bounded_deterministic_and_auditable() {
             source_record_index: 0,
         },
     ];
-    let weights = BTreeMap::from([("openswath".to_string(), 0.25), ("ip2".to_string(), 0.75)]);
+    let weights = BTreeMap::from([
+        ("openswath".to_string(), 0.25),
+        ("ip2".to_string(), 0.75),
+    ]);
     let config = FoundationSamplingConfig {
         strategy: FoundationSamplingStrategy::SourceWeighted,
         train_steps_per_epoch: Some(4),
@@ -317,6 +320,7 @@ fn source_weighted_sampling_is_bounded_deterministic_and_auditable() {
     assert_eq!(first.coverage.normalized_rt_records, 8);
     assert_eq!(first.coverage.ms2_records, 8);
 }
+
 
 #[test]
 fn source_weighted_validation_is_fixed_stratified_and_without_replacement() {
@@ -392,6 +396,7 @@ fn epoch_metrics_report_gradient_clipping_frequency_and_scale() {
         .is_some_and(|value| value > 0.0 && value < 1.0));
 }
 
+
 #[test]
 fn regression_normalization_uses_train_partition_only() {
     let mut records = records();
@@ -411,7 +416,11 @@ fn regression_normalization_uses_train_partition_only() {
         },
     };
     normalization
-        .resolve_from_training_partition(&records, &[0, 1], RetentionTimeObjective::Normalized)
+        .resolve_from_training_partition(
+            &records,
+            &[0, 1],
+            RetentionTimeObjective::Normalized,
+        )
         .unwrap();
 
     assert_eq!(normalization.rt.label_count, 2);
@@ -436,7 +445,11 @@ fn normalized_regression_reports_native_unit_errors() {
         },
     };
     normalization
-        .resolve_from_training_partition(&records, &[0, 1], RetentionTimeObjective::Normalized)
+        .resolve_from_training_partition(
+            &records,
+            &[0, 1],
+            RetentionTimeObjective::Normalized,
+        )
         .unwrap();
     let mut config = trainer_config();
     config.target_normalization = normalization;
@@ -463,7 +476,11 @@ fn task_gradient_diagnostics_report_weighted_objective_norms() {
         },
     };
     normalization
-        .resolve_from_training_partition(&records, &[0, 1], RetentionTimeObjective::Normalized)
+        .resolve_from_training_partition(
+            &records,
+            &[0, 1],
+            RetentionTimeObjective::Normalized,
+        )
         .unwrap();
     let mut config = trainer_config();
     config.target_normalization = normalization;
@@ -476,18 +493,22 @@ fn task_gradient_diagnostics_report_weighted_objective_norms() {
     let gradients = metrics
         .task_gradient_norms
         .expect("gradient diagnostics should run on step zero");
-    assert!(gradients
-        .rt
-        .is_some_and(|value| value.is_finite() && value >= 0.0));
-    assert!(gradients
-        .ccs
-        .is_some_and(|value| value.is_finite() && value >= 0.0));
-    assert!(gradients
-        .ms2
-        .is_some_and(|value| value.is_finite() && value >= 0.0));
+    assert!(gradients.rt.is_some_and(|value| value.is_finite() && value >= 0.0));
+    assert!(gradients.ccs.is_some_and(|value| value.is_finite() && value >= 0.0));
+    assert!(gradients.ms2.is_some_and(|value| value.is_finite() && value >= 0.0));
     assert!(gradients
         .contrastive
         .is_some_and(|value| value.is_finite() && value >= 0.0));
+    for cosine in [
+        gradients.rt_cosine_to_total,
+        gradients.ccs_cosine_to_total,
+        gradients.ms2_cosine_to_total,
+        gradients.masked_residue_cosine_to_total,
+        gradients.chemistry_cosine_to_total,
+        gradients.contrastive_cosine_to_total,
+    ] {
+        assert!(cosine.is_some_and(|value| value.is_finite() && (-1.0..=1.0).contains(&value)));
+    }
 }
 
 #[test]
@@ -499,19 +520,8 @@ fn task_gradient_diagnostics_follow_global_step_interval() {
         every_n_steps: 2,
     };
     let mut trainer = FoundationTrainer::new(tiny_config(), config, Device::Cpu).unwrap();
-    assert!(trainer
-        .train_step(&records)
-        .unwrap()
-        .task_gradient_norms
-        .is_some());
-    assert!(trainer
-        .train_step(&records)
-        .unwrap()
-        .task_gradient_norms
-        .is_none());
-    assert!(trainer
-        .train_step(&records)
-        .unwrap()
-        .task_gradient_norms
-        .is_some());
+    assert!(trainer.train_step(&records).unwrap().task_gradient_norms.is_some());
+    assert!(trainer.train_step(&records).unwrap().task_gradient_norms.is_none());
+    assert!(trainer.train_step(&records).unwrap().task_gradient_norms.is_some());
 }
+

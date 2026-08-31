@@ -10,27 +10,31 @@ use super::checkpoint::{
     foundation_checkpoint_paths, FoundationCheckpointMetadata, FoundationCheckpointProvenance,
     FoundationTrainingProgress,
 };
-use super::collate::{FoundationCollator, FoundationCollatorConfig, FoundationTrainingViews};
+use super::collate::{
+    FoundationCollator, FoundationCollatorConfig, FoundationTrainingViews,
+};
 use super::config::FoundationConfig;
-use super::control::{FoundationFitConfig, FoundationLearningRateSchedule, FoundationSplitMix64};
+use super::control::{
+    FoundationFitConfig, FoundationLearningRateSchedule, FoundationSplitMix64,
+};
 use super::corpus::FoundationRecordProvenance;
 use super::data::{FoundationTrainingRecord, TrainingContext};
-use super::featurize::PeptidoformInput;
 use super::loss::{
     contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,
 };
+use super::featurize::PeptidoformInput;
 use super::model::FoundationMultiTaskOutput;
+use super::optimizer::{FoundationAdamW, FoundationAdamWConfig};
 use super::normalization::{
     FoundationRegressionNormalization, FoundationTargetNormalizationConfig,
 };
-use super::optimizer::{FoundationAdamW, FoundationAdamWConfig};
 use super::sampling::{
     sample_foundation_training_indices, sample_foundation_validation_indices,
     FoundationSamplingConfig,
 };
 use super::wrapper::FoundationModelWrapper;
 use anyhow::{Context, Result as AnyResult};
-use candle_core::{Device, Result, Tensor};
+use candle_core::{backprop::GradStore, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -185,6 +189,18 @@ pub struct FoundationTaskGradientNorms {
     pub chemistry: Option<f64>,
     /// Weighted contrastive gradient norm.
     pub contrastive: Option<f64>,
+    /// Cosine alignment of the weighted RT gradient with the total update gradient.
+    pub rt_cosine_to_total: Option<f64>,
+    /// Cosine alignment of the weighted CCS gradient with the total update gradient.
+    pub ccs_cosine_to_total: Option<f64>,
+    /// Cosine alignment of the weighted MS2 gradient with the total update gradient.
+    pub ms2_cosine_to_total: Option<f64>,
+    /// Cosine alignment of the weighted masked-residue gradient with the total update gradient.
+    pub masked_residue_cosine_to_total: Option<f64>,
+    /// Cosine alignment of the weighted chemistry gradient with the total update gradient.
+    pub chemistry_cosine_to_total: Option<f64>,
+    /// Cosine alignment of the weighted contrastive gradient with the total update gradient.
+    pub contrastive_cosine_to_total: Option<f64>,
 }
 
 /// Scalar diagnostics returned after one optimizer update.
@@ -271,6 +287,18 @@ pub struct FoundationEpochMetrics {
     pub mean_chemistry_gradient_norm: Option<f64>,
     /// Mean weighted contrastive gradient norm across diagnostic steps.
     pub mean_contrastive_gradient_norm: Option<f64>,
+    /// Mean RT-gradient cosine with the combined multi-task update direction.
+    pub mean_rt_gradient_cosine_to_total: Option<f64>,
+    /// Mean CCS-gradient cosine with the combined multi-task update direction.
+    pub mean_ccs_gradient_cosine_to_total: Option<f64>,
+    /// Mean MS2-gradient cosine with the combined multi-task update direction.
+    pub mean_ms2_gradient_cosine_to_total: Option<f64>,
+    /// Mean masked-residue-gradient cosine with the combined update direction.
+    pub mean_masked_residue_gradient_cosine_to_total: Option<f64>,
+    /// Mean chemistry-gradient cosine with the combined update direction.
+    pub mean_chemistry_gradient_cosine_to_total: Option<f64>,
+    /// Mean contrastive-gradient cosine with the combined update direction.
+    pub mean_contrastive_gradient_cosine_to_total: Option<f64>,
     /// Final learning rate used during the epoch.
     pub final_learning_rate: Option<f64>,
 }
@@ -392,9 +420,7 @@ impl FoundationTrainer {
         trainer
             .optimizer
             .load_safetensors(&optimizer_path)
-            .with_context(|| {
-                format!("failed to restore optimizer checkpoint {optimizer_path:?}")
-            })?;
+            .with_context(|| format!("failed to restore optimizer checkpoint {optimizer_path:?}"))?;
         trainer.optimizer.set_step_count(metadata.optimizer_step);
         trainer.global_step = metadata.global_step;
         Ok((trainer, metadata))
@@ -421,18 +447,30 @@ impl FoundationTrainer {
             .collate_views(records, self.wrapper.device(), seed)?;
         self.normalize_regression_targets(&mut views)?;
         let (total, losses, contrastive, regression) = self.loss_for_views(&views, true)?;
-        let task_gradient_norms = if self
+        let diagnostic_step = self
             .config
             .gradient_diagnostics
-            .should_measure(self.global_step)
-        {
-            Some(self.measure_task_gradient_norms(&losses, contrastive.as_ref())?)
+            .should_measure(self.global_step);
+        let (task_gradient_norms, optimizer_metrics) = if diagnostic_step {
+            // Reuse the combined gradient store for the optimizer update so
+            // alignment diagnostics do not add a redundant total-loss backward pass.
+            let total_gradients = total.backward()?;
+            let diagnostics = self.measure_task_gradient_norms(
+                &losses,
+                contrastive.as_ref(),
+                &total_gradients,
+            )?;
+            let optimizer_metrics = self
+                .optimizer
+                .step(&total_gradients, self.config.max_gradient_norm)?;
+            (Some(diagnostics), optimizer_metrics)
         } else {
-            None
+            (
+                None,
+                self.optimizer
+                    .backward_step(&total, self.config.max_gradient_norm)?,
+            )
         };
-        let optimizer_metrics = self
-            .optimizer
-            .backward_step(&total, self.config.max_gradient_norm)?;
         self.global_step = optimizer_metrics.step;
         metrics_from_tensors(
             &total,
@@ -823,8 +861,14 @@ impl FoundationTrainer {
                 fit_config.shuffle_each_epoch,
                 &self.config.sampling,
             )?;
-            let train = self.train_epoch_indices(records, &train_plan.indices, epoch, false)?;
-            let validation = self.evaluate_epoch_indices(records, &validation_plan.indices)?;
+            let train = self.train_epoch_indices(
+                records,
+                &train_plan.indices,
+                epoch,
+                false,
+            )?;
+            let validation =
+                self.evaluate_epoch_indices(records, &validation_plan.indices)?;
             let improved = progress
                 .best_validation_loss
                 .map(|best| validation.mean_total_loss < best - fit_config.early_stopping_min_delta)
@@ -884,16 +928,8 @@ impl FoundationTrainer {
         context: &[TrainingContext],
     ) -> Result<FoundationMultiTaskOutput> {
         let mut output = self.wrapper.predict(peptides, context)?;
-        output.rt = self
-            .config
-            .target_normalization
-            .rt
-            .denormalize_tensor(&output.rt)?;
-        output.ccs = self
-            .config
-            .target_normalization
-            .ccs
-            .denormalize_tensor(&output.ccs)?;
+        output.rt = self.config.target_normalization.rt.denormalize_tensor(&output.rt)?;
+        output.ccs = self.config.target_normalization.ccs.denormalize_tensor(&output.ccs)?;
         Ok(output)
     }
 
@@ -904,16 +940,8 @@ impl FoundationTrainer {
         peptides: &[PeptidoformInput],
     ) -> Result<FoundationMultiTaskOutput> {
         let mut output = self.wrapper.predict_unknown_context(peptides)?;
-        output.rt = self
-            .config
-            .target_normalization
-            .rt
-            .denormalize_tensor(&output.rt)?;
-        output.ccs = self
-            .config
-            .target_normalization
-            .ccs
-            .denormalize_tensor(&output.ccs)?;
+        output.rt = self.config.target_normalization.rt.denormalize_tensor(&output.rt)?;
+        output.ccs = self.config.target_normalization.ccs.denormalize_tensor(&output.ccs)?;
         Ok(output)
     }
 
@@ -943,12 +971,7 @@ impl FoundationTrainer {
                 batch.targets.rt = Some(self.config.target_normalization.rt.normalize_tensor(&rt)?);
             }
             if let Some(ccs) = batch.targets.ccs.take() {
-                batch.targets.ccs = Some(
-                    self.config
-                        .target_normalization
-                        .ccs
-                        .normalize_tensor(&ccs)?,
-                );
+                batch.targets.ccs = Some(self.config.target_normalization.ccs.normalize_tensor(&ccs)?);
             }
         }
         Ok(())
@@ -958,49 +981,90 @@ impl FoundationTrainer {
         &self,
         losses: &FoundationLosses,
         contrastive: Option<&Tensor>,
+        total_gradients: &GradStore,
     ) -> Result<FoundationTaskGradientNorms> {
         let weights = self.config.loss_weights;
+        let (rt, rt_cosine_to_total) = self.weighted_gradient_diagnostics(
+            losses.rt.as_ref(),
+            weights.rt,
+            total_gradients,
+        )?;
+        let (ccs, ccs_cosine_to_total) = self.weighted_gradient_diagnostics(
+            losses.ccs.as_ref(),
+            weights.ccs,
+            total_gradients,
+        )?;
+        let (ms2, ms2_cosine_to_total) = self.weighted_gradient_diagnostics(
+            losses.ms2.as_ref(),
+            weights.ms2,
+            total_gradients,
+        )?;
+        let (masked_residue, masked_residue_cosine_to_total) = self
+            .weighted_gradient_diagnostics(
+                losses.masked_residue.as_ref(),
+                weights.masked_residue,
+                total_gradients,
+            )?;
+        let (chemistry, chemistry_cosine_to_total) = self.weighted_gradient_diagnostics(
+            losses.chemistry.as_ref(),
+            weights.chemistry,
+            total_gradients,
+        )?;
+        let (contrastive, contrastive_cosine_to_total) = self.weighted_gradient_diagnostics(
+            contrastive,
+            weights.contrastive,
+            total_gradients,
+        )?;
         Ok(FoundationTaskGradientNorms {
-            rt: self.weighted_gradient_norm(losses.rt.as_ref(), weights.rt)?,
-            ccs: self.weighted_gradient_norm(losses.ccs.as_ref(), weights.ccs)?,
-            ms2: self.weighted_gradient_norm(losses.ms2.as_ref(), weights.ms2)?,
-            masked_residue: self
-                .weighted_gradient_norm(losses.masked_residue.as_ref(), weights.masked_residue)?,
-            chemistry: self.weighted_gradient_norm(losses.chemistry.as_ref(), weights.chemistry)?,
-            contrastive: self.weighted_gradient_norm(contrastive, weights.contrastive)?,
+            rt,
+            ccs,
+            ms2,
+            masked_residue,
+            chemistry,
+            contrastive,
+            rt_cosine_to_total,
+            ccs_cosine_to_total,
+            ms2_cosine_to_total,
+            masked_residue_cosine_to_total,
+            chemistry_cosine_to_total,
+            contrastive_cosine_to_total,
         })
     }
 
-    fn weighted_gradient_norm(&self, loss: Option<&Tensor>, weight: f64) -> Result<Option<f64>> {
+    fn weighted_gradient_diagnostics(
+        &self,
+        loss: Option<&Tensor>,
+        weight: f64,
+        total_gradients: &GradStore,
+    ) -> Result<(Option<f64>, Option<f64>)> {
         let Some(loss) = loss else {
-            return Ok(None);
+            return Ok((None, None));
         };
         if weight == 0.0 {
-            return Ok(None);
+            return Ok((None, None));
         }
         let weighted = loss.affine(weight, 0.0)?;
         let gradients = weighted.backward()?;
-        Ok(Some(self.optimizer.gradient_norm(&gradients)?))
+        let norm = self.optimizer.gradient_norm(&gradients)?;
+        let cosine = self
+            .optimizer
+            .gradient_cosine(&gradients, total_gradients)?;
+        Ok((Some(norm), cosine))
     }
 
     fn loss_for_views(
         &self,
         views: &FoundationTrainingViews,
         train: bool,
-    ) -> Result<(
-        Tensor,
-        FoundationLosses,
-        Option<Tensor>,
-        RegressionDiagnostics,
-    )> {
-        let first =
-            self.wrapper
-                .model()
-                .forward_t(&views.first.input, &views.first.context, train)?;
-        let second =
-            self.wrapper
-                .model()
-                .forward_t(&views.second.input, &views.second.context, train)?;
+    ) -> Result<(Tensor, FoundationLosses, Option<Tensor>, RegressionDiagnostics)> {
+        let first = self
+            .wrapper
+            .model()
+            .forward_t(&views.first.input, &views.first.context, train)?;
+        let second = self
+            .wrapper
+            .model()
+            .forward_t(&views.second.input, &views.second.context, train)?;
         let regression = RegressionDiagnostics {
             rt: regression_native_metrics(
                 &first.rt,
@@ -1099,6 +1163,12 @@ struct EpochAccumulator {
     masked_residue_gradient_norm: OptionalMean64,
     chemistry_gradient_norm: OptionalMean64,
     contrastive_gradient_norm: OptionalMean64,
+    rt_gradient_cosine_to_total: OptionalMean64,
+    ccs_gradient_cosine_to_total: OptionalMean64,
+    ms2_gradient_cosine_to_total: OptionalMean64,
+    masked_residue_gradient_cosine_to_total: OptionalMean64,
+    chemistry_gradient_cosine_to_total: OptionalMean64,
+    contrastive_gradient_cosine_to_total: OptionalMean64,
     final_learning_rate: Option<f64>,
 }
 
@@ -1132,6 +1202,17 @@ impl EpochAccumulator {
             self.masked_residue_gradient_norm.push(task.masked_residue);
             self.chemistry_gradient_norm.push(task.chemistry);
             self.contrastive_gradient_norm.push(task.contrastive);
+            self.rt_gradient_cosine_to_total.push(task.rt_cosine_to_total);
+            self.ccs_gradient_cosine_to_total
+                .push(task.ccs_cosine_to_total);
+            self.ms2_gradient_cosine_to_total
+                .push(task.ms2_cosine_to_total);
+            self.masked_residue_gradient_cosine_to_total
+                .push(task.masked_residue_cosine_to_total);
+            self.chemistry_gradient_cosine_to_total
+                .push(task.chemistry_cosine_to_total);
+            self.contrastive_gradient_cosine_to_total
+                .push(task.contrastive_cosine_to_total);
         }
     }
 
@@ -1165,6 +1246,18 @@ impl EpochAccumulator {
             mean_masked_residue_gradient_norm: self.masked_residue_gradient_norm.mean(),
             mean_chemistry_gradient_norm: self.chemistry_gradient_norm.mean(),
             mean_contrastive_gradient_norm: self.contrastive_gradient_norm.mean(),
+            mean_rt_gradient_cosine_to_total: self.rt_gradient_cosine_to_total.mean(),
+            mean_ccs_gradient_cosine_to_total: self.ccs_gradient_cosine_to_total.mean(),
+            mean_ms2_gradient_cosine_to_total: self.ms2_gradient_cosine_to_total.mean(),
+            mean_masked_residue_gradient_cosine_to_total: self
+                .masked_residue_gradient_cosine_to_total
+                .mean(),
+            mean_chemistry_gradient_cosine_to_total: self
+                .chemistry_gradient_cosine_to_total
+                .mean(),
+            mean_contrastive_gradient_cosine_to_total: self
+                .contrastive_gradient_cosine_to_total
+                .mean(),
             final_learning_rate: self.final_learning_rate,
         }
     }
@@ -1291,7 +1384,12 @@ mod tests {
         assert_eq!(trainer.optimizer_step(), 1);
     }
 
-    fn training_record(sequence: &str, charge: i32, rt: f32, ccs: f32) -> FoundationTrainingRecord {
+    fn training_record(
+        sequence: &str,
+        charge: i32,
+        rt: f32,
+        ccs: f32,
+    ) -> FoundationTrainingRecord {
         FoundationTrainingRecord {
             peptidoform: PeptidoformInput::unmodified(sequence),
             retention_time: RetentionTimeLabels {
