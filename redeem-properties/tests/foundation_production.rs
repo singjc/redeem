@@ -1,7 +1,8 @@
 use candle_core::Device;
 use redeem_properties::foundation::{
-    load_foundation_corpus, sample_foundation_training_indices, FoundationCheckpointProvenance,
-    FoundationCollatorConfig, FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter,
+    load_foundation_corpus, sample_foundation_training_indices,
+    sample_foundation_validation_indices, FoundationCheckpointProvenance, FoundationCollatorConfig,
+    FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter,
     FoundationCorpusSourceSpec, FoundationCorruptionConfig, FoundationDatasetLoader,
     FoundationLearningRateSchedule, FoundationPartition, FoundationRecordProvenance,
     FoundationSamplingConfig, FoundationSamplingStrategy, FoundationSplitConfig,
@@ -281,6 +282,7 @@ fn source_weighted_sampling_is_bounded_deterministic_and_auditable() {
         train_steps_per_epoch: Some(4),
         validation_steps: Some(2),
         source_weights: weights,
+        ..FoundationSamplingConfig::default()
     };
     let first = sample_foundation_training_indices(
         &records,
@@ -312,4 +314,78 @@ fn source_weighted_sampling_is_bounded_deterministic_and_auditable() {
     assert_eq!(first.source_records.get("ip2"), Some(&6));
     assert_eq!(first.coverage.normalized_rt_records, 8);
     assert_eq!(first.coverage.ms2_records, 8);
+}
+
+#[test]
+fn source_weighted_validation_is_fixed_stratified_and_without_replacement() {
+    let base = records();
+    let mut expanded = Vec::new();
+    let mut provenance = Vec::new();
+    for source_index in 0..2usize {
+        for record_index in 0..4usize {
+            expanded.push(base[record_index % base.len()].clone());
+            provenance.push(FoundationRecordProvenance {
+                source_index,
+                source_id: if source_index == 0 {
+                    "openswath".to_string()
+                } else {
+                    "ip2".to_string()
+                },
+                source_record_index: record_index,
+            });
+        }
+    }
+    let config = FoundationSamplingConfig {
+        validation_steps: Some(2),
+        validation_source_weights: BTreeMap::from([
+            ("openswath".to_string(), 0.25),
+            ("ip2".to_string(), 0.75),
+        ]),
+        ..FoundationSamplingConfig::default()
+    };
+    let indices = (0..expanded.len()).collect::<Vec<_>>();
+    let first = sample_foundation_validation_indices(
+        &expanded,
+        &provenance,
+        &indices,
+        2,
+        20260831,
+        &config,
+    )
+    .unwrap();
+    let second = sample_foundation_validation_indices(
+        &expanded,
+        &provenance,
+        &indices,
+        2,
+        20260831,
+        &config,
+    )
+    .unwrap();
+    assert_eq!(first.indices, second.indices);
+    assert_eq!(first.indices.len(), 4);
+    assert_eq!(first.unique_records, 4);
+    assert_eq!(first.source_records.get("openswath"), Some(&1));
+    assert_eq!(first.source_records.get("ip2"), Some(&3));
+}
+
+#[test]
+fn epoch_metrics_report_gradient_clipping_frequency_and_scale() {
+    let records = records();
+    let mut trainer = FoundationTrainer::new(
+        tiny_config(),
+        FoundationTrainerConfig {
+            max_gradient_norm: Some(1e-8),
+            ..trainer_config()
+        },
+        Device::Cpu,
+    )
+    .unwrap();
+    let metrics = trainer.train_epoch(&records).unwrap();
+    assert_eq!(metrics.steps, 1);
+    assert_eq!(metrics.clipped_steps, 1);
+    assert_eq!(metrics.clipped_fraction, Some(1.0));
+    assert!(metrics
+        .mean_gradient_scale
+        .is_some_and(|value| value > 0.0 && value < 1.0));
 }

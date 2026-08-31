@@ -11,11 +11,14 @@ use super::experiment::{FoundationBenchmarkManifest, FoundationPartition};
 use super::sampling::{
     sample_foundation_training_indices, sample_foundation_validation_indices, FoundationSamplePlan,
 };
-use super::trainer::{FoundationFitSummary, FoundationTrainer, FoundationTrainerConfig};
+use super::trainer::{
+    FoundationEpochMetrics, FoundationFitSummary, FoundationTrainer, FoundationTrainerConfig,
+};
 use super::FoundationConfig;
 use anyhow::{Context, Result};
 use candle_core::Device;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// YAML configuration for one production foundation pretraining run.
@@ -101,6 +104,9 @@ pub struct FoundationTrainingRunSummary {
     pub train_sampling_preview: FoundationSamplePlan,
     /// Fixed validation selection used by the fit loop.
     pub validation_sampling: FoundationSamplePlan,
+    /// Optional final validation diagnostics evaluated separately by source.
+    /// These do not affect checkpoint selection or early stopping.
+    pub validation_by_source: BTreeMap<String, FoundationEpochMetrics>,
     /// Completed fit summary.
     pub fit: FoundationFitSummary,
 }
@@ -190,6 +196,24 @@ pub fn run_foundation_pretraining(
         progress,
     )?;
 
+    let mut validation_by_source = BTreeMap::new();
+    if config.trainer.sampling.report_validation_by_source {
+        let mut by_source = BTreeMap::<String, Vec<usize>>::new();
+        for &index in &validation_sampling.indices {
+            let source = corpus.provenance.get(index).ok_or_else(|| {
+                anyhow::anyhow!("foundation validation provenance index {index} is out of bounds")
+            })?;
+            by_source
+                .entry(source.source_id.clone())
+                .or_default()
+                .push(index);
+        }
+        for (source, indices) in by_source {
+            let metrics = trainer.evaluate_epoch_indices(&corpus.records, &indices)?;
+            validation_by_source.insert(source, metrics);
+        }
+    }
+
     Ok(FoundationTrainingRunSummary {
         corpus_fingerprint: corpus.corpus_fingerprint,
         corpus_records: corpus.records.len(),
@@ -200,6 +224,7 @@ pub fn run_foundation_pretraining(
         resume_metadata,
         train_sampling_preview,
         validation_sampling,
+        validation_by_source,
         fit,
     })
 }

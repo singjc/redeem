@@ -23,6 +23,8 @@ trainer:
     train_steps_per_epoch: null
     validation_steps: null
     source_weights: {}
+    validation_source_weights: {}
+    report_validation_by_source: false
   seed: 20260831
 
 fit:

@@ -41,6 +41,12 @@ pub struct FoundationSamplingConfig {
     /// is non-empty it must contain every source represented in the selected
     /// train partition. Values may be zero to intentionally exclude a source.
     pub source_weights: BTreeMap<String, f64>,
+    /// Optional source weights for a bounded validation subset. Used only when
+    /// `validation_steps` is set; validation remains without replacement.
+    pub validation_source_weights: BTreeMap<String, f64>,
+    /// Report final validation metrics separately for each represented source.
+    /// These diagnostics do not affect checkpoint selection or early stopping.
+    pub report_validation_by_source: bool,
 }
 
 impl Default for FoundationSamplingConfig {
@@ -50,6 +56,8 @@ impl Default for FoundationSamplingConfig {
             train_steps_per_epoch: None,
             validation_steps: None,
             source_weights: BTreeMap::new(),
+            validation_source_weights: BTreeMap::new(),
+            report_validation_by_source: false,
         }
     }
 }
@@ -63,16 +71,8 @@ impl FoundationSamplingConfig {
         if self.validation_steps == Some(0) {
             anyhow::bail!("foundation validation_steps must be at least 1 when set");
         }
-        for (source, weight) in &self.source_weights {
-            if source.trim().is_empty() {
-                anyhow::bail!("foundation source-weight key cannot be empty");
-            }
-            if !(*weight >= 0.0 && weight.is_finite()) {
-                anyhow::bail!(
-                    "foundation source weight for '{source}' must be finite and non-negative"
-                );
-            }
-        }
+        validate_weight_map(&self.source_weights, "source")?;
+        validate_weight_map(&self.validation_source_weights, "validation source")?;
         Ok(())
     }
 }
@@ -168,14 +168,106 @@ pub fn sample_foundation_validation_indices(
     let mut order = validation_indices.to_vec();
     if let Some(steps) = config.validation_steps {
         let limit = steps.saturating_mul(batch_size).min(order.len());
-        // Corpus records are stored source-by-source, so taking the first N
-        // validation records would be source-biased. Shuffle once with a fixed
-        // seed and then truncate; the same subset is reused every epoch.
-        let mut rng = FoundationSplitMix64::new(seed.wrapping_add(0x5641_4c49_4441_5445));
-        rng.shuffle(&mut order);
-        order.truncate(limit);
+        if config.validation_source_weights.is_empty() {
+            // Corpus records are stored source-by-source, so taking the first N
+            // validation records would be source-biased. Shuffle once with a fixed
+            // seed and then truncate; the same subset is reused every epoch.
+            let mut rng = FoundationSplitMix64::new(seed.wrapping_add(0x5641_4c49_4441_5445));
+            rng.shuffle(&mut order);
+            order.truncate(limit);
+        } else {
+            order = source_weighted_validation_indices(
+                provenance,
+                validation_indices,
+                limit,
+                seed,
+                &config.validation_source_weights,
+            )?;
+        }
     }
     summarize_plan(records, provenance, order)
+}
+
+fn source_weighted_validation_indices(
+    provenance: &[FoundationRecordProvenance],
+    validation_indices: &[usize],
+    target_records: usize,
+    seed: u64,
+    source_weights: &BTreeMap<String, f64>,
+) -> Result<Vec<usize>> {
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for &index in validation_indices {
+        let source = provenance.get(index).ok_or_else(|| {
+            anyhow::anyhow!("foundation provenance index {index} is out of bounds")
+        })?;
+        groups
+            .entry(source.source_id.clone())
+            .or_default()
+            .push(index);
+    }
+    validate_weights_against_groups(&groups, source_weights, "validation")?;
+    let total_weight: f64 = source_weights.values().copied().sum();
+    if !(total_weight > 0.0 && total_weight.is_finite()) {
+        anyhow::bail!("foundation validation source weights require at least one positive weight");
+    }
+    let quotas = weighted_quotas(target_records, source_weights, total_weight);
+    let mut sampled = Vec::with_capacity(target_records);
+    for (source_ordinal, (source, pool)) in groups.iter().enumerate() {
+        let desired = *quotas.get(source).unwrap_or(&0);
+        if desired > pool.len() {
+            anyhow::bail!(
+                "foundation validation source '{source}' quota {desired} exceeds its available {} records; reduce validation_steps or its validation_source_weight",
+                pool.len()
+            );
+        }
+        if desired == 0 {
+            continue;
+        }
+        let mut shuffled = pool.clone();
+        let mut rng = FoundationSplitMix64::new(
+            seed.wrapping_add(0x5641_4c53_4f55_5243)
+                .wrapping_add((source_ordinal as u64).rotate_left(23)),
+        );
+        rng.shuffle(&mut shuffled);
+        sampled.extend_from_slice(&shuffled[..desired]);
+    }
+    let mut rng = FoundationSplitMix64::new(seed.wrapping_add(0x5641_4c4d_4958_0000));
+    rng.shuffle(&mut sampled);
+    Ok(sampled)
+}
+
+fn validate_weight_map(weights: &BTreeMap<String, f64>, label: &str) -> Result<()> {
+    for (source, weight) in weights {
+        if source.trim().is_empty() {
+            anyhow::bail!("foundation {label}-weight key cannot be empty");
+        }
+        if !(*weight >= 0.0 && weight.is_finite()) {
+            anyhow::bail!(
+                "foundation {label} weight for '{source}' must be finite and non-negative"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_weights_against_groups(
+    groups: &BTreeMap<String, Vec<usize>>,
+    source_weights: &BTreeMap<String, f64>,
+    label: &str,
+) -> Result<()> {
+    for source in groups.keys() {
+        if !source_weights.contains_key(source) {
+            anyhow::bail!("foundation {label} source weights are missing source '{source}'");
+        }
+    }
+    for source in source_weights.keys() {
+        if !groups.contains_key(source) {
+            anyhow::bail!(
+                "foundation {label} source weight refers to '{source}', which has no selected records"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn source_weighted_indices(
@@ -206,20 +298,7 @@ fn source_weighted_indices(
             .map(|source| (source.clone(), 1.0f64))
             .collect::<BTreeMap<_, _>>()
     } else {
-        for source in groups.keys() {
-            if !source_weights.contains_key(source) {
-                anyhow::bail!(
-                    "foundation source-weighted sampler is missing a weight for source '{source}'"
-                );
-            }
-        }
-        for source in source_weights.keys() {
-            if !groups.contains_key(source) {
-                anyhow::bail!(
-                    "foundation source weight refers to '{source}', which has no selected training records"
-                );
-            }
-        }
+        validate_weights_against_groups(&groups, source_weights, "training")?;
         source_weights.clone()
     };
     let total_weight: f64 = weights.values().copied().sum();

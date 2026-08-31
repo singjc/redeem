@@ -5,7 +5,7 @@
 use anyhow::{bail, Result};
 use candle_core::Device;
 use redeem_properties::foundation::{
-    read_foundation_training_run_config, run_foundation_pretraining,
+    read_foundation_training_run_config, run_foundation_pretraining, FoundationEpochMetrics,
 };
 use std::env;
 
@@ -62,6 +62,18 @@ fn main() -> Result<()> {
     for (source, count) in &summary.validation_sampling.source_records {
         println!("validation_sampling_source\t{source}\t{count}");
     }
+    println!(
+        "validation_sampling_normalized_rt_records\t{}",
+        summary.validation_sampling.coverage.normalized_rt_records
+    );
+    println!(
+        "validation_sampling_observed_rt_records\t{}",
+        summary.validation_sampling.coverage.observed_rt_records
+    );
+    println!(
+        "validation_sampling_ms2_records\t{}",
+        summary.validation_sampling.coverage.ms2_records
+    );
     println!("epochs_this_invocation\t{}", summary.fit.epochs.len());
     println!(
         "completed_epochs\t{}",
@@ -74,10 +86,83 @@ fn main() -> Result<()> {
     println!("best_epoch\t{:?}", summary.fit.progress.best_epoch);
     println!("stopped_early\t{}", summary.fit.stopped_early);
     if let Some(last) = summary.fit.epochs.last() {
-        println!("last_train_loss\t{}", last.train.mean_total_loss);
-        println!("last_validation_loss\t{}", last.validation.mean_total_loss);
-        println!("last_learning_rate\t{:?}", last.train.final_learning_rate);
-        println!("last_gradient_norm\t{:?}", last.train.mean_gradient_norm);
+        print_epoch_metrics("last_train", &last.train);
+        print_epoch_metrics("last_validation", &last.validation);
+    }
+    for (source, metrics) in &summary.validation_by_source {
+        println!(
+            "validation_source_records\t{source}\t{}",
+            summary
+                .validation_sampling
+                .source_records
+                .get(source)
+                .copied()
+                .unwrap_or(0)
+        );
+        print_source_metrics(source, metrics);
     }
     Ok(())
+}
+
+fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
+    println!("{prefix}_loss\t{}", metrics.mean_total_loss);
+    print_optional_f32(&format!("{prefix}_rt_loss"), metrics.mean_rt_loss);
+    print_optional_f32(&format!("{prefix}_ccs_loss"), metrics.mean_ccs_loss);
+    print_optional_f32(&format!("{prefix}_ms2_loss"), metrics.mean_ms2_loss);
+    print_optional_f32(
+        &format!("{prefix}_masked_residue_loss"),
+        metrics.mean_masked_residue_loss,
+    );
+    print_optional_f32(
+        &format!("{prefix}_chemistry_loss"),
+        metrics.mean_chemistry_loss,
+    );
+    print_optional_f32(
+        &format!("{prefix}_contrastive_loss"),
+        metrics.mean_contrastive_loss,
+    );
+    if let Some(value) = metrics.final_learning_rate {
+        println!("{prefix}_learning_rate\t{value}");
+    }
+    if let Some(value) = metrics.mean_gradient_norm {
+        println!("{prefix}_gradient_norm\t{value}");
+    }
+    if let Some(value) = metrics.mean_gradient_scale {
+        println!("{prefix}_gradient_scale\t{value}");
+    }
+    if let Some(value) = metrics.clipped_fraction {
+        println!("{prefix}_clipped_steps\t{}", metrics.clipped_steps);
+        println!("{prefix}_clipped_fraction\t{value}");
+    }
+}
+
+fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
+    println!(
+        "validation_source_total_loss\t{source}\t{}",
+        metrics.mean_total_loss
+    );
+    print_source_optional(source, "rt_loss", metrics.mean_rt_loss);
+    print_source_optional(source, "ccs_loss", metrics.mean_ccs_loss);
+    print_source_optional(source, "ms2_loss", metrics.mean_ms2_loss);
+    print_source_optional(
+        source,
+        "masked_residue_loss",
+        metrics.mean_masked_residue_loss,
+    );
+    print_source_optional(source, "chemistry_loss", metrics.mean_chemistry_loss);
+    print_source_optional(source, "contrastive_loss", metrics.mean_contrastive_loss);
+}
+
+fn print_optional_f32(label: &str, value: Option<f32>) {
+    match value {
+        Some(value) => println!("{label}\t{value}"),
+        None => println!("{label}\tNA"),
+    }
+}
+
+fn print_source_optional(source: &str, label: &str, value: Option<f32>) {
+    match value {
+        Some(value) => println!("validation_source_{label}\t{source}\t{value}"),
+        None => println!("validation_source_{label}\t{source}\tNA"),
+    }
 }

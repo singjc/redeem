@@ -162,6 +162,12 @@ pub struct FoundationEpochMetrics {
     pub mean_contrastive_loss: Option<f32>,
     /// Mean pre-clipping gradient norm for training epochs.
     pub mean_gradient_norm: Option<f64>,
+    /// Mean multiplicative gradient scale after global-norm clipping.
+    pub mean_gradient_scale: Option<f64>,
+    /// Number of optimizer steps where global-norm clipping was active.
+    pub clipped_steps: usize,
+    /// Fraction of optimizer steps where global-norm clipping was active.
+    pub clipped_fraction: Option<f64>,
     /// Final learning rate used during the epoch.
     pub final_learning_rate: Option<f64>,
 }
@@ -814,6 +820,8 @@ struct EpochAccumulator {
     chemistry: OptionalMean,
     contrastive: OptionalMean,
     gradient_norm: OptionalMean64,
+    gradient_scale: OptionalMean64,
+    clipped_steps: usize,
     final_learning_rate: Option<f64>,
 }
 
@@ -829,6 +837,10 @@ impl EpochAccumulator {
         self.contrastive.push(metrics.contrastive_loss);
         if metrics.learning_rate > 0.0 {
             self.gradient_norm.push(Some(metrics.gradient_norm));
+            self.gradient_scale.push(Some(metrics.gradient_scale));
+            if metrics.gradient_scale < 1.0 - 1e-12 {
+                self.clipped_steps = self.clipped_steps.saturating_add(1);
+            }
             self.final_learning_rate = Some(metrics.learning_rate);
         }
     }
@@ -848,6 +860,10 @@ impl EpochAccumulator {
             mean_chemistry_loss: self.chemistry.mean(),
             mean_contrastive_loss: self.contrastive.mean(),
             mean_gradient_norm: self.gradient_norm.mean(),
+            mean_gradient_scale: self.gradient_scale.mean(),
+            clipped_steps: self.clipped_steps,
+            clipped_fraction: (self.gradient_scale.count > 0)
+                .then(|| self.clipped_steps as f64 / self.gradient_scale.count as f64),
             final_learning_rate: self.final_learning_rate,
         }
     }
@@ -867,7 +883,7 @@ impl OptionalMean {
         }
     }
 
-    fn mean(self) -> Option<f32> {
+    fn mean(&self) -> Option<f32> {
         (self.count > 0).then(|| (self.sum / self.count as f64) as f32)
     }
 }
@@ -886,7 +902,7 @@ impl OptionalMean64 {
         }
     }
 
-    fn mean(self) -> Option<f64> {
+    fn mean(&self) -> Option<f64> {
         (self.count > 0).then(|| self.sum / self.count as f64)
     }
 }
