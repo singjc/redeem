@@ -118,6 +118,13 @@ fn openswath_profile_avoids_sequence_nce_collision_and_parses_terminal_modificat
     assert_eq!(report.stats.parsed_rows, 1);
     assert_eq!(report.stats.skipped_error_rows, 0);
     assert_eq!(report.stats.modified_records, 1);
+    assert_eq!(report.stats.canonical_unimod_records, 1);
+    assert_eq!(report.stats.unresolved_modification_records, 0);
+    assert_eq!(report.stats.n_terminal_modification_occurrences, 1);
+    assert_eq!(
+        report.stats.unimod_occurrences.get("UniMod:1 Acetyl"),
+        Some(&1)
+    );
     assert_eq!(
         report.records[0].retention_time.observed_seconds,
         Some(1234.5)
@@ -147,6 +154,87 @@ fn ip2_profile_prefers_modified_peptide_sequence() {
     assert_eq!(report.stats.modified_records, 1);
     assert_eq!(report.records[0].peptidoform.sequence, "ACDEFGK");
     assert_eq!(report.records[0].peptidoform.modifications.len(), 1);
+    assert_eq!(
+        report.records[0].peptidoform.modifications[0].unimod_id,
+        Some(4)
+    );
     assert!((report.records[0].peptidoform.modifications[0].mass_delta - 57.021465).abs() < 1e-5);
+    assert_eq!(
+        report
+            .stats
+            .unimod_occurrences
+            .get("UniMod:4 Carbamidomethyl"),
+        Some(&1)
+    );
     assert_eq!(report.records[0].retention_time.normalized, Some(42.5));
+}
+
+#[test]
+fn modification_family_split_groups_same_unimod_across_sequences() {
+    let table = concat!(
+        "ModifiedPeptide\tPrecursorCharge\n",
+        "PEPM(UniMod:35)IDEK\t2\n",
+        "AAAAAM(UniMod:35)K\t2\n",
+        "AC(UniMod:4)DEFGK\t2\n",
+        "CC(UniMod:4)AAAAK\t2\n",
+        "PEPTIDEK\t2\n",
+    );
+    let mut loader = FoundationDatasetLoader::new(16);
+    let records = loader
+        .load_reader(
+            table.as_bytes(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+    let split = split_foundation_records(
+        &records,
+        &FoundationSplitConfig {
+            mode: FoundationSplitMode::ModificationFamily,
+            validation_fraction: 0.2,
+            test_fraction: 0.2,
+            seed: 19,
+        },
+    )
+    .unwrap();
+
+    let partition = |index: usize| {
+        if split.train.contains(&index) {
+            0
+        } else if split.validation.contains(&index) {
+            1
+        } else {
+            2
+        }
+    };
+    assert_eq!(partition(0), partition(1));
+    assert_eq!(partition(2), partition(3));
+}
+
+#[test]
+fn modification_family_split_rejects_numeric_only_open_modifications() {
+    let table = concat!(
+        "ModifiedPeptide\tPrecursorCharge\n",
+        "PEPM[+15.9949]IDEK\t2\n",
+        "AC(UniMod:4)DEFGK\t2\n",
+    );
+    let mut loader = FoundationDatasetLoader::new(16);
+    let records = loader
+        .load_reader(
+            table.as_bytes(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+    let error = split_foundation_records(
+        &records,
+        &FoundationSplitConfig {
+            mode: FoundationSplitMode::ModificationFamily,
+            validation_fraction: 0.2,
+            test_fraction: 0.2,
+            seed: 19,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("canonical UniMod identity"));
 }

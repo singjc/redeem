@@ -7,8 +7,8 @@
 //! and a size-aware greedy balancer.
 //!
 //! The default split is sequence-disjoint.  Peptidoform-, run-, instrument-,
-//! and modification-signature-disjoint variants are also available for focused
-//! generalization experiments.
+//! modification-signature-, and canonical modification-family-disjoint
+//! variants are also available for focused generalization experiments.
 
 use super::data::FoundationTrainingRecord;
 use super::dataset::canonical_peptidoform_label;
@@ -32,11 +32,18 @@ pub enum FoundationSplitMode {
     /// instrument name.
     Instrument,
     /// Keep residue-specific modification-mass signatures together across
-    /// peptide sequences.  This is useful for modification-pattern transfer
-    /// experiments, but is not yet a strict unseen-UniMod benchmark because
-    /// the current foundation representation stores mass deltas rather than a
-    /// canonical modification ontology.
+    /// peptide sequences. This remains useful for open-modification transfer
+    /// experiments where no canonical identity is available.
     ModificationSignature,
+    /// Keep canonical UniMod families disjoint across partitions, independent
+    /// of peptide sequence and modification site. Every modified record must
+    /// carry canonical UniMod identity; open/numeric-only mass shifts return an
+    /// error rather than being silently treated as a known PTM family.
+    ///
+    /// Unmodified records share one `unmodified` family. For a dedicated
+    /// unseen-PTM benchmark, callers will typically filter to modified records
+    /// before applying this split.
+    ModificationFamily,
 }
 
 /// Deterministic split configuration.
@@ -278,6 +285,7 @@ fn split_key(
                 )
             }),
         FoundationSplitMode::ModificationSignature => Ok(modification_signature(record)),
+        FoundationSplitMode::ModificationFamily => modification_family(record, record_index),
     }
 }
 
@@ -303,6 +311,28 @@ fn modification_signature(record: &FoundationTrainingRecord) -> String {
     modifications.join("|")
 }
 
+fn modification_family(record: &FoundationTrainingRecord, record_index: usize) -> Result<String> {
+    if record.peptidoform.modifications.is_empty() {
+        return Ok("unmodified".to_string());
+    }
+    let mut families = Vec::<u32>::new();
+    for modification in &record.peptidoform.modifications {
+        let Some(unimod_id) = modification.unimod_id else {
+            return Err(anyhow!(
+                "record {record_index} contains a modification without canonical UniMod identity;                  modification-family split requires canonical PTM ids"
+            ));
+        };
+        families.push(unimod_id);
+    }
+    families.sort_unstable();
+    families.dedup();
+    Ok(families
+        .into_iter()
+        .map(|id| format!("UniMod:{id}"))
+        .collect::<Vec<_>>()
+        .join("|"))
+}
+
 fn stable_group_hash(value: &str, seed: u64) -> u64 {
     // FNV-1a is deliberately implemented locally rather than using
     // DefaultHasher, whose algorithm is not a stable serialization contract.
@@ -318,7 +348,8 @@ fn stable_group_hash(value: &str, seed: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::foundation::{
-        FoundationModification, PeptidoformInput, RetentionTimeLabels, TrainingContext,
+        FoundationModification, FoundationModificationSite, PeptidoformInput, RetentionTimeLabels,
+        TrainingContext,
     };
 
     fn record(sequence: &str, run: &str, instrument: &str) -> FoundationTrainingRecord {
@@ -385,18 +416,43 @@ mod tests {
     #[test]
     fn modification_signature_is_sequence_independent() {
         let mut first = record("PEPMIDEK", "run-a", "A");
-        first.peptidoform.modifications = vec![FoundationModification {
-            residue_index: 3,
-            mass_delta: 15.994_915,
-        }];
+        first.peptidoform.modifications = vec![FoundationModification::mass_delta(3, 15.994_915)];
         let mut second = record("AAAAAMK", "run-b", "B");
-        second.peptidoform.modifications = vec![FoundationModification {
-            residue_index: 5,
-            mass_delta: 15.994_915,
-        }];
+        second.peptidoform.modifications = vec![FoundationModification::mass_delta(5, 15.994_915)];
         assert_eq!(
             modification_signature(&first),
             modification_signature(&second)
         );
+    }
+
+    #[test]
+    fn modification_family_uses_unimod_identity_not_sequence_or_site() {
+        let mut first = record("PEPMIDEK", "run-a", "A");
+        first.peptidoform.modifications = vec![FoundationModification::unimod(
+            FoundationModificationSite::Residue(3),
+            3,
+            35,
+            15.994_915,
+        )];
+        let mut second = record("AAAAAMK", "run-b", "B");
+        second.peptidoform.modifications = vec![FoundationModification::unimod(
+            FoundationModificationSite::Residue(5),
+            5,
+            35,
+            15.994_915,
+        )];
+        assert_eq!(modification_family(&first, 0).unwrap(), "UniMod:35");
+        assert_eq!(
+            modification_family(&first, 0).unwrap(),
+            modification_family(&second, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn modification_family_rejects_open_mass_shifts() {
+        let mut record = record("PEPMIDEK", "run-a", "A");
+        record.peptidoform.modifications = vec![FoundationModification::mass_delta(3, 15.994_915)];
+        let error = modification_family(&record, 0).unwrap_err();
+        assert!(error.to_string().contains("canonical UniMod identity"));
     }
 }

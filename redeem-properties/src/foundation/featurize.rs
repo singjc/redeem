@@ -3,14 +3,86 @@
 use super::chemistry::{residue_graph, ATOM_FEATURE_DIM};
 use super::config::FoundationConfig;
 use candle_core::{DType, Device, Result, Tensor};
+use serde::{Deserialize, Serialize};
+
+/// Chemical scope of a peptide modification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FoundationModificationSite {
+    /// Modification is attached to a specific zero-based residue index.
+    Residue(usize),
+    /// Modification is attached to the peptide N terminus.
+    NTerm,
+    /// Modification is attached to the peptide C terminus.
+    CTerm,
+}
 
 /// A site-specific modification supplied to the chemistry featurizer.
+///
+/// `unimod_id` preserves canonical modification identity when the source table
+/// provides it.  `mass_delta` is retained for numerical compatibility and as a
+/// fallback for open/unknown mass-shift annotations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FoundationModification {
-    /// Zero-based residue index.
+    /// Zero-based residue index used by the current residue-local graph.
+    ///
+    /// Terminal modifications are provisionally anchored to residue 0 or the
+    /// final residue respectively until explicit terminal graph nodes are added.
     pub residue_index: usize,
-    /// Monoisotopic mass delta when detailed chemistry is not available.
+    /// Monoisotopic mass delta.
     pub mass_delta: f32,
+    /// Canonical UniMod accession when known.
+    pub unimod_id: Option<u32>,
+    /// Chemical site/scope of the modification.
+    pub site: FoundationModificationSite,
+}
+
+impl FoundationModification {
+    /// Construct an unresolved/open mass-shift modification on a residue.
+    pub fn mass_delta(residue_index: usize, mass_delta: f32) -> Self {
+        Self::mass_delta_at_site(
+            FoundationModificationSite::Residue(residue_index),
+            residue_index,
+            mass_delta,
+        )
+    }
+
+    /// Construct an unresolved/open mass-shift modification at an explicit
+    /// residue or terminal site.
+    pub fn mass_delta_at_site(
+        site: FoundationModificationSite,
+        residue_index: usize,
+        mass_delta: f32,
+    ) -> Self {
+        Self {
+            residue_index,
+            mass_delta,
+            unimod_id: None,
+            site,
+        }
+    }
+
+    /// Construct a canonical UniMod modification.
+    pub fn unimod(
+        site: FoundationModificationSite,
+        residue_index: usize,
+        unimod_id: u32,
+        mass_delta: f32,
+    ) -> Self {
+        Self {
+            residue_index,
+            mass_delta,
+            unimod_id: Some(unimod_id),
+            site,
+        }
+    }
+
+    /// Stable human-readable identity used by reports and split keys.
+    pub fn identity_label(&self) -> String {
+        match self.unimod_id {
+            Some(id) => format!("UniMod:{id}"),
+            None => format!("Mass:{:+.4}", self.mass_delta),
+        }
+    }
 }
 
 /// Input peptidoform consumed by the foundation featurizer.

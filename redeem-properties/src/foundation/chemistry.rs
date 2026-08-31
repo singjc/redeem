@@ -8,6 +8,140 @@
 /// Number of raw features emitted for each atom.
 pub const ATOM_FEATURE_DIM: usize = 12;
 
+/// Signed elemental-composition delta for a canonical modification.
+///
+/// Negative counts are required for transformations such as deamidation.  The
+/// isotope-specific fields preserve the chemistry of isobaric labels rather
+/// than collapsing them into an unexplained mass shift.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ElementalComposition {
+    /// Carbon-12 atoms.
+    pub carbon: i16,
+    /// Carbon-13 atoms.
+    pub carbon_13: i16,
+    /// Hydrogen-1 atoms.
+    pub hydrogen: i16,
+    /// Nitrogen-14 atoms.
+    pub nitrogen: i16,
+    /// Nitrogen-15 atoms.
+    pub nitrogen_15: i16,
+    /// Oxygen-16 atoms.
+    pub oxygen: i16,
+    /// Sulfur atoms.
+    pub sulfur: i16,
+    /// Phosphorus atoms.
+    pub phosphorus: i16,
+}
+
+/// Canonical metadata retained for a supported UniMod modification.
+///
+/// This registry is intentionally small and explicit.  It provides stable
+/// modification identity and elemental composition now; structural graph
+/// templates can then be added one family at a time without losing provenance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FoundationModificationDefinition {
+    /// UniMod accession.
+    pub unimod_id: u32,
+    /// Canonical short name.
+    pub name: &'static str,
+    /// Monoisotopic mass delta.
+    pub mass_delta: f32,
+    /// Signed elemental-composition delta.
+    pub composition: ElementalComposition,
+}
+
+/// Return canonical metadata for UniMod accessions supported by the foundation
+/// loader.
+///
+/// The compositions mirror UniMod definitions for the currently accepted
+/// accessions.  TMT entries retain explicit heavy-isotope atom counts.
+pub fn common_unimod_definition(id: u32) -> Option<FoundationModificationDefinition> {
+    let (name, mass_delta, composition) = match id {
+        1 => (
+            "Acetyl",
+            42.010_565,
+            ElementalComposition {
+                carbon: 2,
+                hydrogen: 2,
+                oxygen: 1,
+                ..ElementalComposition::default()
+            },
+        ),
+        4 => (
+            "Carbamidomethyl",
+            57.021_465,
+            ElementalComposition {
+                carbon: 2,
+                hydrogen: 3,
+                nitrogen: 1,
+                oxygen: 1,
+                ..ElementalComposition::default()
+            },
+        ),
+        7 => (
+            "Deamidated",
+            0.984_016,
+            ElementalComposition {
+                hydrogen: -1,
+                nitrogen: -1,
+                oxygen: 1,
+                ..ElementalComposition::default()
+            },
+        ),
+        21 => (
+            "Phospho",
+            79.966_33,
+            ElementalComposition {
+                hydrogen: 1,
+                oxygen: 3,
+                phosphorus: 1,
+                ..ElementalComposition::default()
+            },
+        ),
+        35 => (
+            "Oxidation",
+            15.994_915,
+            ElementalComposition {
+                oxygen: 1,
+                ..ElementalComposition::default()
+            },
+        ),
+        737 => (
+            "TMT6plex",
+            229.162_93,
+            ElementalComposition {
+                carbon: 8,
+                carbon_13: 4,
+                hydrogen: 20,
+                nitrogen: 1,
+                nitrogen_15: 1,
+                oxygen: 2,
+                ..ElementalComposition::default()
+            },
+        ),
+        2016 => (
+            "TMTpro",
+            304.207_15,
+            ElementalComposition {
+                carbon: 8,
+                carbon_13: 7,
+                hydrogen: 25,
+                nitrogen: 1,
+                nitrogen_15: 2,
+                oxygen: 3,
+                ..ElementalComposition::default()
+            },
+        ),
+        _ => return None,
+    };
+    Some(FoundationModificationDefinition {
+        unimod_id: id,
+        name,
+        mass_delta,
+        composition,
+    })
+}
+
 /// Chemical element represented in a residue graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Element {
@@ -445,5 +579,17 @@ mod tests {
         graph.add_mass_delta_modification(15.9949);
         assert_eq!(graph.atoms.len(), before + 1);
         assert_eq!(graph.atoms.last().unwrap().element, Element::Pseudo);
+    }
+
+    #[test]
+    fn canonical_unimod_registry_preserves_identity_and_composition() {
+        let phospho = common_unimod_definition(21).unwrap();
+        assert_eq!(phospho.name, "Phospho");
+        assert_eq!(phospho.composition.phosphorus, 1);
+        assert_eq!(phospho.composition.oxygen, 3);
+
+        let tmtpro = common_unimod_definition(2016).unwrap();
+        assert_eq!(tmtpro.composition.carbon_13, 7);
+        assert_eq!(tmtpro.composition.nitrogen_15, 2);
     }
 }

@@ -453,10 +453,7 @@ mod tests {
             FoundationTrainingRecord {
                 peptidoform: PeptidoformInput {
                     sequence: "ACDMK".to_string(),
-                    modifications: vec![FoundationModification {
-                        residue_index: 3,
-                        mass_delta: 15.994915,
-                    }],
+                    modifications: vec![FoundationModification::mass_delta(3, 15.994915)],
                 },
                 retention_time: RetentionTimeLabels::default(),
                 ccs: Some(430.0),

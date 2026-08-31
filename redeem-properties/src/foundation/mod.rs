@@ -24,6 +24,9 @@ pub mod split;
 pub mod trainer;
 pub mod wrapper;
 
+pub use chemistry::{
+    common_unimod_definition, ElementalComposition, FoundationModificationDefinition,
+};
 pub use collate::{
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
     FoundationTrainingBatch, FoundationTrainingViews,
@@ -40,7 +43,8 @@ pub use dataset::{
     InstrumentVocabulary,
 };
 pub use featurize::{
-    FoundationBatch, FoundationModification, PeptideGraphFeaturizer, PeptidoformInput,
+    FoundationBatch, FoundationModification, FoundationModificationSite, PeptideGraphFeaturizer,
+    PeptidoformInput,
 };
 pub use loss::{
     contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,

@@ -12,8 +12,9 @@
 //! labels.  This is important for cross-run pretraining: normalized RT is an
 //! intrinsic/portable target whereas observed RT depends on LC context.
 
+use super::chemistry::common_unimod_definition;
 use super::data::{FoundationTrainingRecord, FragmentTarget, RetentionTimeLabels, TrainingContext};
-use super::featurize::{FoundationModification, PeptidoformInput};
+use super::featurize::{FoundationModification, FoundationModificationSite, PeptidoformInput};
 use anyhow::{anyhow, Context, Result};
 use csv::{ReaderBuilder, StringRecord};
 use serde::{Deserialize, Serialize};
@@ -202,6 +203,21 @@ pub struct FoundationTableLoadStats {
     pub unique_peptidoforms: usize,
     /// Grouped records containing at least one modification.
     pub modified_records: usize,
+    /// Modified records where every modification has a canonical UniMod id.
+    pub canonical_unimod_records: usize,
+    /// Modified records containing at least one unresolved/open mass shift.
+    pub unresolved_modification_records: usize,
+    /// Total modification occurrences across grouped precursor records.
+    pub modification_occurrences: usize,
+    /// Modification occurrences carrying a canonical UniMod id, keyed by
+    /// `UniMod:<id> <name>`.
+    pub unimod_occurrences: BTreeMap<String, usize>,
+    /// Modification occurrences represented only by a mass delta.
+    pub unresolved_mass_shift_occurrences: usize,
+    /// N-terminal modification occurrences.
+    pub n_terminal_modification_occurrences: usize,
+    /// C-terminal modification occurrences.
+    pub c_terminal_modification_occurrences: usize,
     /// Records carrying normalized RT/iRT.
     pub normalized_rt_records: usize,
     /// Records carrying observed chromatographic RT.
@@ -870,6 +886,39 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
         peptidoforms.insert(canonical_peptidoform_label(&record.peptidoform));
         if !record.peptidoform.modifications.is_empty() {
             stats.modified_records += 1;
+            let mut all_canonical = true;
+            let mut has_unresolved = false;
+            for modification in &record.peptidoform.modifications {
+                stats.modification_occurrences += 1;
+                match modification.unimod_id {
+                    Some(id) => {
+                        let label = common_unimod_definition(id)
+                            .map(|definition| format!("UniMod:{id} {}", definition.name))
+                            .unwrap_or_else(|| format!("UniMod:{id}"));
+                        *stats.unimod_occurrences.entry(label).or_insert(0) += 1;
+                    }
+                    None => {
+                        all_canonical = false;
+                        has_unresolved = true;
+                        stats.unresolved_mass_shift_occurrences += 1;
+                    }
+                }
+                match modification.site {
+                    FoundationModificationSite::NTerm => {
+                        stats.n_terminal_modification_occurrences += 1;
+                    }
+                    FoundationModificationSite::CTerm => {
+                        stats.c_terminal_modification_occurrences += 1;
+                    }
+                    FoundationModificationSite::Residue(_) => {}
+                }
+            }
+            if all_canonical {
+                stats.canonical_unimod_records += 1;
+            }
+            if has_unresolved {
+                stats.unresolved_modification_records += 1;
+            }
         }
         if record.retention_time.normalized.is_some() {
             stats.normalized_rt_records += 1;
@@ -913,21 +962,40 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
 pub(crate) fn canonical_peptidoform_label(peptidoform: &PeptidoformInput) -> String {
     let mut modifications = peptidoform.modifications.clone();
     modifications.sort_by(|left, right| {
-        left.residue_index.cmp(&right.residue_index).then_with(|| {
-            left.mass_delta
-                .partial_cmp(&right.mass_delta)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        modification_site_sort_key(left.site)
+            .cmp(&modification_site_sort_key(right.site))
+            .then_with(|| left.residue_index.cmp(&right.residue_index))
+            .then_with(|| left.unimod_id.cmp(&right.unimod_id))
+            .then_with(|| {
+                left.mass_delta
+                    .partial_cmp(&right.mass_delta)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     let mut label = peptidoform.sequence.clone();
     for modification in modifications {
         label.push('|');
-        label.push_str(&format!(
-            "{}:{:+.4}",
-            modification.residue_index, modification.mass_delta
-        ));
+        label.push_str(&modification_site_label(modification.site));
+        label.push(':');
+        label.push_str(&modification.identity_label());
     }
     label
+}
+
+fn modification_site_sort_key(site: FoundationModificationSite) -> (u8, usize) {
+    match site {
+        FoundationModificationSite::NTerm => (0, 0),
+        FoundationModificationSite::Residue(index) => (1, index),
+        FoundationModificationSite::CTerm => (2, usize::MAX),
+    }
+}
+
+fn modification_site_label(site: FoundationModificationSite) -> String {
+    match site {
+        FoundationModificationSite::NTerm => "N-term".to_string(),
+        FoundationModificationSite::Residue(index) => format!("R{index}"),
+        FoundationModificationSite::CTerm => "C-term".to_string(),
+    }
 }
 
 fn normalize_header(value: &str) -> String {
@@ -1180,12 +1248,28 @@ pub fn parse_modified_peptide(raw: &str) -> Result<PeptidoformInput> {
                 return Err(anyhow!("unterminated modification in '{raw}'"));
             }
             let token: String = chars[start..end].iter().collect();
-            let mass_delta = modification_mass_delta(&token)?;
-            let residue_index = last_residue.unwrap_or(0);
-            modifications.push(FoundationModification {
-                residue_index,
-                mass_delta,
-            });
+            let parsed = parse_modification_annotation(&token)?;
+            let (site, residue_index) = match last_residue {
+                Some(residue_index) => (
+                    FoundationModificationSite::Residue(residue_index),
+                    residue_index,
+                ),
+                None => (FoundationModificationSite::NTerm, 0),
+            };
+            let modification = match parsed.unimod_id {
+                Some(unimod_id) => FoundationModification::unimod(
+                    site,
+                    residue_index,
+                    unimod_id,
+                    parsed.mass_delta,
+                ),
+                None => FoundationModification::mass_delta_at_site(
+                    site,
+                    residue_index,
+                    parsed.mass_delta,
+                ),
+            };
+            modifications.push(modification);
             index = end + 1;
             continue;
         }
@@ -1217,35 +1301,36 @@ fn strip_flanking_residues(raw: &str) -> &str {
     raw
 }
 
-fn modification_mass_delta(token: &str) -> Result<f32> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ParsedModificationAnnotation {
+    mass_delta: f32,
+    unimod_id: Option<u32>,
+}
+
+fn parse_modification_annotation(token: &str) -> Result<ParsedModificationAnnotation> {
     let normalized = token.trim().trim_start_matches('+').replace(' ', "");
     if let Ok(value) = normalized.parse::<f32>() {
-        return Ok(value);
+        return Ok(ParsedModificationAnnotation {
+            mass_delta: value,
+            unimod_id: None,
+        });
     }
     let lowercase = normalized.to_ascii_lowercase();
     if let Some(id) = lowercase
         .strip_prefix("unimod:")
         .and_then(|value| value.parse::<u32>().ok())
     {
-        return common_unimod_mass(id)
-            .ok_or_else(|| anyhow!("UniMod:{id} is not in the built-in foundation mass resolver"));
+        let definition = common_unimod_definition(id).ok_or_else(|| {
+            anyhow!("UniMod:{id} is not in the built-in foundation modification registry")
+        })?;
+        return Ok(ParsedModificationAnnotation {
+            mass_delta: definition.mass_delta,
+            unimod_id: Some(id),
+        });
     }
     Err(anyhow!(
         "unsupported modification annotation '{token}'; provide a numeric mass delta or supported UniMod id"
     ))
-}
-
-fn common_unimod_mass(id: u32) -> Option<f32> {
-    match id {
-        1 => Some(42.010_567),    // Acetyl
-        4 => Some(57.021_465),    // Carbamidomethyl
-        7 => Some(0.984_016),     // Deamidated
-        21 => Some(79.966_33),    // Phospho
-        35 => Some(15.994_915),   // Oxidation
-        737 => Some(229.162_93),  // TMT6plex
-        2016 => Some(304.207_15), // TMTpro
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1258,7 +1343,17 @@ mod tests {
         assert_eq!(peptide.sequence, "SKEEETSIDMK");
         assert_eq!(peptide.modifications.len(), 2);
         assert_eq!(peptide.modifications[0].residue_index, 5);
+        assert_eq!(peptide.modifications[0].unimod_id, None);
+        assert_eq!(
+            peptide.modifications[0].site,
+            FoundationModificationSite::Residue(5)
+        );
         assert!((peptide.modifications[0].mass_delta - 79.9663).abs() < 1e-4);
+        assert_eq!(peptide.modifications[1].unimod_id, Some(35));
+        assert_eq!(
+            peptide.modifications[1].site,
+            FoundationModificationSite::Residue(9)
+        );
         assert!((peptide.modifications[1].mass_delta - 15.994915).abs() < 1e-5);
     }
 
@@ -1268,7 +1363,12 @@ mod tests {
         assert_eq!(peptide.sequence, "AAAAAAGAASGLPGPVAQGLK");
         assert_eq!(peptide.modifications.len(), 1);
         assert_eq!(peptide.modifications[0].residue_index, 0);
-        assert!((peptide.modifications[0].mass_delta - 42.010567).abs() < 1e-5);
+        assert_eq!(peptide.modifications[0].unimod_id, Some(1));
+        assert_eq!(
+            peptide.modifications[0].site,
+            FoundationModificationSite::NTerm
+        );
+        assert!((peptide.modifications[0].mass_delta - 42.010565).abs() < 1e-5);
     }
 
     #[test]
