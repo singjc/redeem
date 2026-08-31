@@ -1,21 +1,33 @@
 //! Candle training loop for multi-task peptide foundation pretraining.
 //!
-//! The trainer intentionally operates on [`FoundationTrainingRecord`](crate::foundation::FoundationTrainingRecord)
-//! batches rather than the legacy property-specific `PeptideData` tensor
-//! interface.  It performs two independently corrupted forward passes,
-//! combines sparse supervised labels with masked reconstruction objectives,
-//! adds symmetric InfoNCE, and updates all trainable variables with AdamW.
+//! The trainer operates on heterogeneous [`FoundationTrainingRecord`](crate::foundation::FoundationTrainingRecord)
+//! batches rather than the legacy property-specific tensor interface. It owns
+//! a serializable AdamW optimizer, optional gradient clipping, deterministic
+//! learning-rate scheduling, validation, exact checkpoint/resume state, and a
+//! bounded early-stopping fit loop.
 
+use super::checkpoint::{
+    foundation_checkpoint_paths, FoundationCheckpointMetadata, FoundationCheckpointProvenance,
+    FoundationTrainingProgress,
+};
 use super::collate::{FoundationCollator, FoundationCollatorConfig, FoundationTrainingViews};
 use super::config::FoundationConfig;
+use super::control::{FoundationFitConfig, FoundationLearningRateSchedule, FoundationSplitMix64};
+use super::corpus::FoundationRecordProvenance;
 use super::data::FoundationTrainingRecord;
 use super::loss::{
     contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,
 };
+use super::optimizer::{FoundationAdamW, FoundationAdamWConfig};
+use super::sampling::{
+    sample_foundation_training_indices, sample_foundation_validation_indices,
+    FoundationSamplingConfig,
+};
 use super::wrapper::FoundationModelWrapper;
+use anyhow::{Context, Result as AnyResult};
 use candle_core::{Device, Result, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
 
 /// Training hyperparameters independent from the model architecture.
@@ -24,17 +36,29 @@ use std::path::Path;
 pub struct FoundationTrainerConfig {
     /// Mini-batch size used by [`FoundationTrainer::train_epoch`].
     pub batch_size: usize,
-    /// AdamW learning rate.
+    /// Base AdamW learning rate.
     pub learning_rate: f64,
     /// AdamW decoupled weight decay.
     pub weight_decay: f64,
+    /// AdamW first-moment decay.
+    pub adam_beta1: f64,
+    /// AdamW second-moment decay.
+    pub adam_beta2: f64,
+    /// AdamW numerical stabilizer.
+    pub adam_epsilon: f64,
+    /// Optional global L2 gradient clipping threshold.
+    pub max_gradient_norm: Option<f64>,
+    /// Per-step learning-rate schedule.
+    pub learning_rate_schedule: FoundationLearningRateSchedule,
     /// Temperature used by the symmetric InfoNCE objective.
     pub contrastive_temperature: f64,
     /// Relative task-loss contributions.
     pub loss_weights: FoundationLossWeights,
     /// Label/corruption collation settings.
     pub collator: FoundationCollatorConfig,
-    /// Base seed for deterministic view corruption.
+    /// Large-corpus/source-aware sampling controls.
+    pub sampling: FoundationSamplingConfig,
+    /// Base seed for deterministic view corruption and epoch shuffling.
     pub seed: u64,
 }
 
@@ -44,29 +68,51 @@ impl Default for FoundationTrainerConfig {
             batch_size: 32,
             learning_rate: 1e-4,
             weight_decay: 0.01,
+            adam_beta1: 0.9,
+            adam_beta2: 0.999,
+            adam_epsilon: 1e-8,
+            max_gradient_norm: Some(1.0),
+            learning_rate_schedule: FoundationLearningRateSchedule::Constant,
             contrastive_temperature: 0.10,
             loss_weights: FoundationLossWeights::default(),
             collator: FoundationCollatorConfig::default(),
+            sampling: FoundationSamplingConfig::default(),
             seed: 20260831,
         }
     }
 }
 
 impl FoundationTrainerConfig {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.batch_size == 0 {
             candle_core::bail!("foundation batch_size must be greater than zero");
         }
-        if !(self.learning_rate > 0.0 && self.learning_rate.is_finite()) {
-            candle_core::bail!("foundation learning_rate must be positive and finite");
+        let _ = self.optimizer_config().validate()?;
+        if let Some(max_norm) = self.max_gradient_norm {
+            if !(max_norm > 0.0 && max_norm.is_finite()) {
+                candle_core::bail!("foundation max_gradient_norm must be positive and finite");
+            }
         }
-        if !(self.weight_decay >= 0.0 && self.weight_decay.is_finite()) {
-            candle_core::bail!("foundation weight_decay must be non-negative and finite");
-        }
+        self.learning_rate_schedule
+            .validate()
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         if !(self.contrastive_temperature > 0.0 && self.contrastive_temperature.is_finite()) {
             candle_core::bail!("foundation contrastive_temperature must be positive and finite");
         }
+        self.sampling
+            .validate()
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         Ok(())
+    }
+
+    fn optimizer_config(&self) -> FoundationAdamWConfig {
+        FoundationAdamWConfig {
+            learning_rate: self.learning_rate,
+            beta1: self.adam_beta1,
+            beta2: self.adam_beta2,
+            epsilon: self.adam_epsilon,
+            weight_decay: self.weight_decay,
+        }
     }
 }
 
@@ -87,9 +133,15 @@ pub struct FoundationStepMetrics {
     pub chemistry_loss: Option<f32>,
     /// Symmetric contrastive loss; absent for batch size one.
     pub contrastive_loss: Option<f32>,
+    /// Learning rate used for this update.
+    pub learning_rate: f64,
+    /// Global L2 gradient norm before clipping.
+    pub gradient_norm: f64,
+    /// Multiplicative gradient scale applied by clipping.
+    pub gradient_scale: f64,
 }
 
-/// Aggregate diagnostics for one sequential pass through a record slice.
+/// Aggregate diagnostics for one pass through a record slice.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FoundationEpochMetrics {
     /// Number of batches evaluated/optimized.
@@ -108,12 +160,40 @@ pub struct FoundationEpochMetrics {
     pub mean_chemistry_loss: Option<f32>,
     /// Mean symmetric contrastive loss when batch size permitted it.
     pub mean_contrastive_loss: Option<f32>,
+    /// Mean pre-clipping gradient norm for training epochs.
+    pub mean_gradient_norm: Option<f64>,
+    /// Final learning rate used during the epoch.
+    pub final_learning_rate: Option<f64>,
+}
+
+/// One completed fit epoch.
+#[derive(Debug, Clone, Copy)]
+pub struct FoundationFitEpochMetrics {
+    /// Zero-based epoch index.
+    pub epoch: u64,
+    /// Training metrics.
+    pub train: FoundationEpochMetrics,
+    /// Validation metrics.
+    pub validation: FoundationEpochMetrics,
+    /// Whether this epoch established a new best validation loss.
+    pub improved: bool,
+}
+
+/// Summary returned by [`FoundationTrainer::fit`].
+#[derive(Debug, Clone)]
+pub struct FoundationFitSummary {
+    /// Epoch metrics in completion order.
+    pub epochs: Vec<FoundationFitEpochMetrics>,
+    /// Final progress state.
+    pub progress: FoundationTrainingProgress,
+    /// True when early stopping ended the run before `max_epochs`.
+    pub stopped_early: bool,
 }
 
 /// Stateful foundation trainer with model, optimizer, collator, and checkpoint state.
 pub struct FoundationTrainer {
     wrapper: FoundationModelWrapper,
-    optimizer: AdamW,
+    optimizer: FoundationAdamW,
     collator: FoundationCollator,
     config: FoundationTrainerConfig,
     global_step: u64,
@@ -128,14 +208,7 @@ impl FoundationTrainer {
     ) -> Result<Self> {
         config.validate()?;
         let wrapper = FoundationModelWrapper::new(model_config.clone(), device)?;
-        let optimizer = AdamW::new(
-            wrapper.varmap().all_vars(),
-            ParamsAdamW {
-                lr: config.learning_rate,
-                weight_decay: config.weight_decay,
-                ..ParamsAdamW::default()
-            },
-        )?;
+        let optimizer = FoundationAdamW::new(wrapper.varmap(), config.optimizer_config())?;
         let collator = FoundationCollator::new(model_config, config.collator.clone())?;
         Ok(Self {
             wrapper,
@@ -146,11 +219,10 @@ impl FoundationTrainer {
         })
     }
 
-    /// Resume model weights from a SafeTensors checkpoint.
+    /// Load only model weights from a SafeTensors file.
     ///
-    /// AdamW moment state is intentionally not serialized in the first
-    /// implementation; resuming restores model weights and starts fresh
-    /// optimizer moments.  Optimizer-state persistence is a later milestone.
+    /// This intentionally does not claim to be an exact training resume. Use
+    /// [`Self::from_checkpoint`] when optimizer moments/counters matter.
     pub fn load_safetensors<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         self.wrapper.varmap_mut().load(path)
     }
@@ -160,26 +232,102 @@ impl FoundationTrainer {
         self.wrapper.save_safetensors(path)
     }
 
+    /// Save model weights, named AdamW moments, and YAML trainer state.
+    pub fn save_checkpoint<P: AsRef<Path>>(
+        &self,
+        directory: P,
+        progress: FoundationTrainingProgress,
+        provenance: FoundationCheckpointProvenance,
+    ) -> AnyResult<FoundationCheckpointMetadata> {
+        let directory = directory.as_ref();
+        fs::create_dir_all(directory)
+            .with_context(|| format!("failed to create foundation checkpoint {directory:?}"))?;
+        let (model_path, optimizer_path, state_path) = foundation_checkpoint_paths(directory);
+        self.wrapper
+            .save_safetensors(&model_path)
+            .with_context(|| format!("failed to save model checkpoint {model_path:?}"))?;
+        self.optimizer
+            .save_safetensors(&optimizer_path)
+            .with_context(|| format!("failed to save optimizer checkpoint {optimizer_path:?}"))?;
+        let metadata = FoundationCheckpointMetadata::new(
+            self.wrapper.config().clone(),
+            self.config.clone(),
+            self.global_step,
+            self.optimizer.step_count(),
+            progress,
+            provenance,
+        );
+        metadata.validate()?;
+        metadata.write_yaml(&state_path)?;
+        Ok(metadata)
+    }
+
+    /// Reconstruct a trainer and restore model weights plus exact AdamW state.
+    pub fn from_checkpoint<P: AsRef<Path>>(
+        directory: P,
+        device: Device,
+    ) -> AnyResult<(Self, FoundationCheckpointMetadata)> {
+        let directory = directory.as_ref();
+        let (model_path, optimizer_path, state_path) = foundation_checkpoint_paths(directory);
+        let metadata = FoundationCheckpointMetadata::read_yaml(&state_path)?;
+        let mut trainer = Self::new(
+            metadata.model_config.clone(),
+            metadata.trainer_config.clone(),
+            device,
+        )?;
+        trainer
+            .wrapper
+            .varmap_mut()
+            .load(&model_path)
+            .with_context(|| format!("failed to restore model checkpoint {model_path:?}"))?;
+        trainer
+            .optimizer
+            .load_safetensors(&optimizer_path)
+            .with_context(|| {
+                format!("failed to restore optimizer checkpoint {optimizer_path:?}")
+            })?;
+        trainer.optimizer.set_step_count(metadata.optimizer_step);
+        trainer.global_step = metadata.global_step;
+        Ok((trainer, metadata))
+    }
+
     /// Execute one two-view multi-task optimizer update.
     pub fn train_step(
         &mut self,
         records: &[FoundationTrainingRecord],
     ) -> Result<FoundationStepMetrics> {
+        if records.is_empty() {
+            candle_core::bail!("cannot train a foundation step with zero records");
+        }
+        let scheduled_lr = self
+            .config
+            .learning_rate_schedule
+            .learning_rate(self.config.learning_rate, self.global_step)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        self.optimizer.set_learning_rate(scheduled_lr)?;
+
         let seed = self.config.seed.wrapping_add(self.global_step);
         let views = self
             .collator
             .collate_views(records, self.wrapper.device(), seed)?;
         let (total, losses, contrastive) = self.loss_for_views(&views, true)?;
-        self.optimizer.backward_step(&total)?;
-        self.global_step = self.global_step.wrapping_add(1);
-        metrics_from_tensors(&total, &losses, contrastive.as_ref())
+        let optimizer_metrics = self
+            .optimizer
+            .backward_step(&total, self.config.max_gradient_norm)?;
+        self.global_step = optimizer_metrics.step;
+        metrics_from_tensors(
+            &total,
+            &losses,
+            contrastive.as_ref(),
+            Some((
+                optimizer_metrics.learning_rate,
+                optimizer_metrics.gradient_norm,
+                optimizer_metrics.gradient_scale,
+            )),
+        )
     }
 
     /// Train sequential mini-batches for one epoch.
-    ///
-    /// Dataset shuffling/sampling policy is intentionally kept outside this
-    /// method so callers can enforce peptide-/run-disjoint sampling and other
-    /// leakage controls before records reach the trainer.
     pub fn train_epoch(
         &mut self,
         records: &[FoundationTrainingRecord],
@@ -194,8 +342,119 @@ impl FoundationTrainer {
         Ok(accumulator.finish())
     }
 
-    /// Evaluate deterministic corrupted views without updating model weights or
-    /// optimizer state. Validation never increments `global_step`.
+    /// Train one deterministic shuffled epoch.
+    ///
+    /// Only one mini-batch is cloned at a time, so shuffled training does not
+    /// duplicate the full corpus in memory.
+    pub fn train_epoch_shuffled(
+        &mut self,
+        records: &[FoundationTrainingRecord],
+        epoch: u64,
+    ) -> Result<FoundationEpochMetrics> {
+        if records.is_empty() {
+            candle_core::bail!("cannot train a foundation epoch with zero records");
+        }
+        let mut indices: Vec<usize> = (0..records.len()).collect();
+        let mut rng = FoundationSplitMix64::new(
+            self.config
+                .seed
+                .wrapping_add(0x5348_5546_464c_4500)
+                .wrapping_add(epoch),
+        );
+        rng.shuffle(&mut indices);
+        let mut accumulator = EpochAccumulator::default();
+        for batch_indices in indices.chunks(self.config.batch_size) {
+            let batch: Vec<FoundationTrainingRecord> = batch_indices
+                .iter()
+                .map(|index| records[*index].clone())
+                .collect();
+            accumulator.push(self.train_step(&batch)?);
+        }
+        Ok(accumulator.finish())
+    }
+
+    /// Train one epoch from a subset of record indices without materializing a
+    /// second full corpus. Only the current mini-batch is cloned.
+    pub fn train_epoch_indices(
+        &mut self,
+        records: &[FoundationTrainingRecord],
+        indices: &[usize],
+        epoch: u64,
+        shuffle: bool,
+    ) -> Result<FoundationEpochMetrics> {
+        if indices.is_empty() {
+            candle_core::bail!("cannot train a foundation epoch with zero selected records");
+        }
+        let mut order = indices.to_vec();
+        if shuffle {
+            let mut rng = FoundationSplitMix64::new(
+                self.config
+                    .seed
+                    .wrapping_add(0x494e_4445_5845_5300)
+                    .wrapping_add(epoch),
+            );
+            rng.shuffle(&mut order);
+        }
+        let mut accumulator = EpochAccumulator::default();
+        for batch_indices in order.chunks(self.config.batch_size) {
+            let mut batch = Vec::with_capacity(batch_indices.len());
+            for &index in batch_indices {
+                let record = records.get(index).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "foundation training index {index} is out of bounds for {} records",
+                        records.len()
+                    ))
+                })?;
+                batch.push(record.clone());
+            }
+            accumulator.push(self.train_step(&batch)?);
+        }
+        Ok(accumulator.finish())
+    }
+
+    /// Evaluate a materialized validation/test index subset without cloning the
+    /// complete partition. Validation never changes optimizer/global-step state.
+    pub fn evaluate_epoch_indices(
+        &self,
+        records: &[FoundationTrainingRecord],
+        indices: &[usize],
+    ) -> Result<FoundationEpochMetrics> {
+        if indices.is_empty() {
+            candle_core::bail!("cannot evaluate a foundation epoch with zero selected records");
+        }
+        let mut accumulator = EpochAccumulator::default();
+        for (batch_index, batch_indices) in indices.chunks(self.config.batch_size).enumerate() {
+            let mut batch = Vec::with_capacity(batch_indices.len());
+            for &index in batch_indices {
+                let record = records.get(index).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "foundation evaluation index {index} is out of bounds for {} records",
+                        records.len()
+                    ))
+                })?;
+                batch.push(record.clone());
+            }
+            let seed = self
+                .config
+                .seed
+                .wrapping_add(0x4556_494e_4445_5800)
+                .wrapping_add(batch_index as u64);
+            let views = self
+                .collator
+                .collate_views(&batch, self.wrapper.device(), seed)?;
+            let (total, losses, contrastive) = self.loss_for_views(&views, false)?;
+            accumulator.push(metrics_from_tensors(
+                &total,
+                &losses,
+                contrastive.as_ref(),
+                None,
+            )?);
+        }
+        Ok(accumulator.finish())
+    }
+
+    /// Evaluate deterministic corrupted views without updating model weights,
+    /// optimizer moments, or global step.
     pub fn evaluate_epoch(
         &self,
         records: &[FoundationTrainingRecord],
@@ -214,9 +473,279 @@ impl FoundationTrainer {
                 .collator
                 .collate_views(batch, self.wrapper.device(), seed)?;
             let (total, losses, contrastive) = self.loss_for_views(&views, false)?;
-            accumulator.push(metrics_from_tensors(&total, &losses, contrastive.as_ref())?);
+            accumulator.push(metrics_from_tensors(
+                &total,
+                &losses,
+                contrastive.as_ref(),
+                None,
+            )?);
         }
         Ok(accumulator.finish())
+    }
+
+    /// Train/evaluate until `max_epochs` or early stopping, writing exact
+    /// `latest` and best-validation checkpoints under `checkpoint_root`.
+    pub fn fit<P: AsRef<Path>>(
+        &mut self,
+        train_records: &[FoundationTrainingRecord],
+        validation_records: &[FoundationTrainingRecord],
+        fit_config: FoundationFitConfig,
+        checkpoint_root: P,
+        provenance: FoundationCheckpointProvenance,
+        mut progress: FoundationTrainingProgress,
+    ) -> AnyResult<FoundationFitSummary> {
+        let fit_config = fit_config.validate()?;
+        if train_records.is_empty() || validation_records.is_empty() {
+            anyhow::bail!("foundation fit requires non-empty train and validation records");
+        }
+        let checkpoint_root = checkpoint_root.as_ref();
+        fs::create_dir_all(checkpoint_root)?;
+        let mut epochs = Vec::new();
+        let mut stopped_early = false;
+
+        while progress.completed_epochs < fit_config.max_epochs {
+            let epoch = progress.completed_epochs;
+            let train = if fit_config.shuffle_each_epoch {
+                self.train_epoch_shuffled(train_records, epoch)?
+            } else {
+                self.train_epoch(train_records)?
+            };
+            let validation = self.evaluate_epoch(validation_records)?;
+            let improved = progress
+                .best_validation_loss
+                .map(|best| validation.mean_total_loss < best - fit_config.early_stopping_min_delta)
+                .unwrap_or(true);
+
+            progress.completed_epochs = progress.completed_epochs.saturating_add(1);
+            if improved {
+                progress.best_validation_loss = Some(validation.mean_total_loss);
+                progress.best_epoch = Some(epoch);
+                progress.epochs_without_improvement = 0;
+            } else {
+                progress.epochs_without_improvement =
+                    progress.epochs_without_improvement.saturating_add(1);
+            }
+
+            self.save_checkpoint(
+                checkpoint_root.join("latest"),
+                progress.clone(),
+                provenance.clone(),
+            )?;
+            if improved {
+                self.save_checkpoint(
+                    checkpoint_root.join("best"),
+                    progress.clone(),
+                    provenance.clone(),
+                )?;
+            }
+
+            epochs.push(FoundationFitEpochMetrics {
+                epoch,
+                train,
+                validation,
+                improved,
+            });
+
+            if fit_config
+                .early_stopping_patience
+                .is_some_and(|patience| progress.epochs_without_improvement >= patience)
+            {
+                stopped_early = true;
+                break;
+            }
+        }
+
+        Ok(FoundationFitSummary {
+            epochs,
+            progress,
+            stopped_early,
+        })
+    }
+
+    /// Fit directly from materialized train/validation record indices. This is
+    /// the preferred large-corpus API because it keeps one copy of the corpus.
+    pub fn fit_indices<P: AsRef<Path>>(
+        &mut self,
+        records: &[FoundationTrainingRecord],
+        train_indices: &[usize],
+        validation_indices: &[usize],
+        fit_config: FoundationFitConfig,
+        checkpoint_root: P,
+        provenance: FoundationCheckpointProvenance,
+        mut progress: FoundationTrainingProgress,
+    ) -> AnyResult<FoundationFitSummary> {
+        let fit_config = fit_config.validate()?;
+        if train_indices.is_empty() || validation_indices.is_empty() {
+            anyhow::bail!("foundation fit requires non-empty train and validation indices");
+        }
+        let checkpoint_root = checkpoint_root.as_ref();
+        fs::create_dir_all(checkpoint_root)?;
+        let mut epochs = Vec::new();
+        let mut stopped_early = false;
+
+        while progress.completed_epochs < fit_config.max_epochs {
+            let epoch = progress.completed_epochs;
+            let train = self.train_epoch_indices(
+                records,
+                train_indices,
+                epoch,
+                fit_config.shuffle_each_epoch,
+            )?;
+            let validation = self.evaluate_epoch_indices(records, validation_indices)?;
+            let improved = progress
+                .best_validation_loss
+                .map(|best| validation.mean_total_loss < best - fit_config.early_stopping_min_delta)
+                .unwrap_or(true);
+
+            progress.completed_epochs = progress.completed_epochs.saturating_add(1);
+            if improved {
+                progress.best_validation_loss = Some(validation.mean_total_loss);
+                progress.best_epoch = Some(epoch);
+                progress.epochs_without_improvement = 0;
+            } else {
+                progress.epochs_without_improvement =
+                    progress.epochs_without_improvement.saturating_add(1);
+            }
+
+            self.save_checkpoint(
+                checkpoint_root.join("latest"),
+                progress.clone(),
+                provenance.clone(),
+            )?;
+            if improved {
+                self.save_checkpoint(
+                    checkpoint_root.join("best"),
+                    progress.clone(),
+                    provenance.clone(),
+                )?;
+            }
+
+            epochs.push(FoundationFitEpochMetrics {
+                epoch,
+                train,
+                validation,
+                improved,
+            });
+            if fit_config
+                .early_stopping_patience
+                .is_some_and(|patience| progress.epochs_without_improvement >= patience)
+            {
+                stopped_early = true;
+                break;
+            }
+        }
+
+        Ok(FoundationFitSummary {
+            epochs,
+            progress,
+            stopped_early,
+        })
+    }
+
+    /// Fit a combined corpus using deterministic bounded/source-aware sampling.
+    ///
+    /// This is the preferred production multi-source API. The materialized
+    /// benchmark remains the authority for which records belong to train and
+    /// validation; the sampling configuration only selects/reweights records
+    /// *within* those partitions. Validation subsampling, when enabled, is
+    /// fixed across epochs.
+    pub fn fit_corpus_indices<P: AsRef<Path>>(
+        &mut self,
+        records: &[FoundationTrainingRecord],
+        record_provenance: &[FoundationRecordProvenance],
+        train_indices: &[usize],
+        validation_indices: &[usize],
+        fit_config: FoundationFitConfig,
+        checkpoint_root: P,
+        provenance: FoundationCheckpointProvenance,
+        mut progress: FoundationTrainingProgress,
+    ) -> AnyResult<FoundationFitSummary> {
+        let fit_config = fit_config.validate()?;
+        if train_indices.is_empty() || validation_indices.is_empty() {
+            anyhow::bail!("foundation fit requires non-empty train and validation indices");
+        }
+        if records.len() != record_provenance.len() {
+            anyhow::bail!(
+                "foundation corpus record/provenance lengths differ: {} records, {} provenance entries",
+                records.len(),
+                record_provenance.len()
+            );
+        }
+        let checkpoint_root = checkpoint_root.as_ref();
+        fs::create_dir_all(checkpoint_root)?;
+        let validation_plan = sample_foundation_validation_indices(
+            records,
+            record_provenance,
+            validation_indices,
+            self.config.batch_size,
+            self.config.seed,
+            &self.config.sampling,
+        )?;
+        let mut epochs = Vec::new();
+        let mut stopped_early = false;
+
+        while progress.completed_epochs < fit_config.max_epochs {
+            let epoch = progress.completed_epochs;
+            let train_plan = sample_foundation_training_indices(
+                records,
+                record_provenance,
+                train_indices,
+                self.config.batch_size,
+                epoch,
+                self.config.seed,
+                fit_config.shuffle_each_epoch,
+                &self.config.sampling,
+            )?;
+            let train = self.train_epoch_indices(records, &train_plan.indices, epoch, false)?;
+            let validation = self.evaluate_epoch_indices(records, &validation_plan.indices)?;
+            let improved = progress
+                .best_validation_loss
+                .map(|best| validation.mean_total_loss < best - fit_config.early_stopping_min_delta)
+                .unwrap_or(true);
+
+            progress.completed_epochs = progress.completed_epochs.saturating_add(1);
+            if improved {
+                progress.best_validation_loss = Some(validation.mean_total_loss);
+                progress.best_epoch = Some(epoch);
+                progress.epochs_without_improvement = 0;
+            } else {
+                progress.epochs_without_improvement =
+                    progress.epochs_without_improvement.saturating_add(1);
+            }
+
+            self.save_checkpoint(
+                checkpoint_root.join("latest"),
+                progress.clone(),
+                provenance.clone(),
+            )?;
+            if improved {
+                self.save_checkpoint(
+                    checkpoint_root.join("best"),
+                    progress.clone(),
+                    provenance.clone(),
+                )?;
+            }
+
+            epochs.push(FoundationFitEpochMetrics {
+                epoch,
+                train,
+                validation,
+                improved,
+            });
+            if fit_config
+                .early_stopping_patience
+                .is_some_and(|patience| progress.epochs_without_improvement >= patience)
+            {
+                stopped_early = true;
+                break;
+            }
+        }
+
+        Ok(FoundationFitSummary {
+            epochs,
+            progress,
+            stopped_early,
+        })
     }
 
     /// Access the high-level model wrapper for embedding/evaluation/checkpointing.
@@ -224,9 +753,19 @@ impl FoundationTrainer {
         &self.wrapper
     }
 
+    /// Trainer configuration used for this run.
+    pub fn config(&self) -> &FoundationTrainerConfig {
+        &self.config
+    }
+
     /// Number of completed optimizer steps.
     pub fn global_step(&self) -> u64 {
         self.global_step
+    }
+
+    /// Current AdamW moment update count.
+    pub fn optimizer_step(&self) -> u64 {
+        self.optimizer.step_count()
     }
 
     fn loss_for_views(
@@ -274,6 +813,8 @@ struct EpochAccumulator {
     masked_residue: OptionalMean,
     chemistry: OptionalMean,
     contrastive: OptionalMean,
+    gradient_norm: OptionalMean64,
+    final_learning_rate: Option<f64>,
 }
 
 impl EpochAccumulator {
@@ -286,6 +827,10 @@ impl EpochAccumulator {
         self.masked_residue.push(metrics.masked_residue_loss);
         self.chemistry.push(metrics.chemistry_loss);
         self.contrastive.push(metrics.contrastive_loss);
+        if metrics.learning_rate > 0.0 {
+            self.gradient_norm.push(Some(metrics.gradient_norm));
+            self.final_learning_rate = Some(metrics.learning_rate);
+        }
     }
 
     fn finish(self) -> FoundationEpochMetrics {
@@ -302,6 +847,8 @@ impl EpochAccumulator {
             mean_masked_residue_loss: self.masked_residue.mean(),
             mean_chemistry_loss: self.chemistry.mean(),
             mean_contrastive_loss: self.contrastive.mean(),
+            mean_gradient_norm: self.gradient_norm.mean(),
+            final_learning_rate: self.final_learning_rate,
         }
     }
 }
@@ -325,11 +872,32 @@ impl OptionalMean {
     }
 }
 
+#[derive(Default)]
+struct OptionalMean64 {
+    sum: f64,
+    count: usize,
+}
+
+impl OptionalMean64 {
+    fn push(&mut self, value: Option<f64>) {
+        if let Some(value) = value {
+            self.sum += value;
+            self.count += 1;
+        }
+    }
+
+    fn mean(self) -> Option<f64> {
+        (self.count > 0).then(|| self.sum / self.count as f64)
+    }
+}
+
 fn metrics_from_tensors(
     total: &Tensor,
     losses: &FoundationLosses,
     contrastive: Option<&Tensor>,
+    optimizer: Option<(f64, f64, f64)>,
 ) -> Result<FoundationStepMetrics> {
+    let (learning_rate, gradient_norm, gradient_scale) = optimizer.unwrap_or((0.0, 0.0, 1.0));
     Ok(FoundationStepMetrics {
         total_loss: total.to_scalar::<f32>()?,
         rt_loss: scalar_option(losses.rt.as_ref())?,
@@ -338,6 +906,9 @@ fn metrics_from_tensors(
         masked_residue_loss: scalar_option(losses.masked_residue.as_ref())?,
         chemistry_loss: scalar_option(losses.chemistry.as_ref())?,
         contrastive_loss: scalar_option(contrastive)?,
+        learning_rate,
+        gradient_norm,
+        gradient_scale,
     })
 }
 
@@ -349,8 +920,8 @@ fn scalar_option(value: Option<&Tensor>) -> Result<Option<f32>> {
 mod tests {
     use super::*;
     use crate::foundation::{
-        FoundationCorruptionConfig, FoundationTrainingRecord, FragmentTarget, PeptidoformInput,
-        RetentionTimeLabels, TrainingContext,
+        FoundationCorruptionConfig, FragmentTarget, PeptidoformInput, RetentionTimeLabels,
+        TrainingContext,
     };
 
     #[test]
@@ -384,7 +955,9 @@ mod tests {
         assert!(metrics.ccs_loss.unwrap().is_finite());
         assert!(metrics.ms2_loss.unwrap().is_finite());
         assert!(metrics.contrastive_loss.unwrap().is_finite());
+        assert!(metrics.gradient_norm.is_finite());
         assert_eq!(trainer.global_step(), 1);
+        assert_eq!(trainer.optimizer_step(), 1);
     }
 
     fn training_record(sequence: &str, charge: i32, rt: f32, ccs: f32) -> FoundationTrainingRecord {

@@ -1,0 +1,52 @@
+# Omitted fields inherit safe defaults through serde(default).
+model:
+  max_sequence_len: 64
+  model_dim: 192
+  dropout: 0.05
+  instrument_vocab_size: 16
+
+trainer:
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  max_gradient_norm: 1.0
+  learning_rate_schedule:
+    kind: warmup-cosine
+    warmup_steps: 1000
+    total_steps: 100000
+    min_lr_ratio: 0.05
+  # Full production training defaults to one pass over every training record.
+  # For bounded CPU smoke tests set train_steps_per_epoch / validation_steps
+  # and optionally increase representation of a small source.
+  sampling:
+    strategy: uniform-records
+    train_steps_per_epoch: null
+    validation_steps: null
+    source_weights: {}
+  seed: 20260831
+
+fit:
+  max_epochs: 50
+  early_stopping_patience: 8
+  early_stopping_min_delta: 0.0
+  shuffle_each_epoch: true
+
+corpus:
+  instrument_vocab_size: 16
+  loader:
+    strict: true
+    fragment_normalization: Max
+  sources:
+    - id: openswath
+      path: /path/to/openswath_results_finetuning.tsv
+      delimiter: tab
+      metadata: {}
+    - id: ip2-bruker
+      path: /path/to/ip2_spectral_library.tsv.zst
+      delimiter: tab
+      metadata: {}
+
+benchmark_manifest: /path/to/foundation_combined_sequence_split.tsv
+checkpoint_root: /path/to/foundation_training_checkpoints
+resume: false
+experiment_id: combined-foundation-pretraining

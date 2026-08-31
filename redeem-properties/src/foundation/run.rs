@@ -1,0 +1,257 @@
+//! End-to-end multi-source foundation pretraining orchestration.
+//!
+//! This is intentionally a library API first. The example CLI simply loads a
+//! YAML configuration and calls [`run_foundation_pretraining`], keeping the
+//! actual experiment semantics testable and reusable by the future ReDeeM CLI.
+
+use super::checkpoint::{FoundationCheckpointMetadata, FoundationCheckpointProvenance};
+use super::control::FoundationFitConfig;
+use super::corpus::{load_foundation_corpus, FoundationCorpusConfig};
+use super::experiment::{FoundationBenchmarkManifest, FoundationPartition};
+use super::sampling::{
+    sample_foundation_training_indices, sample_foundation_validation_indices, FoundationSamplePlan,
+};
+use super::trainer::{FoundationFitSummary, FoundationTrainer, FoundationTrainerConfig};
+use super::FoundationConfig;
+use anyhow::{Context, Result};
+use candle_core::Device;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// YAML configuration for one production foundation pretraining run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FoundationTrainingRunConfig {
+    /// Model architecture.
+    pub model: FoundationConfig,
+    /// Optimizer/loss/collation/scheduler configuration.
+    pub trainer: FoundationTrainerConfig,
+    /// Epoch/early-stopping controls.
+    pub fit: FoundationFitConfig,
+    /// Multi-source data configuration.
+    pub corpus: FoundationCorpusConfig,
+    /// Materialized corpus-wide benchmark manifest.
+    pub benchmark_manifest: PathBuf,
+    /// Root where `latest/` and `best/` checkpoint directories are written.
+    pub checkpoint_root: PathBuf,
+    /// Resume from `checkpoint_root/latest` when it exists.
+    pub resume: bool,
+    /// Optional experiment identifier stored in checkpoint provenance.
+    pub experiment_id: Option<String>,
+}
+
+impl Default for FoundationTrainingRunConfig {
+    fn default() -> Self {
+        Self {
+            model: FoundationConfig::default(),
+            trainer: FoundationTrainerConfig::default(),
+            fit: FoundationFitConfig::default(),
+            corpus: FoundationCorpusConfig::default(),
+            benchmark_manifest: PathBuf::new(),
+            checkpoint_root: PathBuf::new(),
+            resume: false,
+            experiment_id: None,
+        }
+    }
+}
+
+impl FoundationTrainingRunConfig {
+    /// Validate cross-component configuration invariants.
+    pub fn validate(&self) -> Result<()> {
+        self.model.validate().map_err(anyhow::Error::msg)?;
+        self.trainer
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.fit.validate()?;
+        if self.corpus.instrument_vocab_size != self.model.instrument_vocab_size {
+            anyhow::bail!(
+                "corpus instrument_vocab_size {} must match model instrument_vocab_size {}",
+                self.corpus.instrument_vocab_size,
+                self.model.instrument_vocab_size
+            );
+        }
+        if self.benchmark_manifest.as_os_str().is_empty() {
+            anyhow::bail!("foundation benchmark_manifest path cannot be empty");
+        }
+        if self.checkpoint_root.as_os_str().is_empty() {
+            anyhow::bail!("foundation checkpoint_root path cannot be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Result of one end-to-end pretraining invocation.
+#[derive(Debug, Clone)]
+pub struct FoundationTrainingRunSummary {
+    /// Combined source/corpus fingerprint.
+    pub corpus_fingerprint: u64,
+    /// Number of combined grouped precursor records.
+    pub corpus_records: usize,
+    /// Number of training records selected by the benchmark manifest.
+    pub train_records: usize,
+    /// Number of validation records selected by the benchmark manifest.
+    pub validation_records: usize,
+    /// Number of test records reserved and never consumed by `fit`.
+    pub test_records: usize,
+    /// Whether a checkpoint was loaded before fitting.
+    pub resumed: bool,
+    /// Metadata loaded when resuming.
+    pub resume_metadata: Option<FoundationCheckpointMetadata>,
+    /// Preview of the first/current training epoch sampling mixture.
+    pub train_sampling_preview: FoundationSamplePlan,
+    /// Fixed validation selection used by the fit loop.
+    pub validation_sampling: FoundationSamplePlan,
+    /// Completed fit summary.
+    pub fit: FoundationFitSummary,
+}
+
+/// Execute one multi-source pretraining run from a materialized benchmark.
+pub fn run_foundation_pretraining(
+    config: &FoundationTrainingRunConfig,
+    device: Device,
+) -> Result<FoundationTrainingRunSummary> {
+    config.validate()?;
+    let corpus = load_foundation_corpus(&config.corpus)?;
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&config.benchmark_manifest)?;
+    benchmark
+        .validate_against_records(&corpus.records)
+        .context("foundation benchmark does not match the assembled corpus")?;
+
+    let train_indices = benchmark.partition_indices(FoundationPartition::Train);
+    let validation_indices = benchmark.partition_indices(FoundationPartition::Validation);
+    let test_indices = benchmark.partition_indices(FoundationPartition::Test);
+    if train_indices.is_empty() || validation_indices.is_empty() {
+        anyhow::bail!(
+            "foundation benchmark must contain non-empty train and validation partitions"
+        );
+    }
+
+    let latest = config.checkpoint_root.join("latest");
+    let (mut trainer, progress, resume_metadata, resumed) = if config.resume && latest.exists() {
+        let (trainer, metadata) = FoundationTrainer::from_checkpoint(&latest, device)?;
+        validate_resume_config(
+            config,
+            &metadata,
+            corpus.corpus_fingerprint,
+            benchmark.dataset_fingerprint,
+            benchmark.manifest_fingerprint(),
+        )?;
+        let progress = metadata.progress.clone();
+        (trainer, progress, Some(metadata), true)
+    } else {
+        (
+            FoundationTrainer::new(config.model.clone(), config.trainer.clone(), device)?,
+            Default::default(),
+            None,
+            false,
+        )
+    };
+
+    if resumed && config.model.dropout > 0.0 {
+        log::warn!(
+            "foundation resume restored model and AdamW state, but Candle dropout RNG state is not serialized; stochastic trajectories need not be bitwise identical across processes"
+        );
+    }
+
+    let train_sampling_preview = sample_foundation_training_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &train_indices,
+        config.trainer.batch_size,
+        progress.completed_epochs,
+        config.trainer.seed,
+        config.fit.shuffle_each_epoch,
+        &config.trainer.sampling,
+    )?;
+    let validation_sampling = sample_foundation_validation_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &validation_indices,
+        config.trainer.batch_size,
+        config.trainer.seed,
+        &config.trainer.sampling,
+    )?;
+
+    let provenance = FoundationCheckpointProvenance {
+        corpus_fingerprint: Some(corpus.corpus_fingerprint),
+        benchmark_dataset_fingerprint: Some(benchmark.dataset_fingerprint),
+        benchmark_manifest_fingerprint: Some(benchmark.manifest_fingerprint()),
+        benchmark_manifest: Some(config.benchmark_manifest.to_string_lossy().into_owned()),
+        experiment_id: config.experiment_id.clone(),
+    };
+    let fit = trainer.fit_corpus_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &train_indices,
+        &validation_indices,
+        config.fit,
+        &config.checkpoint_root,
+        provenance,
+        progress,
+    )?;
+
+    Ok(FoundationTrainingRunSummary {
+        corpus_fingerprint: corpus.corpus_fingerprint,
+        corpus_records: corpus.records.len(),
+        train_records: train_indices.len(),
+        validation_records: validation_indices.len(),
+        test_records: test_indices.len(),
+        resumed,
+        resume_metadata,
+        train_sampling_preview,
+        validation_sampling,
+        fit,
+    })
+}
+
+fn validate_resume_config(
+    requested: &FoundationTrainingRunConfig,
+    checkpoint: &FoundationCheckpointMetadata,
+    corpus_fingerprint: u64,
+    benchmark_dataset_fingerprint: u64,
+    benchmark_manifest_fingerprint: u64,
+) -> Result<()> {
+    if checkpoint.model_config != requested.model {
+        anyhow::bail!("foundation resume model configuration differs from checkpoint");
+    }
+    let requested_trainer = serde_yaml::to_string(&requested.trainer)?;
+    let checkpoint_trainer = serde_yaml::to_string(&checkpoint.trainer_config)?;
+    if requested_trainer != checkpoint_trainer {
+        anyhow::bail!("foundation resume trainer configuration differs from checkpoint");
+    }
+    if let Some(expected) = checkpoint.provenance.corpus_fingerprint {
+        if expected != corpus_fingerprint {
+            anyhow::bail!(
+                "foundation resume corpus fingerprint differs from checkpoint: current fnv1a64:{corpus_fingerprint:016x}, checkpoint fnv1a64:{expected:016x}"
+            );
+        }
+    }
+    if let Some(expected) = checkpoint.provenance.benchmark_dataset_fingerprint {
+        if expected != benchmark_dataset_fingerprint {
+            anyhow::bail!(
+                "foundation resume benchmark dataset fingerprint differs from checkpoint: current fnv1a64:{benchmark_dataset_fingerprint:016x}, checkpoint fnv1a64:{expected:016x}"
+            );
+        }
+    }
+    if let Some(expected) = checkpoint.provenance.benchmark_manifest_fingerprint {
+        if expected != benchmark_manifest_fingerprint {
+            anyhow::bail!(
+                "foundation resume benchmark assignment fingerprint differs from checkpoint: current fnv1a64:{benchmark_manifest_fingerprint:016x}, checkpoint fnv1a64:{expected:016x}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read a YAML run configuration from disk.
+pub fn read_foundation_training_run_config<P: AsRef<Path>>(
+    path: P,
+) -> Result<FoundationTrainingRunConfig> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open foundation training config {path:?}"))?;
+    let config: FoundationTrainingRunConfig = serde_yaml::from_reader(file)
+        .with_context(|| format!("failed to parse foundation training config {path:?}"))?;
+    config.validate()?;
+    Ok(config)
+}

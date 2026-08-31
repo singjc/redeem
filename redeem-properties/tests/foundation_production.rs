@@ -1,12 +1,14 @@
 use candle_core::Device;
 use redeem_properties::foundation::{
-    load_foundation_corpus, FoundationCheckpointProvenance, FoundationCollatorConfig,
-    FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter, FoundationCorpusSourceSpec,
-    FoundationCorruptionConfig, FoundationDatasetLoader, FoundationLearningRateSchedule,
-    FoundationPartition, FoundationSplitConfig, FoundationTableLoaderConfig, FoundationTrainer,
-    FoundationTrainerConfig, FoundationTrainingProgress,
+    load_foundation_corpus, sample_foundation_training_indices, FoundationCheckpointProvenance,
+    FoundationCollatorConfig, FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter,
+    FoundationCorpusSourceSpec, FoundationCorruptionConfig, FoundationDatasetLoader,
+    FoundationLearningRateSchedule, FoundationPartition, FoundationRecordProvenance,
+    FoundationSamplingConfig, FoundationSamplingStrategy, FoundationSplitConfig,
+    FoundationTableLoaderConfig, FoundationTrainer, FoundationTrainerConfig,
+    FoundationTrainingProgress,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -80,7 +82,8 @@ fn temp_dir(label: &str) -> PathBuf {
 #[test]
 fn optimizer_checkpoint_restores_moments_and_step_for_same_continuation() {
     let records = records();
-    let mut original = FoundationTrainer::new(tiny_config(), trainer_config(), Device::Cpu).unwrap();
+    let mut original =
+        FoundationTrainer::new(tiny_config(), trainer_config(), Device::Cpu).unwrap();
     original.train_step(&records).unwrap();
 
     let root = temp_dir("resume");
@@ -257,3 +260,56 @@ sources:
     assert_eq!(config.sources[1].id, "ip2_bruker_human");
 }
 
+#[test]
+fn source_weighted_sampling_is_bounded_deterministic_and_auditable() {
+    let records = records();
+    let provenance = vec![
+        FoundationRecordProvenance {
+            source_index: 0,
+            source_id: "openswath".to_string(),
+            source_record_index: 0,
+        },
+        FoundationRecordProvenance {
+            source_index: 1,
+            source_id: "ip2".to_string(),
+            source_record_index: 0,
+        },
+    ];
+    let weights = BTreeMap::from([("openswath".to_string(), 0.25), ("ip2".to_string(), 0.75)]);
+    let config = FoundationSamplingConfig {
+        strategy: FoundationSamplingStrategy::SourceWeighted,
+        train_steps_per_epoch: Some(4),
+        validation_steps: Some(2),
+        source_weights: weights,
+    };
+    let first = sample_foundation_training_indices(
+        &records,
+        &provenance,
+        &[0, 1],
+        2,
+        0,
+        20260831,
+        true,
+        &config,
+    )
+    .unwrap();
+    let second = sample_foundation_training_indices(
+        &records,
+        &provenance,
+        &[0, 1],
+        2,
+        0,
+        20260831,
+        true,
+        &config,
+    )
+    .unwrap();
+
+    assert_eq!(first.indices, second.indices);
+    assert_eq!(first.indices.len(), 8);
+    assert_eq!(first.unique_records, 2);
+    assert_eq!(first.source_records.get("openswath"), Some(&2));
+    assert_eq!(first.source_records.get("ip2"), Some(&6));
+    assert_eq!(first.coverage.normalized_rt_records, 8);
+    assert_eq!(first.coverage.ms2_records, 8);
+}
