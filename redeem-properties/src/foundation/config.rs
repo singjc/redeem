@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Hyperparameters for [`crate::foundation::PeptideFoundationEncoder`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct FoundationConfig {
     /// Maximum peptide length accepted by the encoder.
     pub max_sequence_len: usize,

@@ -84,7 +84,10 @@ fn main() -> Result<()> {
     println!("corpus_config\t{config_path}");
     println!("benchmark\t{benchmark_path}");
     println!("provenance\t{provenance_path}");
-    println!("corpus_fingerprint\tfnv1a64:{:016x}", corpus.corpus_fingerprint);
+    println!(
+        "corpus_fingerprint\tfnv1a64:{:016x}",
+        corpus.corpus_fingerprint
+    );
     println!("records\t{}", corpus.records.len());
     println!("sources\t{}", corpus.sources.len());
     for source in &corpus.sources {
@@ -95,7 +98,10 @@ fn main() -> Result<()> {
     }
     println!("instrument_vocab\t{}", corpus.instrument_names.join(","));
     println!("train_records\t{}", benchmark.summary.train_records);
-    println!("validation_records\t{}", benchmark.summary.validation_records);
+    println!(
+        "validation_records\t{}",
+        benchmark.summary.validation_records
+    );
     println!("test_records\t{}", benchmark.summary.test_records);
     println!("total_groups\t{}", benchmark.summary.total_groups);
     Ok(())

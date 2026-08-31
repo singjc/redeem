@@ -96,6 +96,46 @@ pub struct FoundationBenchmarkManifest {
 }
 
 impl FoundationBenchmarkManifest {
+    /// Stable fingerprint over the exact split configuration and every
+    /// materialized record-to-partition assignment. Unlike
+    /// `dataset_fingerprint`, this changes when partition assignments change.
+    pub fn manifest_fingerprint(&self) -> u64 {
+        let mut hash = StableFnv64::new();
+        hash.u32(self.format_version);
+        hash.u64(self.dataset_fingerprint);
+        hash.usize(self.source_records);
+        hash.usize(self.selected_records);
+        hash.bytes(&[u8::from(self.modified_only)]);
+        hash.bytes(&[u8::from(self.single_modification_family_only)]);
+        hash.usize(self.excluded_mixed_family_records);
+        hash.str(split_mode_name(self.split_config.mode));
+        hash.u64(self.split_config.validation_fraction.to_bits());
+        hash.u64(self.split_config.test_fraction.to_bits());
+        hash.u64(self.split_config.seed);
+        let mut entries: Vec<&FoundationBenchmarkEntry> = self.entries.iter().collect();
+        entries.sort_by_key(|entry| entry.record_index);
+        for entry in entries {
+            hash.usize(entry.record_index);
+            hash.u64(entry.record_fingerprint);
+            hash.bytes(&[match entry.partition {
+                FoundationPartition::Train => 0,
+                FoundationPartition::Validation => 1,
+                FoundationPartition::Test => 2,
+            }]);
+            hash.str(&entry.identity_key);
+        }
+        hash.finish()
+    }
+
+    /// Return original record indices assigned to one partition.
+    pub fn partition_indices(&self, partition: FoundationPartition) -> Vec<usize> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.partition == partition)
+            .map(|entry| entry.record_index)
+            .collect()
+    }
+
     /// Write the manifest as an auditable line-oriented TSV.
     pub fn write_tsv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();

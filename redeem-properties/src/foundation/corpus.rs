@@ -174,8 +174,15 @@ impl FoundationCorpus {
             File::create(path)
                 .with_context(|| format!("failed to create corpus provenance {path:?}"))?,
         );
-        writeln!(writer, "# corpus_fingerprint=fnv1a64:{:016x}", self.corpus_fingerprint)?;
-        writeln!(writer, "record_index\tsource_index\tsource_id\tsource_record_index")?;
+        writeln!(
+            writer,
+            "# corpus_fingerprint=fnv1a64:{:016x}",
+            self.corpus_fingerprint
+        )?;
+        writeln!(
+            writer,
+            "record_index\tsource_index\tsource_id\tsource_record_index"
+        )?;
         for (record_index, provenance) in self.provenance.iter().enumerate() {
             writeln!(
                 writer,
@@ -295,7 +302,10 @@ fn load_source(
             )
         })?;
     let stdout = child.stdout.take().ok_or_else(|| {
-        anyhow!("failed to capture zstd stdout for corpus source '{}'", source.id)
+        anyhow!(
+            "failed to capture zstd stdout for corpus source '{}'",
+            source.id
+        )
     })?;
     let report = loader.load_reader_with_report(
         BufReader::new(stdout),

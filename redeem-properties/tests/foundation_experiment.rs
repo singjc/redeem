@@ -1,7 +1,8 @@
 use redeem_properties::foundation::{
     build_foundation_benchmark_manifest, split_foundation_records, FoundationBenchmarkManifest,
-    FoundationModification, FoundationModificationSite, FoundationSplitConfig, FoundationSplitMode,
-    FoundationTrainingRecord, PeptidoformInput, RetentionTimeLabels, TrainingContext,
+    FoundationModification, FoundationModificationSite, FoundationPartition, FoundationSplitConfig,
+    FoundationSplitMode, FoundationTrainingRecord, PeptidoformInput, RetentionTimeLabels,
+    TrainingContext,
 };
 
 fn record(sequence: &str) -> FoundationTrainingRecord {
@@ -157,4 +158,25 @@ fn modification_family_manifest_requires_modified_only_selection() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("modified_only=true"));
+}
+
+#[test]
+fn benchmark_manifest_fingerprint_changes_when_partition_assignment_changes() {
+    let records = vec![record("PEPTIDEK"), record("AAAAAAK"), record("CCCCCCK")];
+    let mut manifest = build_foundation_benchmark_manifest(
+        &records,
+        FoundationSplitConfig {
+            validation_fraction: 0.0,
+            test_fraction: 0.34,
+            ..FoundationSplitConfig::default()
+        },
+        false,
+    )
+    .unwrap();
+    let before = manifest.manifest_fingerprint();
+    manifest.entries[0].partition = match manifest.entries[0].partition {
+        FoundationPartition::Train => FoundationPartition::Test,
+        _ => FoundationPartition::Train,
+    };
+    assert_ne!(before, manifest.manifest_fingerprint());
 }
