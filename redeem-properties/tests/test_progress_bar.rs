@@ -38,7 +38,11 @@ fn test_progress_bar_with_batch_processing() {
     let progress = Progress::new(num_batches, "Processing Batches");
 
     for batch_idx in 0..num_batches {
-        progress.update_description(&format!("Batch {}/{}: Processing", batch_idx + 1, num_batches));
+        progress.update_description(&format!(
+            "Batch {}/{}: Processing",
+            batch_idx + 1,
+            num_batches
+        ));
 
         for _item in 0..batch_size {
             thread::sleep(Duration::from_millis(2));
@@ -58,7 +62,10 @@ fn test_progress_bar_training_simulation() {
     let batches_per_epoch = 20;
 
     for epoch in 0..num_epochs {
-        let progress = Progress::new(batches_per_epoch, &format!("[{}] Epoch {}: ", context, epoch));
+        let progress = Progress::new(
+            batches_per_epoch,
+            &format!("[{}] Epoch {}: ", context, epoch),
+        );
 
         for batch_idx in 0..batches_per_epoch {
             // Simulate loss computation

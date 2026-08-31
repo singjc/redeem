@@ -775,7 +775,7 @@ mod tests {
             crate::pretrained::default_pretrained_models_dir()
         };
         assert_eq!(path, expected);
-        
+
         println!("Pretrained models successfully available at: {:?}", path);
     }
 

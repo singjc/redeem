@@ -1739,7 +1739,11 @@ mod tests {
         let output = decoder_linear.forward(&x)?;
         let expected_output = Tensor::zeros((3, out_features), DType::F32, &device)?;
 
-        assert_eq!(output.shape(), expected_output.shape(), "Output shape mismatch");
+        assert_eq!(
+            output.shape(),
+            expected_output.shape(),
+            "Output shape mismatch"
+        );
 
         let output_vec = output.to_vec2::<f32>()?;
         for row in &output_vec {
@@ -1762,7 +1766,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1790,7 +1797,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1813,7 +1823,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1830,7 +1843,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1849,7 +1865,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1876,7 +1895,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1898,7 +1920,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1924,7 +1949,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepMs2Bert);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1958,7 +1986,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepCcsCnnLstm);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -1989,7 +2020,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepCcsCnnLstm);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();
@@ -2007,7 +2041,10 @@ mod tests {
             resolved_model_and_constants(PretrainedModel::AlphapeptdeepCcsCnnLstm);
 
         assert!(model_path.exists(), "Test model file does not exist");
-        assert!(constants_path.exists(), "Test constants file does not exist");
+        assert!(
+            constants_path.exists(),
+            "Test constants file does not exist"
+        );
 
         let var_store =
             VarBuilder::from_pth(model_path, candle_core::DType::F32, &Device::Cpu).unwrap();

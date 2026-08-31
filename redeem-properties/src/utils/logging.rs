@@ -25,10 +25,10 @@ enum ProgressMessage {
 /// * `description` - A description displayed alongside the progress bar.
 pub struct Progress {
     total: usize,
-    count: AtomicUsize,                          // Atomic counter for tracking progress
-    sender: mpsc::Sender<ProgressMessage>,       // Channel to send updates and descriptions
+    count: AtomicUsize,                    // Atomic counter for tracking progress
+    sender: mpsc::Sender<ProgressMessage>, // Channel to send updates and descriptions
     progress_thread: Option<thread::JoinHandle<()>>, // Background thread to update tqdm
-    description: String,                         // Description for the progress bar
+    description: String,                   // Description for the progress bar
 }
 
 impl Progress {
@@ -52,7 +52,7 @@ impl Progress {
     pub fn new(total: usize, description: &str) -> Self {
         let mut progress = pbar(Some(total));
         progress.set_desc(Some(description));
-        
+
         let count = AtomicUsize::new(0);
         let (tx, rx) = mpsc::channel();
 
@@ -107,7 +107,9 @@ impl Progress {
 
     /// Updates the progress bar's description dynamically.
     pub fn update_description(&self, new_desc: &str) {
-        let _ = self.sender.send(ProgressMessage::SetDescription(new_desc.to_string()));
+        let _ = self
+            .sender
+            .send(ProgressMessage::SetDescription(new_desc.to_string()));
     }
 
     /// Finalizes the progress bar by ensuring all updates are completed.

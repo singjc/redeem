@@ -309,20 +309,14 @@ impl Predictor {
         })
     }
 
-    fn fine_tune_from_transition_tsv(
-        &mut self,
-        config: &OpenMsRedeemFineTuneConfig,
-    ) -> Result<()> {
+    fn fine_tune_from_transition_tsv(&mut self, config: &OpenMsRedeemFineTuneConfig) -> Result<()> {
         let config = parse_fine_tune_config(config)?;
         let _validation_batch_size = config.validation_batch_size;
         let modifications = load_modifications().context("Failed to load modification map")?;
 
         if config.enable_rt {
-            let (train_data, validation_data, norm) = load_fine_tune_data_for_model(
-                &config,
-                RT_ARCH,
-                &modifications,
-            )?;
+            let (train_data, validation_data, norm) =
+                load_fine_tune_data_for_model(&config, RT_ARCH, &modifications)?;
             self.rt_model
                 .fine_tune(
                     &train_data,
@@ -352,11 +346,8 @@ impl Predictor {
                 .ccs_model
                 .as_mut()
                 .ok_or_else(|| anyhow!("CCS fine-tuning requested, but no CCS model is loaded"))?;
-            let (train_data, validation_data, norm) = load_fine_tune_data_for_model(
-                &config,
-                CCS_ARCH,
-                &modifications,
-            )?;
+            let (train_data, validation_data, norm) =
+                load_fine_tune_data_for_model(&config, CCS_ARCH, &modifications)?;
             ccs_model
                 .fine_tune(
                     &train_data,
@@ -372,21 +363,13 @@ impl Predictor {
                 .context("Failed to fine-tune CCS model")?;
 
             if let Some(path) = &config.ccs_model_output_path {
-                save_model_with_constants(
-                    ccs_model,
-                    path,
-                    self.ccs_model_path.as_ref(),
-                    "CCS",
-                )?;
+                save_model_with_constants(ccs_model, path, self.ccs_model_path.as_ref(), "CCS")?;
             }
         }
 
         if config.enable_ms2 {
-            let (train_data, validation_data, norm) = load_fine_tune_data_for_model(
-                &config,
-                MS2_ARCH,
-                &modifications,
-            )?;
+            let (train_data, validation_data, norm) =
+                load_fine_tune_data_for_model(&config, MS2_ARCH, &modifications)?;
             self.ms2_model
                 .fine_tune(
                     &train_data,
@@ -503,7 +486,11 @@ fn load_fine_tune_data_for_model(
     config: &ParsedFineTuneConfig,
     model_arch: &str,
     modifications: &HashMap<(String, Option<char>), ModificationMap>,
-) -> Result<(Vec<PeptideData>, Option<Vec<PeptideData>>, TargetNormalization)> {
+) -> Result<(
+    Vec<PeptideData>,
+    Option<Vec<PeptideData>>,
+    TargetNormalization,
+)> {
     let train_raw = load_transition_training_records(
         &config.training_tsv_path,
         model_arch,
@@ -641,8 +628,7 @@ fn load_transition_training_records(
                 &["collisionenergy", "collision_energy", "nce"],
             )
             .and_then(|value| value.parse::<i32>().ok()),
-            record_field(&record, &headers, &["instrument"])
-                .map(|value| value.to_string()),
+            record_field(&record, &headers, &["instrument"]).map(|value| value.to_string()),
             default_instrument,
             modifications,
         )?;
@@ -674,12 +660,7 @@ fn load_transition_training_records(
         let ion_mobility = record_field(
             &record,
             &headers,
-            &[
-                "precursorionmobility",
-                "ion_mobility",
-                "ion mobility",
-                "im",
-            ],
+            &["precursorionmobility", "ion_mobility", "ion mobility", "im"],
         )
         .and_then(|value| value.parse::<f32>().ok());
         let ccs = record_field(&record, &headers, &["ccs"])
@@ -705,7 +686,8 @@ fn load_transition_training_records(
             retention_time,
             ion_mobility,
             ccs,
-            ms2_intensities: has_ms2_matrix.then(|| vec![vec![0.0; 8]; peptide_len.saturating_sub(1)]),
+            ms2_intensities: has_ms2_matrix
+                .then(|| vec![vec![0.0; 8]; peptide_len.saturating_sub(1)]),
         });
 
         if entry.precursor_mass.is_none() {
@@ -844,7 +826,9 @@ fn parse_modified_sequence_for_training(
         mods,
         mod_sites,
         charge,
-        nce: explicit_nce.filter(|value| *value > 0).unwrap_or(default_nce),
+        nce: explicit_nce
+            .filter(|value| *value > 0)
+            .unwrap_or(default_nce),
         instrument: Some(Arc::from(instrument.into_bytes())),
     })
 }
@@ -854,7 +838,10 @@ fn compute_target_normalization(
     model_arch: &str,
 ) -> Result<TargetNormalization> {
     let values: Vec<f32> = match model_arch {
-        RT_ARCH => peptides.iter().filter_map(|peptide| peptide.retention_time).collect(),
+        RT_ARCH => peptides
+            .iter()
+            .filter_map(|peptide| peptide.retention_time)
+            .collect(),
         CCS_ARCH => peptides.iter().filter_map(|peptide| peptide.ccs).collect(),
         MS2_ARCH => peptides
             .iter()
@@ -1020,14 +1007,20 @@ fn save_model_with_constants<M: SaveableModel>(
     let output = output_path
         .to_str()
         .ok_or_else(|| anyhow!("{label} output path is not valid UTF-8"))?;
-    model
-        .save_model(output)
-        .with_context(|| format!("Failed to save {label} fine-tuned model to {}", output_path.display()))?;
+    model.save_model(output).with_context(|| {
+        format!(
+            "Failed to save {label} fine-tuned model to {}",
+            output_path.display()
+        )
+    })?;
     copy_neighboring_constants(source_model_path, output_path)?;
     Ok(())
 }
 
-fn copy_neighboring_constants(source_model_path: Option<&PathBuf>, output_path: &Path) -> Result<()> {
+fn copy_neighboring_constants(
+    source_model_path: Option<&PathBuf>,
+    output_path: &Path,
+) -> Result<()> {
     let Some(source_model_path) = source_model_path else {
         return Ok(());
     };
@@ -1037,7 +1030,12 @@ fn copy_neighboring_constants(source_model_path: Option<&PathBuf>, output_path: 
     let extension = output_path
         .extension()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow!("Output model path '{}' must include a file extension", output_path.display()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Output model path '{}' must include a file extension",
+                output_path.display()
+            )
+        })?;
     let destination = output_path.with_extension(format!("{extension}.model_const.yaml"));
     fs::copy(&source_constants_path, &destination).with_context(|| {
         format!(
@@ -1215,7 +1213,10 @@ fn optional_output_model_path(path: *const c_char, label: &str) -> Result<Option
     match optional_string_from_c_str(path)? {
         Some(value) if !value.is_empty() => {
             let path = PathBuf::from(value);
-            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
             if extension.to_ascii_lowercase() != "safetensors" {
                 return Err(anyhow!(
                     "{label} must use the .safetensors extension so the fine-tuned model can be reloaded"
@@ -1779,10 +1780,11 @@ mod tests {
         assert!(!predictor.is_null(), "{}", unsafe { last_error_string() });
 
         let training_tsv = write_finetune_fixture();
-        let output_model =
-            std::env::temp_dir().join("redeem-openms-ffi-finetuned-rt.safetensors");
-        let output_constants =
-            PathBuf::from(format!("{}.model_const.yaml", output_model.to_string_lossy()));
+        let output_model = std::env::temp_dir().join("redeem-openms-ffi-finetuned-rt.safetensors");
+        let output_constants = PathBuf::from(format!(
+            "{}.model_const.yaml",
+            output_model.to_string_lossy()
+        ));
         let source_constants = neighboring_constants_path(Path::new(
             _rt.to_str().expect("RT model path must be valid UTF-8"),
         ));

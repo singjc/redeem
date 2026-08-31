@@ -7,7 +7,7 @@ use std::str::FromStr;
 use redeem_classifiers::config::ModelType;
 use redeem_classifiers::data_handling::RankGrouping;
 use redeem_cli::classifiers::score::score::{
-    load_score_config, score_pin, write_score_output, write_score_report, ScoreConfig,
+    ScoreConfig, load_score_config, score_pin, write_score_output, write_score_report,
 };
 use redeem_cli::properties::inference::inference;
 use redeem_cli::properties::inference::input::PropertyInferenceConfig;
