@@ -10,7 +10,10 @@ use super::checkpoint::{
     foundation_checkpoint_paths, FoundationCheckpointMetadata, FoundationCheckpointProvenance,
     FoundationTrainingProgress,
 };
-use super::collate::{FoundationCollator, FoundationCollatorConfig, FoundationTrainingViews};
+use super::collate::{
+    FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
+    FoundationTrainingBatch, FoundationTrainingViews,
+};
 use super::config::FoundationConfig;
 use super::control::{FoundationFitConfig, FoundationLearningRateSchedule, FoundationSplitMix64};
 use super::corpus::FoundationRecordProvenance;
@@ -53,6 +56,27 @@ impl Default for FoundationGradientDiagnosticsConfig {
         Self {
             enabled: false,
             every_n_steps: 1,
+        }
+    }
+}
+
+/// Validation/evaluation controls that do not alter optimization semantics.
+///
+/// Clean property validation evaluates RT/CCS/MS2 on uncorrupted peptide
+/// inputs. This is intentionally separate from the standard corrupted
+/// multi-task validation pass so self-supervised reconstruction diagnostics
+/// remain available without contaminating deployable property metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FoundationEvaluationConfig {
+    /// Compute a second uncorrupted RT/CCS/MS2 validation pass each epoch.
+    pub clean_property_validation: bool,
+}
+
+impl Default for FoundationEvaluationConfig {
+    fn default() -> Self {
+        Self {
+            clean_property_validation: false,
         }
     }
 }
@@ -121,6 +145,8 @@ pub struct FoundationTrainerConfig {
     pub shared_gradient_scales: FoundationSharedGradientScalesConfig,
     /// Sampled weighted per-task gradient diagnostics.
     pub gradient_diagnostics: FoundationGradientDiagnosticsConfig,
+    /// Validation/evaluation behavior that does not change optimizer updates.
+    pub evaluation: FoundationEvaluationConfig,
     /// Per-step learning-rate schedule.
     pub learning_rate_schedule: FoundationLearningRateSchedule,
     /// Temperature used by the symmetric InfoNCE objective.
@@ -150,6 +176,7 @@ impl Default for FoundationTrainerConfig {
             max_gradient_norm: Some(1.0),
             shared_gradient_scales: FoundationSharedGradientScalesConfig::default(),
             gradient_diagnostics: FoundationGradientDiagnosticsConfig::default(),
+            evaluation: FoundationEvaluationConfig::default(),
             learning_rate_schedule: FoundationLearningRateSchedule::Constant,
             contrastive_temperature: 0.10,
             loss_weights: FoundationLossWeights::default(),
@@ -353,8 +380,11 @@ pub struct FoundationFitEpochMetrics {
     pub epoch: u64,
     /// Training metrics.
     pub train: FoundationEpochMetrics,
-    /// Validation metrics.
+    /// Standard corrupted multi-task validation metrics.
     pub validation: FoundationEpochMetrics,
+    /// Optional clean RT/CCS/MS2 validation metrics on uncorrupted inputs.
+    /// This diagnostic does not affect checkpoint selection or early stopping.
+    pub property_validation: Option<FoundationEpochMetrics>,
     /// Whether this epoch established a new best validation loss.
     pub improved: bool,
 }
@@ -690,6 +720,68 @@ impl FoundationTrainer {
         Ok(accumulator.finish())
     }
 
+    /// Evaluate RT/CCS/MS2 on uncorrupted peptide inputs.
+    ///
+    /// No masked-residue, chemistry-reconstruction, or contrastive objectives
+    /// are active in this pass. This produces deployment-oriented property
+    /// metrics while leaving the normal corrupted multi-task validation pass
+    /// available for representation-learning diagnostics.
+    pub fn evaluate_property_epoch_indices(
+        &self,
+        records: &[FoundationTrainingRecord],
+        indices: &[usize],
+    ) -> Result<FoundationEpochMetrics> {
+        if indices.is_empty() {
+            candle_core::bail!(
+                "cannot evaluate clean foundation properties with zero selected records"
+            );
+        }
+        let clean_collator = FoundationCollator::new(
+            self.wrapper.config().clone(),
+            FoundationCollatorConfig {
+                retention_time_objective: self.config.collator.retention_time_objective,
+                corruption: FoundationCorruptionConfig {
+                    residue_mask_probability: 0.0,
+                    chemistry_mask_probability: 0.0,
+                },
+            },
+        )?;
+        let mut accumulator = EpochAccumulator::default();
+        for batch_indices in indices.chunks(self.config.batch_size) {
+            let mut records_batch = Vec::with_capacity(batch_indices.len());
+            for &index in batch_indices {
+                let record = records.get(index).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "foundation clean-property evaluation index {index} is out of bounds for {} records",
+                        records.len()
+                    ))
+                })?;
+                records_batch.push(record.clone());
+            }
+            let mut batch = clean_collator.collate(
+                &records_batch,
+                self.wrapper.device(),
+                self.config.seed.wrapping_add(0x5052_4f50_4552_5459),
+            )?;
+            self.normalize_batch_regression_targets(&mut batch)?;
+            let (total, losses, regression) = self.property_loss_for_batch(&batch)?;
+            accumulator.push(metrics_from_tensors(
+                &total, &losses, None, regression, None, None,
+            )?);
+        }
+        Ok(accumulator.finish())
+    }
+
+    /// Evaluate a materialized record slice with the same clean property-only
+    /// semantics as [`FoundationTrainer::evaluate_property_epoch_indices`].
+    pub fn evaluate_property_epoch(
+        &self,
+        records: &[FoundationTrainingRecord],
+    ) -> Result<FoundationEpochMetrics> {
+        let indices = (0..records.len()).collect::<Vec<_>>();
+        self.evaluate_property_epoch_indices(records, &indices)
+    }
+
     /// Train/evaluate until `max_epochs` or early stopping, writing exact
     /// `latest` and best-validation checkpoints under `checkpoint_root`.
     pub fn fit<P: AsRef<Path>>(
@@ -718,6 +810,12 @@ impl FoundationTrainer {
                 self.train_epoch(train_records)?
             };
             let validation = self.evaluate_epoch(validation_records)?;
+            let property_validation = self
+                .config
+                .evaluation
+                .clean_property_validation
+                .then(|| self.evaluate_property_epoch(validation_records))
+                .transpose()?;
             let improved = progress
                 .best_validation_loss
                 .map(|best| validation.mean_total_loss < best - fit_config.early_stopping_min_delta)
@@ -750,6 +848,7 @@ impl FoundationTrainer {
                 epoch,
                 train,
                 validation,
+                property_validation,
                 improved,
             });
 
@@ -799,6 +898,12 @@ impl FoundationTrainer {
                 fit_config.shuffle_each_epoch,
             )?;
             let validation = self.evaluate_epoch_indices(records, validation_indices)?;
+            let property_validation = self
+                .config
+                .evaluation
+                .clean_property_validation
+                .then(|| self.evaluate_property_epoch_indices(records, validation_indices))
+                .transpose()?;
             let improved = progress
                 .best_validation_loss
                 .map(|best| validation.mean_total_loss < best - fit_config.early_stopping_min_delta)
@@ -831,6 +936,7 @@ impl FoundationTrainer {
                 epoch,
                 train,
                 validation,
+                property_validation,
                 improved,
             });
             if fit_config
@@ -905,6 +1011,12 @@ impl FoundationTrainer {
             )?;
             let train = self.train_epoch_indices(records, &train_plan.indices, epoch, false)?;
             let validation = self.evaluate_epoch_indices(records, &validation_plan.indices)?;
+            let property_validation = self
+                .config
+                .evaluation
+                .clean_property_validation
+                .then(|| self.evaluate_property_epoch_indices(records, &validation_plan.indices))
+                .transpose()?;
             let improved = progress
                 .best_validation_loss
                 .map(|best| validation.mean_total_loss < best - fit_config.early_stopping_min_delta)
@@ -937,6 +1049,7 @@ impl FoundationTrainer {
                 epoch,
                 train,
                 validation,
+                property_validation,
                 improved,
             });
             if fit_config
@@ -1017,21 +1130,59 @@ impl FoundationTrainer {
         self.optimizer.step_count()
     }
 
-    fn normalize_regression_targets(&self, views: &mut FoundationTrainingViews) -> Result<()> {
-        for batch in [&mut views.first, &mut views.second] {
-            if let Some(rt) = batch.targets.rt.take() {
-                batch.targets.rt = Some(self.config.target_normalization.rt.normalize_tensor(&rt)?);
-            }
-            if let Some(ccs) = batch.targets.ccs.take() {
-                batch.targets.ccs = Some(
-                    self.config
-                        .target_normalization
-                        .ccs
-                        .normalize_tensor(&ccs)?,
-                );
-            }
+    fn normalize_batch_regression_targets(
+        &self,
+        batch: &mut FoundationTrainingBatch,
+    ) -> Result<()> {
+        if let Some(rt) = batch.targets.rt.take() {
+            batch.targets.rt = Some(self.config.target_normalization.rt.normalize_tensor(&rt)?);
+        }
+        if let Some(ccs) = batch.targets.ccs.take() {
+            batch.targets.ccs = Some(
+                self.config
+                    .target_normalization
+                    .ccs
+                    .normalize_tensor(&ccs)?,
+            );
         }
         Ok(())
+    }
+
+    fn normalize_regression_targets(&self, views: &mut FoundationTrainingViews) -> Result<()> {
+        self.normalize_batch_regression_targets(&mut views.first)?;
+        self.normalize_batch_regression_targets(&mut views.second)?;
+        Ok(())
+    }
+
+    fn property_loss_for_batch(
+        &self,
+        batch: &FoundationTrainingBatch,
+    ) -> Result<(Tensor, FoundationLosses, RegressionDiagnostics)> {
+        let output = self
+            .wrapper
+            .model()
+            .forward_t_with_rt_encoder_gradient_scale(
+                &batch.input,
+                &batch.context,
+                false,
+                self.config.shared_gradient_scales.rt_encoder,
+            )?;
+        let regression = RegressionDiagnostics {
+            rt: regression_native_sufficient_statistics(
+                &output.rt,
+                batch.targets.rt.as_ref(),
+                batch.targets.rt_mask.as_ref(),
+                &self.config.target_normalization.rt,
+            )?,
+            ccs: regression_native_sufficient_statistics(
+                &output.ccs,
+                batch.targets.ccs.as_ref(),
+                batch.targets.ccs_mask.as_ref(),
+                &self.config.target_normalization.ccs,
+            )?,
+        };
+        let losses = multi_task_loss(&output, &batch.targets, self.config.loss_weights)?;
+        Ok((losses.total.clone(), losses, regression))
     }
 
     fn measure_task_gradient_norms(

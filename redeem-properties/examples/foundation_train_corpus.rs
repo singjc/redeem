@@ -30,6 +30,10 @@ fn main() -> Result<()> {
         "rt_encoder_gradient_scale\t{}",
         config.trainer.shared_gradient_scales.rt_encoder
     );
+    println!(
+        "clean_property_validation\t{}",
+        config.trainer.evaluation.clean_property_validation
+    );
     print_normalization("rt", &summary.target_normalization.rt);
     print_normalization("ccs", &summary.target_normalization.ccs);
     println!(
@@ -99,10 +103,19 @@ fn main() -> Result<()> {
             &format!("epoch{}_validation", epoch.epoch),
             &epoch.validation,
         );
+        if let Some(property_validation) = &epoch.property_validation {
+            print_epoch_metrics(
+                &format!("epoch{}_property_validation", epoch.epoch),
+                property_validation,
+            );
+        }
     }
     if let Some(last) = summary.fit.epochs.last() {
         print_epoch_metrics("last_train", &last.train);
         print_epoch_metrics("last_validation", &last.validation);
+        if let Some(property_validation) = &last.property_validation {
+            print_epoch_metrics("last_property_validation", property_validation);
+        }
     }
     for (source, metrics) in &summary.validation_by_source {
         println!(
@@ -114,7 +127,19 @@ fn main() -> Result<()> {
                 .copied()
                 .unwrap_or(0)
         );
-        print_source_metrics(source, metrics);
+        print_source_metrics("validation_source", source, metrics);
+    }
+    for (source, metrics) in &summary.property_validation_by_source {
+        println!(
+            "property_validation_source_records\t{source}\t{}",
+            summary
+                .validation_sampling
+                .source_records
+                .get(source)
+                .copied()
+                .unwrap_or(0)
+        );
+        print_source_metrics("property_validation_source", source, metrics);
     }
     Ok(())
 }
@@ -227,33 +252,56 @@ fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
     );
 }
 
-fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
-    println!(
-        "validation_source_total_loss\t{source}\t{}",
-        metrics.mean_total_loss
+fn print_source_metrics(prefix: &str, source: &str, metrics: &FoundationEpochMetrics) {
+    println!("{prefix}_total_loss\t{source}\t{}", metrics.mean_total_loss);
+    print_source_optional(prefix, source, "rt_loss", metrics.mean_rt_loss);
+    print_source_optional(prefix, source, "rt_mae_native", metrics.mean_rt_mae_native);
+    print_source_optional(
+        prefix,
+        source,
+        "rt_rmse_native",
+        metrics.mean_rt_rmse_native,
     );
-    print_source_optional(source, "rt_loss", metrics.mean_rt_loss);
-    print_source_optional(source, "rt_mae_native", metrics.mean_rt_mae_native);
-    print_source_optional(source, "rt_rmse_native", metrics.mean_rt_rmse_native);
     println!(
-        "validation_source_rt_native_labels\t{source}\t{}",
+        "{prefix}_rt_native_labels\t{source}\t{}",
         metrics.rt_native_label_count
     );
-    print_source_optional(source, "ccs_loss", metrics.mean_ccs_loss);
-    print_source_optional(source, "ccs_mae_native", metrics.mean_ccs_mae_native);
-    print_source_optional(source, "ccs_rmse_native", metrics.mean_ccs_rmse_native);
+    print_source_optional(prefix, source, "ccs_loss", metrics.mean_ccs_loss);
+    print_source_optional(
+        prefix,
+        source,
+        "ccs_mae_native",
+        metrics.mean_ccs_mae_native,
+    );
+    print_source_optional(
+        prefix,
+        source,
+        "ccs_rmse_native",
+        metrics.mean_ccs_rmse_native,
+    );
     println!(
-        "validation_source_ccs_native_labels\t{source}\t{}",
+        "{prefix}_ccs_native_labels\t{source}\t{}",
         metrics.ccs_native_label_count
     );
-    print_source_optional(source, "ms2_loss", metrics.mean_ms2_loss);
+    print_source_optional(prefix, source, "ms2_loss", metrics.mean_ms2_loss);
     print_source_optional(
+        prefix,
         source,
         "masked_residue_loss",
         metrics.mean_masked_residue_loss,
     );
-    print_source_optional(source, "chemistry_loss", metrics.mean_chemistry_loss);
-    print_source_optional(source, "contrastive_loss", metrics.mean_contrastive_loss);
+    print_source_optional(
+        prefix,
+        source,
+        "chemistry_loss",
+        metrics.mean_chemistry_loss,
+    );
+    print_source_optional(
+        prefix,
+        source,
+        "contrastive_loss",
+        metrics.mean_contrastive_loss,
+    );
 }
 
 fn print_normalization(label: &str, normalization: &FoundationRegressionNormalization) {
@@ -293,9 +341,9 @@ fn print_optional_f64(label: &str, value: Option<f64>) {
     }
 }
 
-fn print_source_optional(source: &str, label: &str, value: Option<f32>) {
+fn print_source_optional(prefix: &str, source: &str, label: &str, value: Option<f32>) {
     match value {
-        Some(value) => println!("validation_source_{label}\t{source}\t{value}"),
-        None => println!("validation_source_{label}\t{source}\tNA"),
+        Some(value) => println!("{prefix}_{label}\t{source}\t{value}"),
+        None => println!("{prefix}_{label}\t{source}\tNA"),
     }
 }

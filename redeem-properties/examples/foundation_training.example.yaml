@@ -10,9 +10,15 @@ trainer:
   learning_rate: 0.0001
   weight_decay: 0.01
   max_gradient_norm: 1.0
+  shared_gradient_scales:
+    rt_encoder: 1.0
   gradient_diagnostics:
     enabled: false
     every_n_steps: 100
+  # Optional second validation pass on clean, uncorrupted inputs. This reports
+  # RT/CCS/MS2 metrics without masked-reconstruction or contrastive objectives.
+  evaluation:
+    clean_property_validation: false
   learning_rate_schedule:
     kind: warmup-cosine
     warmup_steps: 1000

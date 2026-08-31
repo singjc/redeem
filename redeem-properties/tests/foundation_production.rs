@@ -573,3 +573,38 @@ fn task_gradient_diagnostics_follow_global_step_interval() {
         .task_gradient_norms
         .is_some());
 }
+
+#[test]
+fn clean_property_validation_disables_corruption_only_objectives() {
+    let records = records();
+    let trainer = FoundationTrainer::new(
+        tiny_config(),
+        FoundationTrainerConfig {
+            collator: FoundationCollatorConfig {
+                corruption: FoundationCorruptionConfig {
+                    residue_mask_probability: 1.0,
+                    chemistry_mask_probability: 1.0,
+                },
+                ..FoundationCollatorConfig::default()
+            },
+            ..FoundationTrainerConfig::default()
+        },
+        Device::Cpu,
+    )
+    .unwrap();
+
+    let corrupted = trainer.evaluate_epoch(&records).unwrap();
+    assert!(corrupted.mean_masked_residue_loss.is_some());
+    assert!(corrupted.mean_chemistry_loss.is_some());
+    assert!(corrupted.mean_contrastive_loss.is_some());
+
+    let clean = trainer.evaluate_property_epoch(&records).unwrap();
+    assert!(clean.mean_rt_loss.is_some_and(f32::is_finite));
+    assert!(clean.mean_ccs_loss.is_some_and(f32::is_finite));
+    assert!(clean.mean_ms2_loss.is_some_and(f32::is_finite));
+    assert!(clean.mean_masked_residue_loss.is_none());
+    assert!(clean.mean_chemistry_loss.is_none());
+    assert!(clean.mean_contrastive_loss.is_none());
+    assert_eq!(clean.rt_native_label_count, records.len());
+    assert_eq!(clean.ccs_native_label_count, records.len());
+}

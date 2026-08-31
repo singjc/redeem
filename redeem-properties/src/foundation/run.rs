@@ -105,9 +105,13 @@ pub struct FoundationTrainingRunSummary {
     pub train_sampling_preview: FoundationSamplePlan,
     /// Fixed validation selection used by the fit loop.
     pub validation_sampling: FoundationSamplePlan,
-    /// Optional final validation diagnostics evaluated separately by source.
+    /// Optional final corrupted multi-task validation diagnostics evaluated separately by source.
     /// These do not affect checkpoint selection or early stopping.
     pub validation_by_source: BTreeMap<String, FoundationEpochMetrics>,
+    /// Optional final clean RT/CCS/MS2 validation diagnostics by source.
+    /// These use uncorrupted peptide inputs and are disabled unless
+    /// `trainer.evaluation.clean_property_validation` is enabled.
+    pub property_validation_by_source: BTreeMap<String, FoundationEpochMetrics>,
     /// Train-partition-only regression normalization actually used by the run.
     pub target_normalization: FoundationTargetNormalizationConfig,
     /// Completed fit summary.
@@ -218,6 +222,7 @@ pub fn run_foundation_pretraining(
     )?;
 
     let mut validation_by_source = BTreeMap::new();
+    let mut property_validation_by_source = BTreeMap::new();
     if resolved_trainer_config.sampling.report_validation_by_source {
         let mut by_source = BTreeMap::<String, Vec<usize>>::new();
         for &index in &validation_sampling.indices {
@@ -231,7 +236,12 @@ pub fn run_foundation_pretraining(
         }
         for (source, indices) in by_source {
             let metrics = trainer.evaluate_epoch_indices(&corpus.records, &indices)?;
-            validation_by_source.insert(source, metrics);
+            validation_by_source.insert(source.clone(), metrics);
+            if resolved_trainer_config.evaluation.clean_property_validation {
+                let property_metrics =
+                    trainer.evaluate_property_epoch_indices(&corpus.records, &indices)?;
+                property_validation_by_source.insert(source, property_metrics);
+            }
         }
     }
 
@@ -246,6 +256,7 @@ pub fn run_foundation_pretraining(
         train_sampling_preview,
         validation_sampling,
         validation_by_source,
+        property_validation_by_source,
         target_normalization: trainer.config().target_normalization,
         fit,
     })
