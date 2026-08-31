@@ -8,9 +8,11 @@ use redeem_properties::foundation::{
 #[test]
 fn foundation_encoder_returns_global_and_residue_embeddings() {
     let device = Device::Cpu;
-    let mut config = FoundationConfig::default();
-    config.max_sequence_len = 16;
-    config.transformer_layers = 2;
+    let config = FoundationConfig {
+        max_sequence_len: 16,
+        transformer_layers: 2,
+        ..FoundationConfig::default()
+    };
     let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
     let batch = featurizer
         .featurize(&[PeptidoformInput::unmodified("PEPTIDEK")], &device)
@@ -30,9 +32,11 @@ fn foundation_encoder_returns_global_and_residue_embeddings() {
 #[test]
 fn multi_task_heads_have_expected_shapes() {
     let device = Device::Cpu;
-    let mut config = FoundationConfig::default();
-    config.max_sequence_len = 12;
-    config.transformer_layers = 1;
+    let config = FoundationConfig {
+        max_sequence_len: 12,
+        transformer_layers: 1,
+        ..FoundationConfig::default()
+    };
     let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
     let batch = featurizer
         .featurize(&[PeptidoformInput::unmodified("PEPTIDEK")], &device)
@@ -58,12 +62,14 @@ fn multi_task_heads_have_expected_shapes() {
 #[test]
 fn batched_default_length_attention_handles_contiguous_qkv() {
     let device = Device::Cpu;
-    let mut config = FoundationConfig::default();
     // One layer is sufficient to exercise the exact Q/K/V layout used by the
     // default 64-residue, four-head model while keeping the regression test
     // inexpensive. With batch size two this produces Q/K/V tensors shaped
     // `[2, 4, 64, 48]`, matching the layout that exposed the CPU matmul bug.
-    config.transformer_layers = 1;
+    let config = FoundationConfig {
+        transformer_layers: 1,
+        ..FoundationConfig::default()
+    };
 
     let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
     let batch = featurizer
