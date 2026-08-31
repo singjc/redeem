@@ -102,7 +102,8 @@ pub use split::{
     FoundationSplitConfig, FoundationSplitIndices, FoundationSplitMode, FoundationSplitSummary,
 };
 pub use trainer::{
-    FoundationEpochMetrics, FoundationFitEpochMetrics, FoundationFitSummary, FoundationStepMetrics,
+    FoundationEpochMetrics, FoundationFitEpochMetrics, FoundationFitSummary,
+    FoundationGradientDiagnosticsConfig, FoundationStepMetrics, FoundationTaskGradientNorms,
     FoundationTrainer, FoundationTrainerConfig,
 };
 pub use wrapper::FoundationModelWrapper;

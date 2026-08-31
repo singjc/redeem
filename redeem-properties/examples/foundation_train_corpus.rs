@@ -88,6 +88,14 @@ fn main() -> Result<()> {
     );
     println!("best_epoch\t{:?}", summary.fit.progress.best_epoch);
     println!("stopped_early\t{}", summary.fit.stopped_early);
+    for epoch in &summary.fit.epochs {
+        println!("epoch\t{}\timproved={}", epoch.epoch, epoch.improved);
+        print_epoch_metrics(&format!("epoch{}_train", epoch.epoch), &epoch.train);
+        print_epoch_metrics(
+            &format!("epoch{}_validation", epoch.epoch),
+            &epoch.validation,
+        );
+    }
     if let Some(last) = summary.fit.epochs.last() {
         print_epoch_metrics("last_train", &last.train);
         print_epoch_metrics("last_validation", &last.validation);
@@ -153,6 +161,34 @@ fn print_epoch_metrics(prefix: &str, metrics: &FoundationEpochMetrics) {
         println!("{prefix}_clipped_steps\t{}", metrics.clipped_steps);
         println!("{prefix}_clipped_fraction\t{value}");
     }
+    println!(
+        "{prefix}_gradient_diagnostic_steps\t{}",
+        metrics.gradient_diagnostic_steps
+    );
+    print_optional_f64(
+        &format!("{prefix}_rt_gradient_norm"),
+        metrics.mean_rt_gradient_norm,
+    );
+    print_optional_f64(
+        &format!("{prefix}_ccs_gradient_norm"),
+        metrics.mean_ccs_gradient_norm,
+    );
+    print_optional_f64(
+        &format!("{prefix}_ms2_gradient_norm"),
+        metrics.mean_ms2_gradient_norm,
+    );
+    print_optional_f64(
+        &format!("{prefix}_masked_residue_gradient_norm"),
+        metrics.mean_masked_residue_gradient_norm,
+    );
+    print_optional_f64(
+        &format!("{prefix}_chemistry_gradient_norm"),
+        metrics.mean_chemistry_gradient_norm,
+    );
+    print_optional_f64(
+        &format!("{prefix}_contrastive_gradient_norm"),
+        metrics.mean_contrastive_gradient_norm,
+    );
 }
 
 fn print_source_metrics(source: &str, metrics: &FoundationEpochMetrics) {
@@ -200,6 +236,13 @@ fn print_normalization(label: &str, normalization: &FoundationRegressionNormaliz
 }
 
 fn print_optional_f32(label: &str, value: Option<f32>) {
+    match value {
+        Some(value) => println!("{label}\t{value}"),
+        None => println!("{label}\tNA"),
+    }
+}
+
+fn print_optional_f64(label: &str, value: Option<f64>) {
     match value {
         Some(value) => println!("{label}\t{value}"),
         None => println!("{label}\tNA"),

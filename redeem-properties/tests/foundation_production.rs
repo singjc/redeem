@@ -4,11 +4,12 @@ use redeem_properties::foundation::{
     sample_foundation_validation_indices, FoundationCheckpointProvenance, FoundationCollatorConfig,
     FoundationConfig, FoundationCorpusConfig, FoundationCorpusDelimiter,
     FoundationCorpusSourceSpec, FoundationCorruptionConfig, FoundationDatasetLoader,
-    FoundationLearningRateSchedule, FoundationPartition, FoundationRecordProvenance,
-    FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
-    FoundationSamplingConfig, FoundationSamplingStrategy, FoundationSplitConfig,
-    FoundationTableLoaderConfig, FoundationTargetNormalizationConfig, FoundationTrainer,
-    FoundationTrainerConfig, FoundationTrainingProgress, RetentionTimeObjective,
+    FoundationGradientDiagnosticsConfig, FoundationLearningRateSchedule, FoundationPartition,
+    FoundationRecordProvenance, FoundationRegressionNormalization,
+    FoundationRegressionNormalizationStrategy, FoundationSamplingConfig,
+    FoundationSamplingStrategy, FoundationSplitConfig, FoundationTableLoaderConfig,
+    FoundationTargetNormalizationConfig, FoundationTrainer, FoundationTrainerConfig,
+    FoundationTrainingProgress, RetentionTimeObjective,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -446,4 +447,71 @@ fn normalized_regression_reports_native_unit_errors() {
     assert!(metrics.rt_rmse_native.is_some_and(f32::is_finite));
     assert!(metrics.ccs_mae_native.is_some_and(f32::is_finite));
     assert!(metrics.ccs_rmse_native.is_some_and(f32::is_finite));
+}
+
+#[test]
+fn task_gradient_diagnostics_report_weighted_objective_norms() {
+    let records = records();
+    let mut normalization = FoundationTargetNormalizationConfig {
+        rt: FoundationRegressionNormalization {
+            strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
+            ..FoundationRegressionNormalization::default()
+        },
+        ccs: FoundationRegressionNormalization {
+            strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
+            ..FoundationRegressionNormalization::default()
+        },
+    };
+    normalization
+        .resolve_from_training_partition(&records, &[0, 1], RetentionTimeObjective::Normalized)
+        .unwrap();
+    let mut config = trainer_config();
+    config.target_normalization = normalization;
+    config.gradient_diagnostics = FoundationGradientDiagnosticsConfig {
+        enabled: true,
+        every_n_steps: 1,
+    };
+    let mut trainer = FoundationTrainer::new(tiny_config(), config, Device::Cpu).unwrap();
+    let metrics = trainer.train_step(&records).unwrap();
+    let gradients = metrics
+        .task_gradient_norms
+        .expect("gradient diagnostics should run on step zero");
+    assert!(gradients
+        .rt
+        .is_some_and(|value| value.is_finite() && value >= 0.0));
+    assert!(gradients
+        .ccs
+        .is_some_and(|value| value.is_finite() && value >= 0.0));
+    assert!(gradients
+        .ms2
+        .is_some_and(|value| value.is_finite() && value >= 0.0));
+    assert!(gradients
+        .contrastive
+        .is_some_and(|value| value.is_finite() && value >= 0.0));
+}
+
+#[test]
+fn task_gradient_diagnostics_follow_global_step_interval() {
+    let records = records();
+    let mut config = trainer_config();
+    config.gradient_diagnostics = FoundationGradientDiagnosticsConfig {
+        enabled: true,
+        every_n_steps: 2,
+    };
+    let mut trainer = FoundationTrainer::new(tiny_config(), config, Device::Cpu).unwrap();
+    assert!(trainer
+        .train_step(&records)
+        .unwrap()
+        .task_gradient_norms
+        .is_some());
+    assert!(trainer
+        .train_step(&records)
+        .unwrap()
+        .task_gradient_norms
+        .is_none());
+    assert!(trainer
+        .train_step(&records)
+        .unwrap()
+        .task_gradient_norms
+        .is_some());
 }

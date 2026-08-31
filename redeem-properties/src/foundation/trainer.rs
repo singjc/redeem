@@ -35,6 +35,43 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+/// Optional per-task gradient diagnostics.
+///
+/// Computing a task gradient norm requires an additional backward pass for that
+/// task, so diagnostics are intentionally sampled rather than run every step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FoundationGradientDiagnosticsConfig {
+    /// Enable weighted per-task gradient-norm measurements.
+    pub enabled: bool,
+    /// Measure on optimizer steps where `global_step % every_n_steps == 0`.
+    pub every_n_steps: u64,
+}
+
+impl Default for FoundationGradientDiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_n_steps: 1,
+        }
+    }
+}
+
+impl FoundationGradientDiagnosticsConfig {
+    fn validate(self) -> Result<Self> {
+        if self.enabled && self.every_n_steps == 0 {
+            candle_core::bail!(
+                "foundation gradient diagnostics every_n_steps must be at least 1 when enabled"
+            );
+        }
+        Ok(self)
+    }
+
+    fn should_measure(self, global_step: u64) -> bool {
+        self.enabled && self.every_n_steps > 0 && global_step % self.every_n_steps == 0
+    }
+}
+
 /// Training hyperparameters independent from the model architecture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,6 +90,8 @@ pub struct FoundationTrainerConfig {
     pub adam_epsilon: f64,
     /// Optional global L2 gradient clipping threshold.
     pub max_gradient_norm: Option<f64>,
+    /// Sampled weighted per-task gradient diagnostics.
+    pub gradient_diagnostics: FoundationGradientDiagnosticsConfig,
     /// Per-step learning-rate schedule.
     pub learning_rate_schedule: FoundationLearningRateSchedule,
     /// Temperature used by the symmetric InfoNCE objective.
@@ -80,6 +119,7 @@ impl Default for FoundationTrainerConfig {
             adam_beta2: 0.999,
             adam_epsilon: 1e-8,
             max_gradient_norm: Some(1.0),
+            gradient_diagnostics: FoundationGradientDiagnosticsConfig::default(),
             learning_rate_schedule: FoundationLearningRateSchedule::Constant,
             contrastive_temperature: 0.10,
             loss_weights: FoundationLossWeights::default(),
@@ -102,6 +142,7 @@ impl FoundationTrainerConfig {
                 candle_core::bail!("foundation max_gradient_norm must be positive and finite");
             }
         }
+        let _ = self.gradient_diagnostics.validate()?;
         self.learning_rate_schedule
             .validate()
             .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
@@ -124,6 +165,26 @@ impl FoundationTrainerConfig {
             weight_decay: self.weight_decay,
         }
     }
+}
+
+/// Weighted per-task global gradient norms measured on one diagnostic step.
+///
+/// Each norm includes the task's configured loss weight and is measured before
+/// global gradient clipping. Missing/inactive objectives remain `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FoundationTaskGradientNorms {
+    /// Weighted RT gradient norm.
+    pub rt: Option<f64>,
+    /// Weighted CCS gradient norm.
+    pub ccs: Option<f64>,
+    /// Weighted MS2 gradient norm.
+    pub ms2: Option<f64>,
+    /// Weighted masked-residue gradient norm.
+    pub masked_residue: Option<f64>,
+    /// Weighted chemistry-reconstruction gradient norm.
+    pub chemistry: Option<f64>,
+    /// Weighted contrastive gradient norm.
+    pub contrastive: Option<f64>,
 }
 
 /// Scalar diagnostics returned after one optimizer update.
@@ -157,6 +218,8 @@ pub struct FoundationStepMetrics {
     pub gradient_norm: f64,
     /// Multiplicative gradient scale applied by clipping.
     pub gradient_scale: f64,
+    /// Optional weighted per-task gradient diagnostics measured on this step.
+    pub task_gradient_norms: Option<FoundationTaskGradientNorms>,
 }
 
 /// Aggregate diagnostics for one pass through a record slice.
@@ -194,6 +257,20 @@ pub struct FoundationEpochMetrics {
     pub clipped_steps: usize,
     /// Fraction of optimizer steps where global-norm clipping was active.
     pub clipped_fraction: Option<f64>,
+    /// Number of steps where per-task gradient diagnostics were measured.
+    pub gradient_diagnostic_steps: usize,
+    /// Mean weighted RT gradient norm across diagnostic steps.
+    pub mean_rt_gradient_norm: Option<f64>,
+    /// Mean weighted CCS gradient norm across diagnostic steps.
+    pub mean_ccs_gradient_norm: Option<f64>,
+    /// Mean weighted MS2 gradient norm across diagnostic steps.
+    pub mean_ms2_gradient_norm: Option<f64>,
+    /// Mean weighted masked-residue gradient norm across diagnostic steps.
+    pub mean_masked_residue_gradient_norm: Option<f64>,
+    /// Mean weighted chemistry gradient norm across diagnostic steps.
+    pub mean_chemistry_gradient_norm: Option<f64>,
+    /// Mean weighted contrastive gradient norm across diagnostic steps.
+    pub mean_contrastive_gradient_norm: Option<f64>,
     /// Final learning rate used during the epoch.
     pub final_learning_rate: Option<f64>,
 }
@@ -344,6 +421,15 @@ impl FoundationTrainer {
             .collate_views(records, self.wrapper.device(), seed)?;
         self.normalize_regression_targets(&mut views)?;
         let (total, losses, contrastive, regression) = self.loss_for_views(&views, true)?;
+        let task_gradient_norms = if self
+            .config
+            .gradient_diagnostics
+            .should_measure(self.global_step)
+        {
+            Some(self.measure_task_gradient_norms(&losses, contrastive.as_ref())?)
+        } else {
+            None
+        };
         let optimizer_metrics = self
             .optimizer
             .backward_step(&total, self.config.max_gradient_norm)?;
@@ -358,6 +444,7 @@ impl FoundationTrainer {
                 optimizer_metrics.gradient_norm,
                 optimizer_metrics.gradient_scale,
             )),
+            task_gradient_norms,
         )
     }
 
@@ -484,6 +571,7 @@ impl FoundationTrainer {
                 contrastive.as_ref(),
                 regression,
                 None,
+                None,
             )?);
         }
         Ok(accumulator.finish())
@@ -515,6 +603,7 @@ impl FoundationTrainer {
                 &losses,
                 contrastive.as_ref(),
                 regression,
+                None,
                 None,
             )?);
         }
@@ -865,6 +954,35 @@ impl FoundationTrainer {
         Ok(())
     }
 
+    fn measure_task_gradient_norms(
+        &self,
+        losses: &FoundationLosses,
+        contrastive: Option<&Tensor>,
+    ) -> Result<FoundationTaskGradientNorms> {
+        let weights = self.config.loss_weights;
+        Ok(FoundationTaskGradientNorms {
+            rt: self.weighted_gradient_norm(losses.rt.as_ref(), weights.rt)?,
+            ccs: self.weighted_gradient_norm(losses.ccs.as_ref(), weights.ccs)?,
+            ms2: self.weighted_gradient_norm(losses.ms2.as_ref(), weights.ms2)?,
+            masked_residue: self
+                .weighted_gradient_norm(losses.masked_residue.as_ref(), weights.masked_residue)?,
+            chemistry: self.weighted_gradient_norm(losses.chemistry.as_ref(), weights.chemistry)?,
+            contrastive: self.weighted_gradient_norm(contrastive, weights.contrastive)?,
+        })
+    }
+
+    fn weighted_gradient_norm(&self, loss: Option<&Tensor>, weight: f64) -> Result<Option<f64>> {
+        let Some(loss) = loss else {
+            return Ok(None);
+        };
+        if weight == 0.0 {
+            return Ok(None);
+        }
+        let weighted = loss.affine(weight, 0.0)?;
+        let gradients = weighted.backward()?;
+        Ok(Some(self.optimizer.gradient_norm(&gradients)?))
+    }
+
     fn loss_for_views(
         &self,
         views: &FoundationTrainingViews,
@@ -974,6 +1092,13 @@ struct EpochAccumulator {
     gradient_norm: OptionalMean64,
     gradient_scale: OptionalMean64,
     clipped_steps: usize,
+    gradient_diagnostic_steps: usize,
+    rt_gradient_norm: OptionalMean64,
+    ccs_gradient_norm: OptionalMean64,
+    ms2_gradient_norm: OptionalMean64,
+    masked_residue_gradient_norm: OptionalMean64,
+    chemistry_gradient_norm: OptionalMean64,
+    contrastive_gradient_norm: OptionalMean64,
     final_learning_rate: Option<f64>,
 }
 
@@ -998,6 +1123,15 @@ impl EpochAccumulator {
                 self.clipped_steps = self.clipped_steps.saturating_add(1);
             }
             self.final_learning_rate = Some(metrics.learning_rate);
+        }
+        if let Some(task) = metrics.task_gradient_norms {
+            self.gradient_diagnostic_steps = self.gradient_diagnostic_steps.saturating_add(1);
+            self.rt_gradient_norm.push(task.rt);
+            self.ccs_gradient_norm.push(task.ccs);
+            self.ms2_gradient_norm.push(task.ms2);
+            self.masked_residue_gradient_norm.push(task.masked_residue);
+            self.chemistry_gradient_norm.push(task.chemistry);
+            self.contrastive_gradient_norm.push(task.contrastive);
         }
     }
 
@@ -1024,6 +1158,13 @@ impl EpochAccumulator {
             clipped_steps: self.clipped_steps,
             clipped_fraction: (self.gradient_scale.count > 0)
                 .then(|| self.clipped_steps as f64 / self.gradient_scale.count as f64),
+            gradient_diagnostic_steps: self.gradient_diagnostic_steps,
+            mean_rt_gradient_norm: self.rt_gradient_norm.mean(),
+            mean_ccs_gradient_norm: self.ccs_gradient_norm.mean(),
+            mean_ms2_gradient_norm: self.ms2_gradient_norm.mean(),
+            mean_masked_residue_gradient_norm: self.masked_residue_gradient_norm.mean(),
+            mean_chemistry_gradient_norm: self.chemistry_gradient_norm.mean(),
+            mean_contrastive_gradient_norm: self.contrastive_gradient_norm.mean(),
             final_learning_rate: self.final_learning_rate,
         }
     }
@@ -1073,6 +1214,7 @@ fn metrics_from_tensors(
     contrastive: Option<&Tensor>,
     regression: RegressionDiagnostics,
     optimizer: Option<(f64, f64, f64)>,
+    task_gradient_norms: Option<FoundationTaskGradientNorms>,
 ) -> Result<FoundationStepMetrics> {
     let (learning_rate, gradient_norm, gradient_scale) = optimizer.unwrap_or((0.0, 0.0, 1.0));
     Ok(FoundationStepMetrics {
@@ -1090,6 +1232,7 @@ fn metrics_from_tensors(
         learning_rate,
         gradient_norm,
         gradient_scale,
+        task_gradient_norms,
     })
 }
 
