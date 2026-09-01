@@ -254,8 +254,8 @@ impl PeptideFoundationMultiTaskModel {
         config.validate().map_err(candle_core::Error::Msg)?;
         let encoder = PeptideFoundationEncoder::new(config.clone(), vb.pp("encoder"))?;
         Ok(Self {
-            rt_head: nn::linear(config.model_dim, 1, vb.pp("heads.rt"))?,
-            ccs_head: nn::linear(config.model_dim + 2, 1, vb.pp("heads.ccs"))?,
+            rt_head: zero_initialized_regression_linear(config.model_dim, vb.pp("heads.rt"))?,
+            ccs_head: zero_initialized_regression_linear(config.model_dim + 2, vb.pp("heads.ccs"))?,
             instrument_embedding: nn::embedding(
                 config.instrument_vocab_size,
                 16,
@@ -412,6 +412,19 @@ impl PeptideFoundationMultiTaskModel {
     pub fn config(&self) -> &FoundationConfig {
         &self.config
     }
+}
+
+/// Create a scalar regression head with a deterministic zero prediction prior.
+///
+/// RT and CCS training targets are normally standardized on the train partition, so zero is
+/// the neutral target-space prior. Zero-initializing the final scalar projection prevents a
+/// random fresh head from starting several standard deviations away from the label mean and
+/// dominating global gradient clipping. Checkpoint/safetensors loading is unaffected because
+/// a file-backed `VarBuilder` supplies the stored tensors instead of applying these hints.
+fn zero_initialized_regression_linear(in_dim: usize, vb: VarBuilder<'_>) -> Result<Linear> {
+    let weight = vb.get_with_hints((1, in_dim), "weight", nn::Init::Const(0.0))?;
+    let bias = vb.get_with_hints(1, "bias", nn::Init::Const(0.0))?;
+    Ok(Linear::new(weight, Some(bias)))
 }
 
 /// Identity in the forward pass with a configurable gradient multiplier.

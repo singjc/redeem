@@ -64,6 +64,47 @@ fn multi_task_heads_have_expected_shapes() {
 }
 
 #[test]
+fn normalized_regression_heads_start_from_zero_prediction() {
+    let device = Device::Cpu;
+    let config = FoundationConfig {
+        max_sequence_len: 12,
+        transformer_layers: 1,
+        dropout: 0.0,
+        ..FoundationConfig::default()
+    };
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let batch = featurizer
+        .featurize(
+            &[
+                PeptidoformInput::unmodified("PEPTIDEK"),
+                PeptidoformInput::unmodified("AGHCEWQMKYR"),
+            ],
+            &device,
+        )
+        .unwrap();
+    let context = PrecursorContextBatch {
+        charge: Tensor::from_vec(vec![2.0f32, 4.0], 2, &device).unwrap(),
+        charge_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
+        nce: Tensor::from_vec(vec![25.0f32, 35.0], 2, &device).unwrap(),
+        nce_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
+        instrument_ids: Tensor::from_vec(vec![0u32, 0], 2, &device).unwrap(),
+        instrument_present: Tensor::from_vec(vec![0.0f32, 0.0], 2, &device).unwrap(),
+    };
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultiTaskModel::new(config, vb).unwrap();
+    let output = model.forward_t(&batch, &context, false).unwrap();
+
+    for row in output.rt.to_vec2::<f32>().unwrap() {
+        assert_eq!(row, vec![0.0]);
+    }
+    for row in output.ccs.to_vec2::<f32>().unwrap() {
+        assert_eq!(row, vec![0.0]);
+    }
+}
+
+#[test]
 fn batched_default_length_attention_handles_contiguous_qkv() {
     let device = Device::Cpu;
     // One layer is sufficient to exercise the exact Q/K/V layout used by the
