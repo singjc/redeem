@@ -11,13 +11,15 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_diffusion_dataset_fingerprint, foundation_diffusion_length_loss,
-    foundation_diffusion_record_fingerprint, foundation_diffusion_x0_loss, load_foundation_corpus,
+    foundation_diffusion_record_fingerprint, foundation_diffusion_x0_loss,
+    foundation_spectrum_peptide_alignment_loss, load_foundation_corpus,
     read_foundation_training_run_config, FoundationAdamW, FoundationAdamWConfig,
     FoundationBenchmarkManifest, FoundationDiffusionCollator, FoundationDiffusionConfig,
     FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
     FoundationSpectrumCollator, FoundationSpectrumConfig, FoundationTrainingRecord,
-    PeptideSpectrumDiffusionModel, PeptidoformInput, PrecursorContextBatch,
-    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    PeptideFoundationEncoder, PeptideGraphFeaturizer, PeptideSpectrumDiffusionModel,
+    PeptidoformInput, PrecursorContextBatch, FOUNDATION_DIFFUSION_PAD,
+    FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 use serde::Serialize;
 use std::env;
@@ -42,6 +44,11 @@ struct DiffusionPilotMetadata {
     max_gradient_norm: f64,
     spectrum_forcing_fraction: f64,
     length_loss_weight: f64,
+    alignment_weight: f64,
+    alignment_temperature: f64,
+    alignment_every: usize,
+    initial_diffusion_checkpoint: Option<String>,
+    peptide_encoder_checkpoint: Option<String>,
     best_step: usize,
     best_validation_spectrum_only_loss: f64,
     diffusion: FoundationDiffusionConfig,
@@ -67,11 +74,65 @@ enum CorruptionMode {
     SpectrumOnlyMasked,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AlignmentMetrics {
+    loss: f64,
+    retrieval_top1: f64,
+    mean_positive_cosine: f64,
+    mean_rotated_cosine: f64,
+    pairs: usize,
+}
+
+struct FrozenPeptideTeacher {
+    _varmap: VarMap,
+    encoder: PeptideFoundationEncoder,
+    featurizer: PeptideGraphFeaturizer,
+}
+
+impl FrozenPeptideTeacher {
+    fn load(
+        model_config: redeem_properties::foundation::FoundationConfig,
+        checkpoint: &Path,
+        device: &Device,
+    ) -> Result<Self> {
+        let model_path = resolve_model_safetensors(checkpoint);
+        let mut varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let encoder = PeptideFoundationEncoder::new(model_config.clone(), vb.pp("encoder"))?;
+        varmap.load(&model_path).with_context(|| {
+            format!("failed to load frozen peptide encoder from {model_path:?}")
+        })?;
+        let featurizer = PeptideGraphFeaturizer::new(model_config)?;
+        Ok(Self {
+            _varmap: varmap,
+            encoder,
+            featurizer,
+        })
+    }
+
+    fn encode_records(
+        &self,
+        records: &[&FoundationTrainingRecord],
+        device: &Device,
+    ) -> Result<Tensor> {
+        let peptides: Vec<PeptidoformInput> = records
+            .iter()
+            .map(|record| record.peptidoform.clone())
+            .collect();
+        let batch = self.featurizer.featurize(&peptides, device)?;
+        Ok(self
+            .encoder
+            .forward_t(&batch, false)?
+            .peptide_embedding
+            .detach())
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 || args.len() > 9 {
+    if args.len() < 3 || args.len() > 14 {
         anyhow::bail!(
-            "usage: foundation_train_diffusion FOUNDATION_TRAINING.yaml OUTPUT_DIR [train_steps=1000] [batch_size=16] [validation_batches=32] [seed=20260901] [spectrum_forcing_fraction=0.5] [length_loss_weight=0.1]"
+            "usage: foundation_train_diffusion FOUNDATION_TRAINING.yaml OUTPUT_DIR [train_steps=1000] [batch_size=16] [validation_batches=32] [seed=20260901] [spectrum_forcing_fraction=0.5] [length_loss_weight=0.1] [initial_diffusion_checkpoint=none] [peptide_encoder_checkpoint=none] [alignment_weight=0.0] [alignment_temperature=0.07] [alignment_every=4]"
         );
     }
 
@@ -83,6 +144,11 @@ fn main() -> Result<()> {
     let seed = parse_or(&args, 6, 20_260_901u64)?;
     let spectrum_forcing_fraction = parse_or(&args, 7, 0.5f64)?;
     let length_loss_weight = parse_or(&args, 8, 0.1f64)?;
+    let initial_diffusion_checkpoint = optional_path(&args, 9);
+    let peptide_encoder_checkpoint = optional_path(&args, 10);
+    let alignment_weight = parse_or(&args, 11, 0.0f64)?;
+    let alignment_temperature = parse_or(&args, 12, 0.07f64)?;
+    let alignment_every = parse_or(&args, 13, 4usize)?;
     if train_steps == 0 || batch_size == 0 || validation_batches == 0 {
         anyhow::bail!("train_steps, batch_size, and validation_batches must all be positive");
     }
@@ -91,6 +157,18 @@ fn main() -> Result<()> {
     }
     if !(length_loss_weight >= 0.0 && length_loss_weight.is_finite()) {
         anyhow::bail!("length_loss_weight must be finite and non-negative");
+    }
+    if !(alignment_weight >= 0.0 && alignment_weight.is_finite()) {
+        anyhow::bail!("alignment_weight must be finite and non-negative");
+    }
+    if !(alignment_temperature > 0.0 && alignment_temperature.is_finite()) {
+        anyhow::bail!("alignment_temperature must be finite and positive");
+    }
+    if alignment_every == 0 {
+        anyhow::bail!("alignment_every must be positive");
+    }
+    if alignment_weight > 0.0 && peptide_encoder_checkpoint.is_none() {
+        anyhow::bail!("alignment_weight > 0 requires peptide_encoder_checkpoint");
     }
 
     let device = Device::Cpu;
@@ -176,6 +254,23 @@ fn main() -> Result<()> {
     println!("seed\t{seed}");
     println!("spectrum_forcing_fraction\t{spectrum_forcing_fraction}");
     println!("length_loss_weight\t{length_loss_weight}");
+    println!("alignment_weight\t{alignment_weight}");
+    println!("alignment_temperature\t{alignment_temperature}");
+    println!("alignment_every\t{alignment_every}");
+    println!(
+        "initial_diffusion_checkpoint\t{}",
+        initial_diffusion_checkpoint
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "peptide_encoder_checkpoint\t{}",
+        peptide_encoder_checkpoint
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".into())
+    );
     println!(
         "sampled_training_pairs\t{}",
         train_steps.saturating_mul(batch_size)
@@ -233,10 +328,30 @@ fn main() -> Result<()> {
     let initial_dir = output_root.join("initial");
     fs::create_dir_all(&initial_dir)?;
 
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = PeptideSpectrumDiffusionModel::new(config.clone(), vb)?;
+    if let Some(checkpoint) = initial_diffusion_checkpoint.as_ref() {
+        let model_path = resolve_model_safetensors(checkpoint);
+        varmap
+            .load(&model_path)
+            .with_context(|| format!("failed to warm-start diffusion model from {model_path:?}"))?;
+    }
     varmap.save(initial_dir.join("model.safetensors"))?;
+
+    let peptide_teacher = peptide_encoder_checkpoint
+        .as_ref()
+        .map(|path| FrozenPeptideTeacher::load(run.model.clone(), path, &device))
+        .transpose()?;
+    if let Some(teacher) = peptide_teacher.as_ref() {
+        if teacher.encoder.config().model_dim != config.model_dim {
+            anyhow::bail!(
+                "peptide teacher model_dim {} does not match diffusion model_dim {}",
+                teacher.encoder.config().model_dim,
+                config.model_dim
+            );
+        }
+    }
 
     let learning_rate = 1.0e-4;
     let max_gradient_norm = 1.0;
@@ -292,7 +407,22 @@ fn main() -> Result<()> {
         let x0_loss = foundation_diffusion_x0_loss(&output, &packed.diffusion)?;
         let length_loss = foundation_diffusion_length_loss(&output, &packed.diffusion)?;
         let weighted_length = length_loss.affine(length_loss_weight, 0.0)?;
-        let loss = (&x0_loss + &weighted_length)?;
+        let mut loss = (&x0_loss + &weighted_length)?;
+        let use_alignment = alignment_weight > 0.0 && step % alignment_every == 0;
+        let mut alignment_loss_value = None;
+        if use_alignment {
+            let teacher = peptide_teacher
+                .as_ref()
+                .expect("alignment configuration validated before training");
+            let peptide_embedding = teacher.encode_records(&records, &device)?;
+            let alignment_loss = foundation_spectrum_peptide_alignment_loss(
+                &output.spectrum_embedding,
+                &peptide_embedding,
+                alignment_temperature,
+            )?;
+            alignment_loss_value = Some(f64::from(alignment_loss.to_scalar::<f32>()?));
+            loss = (&loss + &alignment_loss.affine(alignment_weight, 0.0)?)?;
+        }
         let x0_loss_value = f64::from(x0_loss.to_scalar::<f32>()?);
         let length_loss_value = f64::from(length_loss.to_scalar::<f32>()?);
         let total_loss_value = f64::from(loss.to_scalar::<f32>()?);
@@ -305,7 +435,10 @@ fn main() -> Result<()> {
                 "random_t"
             };
             println!(
-                "train\tstep={step}\tmode={mode}\tloss={x0_loss_value:.6}\tlength_loss={length_loss_value:.6}\ttotal_loss={total_loss_value:.6}\tperplexity={:.4}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                "train\tstep={step}\tmode={mode}\tloss={x0_loss_value:.6}\tlength_loss={length_loss_value:.6}\talignment_loss={}\ttotal_loss={total_loss_value:.6}\tperplexity={:.4}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                alignment_loss_value
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_else(|| "na".into()),
                 x0_loss_value.exp(),
                 optimizer_step.gradient_norm,
                 optimizer_step.gradient_scale,
@@ -376,6 +509,30 @@ fn main() -> Result<()> {
                 spectrum_only_metrics.length_accuracy - shuffled_spectrum_metrics.length_accuracy,
             );
 
+            if let Some(teacher) = peptide_teacher.as_ref() {
+                let alignment_metrics = evaluate_alignment(
+                    &model,
+                    teacher,
+                    &corpus.records,
+                    &validation_selection,
+                    batch_size,
+                    &config,
+                    &diffusion_collator,
+                    &spectrum_collator,
+                    alignment_temperature,
+                    &device,
+                )?;
+                println!(
+                    "validation_alignment\tstep={step}\tloss={:.6}\tretrieval_top1={:.6}\tmean_positive_cosine={:.6}\tmean_rotated_cosine={:.6}\tcosine_delta={:.6}\tpairs={}",
+                    alignment_metrics.loss,
+                    alignment_metrics.retrieval_top1,
+                    alignment_metrics.mean_positive_cosine,
+                    alignment_metrics.mean_rotated_cosine,
+                    alignment_metrics.mean_positive_cosine - alignment_metrics.mean_rotated_cosine,
+                    alignment_metrics.pairs,
+                );
+            }
+
             if spectrum_only_metrics.loss < best_spectrum_only {
                 best_spectrum_only = spectrum_only_metrics.loss;
                 best_step = step;
@@ -384,7 +541,7 @@ fn main() -> Result<()> {
                     &varmap,
                     &optimizer,
                     &DiffusionPilotMetadata {
-                        version: 2,
+                        version: 3,
                         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
                         benchmark_manifest_fingerprint: format!(
                             "fnv1a64:{:016x}",
@@ -404,6 +561,15 @@ fn main() -> Result<()> {
                         max_gradient_norm,
                         spectrum_forcing_fraction,
                         length_loss_weight,
+                        alignment_weight,
+                        alignment_temperature,
+                        alignment_every,
+                        initial_diffusion_checkpoint: initial_diffusion_checkpoint
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                        peptide_encoder_checkpoint: peptide_encoder_checkpoint
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
                         best_step,
                         best_validation_spectrum_only_loss: best_spectrum_only,
                         diffusion: config.clone(),
@@ -416,7 +582,7 @@ fn main() -> Result<()> {
                 &varmap,
                 &optimizer,
                 &DiffusionPilotMetadata {
-                    version: 2,
+                    version: 3,
                     corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
                     benchmark_manifest_fingerprint: format!(
                         "fnv1a64:{:016x}",
@@ -436,6 +602,15 @@ fn main() -> Result<()> {
                     max_gradient_norm,
                     spectrum_forcing_fraction,
                     length_loss_weight,
+                    alignment_weight,
+                    alignment_temperature,
+                    alignment_every,
+                    initial_diffusion_checkpoint: initial_diffusion_checkpoint
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    peptide_encoder_checkpoint: peptide_encoder_checkpoint
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
                     best_step,
                     best_validation_spectrum_only_loss: best_spectrum_only,
                     diffusion: config.clone(),
@@ -448,6 +623,124 @@ fn main() -> Result<()> {
     println!("best_validation_spectrum_only_loss\t{best_spectrum_only:.8}");
     println!("best_checkpoint\t{}", output_root.join("best").display());
     Ok(())
+}
+
+fn resolve_model_safetensors(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("model.safetensors")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn optional_path(args: &[String], index: usize) -> Option<PathBuf> {
+    args.get(index).and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none"))
+            .then(|| PathBuf::from(trimmed))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_alignment(
+    model: &PeptideSpectrumDiffusionModel,
+    teacher: &FrozenPeptideTeacher,
+    all_records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    batch_size: usize,
+    config: &FoundationDiffusionConfig,
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    temperature: f64,
+    device: &Device,
+) -> Result<AlignmentMetrics> {
+    let mut loss_sum = 0.0f64;
+    let mut batches = 0usize;
+    let mut retrieval_correct = 0usize;
+    let mut positive_sum = 0.0f64;
+    let mut rotated_sum = 0.0f64;
+    let mut pairs = 0usize;
+
+    for chunk in indices.chunks(batch_size) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let records: Vec<&FoundationTrainingRecord> =
+            chunk.iter().map(|&index| &all_records[index]).collect();
+        let packed = collate_records(
+            &records,
+            config,
+            diffusion_collator,
+            spectrum_collator,
+            CorruptionMode::SpectrumOnlyMasked,
+            false,
+            0x73d1_f581_2a94_bc06 ^ pairs as u64,
+            device,
+        )?;
+        let output = model.forward_t(
+            &packed.diffusion,
+            &packed.spectrum,
+            &packed.precursor,
+            false,
+        )?;
+        let peptide_embedding = teacher.encode_records(&records, device)?;
+        let loss = foundation_spectrum_peptide_alignment_loss(
+            &output.spectrum_embedding,
+            &peptide_embedding,
+            temperature,
+        )?;
+        loss_sum += f64::from(loss.to_scalar::<f32>()?);
+        batches += 1;
+
+        let spectrum = output.spectrum_embedding.to_vec2::<f32>()?;
+        let peptide = peptide_embedding.to_vec2::<f32>()?;
+        for row in 0..spectrum.len() {
+            let mut best_index = 0usize;
+            let mut best_cosine = f64::NEG_INFINITY;
+            for candidate in 0..peptide.len() {
+                let cosine = cosine_similarity(&spectrum[row], &peptide[candidate]);
+                if cosine > best_cosine {
+                    best_cosine = cosine;
+                    best_index = candidate;
+                }
+            }
+            retrieval_correct += usize::from(best_index == row);
+            positive_sum += cosine_similarity(&spectrum[row], &peptide[row]);
+            let rotated = (row + 1) % peptide.len();
+            rotated_sum += cosine_similarity(&spectrum[row], &peptide[rotated]);
+            pairs += 1;
+        }
+    }
+
+    if batches == 0 || pairs == 0 {
+        anyhow::bail!("alignment validation selected no peptide-spectrum pairs");
+    }
+    Ok(AlignmentMetrics {
+        loss: loss_sum / batches as f64,
+        retrieval_top1: retrieval_correct as f64 / pairs as f64,
+        mean_positive_cosine: positive_sum / pairs as f64,
+        mean_rotated_cosine: rotated_sum / pairs as f64,
+        pairs,
+    })
+}
+
+fn cosine_similarity(first: &[f32], second: &[f32]) -> f64 {
+    let mut dot = 0.0f64;
+    let mut first_norm = 0.0f64;
+    let mut second_norm = 0.0f64;
+    for (&left, &right) in first.iter().zip(second) {
+        let left = left as f64;
+        let right = right as f64;
+        dot += left * right;
+        first_norm += left * left;
+        second_norm += right * right;
+    }
+    let denominator = (first_norm * second_norm).sqrt();
+    if denominator > 0.0 {
+        dot / denominator
+    } else {
+        0.0
+    }
 }
 
 struct PackedBatch {
