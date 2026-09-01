@@ -6,7 +6,7 @@
 //! used as a training adapter.
 
 use super::data::FoundationTrainingRecord;
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
 
 /// One observed centroided MS/MS peak.

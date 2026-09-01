@@ -549,15 +549,18 @@ impl FoundationDiffusionCollator {
             }
         }
 
+        let active_count = target_classes.len();
+        debug_assert_eq!(active_indices.len(), active_count);
+
         Ok(FoundationDiffusionBatch {
             noisy_tokens: Tensor::from_vec(noisy, (b, l), device)?.to_dtype(DType::U32)?,
             clean_tokens: Tensor::from_vec(clean, (b, l), device)?.to_dtype(DType::U32)?,
             token_mask: Tensor::from_vec(mask, (b, l), device)?,
             timesteps: Tensor::from_vec(timestep_ids, b, device)?.to_dtype(DType::U32)?,
             timestep_features: Tensor::from_vec(timestep_features, (b, 4), device)?,
-            active_indices: Tensor::from_vec(active_indices, target_classes.len(), device)?
+            active_indices: Tensor::from_vec(active_indices, active_count, device)?
                 .to_dtype(DType::U32)?,
-            target_classes: Tensor::from_vec(target_classes, target_classes.len(), device)?
+            target_classes: Tensor::from_vec(target_classes, active_count, device)?
                 .to_dtype(DType::U32)?,
         })
     }
