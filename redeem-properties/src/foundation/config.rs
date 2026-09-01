@@ -16,6 +16,33 @@ pub enum FoundationCcsContextMode {
     NeutralMassCharge,
 }
 
+/// Frozen train-derived physical CCS prior used by the residual CCS head.
+///
+/// Coefficients operate on native CCS units using the feature order:
+///
+/// 0. intercept,
+/// 1. charge / 4,
+/// 2. charge^2 / 16,
+/// 3. precursor m/z / 1000,
+/// 4. (precursor m/z * charge) / 3000,
+/// 5. peptide sequence length / 30,
+/// 6. charge-present mask,
+/// 7. precursor-m/z-present mask.
+///
+/// The native baseline is converted into the standardized CCS space used by
+/// training before the learned CCS residual is added. Fitting these values on
+/// a train-only partition keeps the shared peptide representation independent
+/// of dataset-specific calibration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FoundationCcsPhysicsBaselineConfig {
+    /// Native-unit linear coefficients in the feature order documented above.
+    pub coefficients_native: [f64; 8],
+    /// Train-partition native CCS mean used by target standardization.
+    pub target_mean_native: f64,
+    /// Train-partition native CCS standard deviation used by target standardization.
+    pub target_std_native: f64,
+}
+
 /// Hyperparameters for [`crate::foundation::PeptideFoundationEncoder`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -48,6 +75,10 @@ pub struct FoundationConfig {
     pub ms2_fragment_channels: usize,
     /// Scalar precursor context supplied only to the CCS head.
     pub ccs_context_mode: FoundationCcsContextMode,
+    /// Optional frozen train-derived physical CCS prior. When present, the
+    /// trainable CCS head learns an additive residual in standardized target
+    /// space rather than the entire CCS value from scratch.
+    pub ccs_physics_baseline: Option<FoundationCcsPhysicsBaselineConfig>,
 }
 
 impl Default for FoundationConfig {
@@ -67,6 +98,7 @@ impl Default for FoundationConfig {
             instrument_vocab_size: 16,
             ms2_fragment_channels: 8,
             ccs_context_mode: FoundationCcsContextMode::ChargePresence,
+            ccs_physics_baseline: None,
         }
     }
 }
@@ -93,6 +125,23 @@ impl FoundationConfig {
         }
         if !(0.0..1.0).contains(&self.dropout) {
             return Err("dropout must be in [0, 1)".into());
+        }
+        if let Some(baseline) = &self.ccs_physics_baseline {
+            if !baseline.target_mean_native.is_finite() {
+                return Err("ccs_physics_baseline target_mean_native must be finite".into());
+            }
+            if !baseline.target_std_native.is_finite() || baseline.target_std_native <= 0.0 {
+                return Err(
+                    "ccs_physics_baseline target_std_native must be finite and positive".into(),
+                );
+            }
+            if baseline
+                .coefficients_native
+                .iter()
+                .any(|value| !value.is_finite())
+            {
+                return Err("ccs_physics_baseline coefficients_native must all be finite".into());
+            }
         }
         Ok(())
     }

@@ -2,8 +2,9 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Module, VarBuilder, VarMap};
 use redeem_properties::foundation::model::gradient_scaled_identity;
 use redeem_properties::foundation::{
-    FoundationConfig, PeptideFoundationEncoder, PeptideFoundationMultiTaskModel,
-    PeptideGraphFeaturizer, PeptidoformInput, PrecursorContextBatch,
+    FoundationCcsPhysicsBaselineConfig, FoundationConfig, PeptideFoundationEncoder,
+    PeptideFoundationMultiTaskModel, PeptideGraphFeaturizer, PeptidoformInput,
+    PrecursorContextBatch,
 };
 
 #[test]
@@ -341,6 +342,58 @@ fn ccs_encoder_gradient_gate_preserves_forward_values() {
 #[test]
 fn ccs_encoder_gradient_gate_scales_encoder_but_not_ccs_head_gradients() {
     assert_gradient_scale_primitive(0.5);
+}
+
+#[test]
+fn ccs_physics_baseline_initializes_a_native_physics_prior_plus_zero_residual() {
+    let device = Device::Cpu;
+    let config = FoundationConfig {
+        max_sequence_len: 12,
+        transformer_layers: 1,
+        dropout: 0.0,
+        ccs_physics_baseline: Some(FoundationCcsPhysicsBaselineConfig {
+            // Make the expected native baseline easy to compute:
+            // 100 + 40 * (charge/4) + 30 * (mz/1000) + 60 * (len/30).
+            coefficients_native: [100.0, 40.0, 0.0, 30.0, 0.0, 60.0, 0.0, 0.0],
+            target_mean_native: 200.0,
+            target_std_native: 50.0,
+        }),
+        ..FoundationConfig::default()
+    };
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let batch = featurizer
+        .featurize(
+            &[
+                PeptidoformInput::unmodified("PEPTIDEK"),    // len = 8
+                PeptidoformInput::unmodified("AGHCEWQMKYR"), // len = 11
+            ],
+            &device,
+        )
+        .unwrap();
+    let context = PrecursorContextBatch {
+        charge: Tensor::from_vec(vec![2.0f32, 4.0], 2, &device).unwrap(),
+        charge_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
+        precursor_mz: Tensor::from_vec(vec![500.0f32, 1000.0], 2, &device).unwrap(),
+        precursor_mz_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
+        nce: Tensor::zeros(2, DType::F32, &device).unwrap(),
+        nce_present: Tensor::zeros(2, DType::F32, &device).unwrap(),
+        instrument_ids: Tensor::zeros(2, DType::U32, &device).unwrap(),
+        instrument_present: Tensor::zeros(2, DType::F32, &device).unwrap(),
+    };
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultiTaskModel::new(config, vb).unwrap();
+    let output = model.forward_t(&batch, &context, false).unwrap();
+    let values = output.ccs.squeeze(1).unwrap().to_vec1::<f32>().unwrap();
+
+    let native0 = 100.0 + 40.0 * (2.0 / 4.0) + 30.0 * (500.0 / 1000.0) + 60.0 * (8.0 / 30.0);
+    let native1 = 100.0 + 40.0 * (4.0 / 4.0) + 30.0 * (1000.0 / 1000.0) + 60.0 * (11.0 / 30.0);
+    let expected0 = (native0 - 200.0) / 50.0;
+    let expected1 = (native1 - 200.0) / 50.0;
+
+    assert!((values[0] - expected0).abs() < 1e-5);
+    assert!((values[1] - expected1).abs() < 1e-5);
 }
 
 #[test]

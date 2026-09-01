@@ -1,7 +1,9 @@
 //! Hierarchical chemistry-aware peptide encoder and multi-task prediction heads.
 
 use super::chemistry::ATOM_FEATURE_DIM;
-use super::config::{FoundationCcsContextMode, FoundationConfig};
+use super::config::{
+    FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, FoundationConfig,
+};
 use super::featurize::FoundationBatch;
 use super::layers::{GraphMessageLayer, PeptideTransformerBlock};
 use candle_core::{DType, Module, Result, Tensor};
@@ -367,7 +369,14 @@ impl PeptideFoundationMultiTaskModel {
             }
         };
         let ccs_features = Tensor::cat(&[&ccs_embedding, &ccs_scalar_context], 1)?;
-        let ccs = self.ccs_head.forward(&ccs_features)?;
+        let ccs_residual = self.ccs_head.forward(&ccs_features)?;
+        let ccs = if let Some(physics_baseline) = &self.config.ccs_physics_baseline {
+            let baseline =
+                standardized_ccs_physics_baseline(&foundation, context, physics_baseline)?;
+            (&baseline + &ccs_residual)?
+        } else {
+            ccs_residual
+        };
 
         let (batch_size, sequence_len, _) = foundation.residue_embeddings.dims3()?;
         let left = foundation
@@ -437,6 +446,63 @@ impl PeptideFoundationMultiTaskModel {
     pub fn config(&self) -> &FoundationConfig {
         &self.config
     }
+}
+
+/// Evaluate a frozen train-derived physical CCS prior and map it into the
+/// standardized target space used by the learned residual head.
+///
+/// The prior is intentionally parameter-free. This lets a model start from a
+/// strong precursor-physics prediction while reserving all learned CCS
+/// capacity for peptide-specific deviations from that baseline.
+fn standardized_ccs_physics_baseline(
+    foundation: &FoundationOutput,
+    context: &PrecursorContextBatch,
+    baseline: &FoundationCcsPhysicsBaselineConfig,
+) -> Result<Tensor> {
+    let batch_size = context.charge.dims1()?;
+    let device = context.charge.device();
+
+    let charge_present = &context.charge_present;
+    let mz_present = &context.precursor_mz_present;
+    let physical_present = charge_present.broadcast_mul(mz_present)?;
+
+    let charge = context.charge.broadcast_mul(charge_present)?;
+    let precursor_mz = context.precursor_mz.broadcast_mul(mz_present)?;
+    let charge_squared = charge.sqr()?;
+    let neutral_mass_proxy = charge
+        .broadcast_mul(&precursor_mz)?
+        .broadcast_mul(&physical_present)?;
+    let sequence_len = foundation.residue_mask.sum(1)?;
+
+    let ones = Tensor::ones(batch_size, DType::F32, device)?;
+    let features = Tensor::cat(
+        &[
+            &ones.unsqueeze(1)?,
+            &charge.affine(1.0 / 4.0, 0.0)?.unsqueeze(1)?,
+            &charge_squared.affine(1.0 / 16.0, 0.0)?.unsqueeze(1)?,
+            &precursor_mz.affine(1.0 / 1000.0, 0.0)?.unsqueeze(1)?,
+            &neutral_mass_proxy.affine(1.0 / 3000.0, 0.0)?.unsqueeze(1)?,
+            &sequence_len.affine(1.0 / 30.0, 0.0)?.unsqueeze(1)?,
+            &charge_present.unsqueeze(1)?,
+            &mz_present.unsqueeze(1)?,
+        ],
+        1,
+    )?;
+
+    let coefficients = Tensor::from_vec(
+        baseline
+            .coefficients_native
+            .iter()
+            .map(|value| *value as f32)
+            .collect::<Vec<_>>(),
+        (8, 1),
+        device,
+    )?;
+    let native = features.matmul(&coefficients)?;
+    native.affine(
+        1.0 / baseline.target_std_native,
+        -baseline.target_mean_native / baseline.target_std_native,
+    )
 }
 
 /// Create a scalar regression head with a deterministic zero prediction prior.
