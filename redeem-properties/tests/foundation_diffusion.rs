@@ -1,12 +1,13 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_diffusion_x0_loss, foundation_peptidoform_neutral_mass,
-    foundation_precursor_mass_error_da, foundation_spectrum_peptide_alignment_loss,
-    FoundationAdamW, FoundationAdamWConfig, FoundationDiffusionCollator, FoundationDiffusionConfig,
-    FoundationDiffusionVocabulary, FoundationSpectrum, FoundationSpectrumCollator,
-    FoundationSpectrumConfig, PeptideSpectrumDiffusionModel, PeptidoformInput,
-    PrecursorContextBatch, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    foundation_diffusion_length_loss, foundation_diffusion_x0_loss,
+    foundation_peptidoform_neutral_mass, foundation_precursor_mass_error_da,
+    foundation_spectrum_peptide_alignment_loss, FoundationAdamW, FoundationAdamWConfig,
+    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
+    FoundationSpectrum, FoundationSpectrumCollator, FoundationSpectrumConfig,
+    PeptideSpectrumDiffusionModel, PeptidoformInput, PrecursorContextBatch,
+    FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 
 #[test]
@@ -63,9 +64,13 @@ fn diffusion_model_executes_one_real_backward_update() {
         output.token_logits.dims(),
         &[2, config.max_tokens, FOUNDATION_DIFFUSION_VOCAB_SIZE]
     );
-    let loss = foundation_diffusion_x0_loss(&output, &diffusion_batch).unwrap();
+    assert_eq!(output.length_logits.dims(), &[2, config.max_tokens]);
+    let x0_loss = foundation_diffusion_x0_loss(&output, &diffusion_batch).unwrap();
+    let length_loss = foundation_diffusion_length_loss(&output, &diffusion_batch).unwrap();
+    let loss = (&x0_loss + &length_loss.affine(0.1, 0.0).unwrap()).unwrap();
     let before = loss.to_scalar::<f32>().unwrap();
     assert!(before.is_finite());
+    assert!(length_loss.to_scalar::<f32>().unwrap().is_finite());
     let alignment = foundation_spectrum_peptide_alignment_loss(
         &output.spectrum_embedding,
         &output.spectrum_embedding,
@@ -81,6 +86,51 @@ fn diffusion_model_executes_one_real_backward_update() {
     assert_eq!(step.step, 1);
     assert!(step.gradient_norm.is_finite());
     assert!(step.gradient_norm > 0.0);
+}
+
+#[test]
+fn diffusion_all_masked_batch_removes_clean_token_content_and_tracks_length() {
+    let device = Device::Cpu;
+    let config = FoundationDiffusionConfig {
+        max_tokens: 16,
+        model_dim: 32,
+        num_attention_heads: 4,
+        feed_forward_dim: 64,
+        spectrum_layers: 1,
+        decoder_layers: 1,
+        ..FoundationDiffusionConfig::default()
+    };
+    let peptides = vec![
+        PeptidoformInput::unmodified("PEPTIDEK"),
+        PeptidoformInput::unmodified("MELTQK"),
+    ];
+    let batch = FoundationDiffusionCollator::new(config)
+        .unwrap()
+        .collate_all_masked(&peptides, 20, &device)
+        .unwrap();
+    let noisy = batch.noisy_tokens.to_vec2::<u32>().unwrap();
+    let clean = batch.clean_tokens.to_vec2::<u32>().unwrap();
+    let mask = batch.token_mask.to_vec2::<f32>().unwrap();
+    for row in 0..noisy.len() {
+        for col in 0..noisy[row].len() {
+            if mask[row][col] > 0.0 {
+                assert_eq!(
+                    noisy[row][col],
+                    redeem_properties::foundation::FOUNDATION_DIFFUSION_MASK
+                );
+                assert_ne!(
+                    clean[row][col],
+                    redeem_properties::foundation::FOUNDATION_DIFFUSION_PAD
+                );
+            } else {
+                assert_eq!(
+                    noisy[row][col],
+                    redeem_properties::foundation::FOUNDATION_DIFFUSION_PAD
+                );
+            }
+        }
+    }
+    assert_eq!(batch.length_targets.to_vec1::<u32>().unwrap(), vec![8, 6]);
 }
 
 #[test]

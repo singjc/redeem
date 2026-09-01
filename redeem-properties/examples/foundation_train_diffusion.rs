@@ -10,13 +10,14 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_diffusion_dataset_fingerprint, foundation_diffusion_record_fingerprint,
-    foundation_diffusion_x0_loss, load_foundation_corpus, read_foundation_training_run_config,
-    FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest,
-    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationSpectrumConfig,
-    FoundationTrainingRecord, PeptideSpectrumDiffusionModel, PeptidoformInput,
-    PrecursorContextBatch,
+    foundation_diffusion_dataset_fingerprint, foundation_diffusion_length_loss,
+    foundation_diffusion_record_fingerprint, foundation_diffusion_x0_loss, load_foundation_corpus,
+    read_foundation_training_run_config, FoundationAdamW, FoundationAdamWConfig,
+    FoundationBenchmarkManifest, FoundationDiffusionCollator, FoundationDiffusionConfig,
+    FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
+    FoundationSpectrumCollator, FoundationSpectrumConfig, FoundationTrainingRecord,
+    PeptideSpectrumDiffusionModel, PeptidoformInput, PrecursorContextBatch,
+    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 use serde::Serialize;
 use std::env;
@@ -39,36 +40,57 @@ struct DiffusionPilotMetadata {
     seed: u64,
     learning_rate: f64,
     max_gradient_norm: f64,
+    spectrum_forcing_fraction: f64,
+    length_loss_weight: f64,
     best_step: usize,
-    best_validation_high_noise_loss: f64,
+    best_validation_spectrum_only_loss: f64,
     diffusion: FoundationDiffusionConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct DenoisingMetrics {
     loss: f64,
+    length_loss: f64,
     token_accuracy: f64,
     exact_sequence_rate: f64,
+    input_match_rate: f64,
+    length_accuracy: f64,
+    length_mae_tokens: f64,
     active_tokens: usize,
     sequences: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CorruptionMode {
+    Random,
+    MaxNoise,
+    SpectrumOnlyMasked,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 || args.len() > 7 {
+    if args.len() < 3 || args.len() > 9 {
         anyhow::bail!(
-            "usage: foundation_train_diffusion FOUNDATION_TRAINING.yaml OUTPUT_DIR [train_steps=300] [batch_size=8] [validation_batches=32] [seed=20260901]"
+            "usage: foundation_train_diffusion FOUNDATION_TRAINING.yaml OUTPUT_DIR [train_steps=1000] [batch_size=16] [validation_batches=32] [seed=20260901] [spectrum_forcing_fraction=0.5] [length_loss_weight=0.1]"
         );
     }
 
     let training_yaml = &args[1];
     let output_root = PathBuf::from(&args[2]);
-    let train_steps = parse_or(&args, 3, 300usize)?;
-    let batch_size = parse_or(&args, 4, 8usize)?;
+    let train_steps = parse_or(&args, 3, 1_000usize)?;
+    let batch_size = parse_or(&args, 4, 16usize)?;
     let validation_batches = parse_or(&args, 5, 32usize)?;
     let seed = parse_or(&args, 6, 20_260_901u64)?;
+    let spectrum_forcing_fraction = parse_or(&args, 7, 0.5f64)?;
+    let length_loss_weight = parse_or(&args, 8, 0.1f64)?;
     if train_steps == 0 || batch_size == 0 || validation_batches == 0 {
         anyhow::bail!("train_steps, batch_size, and validation_batches must all be positive");
+    }
+    if !(0.0..=1.0).contains(&spectrum_forcing_fraction) {
+        anyhow::bail!("spectrum_forcing_fraction must be in [0, 1]");
+    }
+    if !(length_loss_weight >= 0.0 && length_loss_weight.is_finite()) {
+        anyhow::bail!("length_loss_weight must be finite and non-negative");
     }
 
     let device = Device::Cpu;
@@ -148,6 +170,31 @@ fn main() -> Result<()> {
     println!("batch_size\t{batch_size}");
     println!("validation_batches\t{validation_batches}");
     println!("seed\t{seed}");
+    println!("spectrum_forcing_fraction\t{spectrum_forcing_fraction}");
+    println!("length_loss_weight\t{length_loss_weight}");
+    println!(
+        "sampled_training_pairs\t{}",
+        train_steps.saturating_mul(batch_size)
+    );
+    println!(
+        "nominal_train_pair_exposure_fraction\t{:.8}",
+        train_steps.saturating_mul(batch_size) as f64 / train_indices.len() as f64
+    );
+
+    let baseline = token_baselines(
+        &corpus.records,
+        &train_indices,
+        &validation_indices,
+        vocabulary,
+        config.max_tokens,
+    )?;
+    println!(
+        "baseline\tuniform_active_classes\tloss={:.6}\tperplexity={:.4}\ttoken_accuracy={:.6}",
+        baseline.uniform_loss,
+        baseline.uniform_loss.exp(),
+        baseline.uniform_accuracy
+    );
+    println!("baseline\ttrain_unigram\tloss={:.6}\tperplexity={:.4}\ttoken_accuracy={:.6}\tmode_token={}", baseline.unigram_loss, baseline.unigram_loss.exp(), baseline.unigram_accuracy, baseline.mode_token);
 
     fs::create_dir_all(&output_root)?;
     write_pair_manifest(
@@ -190,9 +237,9 @@ fn main() -> Result<()> {
         seed ^ 0xa7f4_39d1_2e68_5c0b,
     );
 
-    let mut best_high_noise = f64::INFINITY;
+    let mut best_spectrum_only = f64::INFINITY;
     let mut best_step = 0usize;
-    let eval_every = train_steps.min(50).max(1);
+    let eval_every = train_steps.min(100).max(1);
 
     for step in 1..=train_steps {
         let selected = deterministic_batch(
@@ -204,25 +251,43 @@ fn main() -> Result<()> {
             .iter()
             .map(|&index| &corpus.records[index])
             .collect();
+        let forcing_draw = mix64(seed ^ (step as u64).wrapping_mul(0xd6e8_feb8_6659_fd93));
+        let force_spectrum = (forcing_draw as f64 / u64::MAX as f64) < spectrum_forcing_fraction;
+        let corruption = if force_spectrum {
+            CorruptionMode::SpectrumOnlyMasked
+        } else {
+            CorruptionMode::Random
+        };
         let packed = collate_records(
             &records,
             &config,
             &diffusion_collator,
             &spectrum_collator,
-            None,
+            corruption,
+            false,
             seed ^ step as u64,
             &device,
         )?;
         let output =
             model.forward_t(&packed.diffusion, &packed.spectrum, &packed.precursor, true)?;
-        let loss = foundation_diffusion_x0_loss(&output, &packed.diffusion)?;
-        let loss_value = f64::from(loss.to_scalar::<f32>()?);
+        let x0_loss = foundation_diffusion_x0_loss(&output, &packed.diffusion)?;
+        let length_loss = foundation_diffusion_length_loss(&output, &packed.diffusion)?;
+        let weighted_length = length_loss.affine(length_loss_weight, 0.0)?;
+        let loss = (&x0_loss + &weighted_length)?;
+        let x0_loss_value = f64::from(x0_loss.to_scalar::<f32>()?);
+        let length_loss_value = f64::from(length_loss.to_scalar::<f32>()?);
+        let total_loss_value = f64::from(loss.to_scalar::<f32>()?);
         let optimizer_step = optimizer.backward_step(&loss, Some(max_gradient_norm))?;
 
         if step == 1 || step % 10 == 0 || step == train_steps {
+            let mode = if force_spectrum {
+                "spectrum_only_masked"
+            } else {
+                "random_t"
+            };
             println!(
-                "train\tstep={step}\tloss={loss_value:.6}\tperplexity={:.4}\tgradient_norm={:.6}\tgradient_scale={:.6}",
-                loss_value.exp(),
+                "train\tstep={step}\tmode={mode}\tloss={x0_loss_value:.6}\tlength_loss={length_loss_value:.6}\ttotal_loss={total_loss_value:.6}\tperplexity={:.4}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                x0_loss_value.exp(),
                 optimizer_step.gradient_norm,
                 optimizer_step.gradient_scale,
             );
@@ -237,7 +302,8 @@ fn main() -> Result<()> {
                 &config,
                 &diffusion_collator,
                 &spectrum_collator,
-                None,
+                CorruptionMode::Random,
+                false,
                 seed ^ 0x48e2_7c61_934d_ab05,
                 &device,
             )?;
@@ -249,22 +315,57 @@ fn main() -> Result<()> {
                 &config,
                 &diffusion_collator,
                 &spectrum_collator,
-                Some(config.diffusion_steps),
+                CorruptionMode::MaxNoise,
+                false,
                 seed ^ 0xd1b5_4a32_07c9_ef86,
+                &device,
+            )?;
+            let spectrum_only_metrics = evaluate(
+                &model,
+                &corpus.records,
+                &validation_selection,
+                batch_size,
+                &config,
+                &diffusion_collator,
+                &spectrum_collator,
+                CorruptionMode::SpectrumOnlyMasked,
+                false,
+                seed ^ 0x278d_e6e4_f126_c7b5,
+                &device,
+            )?;
+            let shuffled_spectrum_metrics = evaluate(
+                &model,
+                &corpus.records,
+                &validation_selection,
+                batch_size,
+                &config,
+                &diffusion_collator,
+                &spectrum_collator,
+                CorruptionMode::SpectrumOnlyMasked,
+                true,
+                seed ^ 0x8c34_ef51_70da_2bb1,
                 &device,
             )?;
             print_validation("random_t", step, random_metrics);
             print_validation("max_noise_t", step, high_noise_metrics);
+            print_validation("spectrum_only_masked", step, spectrum_only_metrics);
+            print_validation("spectrum_only_shuffled", step, shuffled_spectrum_metrics);
+            println!(
+                "validation_ablation\tstep={step}\tspectrum_loss_delta={:.6}\tspectrum_token_accuracy_delta={:.6}\tlength_accuracy_delta={:.6}",
+                shuffled_spectrum_metrics.loss - spectrum_only_metrics.loss,
+                spectrum_only_metrics.token_accuracy - shuffled_spectrum_metrics.token_accuracy,
+                spectrum_only_metrics.length_accuracy - shuffled_spectrum_metrics.length_accuracy,
+            );
 
-            if high_noise_metrics.loss < best_high_noise {
-                best_high_noise = high_noise_metrics.loss;
+            if spectrum_only_metrics.loss < best_spectrum_only {
+                best_spectrum_only = spectrum_only_metrics.loss;
                 best_step = step;
                 save_checkpoint(
                     &output_root.join("best"),
                     &varmap,
                     &optimizer,
                     &DiffusionPilotMetadata {
-                        version: 1,
+                        version: 2,
                         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
                         benchmark_manifest_fingerprint: format!(
                             "fnv1a64:{:016x}",
@@ -282,8 +383,10 @@ fn main() -> Result<()> {
                         seed,
                         learning_rate,
                         max_gradient_norm,
+                        spectrum_forcing_fraction,
+                        length_loss_weight,
                         best_step,
-                        best_validation_high_noise_loss: best_high_noise,
+                        best_validation_spectrum_only_loss: best_spectrum_only,
                         diffusion: config.clone(),
                     },
                 )?;
@@ -294,7 +397,7 @@ fn main() -> Result<()> {
                 &varmap,
                 &optimizer,
                 &DiffusionPilotMetadata {
-                    version: 1,
+                    version: 2,
                     corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
                     benchmark_manifest_fingerprint: format!(
                         "fnv1a64:{:016x}",
@@ -312,8 +415,10 @@ fn main() -> Result<()> {
                     seed,
                     learning_rate,
                     max_gradient_norm,
+                    spectrum_forcing_fraction,
+                    length_loss_weight,
                     best_step,
-                    best_validation_high_noise_loss: best_high_noise,
+                    best_validation_spectrum_only_loss: best_spectrum_only,
                     diffusion: config.clone(),
                 },
             )?;
@@ -321,7 +426,7 @@ fn main() -> Result<()> {
     }
 
     println!("best_step\t{best_step}");
-    println!("best_validation_high_noise_loss\t{best_high_noise:.8}");
+    println!("best_validation_spectrum_only_loss\t{best_spectrum_only:.8}");
     println!("best_checkpoint\t{}", output_root.join("best").display());
     Ok(())
 }
@@ -338,11 +443,19 @@ fn collate_records(
     config: &FoundationDiffusionConfig,
     diffusion_collator: &FoundationDiffusionCollator,
     spectrum_collator: &FoundationSpectrumCollator,
-    fixed_timestep: Option<usize>,
+    corruption: CorruptionMode,
+    shuffle_spectra: bool,
     seed: u64,
     device: &Device,
 ) -> Result<PackedBatch> {
-    let spectra: Vec<FoundationSpectrum> = records
+    let spectrum_records: Vec<&FoundationTrainingRecord> = if shuffle_spectra && records.len() > 1 {
+        (0..records.len())
+            .map(|index| records[(index + 1) % records.len()])
+            .collect()
+    } else {
+        records.to_vec()
+    };
+    let spectra: Vec<FoundationSpectrum> = spectrum_records
         .iter()
         .map(|record| {
             FoundationSpectrum::from_training_record(record).ok_or_else(|| {
@@ -354,12 +467,17 @@ fn collate_records(
         .iter()
         .map(|record| record.peptidoform.clone())
         .collect();
-    let diffusion = match fixed_timestep {
-        Some(timestep) => {
-            let timesteps = vec![timestep; peptides.len()];
+    let diffusion = match corruption {
+        CorruptionMode::Random => {
+            diffusion_collator.collate_random_timesteps(&peptides, seed, device)?
+        }
+        CorruptionMode::MaxNoise => {
+            let timesteps = vec![config.diffusion_steps; peptides.len()];
             diffusion_collator.collate(&peptides, &timesteps, seed, device)?
         }
-        None => diffusion_collator.collate_random_timesteps(&peptides, seed, device)?,
+        CorruptionMode::SpectrumOnlyMasked => {
+            diffusion_collator.collate_all_masked(&peptides, config.diffusion_steps, device)?
+        }
     };
     let spectrum = spectrum_collator.collate(&spectra, device)?;
     let precursor = precursor_context(records, config, device)?;
@@ -468,15 +586,20 @@ fn evaluate(
     config: &FoundationDiffusionConfig,
     diffusion_collator: &FoundationDiffusionCollator,
     spectrum_collator: &FoundationSpectrumCollator,
-    fixed_timestep: Option<usize>,
+    corruption: CorruptionMode,
+    shuffle_spectra: bool,
     seed: u64,
     device: &Device,
 ) -> Result<DenoisingMetrics> {
     let mut loss_sum = 0.0f64;
+    let mut length_loss_sum = 0.0f64;
     let mut batches = 0usize;
     let mut correct_tokens = 0usize;
+    let mut input_matches = 0usize;
     let mut active_tokens = 0usize;
     let mut exact_sequences = 0usize;
+    let mut correct_lengths = 0usize;
+    let mut absolute_length_error = 0usize;
     let mut sequences = 0usize;
 
     for (batch_index, chunk) in indices.chunks(batch_size).enumerate() {
@@ -490,7 +613,8 @@ fn evaluate(
             config,
             diffusion_collator,
             spectrum_collator,
-            fixed_timestep,
+            corruption,
+            shuffle_spectra,
             seed ^ batch_index as u64,
             device,
         )?;
@@ -501,13 +625,25 @@ fn evaluate(
             false,
         )?;
         let loss = foundation_diffusion_x0_loss(&output, &packed.diffusion)?;
+        let length_loss = foundation_diffusion_length_loss(&output, &packed.diffusion)?;
         loss_sum += f64::from(loss.to_scalar::<f32>()?);
+        length_loss_sum += f64::from(length_loss.to_scalar::<f32>()?);
         batches += 1;
 
         let logits = output.token_logits.to_vec3::<f32>()?;
+        let length_logits = output.length_logits.to_vec2::<f32>()?;
+        let length_targets = packed.diffusion.length_targets.to_vec1::<u32>()?;
         let clean = packed.diffusion.clean_tokens.to_vec2::<u32>()?;
+        let noisy = packed.diffusion.noisy_tokens.to_vec2::<u32>()?;
         let mask = packed.diffusion.token_mask.to_vec2::<f32>()?;
         for batch_row in 0..logits.len() {
+            let predicted_length_class = argmax(&length_logits[batch_row]);
+            let target_length_class = length_targets[batch_row] as usize;
+            if predicted_length_class == target_length_class {
+                correct_lengths += 1;
+            }
+            absolute_length_error += predicted_length_class.abs_diff(target_length_class);
+
             let mut sequence_exact = true;
             let mut has_active = false;
             for position in 0..logits[batch_row].len() {
@@ -516,6 +652,9 @@ fn evaluate(
                 }
                 has_active = true;
                 active_tokens += 1;
+                if noisy[batch_row][position] == clean[batch_row][position] {
+                    input_matches += 1;
+                }
                 let predicted = argmax(&logits[batch_row][position]) as u32;
                 if predicted == clean[batch_row][position] {
                     correct_tokens += 1;
@@ -537,8 +676,12 @@ fn evaluate(
     }
     Ok(DenoisingMetrics {
         loss: loss_sum / batches as f64,
+        length_loss: length_loss_sum / batches as f64,
         token_accuracy: correct_tokens as f64 / active_tokens as f64,
         exact_sequence_rate: exact_sequences as f64 / sequences as f64,
+        input_match_rate: input_matches as f64 / active_tokens as f64,
+        length_accuracy: correct_lengths as f64 / sequences as f64,
+        length_mae_tokens: absolute_length_error as f64 / sequences as f64,
         active_tokens,
         sequences,
     })
@@ -555,11 +698,15 @@ fn argmax(values: &[f32]) -> usize {
 
 fn print_validation(label: &str, step: usize, metrics: DenoisingMetrics) {
     println!(
-        "validation\tmode={label}\tstep={step}\tloss={:.6}\tperplexity={:.4}\ttoken_accuracy={:.6}\texact_sequence_rate={:.6}\tactive_tokens={}\tsequences={}",
+        "validation\tmode={label}\tstep={step}\tloss={:.6}\tperplexity={:.4}\ttoken_accuracy={:.6}\texact_sequence_rate={:.6}\tinput_match_rate={:.6}\tlength_loss={:.6}\tlength_accuracy={:.6}\tlength_mae_tokens={:.4}\tactive_tokens={}\tsequences={}",
         metrics.loss,
         metrics.loss.exp(),
         metrics.token_accuracy,
         metrics.exact_sequence_rate,
+        metrics.input_match_rate,
+        metrics.length_loss,
+        metrics.length_accuracy,
+        metrics.length_mae_tokens,
         metrics.active_tokens,
         metrics.sequences,
     );
@@ -610,6 +757,96 @@ fn write_pair_manifest(
         )?;
     }
     output.flush()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenBaselineMetrics {
+    uniform_loss: f64,
+    uniform_accuracy: f64,
+    unigram_loss: f64,
+    unigram_accuracy: f64,
+    mode_token: usize,
+}
+
+fn token_baselines(
+    records: &[FoundationTrainingRecord],
+    train_indices: &[usize],
+    validation_indices: &[usize],
+    vocabulary: FoundationDiffusionVocabulary,
+    max_tokens: usize,
+) -> Result<TokenBaselineMetrics> {
+    let mut train_counts = vec![0u64; FOUNDATION_DIFFUSION_VOCAB_SIZE];
+    let mut validation_counts = vec![0u64; FOUNDATION_DIFFUSION_VOCAB_SIZE];
+    accumulate_token_counts(
+        records,
+        train_indices,
+        vocabulary,
+        max_tokens,
+        &mut train_counts,
+    )?;
+    accumulate_token_counts(
+        records,
+        validation_indices,
+        vocabulary,
+        max_tokens,
+        &mut validation_counts,
+    )?;
+
+    let active_classes = FOUNDATION_DIFFUSION_VOCAB_SIZE - 1;
+    let uniform_loss = (active_classes as f64).ln();
+    let uniform_accuracy = 1.0 / active_classes as f64;
+
+    let train_total: u64 = train_counts.iter().sum();
+    let validation_total: u64 = validation_counts.iter().sum();
+    if train_total == 0 || validation_total == 0 {
+        anyhow::bail!("diffusion token baseline contains no active train/validation tokens");
+    }
+    let smoothed_total = train_total as f64 + active_classes as f64;
+    let mut unigram_loss = 0.0f64;
+    for token in 1..FOUNDATION_DIFFUSION_VOCAB_SIZE {
+        let probability = (train_counts[token] as f64 + 1.0) / smoothed_total;
+        unigram_loss -= validation_counts[token] as f64 * probability.ln();
+    }
+    unigram_loss /= validation_total as f64;
+    let mode_token = (1..FOUNDATION_DIFFUSION_VOCAB_SIZE)
+        .max_by_key(|&token| train_counts[token])
+        .unwrap_or(1);
+    let unigram_accuracy = validation_counts[mode_token] as f64 / validation_total as f64;
+
+    Ok(TokenBaselineMetrics {
+        uniform_loss,
+        uniform_accuracy,
+        unigram_loss,
+        unigram_accuracy,
+        mode_token,
+    })
+}
+
+fn accumulate_token_counts(
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    vocabulary: FoundationDiffusionVocabulary,
+    max_tokens: usize,
+    counts: &mut [u64],
+) -> Result<()> {
+    for &index in indices {
+        let record = records.get(index).ok_or_else(|| {
+            anyhow::anyhow!("diffusion token baseline index {index} out of bounds")
+        })?;
+        let tokens = vocabulary
+            .encode(&record.peptidoform, max_tokens)
+            .map_err(anyhow::Error::msg)?;
+        for token in tokens {
+            if token == FOUNDATION_DIFFUSION_PAD {
+                break;
+            }
+            let slot = counts
+                .get_mut(token as usize)
+                .ok_or_else(|| anyhow::anyhow!("diffusion token {token} exceeds vocabulary"))?;
+            *slot += 1;
+        }
+    }
     Ok(())
 }
 

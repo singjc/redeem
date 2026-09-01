@@ -455,6 +455,8 @@ pub struct FoundationDiffusionBatch {
     pub active_indices: Tensor,
     /// Clean classes aligned with `active_indices`.
     pub target_classes: Tensor,
+    /// Zero-based active-token length classes `[batch]`, where class `k` means `k + 1` active tokens.
+    pub length_targets: Tensor,
 }
 
 /// Deterministic multinomial forward-process collator.
@@ -497,6 +499,32 @@ impl FoundationDiffusionCollator {
         seed: u64,
         device: &Device,
     ) -> Result<FoundationDiffusionBatch> {
+        self.collate_impl(peptides, timesteps, seed, false, device)
+    }
+
+    /// Collate a spectrum-forcing batch whose active peptide tokens are all replaced by MASK.
+    ///
+    /// The clean active-token mask is retained for this auxiliary training objective, so this is
+    /// not yet a de-novo generation interface. It is intentionally useful for verifying that the
+    /// spectrum/precursor path carries sequence information when x_t itself contains none.
+    pub fn collate_all_masked(
+        &self,
+        peptides: &[PeptidoformInput],
+        timestep: usize,
+        device: &Device,
+    ) -> Result<FoundationDiffusionBatch> {
+        let timesteps = vec![timestep; peptides.len()];
+        self.collate_impl(peptides, &timesteps, 0, true, device)
+    }
+
+    fn collate_impl(
+        &self,
+        peptides: &[PeptidoformInput],
+        timesteps: &[usize],
+        seed: u64,
+        force_all_masked: bool,
+        device: &Device,
+    ) -> Result<FoundationDiffusionBatch> {
         if peptides.is_empty() || peptides.len() != timesteps.len() {
             candle_core::bail!(
                 "diffusion collation requires non-empty peptide/timestep arrays of equal length"
@@ -509,6 +537,7 @@ impl FoundationDiffusionCollator {
         let mut mask = vec![0.0f32; b * l];
         let mut active_indices = Vec::<u32>::new();
         let mut target_classes = Vec::<u32>::new();
+        let mut length_targets = Vec::<u32>::with_capacity(b);
         let mut timestep_ids = Vec::<u32>::with_capacity(b);
         let mut timestep_features = Vec::<f32>::with_capacity(b * 4);
         let mut rng = DiffusionRng::new(seed);
@@ -529,6 +558,7 @@ impl FoundationDiffusionCollator {
                 alpha_bar,
             ));
 
+            let mut active_length = 0usize;
             for (position, &token) in tokens.iter().enumerate() {
                 let flat = batch_idx * l + position;
                 clean[flat] = token;
@@ -536,10 +566,13 @@ impl FoundationDiffusionCollator {
                     noisy[flat] = FOUNDATION_DIFFUSION_PAD;
                     continue;
                 }
+                active_length += 1;
                 mask[flat] = 1.0;
                 active_indices.push(flat as u32);
                 target_classes.push(token);
-                noisy[flat] = if rng.next_f64() < alpha_bar {
+                noisy[flat] = if force_all_masked {
+                    FOUNDATION_DIFFUSION_MASK
+                } else if rng.next_f64() < alpha_bar {
                     token
                 } else {
                     // Multinomial replacement over all non-padding categories,
@@ -547,6 +580,8 @@ impl FoundationDiffusionCollator {
                     1 + (rng.next_u64() % (FOUNDATION_DIFFUSION_VOCAB_SIZE as u64 - 1)) as u32
                 };
             }
+            debug_assert!(active_length > 0 && active_length <= l);
+            length_targets.push((active_length - 1) as u32);
         }
 
         let active_count = target_classes.len();
@@ -562,6 +597,7 @@ impl FoundationDiffusionCollator {
                 .to_dtype(DType::U32)?,
             target_classes: Tensor::from_vec(target_classes, active_count, device)?
                 .to_dtype(DType::U32)?,
+            length_targets: Tensor::from_vec(length_targets, b, device)?.to_dtype(DType::U32)?,
         })
     }
 }
@@ -717,6 +753,8 @@ pub struct FoundationDiffusionOutput {
     pub spectrum_memory: Tensor,
     /// Mask-aware pooled observed-spectrum embedding `[batch, model_dim]`.
     pub spectrum_embedding: Tensor,
+    /// Active-token length logits `[batch, max_tokens]`; class `k` means `k + 1` active tokens.
+    pub length_logits: Tensor,
 }
 
 /// Bidirectional foundation-model inverse scaffold.
@@ -731,6 +769,7 @@ pub struct PeptideSpectrumDiffusionModel {
     layers: Vec<SpectrumConditionedDiffusionBlock>,
     output_norm: LayerNorm,
     token_head: Linear,
+    length_head: Linear,
 }
 
 impl PeptideSpectrumDiffusionModel {
@@ -763,6 +802,11 @@ impl PeptideSpectrumDiffusionModel {
             FOUNDATION_DIFFUSION_VOCAB_SIZE,
             vb.pp("decoder.token_head"),
         )?;
+        let length_head = nn::linear(
+            config.model_dim,
+            config.max_tokens,
+            vb.pp("decoder.length_head"),
+        )?;
         Ok(Self {
             config,
             spectrum_encoder,
@@ -773,6 +817,7 @@ impl PeptideSpectrumDiffusionModel {
             layers,
             output_norm,
             token_head,
+            length_head,
         })
     }
 
@@ -826,11 +871,14 @@ impl PeptideSpectrumDiffusionModel {
             ],
             1,
         )?;
-        let precursor_embedding = self
-            .precursor_projection
-            .forward(&precursor_features)?
-            .unsqueeze(1)?
-            .broadcast_as((batch, token_len, self.config.model_dim))?;
+        let precursor_summary = self.precursor_projection.forward(&precursor_features)?;
+        let length_hidden = (&spectrum_encoding.spectrum_embedding + &precursor_summary)?;
+        let length_logits = self.length_head.forward(&length_hidden)?;
+        let precursor_embedding = precursor_summary.unsqueeze(1)?.broadcast_as((
+            batch,
+            token_len,
+            self.config.model_dim,
+        ))?;
         let timestep_embedding = self
             .timestep_projection
             .forward(&diffusion.timestep_features)?
@@ -863,6 +911,7 @@ impl PeptideSpectrumDiffusionModel {
             token_logits,
             spectrum_memory,
             spectrum_embedding: spectrum_encoding.spectrum_embedding,
+            length_logits,
         })
     }
 
@@ -887,6 +936,22 @@ pub fn foundation_diffusion_x0_loss(
     let flat_logits = output.token_logits.reshape((b * l, classes))?;
     let selected_logits = flat_logits.index_select(&batch.active_indices, 0)?;
     loss::cross_entropy(&selected_logits, &batch.target_classes)
+}
+
+/// Cross-entropy sequence-length objective used to initialize true de-novo generation.
+///
+/// Class `k` corresponds to `k + 1` active residue/PTM/EOS tokens. The target is
+/// derived from the clean sequence during training but the prediction itself depends
+/// only on the observed spectrum and precursor context.
+pub fn foundation_diffusion_length_loss(
+    output: &FoundationDiffusionOutput,
+    batch: &FoundationDiffusionBatch,
+) -> Result<Tensor> {
+    let (_, classes) = output.length_logits.dims2()?;
+    if classes == 0 {
+        candle_core::bail!("diffusion length head exposes zero classes");
+    }
+    loss::cross_entropy(&output.length_logits, &batch.length_targets)
 }
 
 /// Symmetric contrastive alignment between observed-spectrum and chemistry-aware
