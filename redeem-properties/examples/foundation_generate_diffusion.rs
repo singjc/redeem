@@ -9,13 +9,16 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_diffusion_reverse_probabilities, foundation_precursor_mass_error_da,
-    load_foundation_corpus, read_foundation_training_run_config, FoundationBenchmarkManifest,
-    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
+    foundation_diffusion_residue_ptm_valid, foundation_diffusion_reverse_probabilities,
+    foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
+    foundation_precursor_mass_error_da, foundation_precursor_neutral_mass, load_foundation_corpus,
+    read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationDiffusionCollator,
+    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
+    FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
     PeptideSpectrumDiffusionModel, PeptidoformInput, PrecursorContextBatch,
     FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
     FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
 use serde::Deserialize;
 use std::cmp::Ordering;
@@ -45,6 +48,7 @@ struct GenerationMetrics {
     predicted_length_exact: usize,
     predicted_length_abs_error: usize,
     chains: usize,
+    final_states: usize,
     valid_decodes: usize,
     unique_candidates: usize,
     mass_valid_candidates: usize,
@@ -63,9 +67,9 @@ struct GenerationMetrics {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 || args.len() > 9 {
+    if args.len() < 4 || args.len() > 11 {
         anyhow::bail!(
-            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0]"
+            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4]"
         );
     }
 
@@ -77,8 +81,16 @@ fn main() -> Result<()> {
     let seed = parse_or(&args, 6, 20_260_901u64)?;
     let mass_tolerance_da = parse_or(&args, 7, 0.05f64)?;
     let temperature = parse_or(&args, 8, 1.0f64)?;
-    if validation_records == 0 || samples_per_record == 0 {
-        anyhow::bail!("validation_records and samples_per_record must be positive");
+    let mass_beam_width = parse_or(&args, 9, 512usize)?;
+    let final_candidates_per_chain = parse_or(&args, 10, 4usize)?;
+    if validation_records == 0
+        || samples_per_record == 0
+        || mass_beam_width == 0
+        || final_candidates_per_chain == 0
+    {
+        anyhow::bail!(
+            "validation_records, samples_per_record, mass_beam_width and final_candidates_per_chain must be positive"
+        );
     }
     if !(mass_tolerance_da > 0.0 && mass_tolerance_da.is_finite()) {
         anyhow::bail!("mass_tolerance_da must be positive and finite");
@@ -139,6 +151,8 @@ fn main() -> Result<()> {
     println!("diffusion_steps\t{}", config.diffusion_steps);
     println!("mass_tolerance_da\t{mass_tolerance_da}");
     println!("temperature\t{temperature}");
+    println!("mass_beam_width\t{mass_beam_width}");
+    println!("final_candidates_per_chain\t{final_candidates_per_chain}");
     println!("seed\t{seed}");
 
     if let Some(parent) = output_tsv.parent() {
@@ -186,13 +200,16 @@ fn main() -> Result<()> {
 
         let mut rng =
             GenerationRng::new(seed ^ mix64(record_index as u64) ^ selection_index as u64);
+        let target_neutral_mass = precursor_neutral_mass(record)?;
         let active_lengths = sample_generation_lengths(
             &predicted_length_distribution,
             predicted_active_length,
             samples_per_record,
             config.max_tokens,
+            target_neutral_mass,
             &mut rng,
         );
+        metrics.chains += active_lengths.len();
         let (rows, reverse_scores) = reverse_generate(
             &model,
             &diffusion_collator,
@@ -201,11 +218,15 @@ fn main() -> Result<()> {
             record,
             &spectrum,
             &active_lengths,
+            target_neutral_mass,
+            mass_tolerance_da,
+            mass_beam_width,
+            final_candidates_per_chain,
             temperature,
             &mut rng,
             &device,
         )?;
-        metrics.chains += rows.len();
+        metrics.final_states += rows.len();
 
         let mut unique = HashMap::<Vec<u32>, GeneratedCandidate>::new();
         for (tokens, reverse_log_probability) in rows.into_iter().zip(reverse_scores) {
@@ -356,8 +377,12 @@ fn main() -> Result<()> {
     );
     println!("generation_summary\tchains\t{}", metrics.chains);
     println!(
+        "generation_summary\tfinal_mass_beam_states\t{}",
+        metrics.final_states
+    );
+    println!(
         "generation_summary\tvalid_decode_rate\t{:.6}",
-        metrics.valid_decodes as f64 / metrics.chains.max(1) as f64
+        metrics.valid_decodes as f64 / metrics.final_states.max(1) as f64
     );
     println!(
         "generation_summary\tmean_unique_candidates\t{:.4}",
@@ -418,6 +443,10 @@ fn reverse_generate(
     record: &FoundationTrainingRecord,
     spectrum: &FoundationSpectrum,
     active_lengths: &[usize],
+    target_neutral_mass: Option<f64>,
+    mass_tolerance_da: f64,
+    mass_beam_width: usize,
+    final_candidates_per_chain: usize,
     temperature: f64,
     rng: &mut GenerationRng,
     device: &Device,
@@ -438,7 +467,11 @@ fn reverse_generate(
     let precursor = precursor_context(&record_refs, device)?;
     let mut reverse_log_probability = vec![0.0f64; batch];
 
-    for timestep in (1..=config.diffusion_steps).rev() {
+    // Stochastically traverse t=T..2. The final t=1 posterior equals the model's
+    // predicted x0 distribution, so v0.11.5 replaces independent token sampling
+    // at that final step with a global precursor-mass-aware beam over the entire
+    // peptide/PTM row.
+    for timestep in (2..=config.diffusion_steps).rev() {
         let diffusion =
             diffusion_collator.collate_inference_tokens(&rows, active_lengths, timestep, device)?;
         let output = model.forward_t(&diffusion, &spectrum_batch, &precursor, false)?;
@@ -465,7 +498,186 @@ fn reverse_generate(
             rows[batch_index][active_length - 1] = FOUNDATION_DIFFUSION_EOS;
         }
     }
-    Ok((rows, reverse_log_probability))
+
+    let final_diffusion =
+        diffusion_collator.collate_inference_tokens(&rows, active_lengths, 1, device)?;
+    let final_output = model.forward_t(&final_diffusion, &spectrum_batch, &precursor, false)?;
+    let final_logits = final_output.token_logits.to_vec3::<f32>()?;
+    let mut finalized_rows = Vec::new();
+    let mut finalized_scores = Vec::new();
+
+    for batch_index in 0..batch {
+        let active_length = active_lengths[batch_index];
+        let finalized = mass_guided_final_beam(
+            &final_logits[batch_index],
+            active_length,
+            target_neutral_mass,
+            mass_tolerance_da,
+            mass_beam_width,
+            final_candidates_per_chain,
+            temperature,
+            config.max_tokens,
+        );
+        for (row, final_log_probability) in finalized {
+            finalized_rows.push(row);
+            finalized_scores.push(reverse_log_probability[batch_index] + final_log_probability);
+        }
+    }
+    Ok((finalized_rows, finalized_scores))
+}
+
+#[derive(Debug, Clone)]
+struct MassBeamState {
+    prefix: Vec<u32>,
+    neutral_mass: f64,
+    log_probability: f64,
+    priority: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mass_guided_final_beam(
+    logits: &[Vec<f32>],
+    active_length: usize,
+    target_neutral_mass: Option<f64>,
+    mass_tolerance_da: f64,
+    beam_width: usize,
+    final_candidates_per_chain: usize,
+    temperature: f64,
+    max_tokens: usize,
+) -> Vec<(Vec<u32>, f64)> {
+    let nonterminal_positions = active_length.saturating_sub(1);
+    if nonterminal_positions == 0 {
+        return Vec::new();
+    }
+    let target = target_neutral_mass.unwrap_or(f64::NAN);
+    let has_mass = target.is_finite() && target > FOUNDATION_PEPTIDE_WATER_MASS_DA;
+    let expected_per_position = if has_mass {
+        (target - FOUNDATION_PEPTIDE_WATER_MASS_DA) / nonterminal_positions as f64
+    } else {
+        110.0
+    };
+    let overshoot_slack = mass_tolerance_da.max(25.0);
+    let mass_bin_width = mass_tolerance_da.max(0.05);
+    let mut beam = vec![MassBeamState {
+        prefix: Vec::with_capacity(nonterminal_positions),
+        neutral_mass: FOUNDATION_PEPTIDE_WATER_MASS_DA,
+        log_probability: 0.0,
+        priority: 0.0,
+    }];
+
+    for position in 0..nonterminal_positions {
+        let probabilities = clean_x0_probabilities(&logits[position], position, temperature);
+        let mut token_order: Vec<usize> = (FOUNDATION_DIFFUSION_EOS as usize
+            ..FOUNDATION_DIFFUSION_VOCAB_SIZE)
+            .filter(|&token| token != FOUNDATION_DIFFUSION_EOS as usize)
+            .collect();
+        token_order.sort_by(|&left, &right| probabilities[right].total_cmp(&probabilities[left]));
+
+        let mut binned = HashMap::<(i64, u32), MassBeamState>::new();
+        for state in &beam {
+            for &token_index in &token_order {
+                let probability = probabilities[token_index];
+                if probability <= 0.0 || !probability.is_finite() {
+                    continue;
+                }
+                let token = token_index as u32;
+                if !mass_beam_token_allowed(&state.prefix, token, position, nonterminal_positions) {
+                    continue;
+                }
+                let Some(token_mass) = foundation_diffusion_token_mass_da(token) else {
+                    continue;
+                };
+                let neutral_mass = state.neutral_mass + token_mass;
+                if has_mass && neutral_mass > target + overshoot_slack {
+                    continue;
+                }
+                let log_probability = state.log_probability + probability.max(1e-300).ln();
+                let remaining = nonterminal_positions - position - 1;
+                let projected_mass = neutral_mass + remaining as f64 * expected_per_position;
+                let mass_penalty = if has_mass {
+                    0.002 * (projected_mass - target).abs()
+                } else {
+                    0.0
+                };
+                let priority = log_probability - mass_penalty;
+                let mut prefix = state.prefix.clone();
+                prefix.push(token);
+                let candidate = MassBeamState {
+                    prefix,
+                    neutral_mass,
+                    log_probability,
+                    priority,
+                };
+                let bin = (neutral_mass / mass_bin_width).round() as i64;
+                let key = (bin, token);
+                match binned.get_mut(&key) {
+                    Some(existing) if candidate.priority > existing.priority => {
+                        *existing = candidate
+                    }
+                    None => {
+                        binned.insert(key, candidate);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        beam = binned.into_values().collect();
+        beam.sort_by(|left, right| right.priority.total_cmp(&left.priority));
+        beam.truncate(beam_width);
+        if beam.is_empty() {
+            return Vec::new();
+        }
+    }
+
+    beam.sort_by(|left, right| {
+        if has_mass {
+            let left_error = (left.neutral_mass - target).abs();
+            let right_error = (right.neutral_mass - target).abs();
+            let left_valid = left_error <= mass_tolerance_da;
+            let right_valid = right_error <= mass_tolerance_da;
+            right_valid
+                .cmp(&left_valid)
+                .then_with(|| left_error.total_cmp(&right_error))
+                .then_with(|| right.log_probability.total_cmp(&left.log_probability))
+        } else {
+            right.log_probability.total_cmp(&left.log_probability)
+        }
+    });
+    beam.truncate(final_candidates_per_chain);
+    beam.into_iter()
+        .map(|state| {
+            let mut row = vec![FOUNDATION_DIFFUSION_PAD; max_tokens];
+            for (position, token) in state.prefix.into_iter().enumerate() {
+                row[position] = token;
+            }
+            row[active_length - 1] = FOUNDATION_DIFFUSION_EOS;
+            (row, state.log_probability)
+        })
+        .collect()
+}
+
+fn mass_beam_token_allowed(
+    prefix: &[u32],
+    token: u32,
+    position: usize,
+    nonterminal_positions: usize,
+) -> bool {
+    if foundation_diffusion_token_residue(token).is_some() {
+        return true;
+    }
+    if token == FOUNDATION_DIFFUSION_NTERM_ACETYL {
+        return position == 0 && nonterminal_positions >= 2;
+    }
+    if token < FOUNDATION_DIFFUSION_RESIDUE_ACETYL {
+        return false;
+    }
+    let Some(&previous) = prefix.last() else {
+        return false;
+    };
+    let Some(previous_residue) = foundation_diffusion_token_residue(previous) else {
+        return false;
+    };
+    foundation_diffusion_residue_ptm_valid(token, previous_residue)
 }
 
 fn predict_length_distribution(
@@ -496,14 +708,59 @@ fn sample_generation_lengths(
     argmax_length: usize,
     samples: usize,
     max_tokens: usize,
+    target_neutral_mass: Option<f64>,
     rng: &mut GenerationRng,
 ) -> Vec<usize> {
     let mut lengths = Vec::with_capacity(samples);
-    lengths.push(argmax_length.clamp(2, max_tokens));
-    for _ in 1..samples {
-        lengths.push((sample_probability(probabilities, rng) + 1).clamp(2, max_tokens));
+    push_unique_length(&mut lengths, argmax_length, max_tokens);
+
+    // Precursor mass supplies a target-independent estimate of residue count.
+    // Seed nearby lengths before stochastic draws so badly calibrated length
+    // logits cannot exclude the physically plausible region entirely.
+    if let Some(target) = target_neutral_mass.filter(|value| value.is_finite()) {
+        let residue_estimate = ((target - FOUNDATION_PEPTIDE_WATER_MASS_DA) / 111.0)
+            .round()
+            .max(1.0) as isize;
+        for offset in [0isize, 1, -1, 2, -2] {
+            let active = residue_estimate + 1 + offset; // + EOS; PTMs may consume extra slots.
+            if active >= 2 {
+                push_unique_length(&mut lengths, active as usize, max_tokens);
+                if lengths.len() >= samples {
+                    return lengths;
+                }
+            }
+        }
     }
+
+    let mut ranked: Vec<usize> = (0..probabilities.len()).collect();
+    ranked.sort_by(|&left, &right| probabilities[right].total_cmp(&probabilities[left]));
+    for index in ranked.into_iter().take(samples) {
+        push_unique_length(&mut lengths, index + 1, max_tokens);
+        if lengths.len() >= samples {
+            return lengths;
+        }
+    }
+    let mut attempts = 0usize;
+    while lengths.len() < samples && attempts < samples.saturating_mul(16).max(32) {
+        push_unique_length(
+            &mut lengths,
+            sample_probability(probabilities, rng) + 1,
+            max_tokens,
+        );
+        attempts += 1;
+        if lengths.len() >= max_tokens.saturating_sub(1) {
+            break;
+        }
+    }
+    lengths.truncate(samples);
     lengths
+}
+
+fn push_unique_length(lengths: &mut Vec<usize>, length: usize, max_tokens: usize) {
+    let length = length.clamp(2, max_tokens);
+    if !lengths.contains(&length) {
+        lengths.push(length);
+    }
 }
 
 fn clean_x0_probabilities(logits: &[f32], position: usize, temperature: f64) -> Vec<f64> {
@@ -585,6 +842,16 @@ fn precursor_context(
         instrument_ids: Tensor::zeros(batch, DType::U32, device)?,
         instrument_present: Tensor::zeros(batch, DType::F32, device)?,
     })
+}
+
+fn precursor_neutral_mass(record: &FoundationTrainingRecord) -> Result<Option<f64>> {
+    match (record.context.precursor_mz, record.context.charge) {
+        (Some(mz), Some(charge)) if charge > 0 => Ok(Some(
+            foundation_precursor_neutral_mass(mz as f64, charge as i32)
+                .map_err(anyhow::Error::msg)?,
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn precursor_mass_error(

@@ -45,7 +45,7 @@ pub const FOUNDATION_DIFFUSION_OXIDATION: u32 = 27;
 pub const FOUNDATION_DIFFUSION_VOCAB_SIZE: usize = 28;
 
 const PROTON_MASS_DA: f64 = 1.007_276_466_77;
-const WATER_MASS_DA: f64 = 18.010_564_684;
+pub const FOUNDATION_PEPTIDE_WATER_MASS_DA: f64 = 18.010_564_684;
 
 /// Configuration for the first spectrum-conditioned peptide diffusion model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -421,6 +421,53 @@ fn diffusion_token_residue(token: u32) -> Option<char> {
     ];
     let offset = token.checked_sub(FOUNDATION_DIFFUSION_FIRST_RESIDUE)? as usize;
     RESIDUES.get(offset).copied()
+}
+
+/// Return the amino-acid residue represented by one diffusion token.
+pub fn foundation_diffusion_token_residue(token: u32) -> Option<char> {
+    diffusion_token_residue(token)
+}
+
+/// Monoisotopic neutral-mass contribution of one clean diffusion token.
+///
+/// Residue tokens contribute residue masses, PTM markers contribute their
+/// UniMod mass deltas, and EOS contributes zero. PAD/MASK do not describe a
+/// clean peptide and therefore return `None`.
+pub fn foundation_diffusion_token_mass_da(token: u32) -> Option<f64> {
+    if token == FOUNDATION_DIFFUSION_EOS {
+        return Some(0.0);
+    }
+    if let Some(residue) = diffusion_token_residue(token) {
+        return residue_mass(residue);
+    }
+    match token {
+        FOUNDATION_DIFFUSION_NTERM_ACETYL | FOUNDATION_DIFFUSION_RESIDUE_ACETYL => Some(42.010_565),
+        FOUNDATION_DIFFUSION_CARBAMIDOMETHYL => Some(57.021_465),
+        FOUNDATION_DIFFUSION_DEAMIDATED => Some(0.984_016),
+        FOUNDATION_DIFFUSION_OXIDATION => Some(15.994_915),
+        _ => None,
+    }
+}
+
+/// Whether a residue-local PTM diffusion token is chemically valid on a residue.
+pub fn foundation_diffusion_residue_ptm_valid(token: u32, residue: char) -> bool {
+    let unimod_id = match token {
+        FOUNDATION_DIFFUSION_RESIDUE_ACETYL => 1,
+        FOUNDATION_DIFFUSION_CARBAMIDOMETHYL => 4,
+        FOUNDATION_DIFFUSION_DEAMIDATED => 7,
+        FOUNDATION_DIFFUSION_OXIDATION => 35,
+        _ => return false,
+    };
+    let Some(definition) = common_unimod_definition(unimod_id) else {
+        return false;
+    };
+    let modification = FoundationModification::unimod(
+        FoundationModificationSite::Residue(0),
+        0,
+        unimod_id,
+        definition.mass_delta,
+    );
+    exact_graph_modification_for(residue, &modification).is_some()
 }
 
 fn residue_modification_token(
@@ -1189,7 +1236,7 @@ pub fn foundation_spectrum_peptide_alignment_loss(
 pub fn foundation_peptidoform_neutral_mass(
     peptide: &PeptidoformInput,
 ) -> std::result::Result<f64, String> {
-    let mut mass = WATER_MASS_DA;
+    let mut mass = FOUNDATION_PEPTIDE_WATER_MASS_DA;
     for residue in peptide.sequence.chars() {
         mass += residue_mass(residue)
             .ok_or_else(|| format!("unsupported residue '{residue}' for peptide mass"))?;
@@ -1400,6 +1447,31 @@ mod tests {
         .unwrap();
         assert!((later.iter().sum::<f64>() - 1.0).abs() < 1e-10);
         assert!(later[FOUNDATION_DIFFUSION_MASK as usize] > 0.0);
+    }
+
+    #[test]
+    fn clean_diffusion_token_masses_match_decoded_peptidoform_mass() {
+        let peptide = modified_peptide();
+        let vocabulary = FoundationDiffusionVocabulary;
+        let tokens = vocabulary.encode(&peptide, 32).unwrap();
+        let token_mass: f64 = tokens
+            .iter()
+            .copied()
+            .take_while(|&token| token != FOUNDATION_DIFFUSION_PAD)
+            .map(|token| foundation_diffusion_token_mass_da(token).unwrap())
+            .sum();
+        let peptide_mass = foundation_peptidoform_neutral_mass(&peptide).unwrap();
+        assert!((token_mass + FOUNDATION_PEPTIDE_WATER_MASS_DA - peptide_mass).abs() < 1e-5);
+        assert!(foundation_diffusion_residue_ptm_valid(
+            FOUNDATION_DIFFUSION_OXIDATION,
+            'M'
+        ));
+        assert!(!foundation_diffusion_residue_ptm_valid(
+            FOUNDATION_DIFFUSION_OXIDATION,
+            'A'
+        ));
+        assert_eq!(foundation_diffusion_token_residue(3), Some('A'));
+        assert_eq!(foundation_diffusion_token_residue(22), Some('Y'));
     }
 
     #[test]
