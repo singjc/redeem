@@ -13,7 +13,8 @@ use super::sampling::{
     sample_foundation_training_indices, sample_foundation_validation_indices, FoundationSamplePlan,
 };
 use super::trainer::{
-    FoundationEpochMetrics, FoundationFitSummary, FoundationTrainer, FoundationTrainerConfig,
+    FoundationEpochMetrics, FoundationFitSummary, FoundationPropertyEvaluationMetrics,
+    FoundationTrainer, FoundationTrainerConfig,
 };
 use super::FoundationConfig;
 use anyhow::{Context, Result};
@@ -135,8 +136,12 @@ pub struct FoundationCheckpointEvaluationSummary {
     pub checkpoint_metadata: FoundationCheckpointMetadata,
     /// Clean RT/CCS/MS2 metrics on the sampled partition.
     pub property_metrics: FoundationEpochMetrics,
+    /// Native-unit RT/CCS calibration and baseline diagnostics from the same pass.
+    pub property_diagnostics: FoundationPropertyEvaluationMetrics,
     /// Clean property metrics separately by source represented in the sample.
     pub property_metrics_by_source: BTreeMap<String, FoundationEpochMetrics>,
+    /// Source-specific native-unit regression diagnostics from the same clean pass.
+    pub property_diagnostics_by_source: BTreeMap<String, FoundationPropertyEvaluationMetrics>,
 }
 
 /// Evaluate a frozen checkpoint without optimizer updates.
@@ -209,8 +214,9 @@ pub fn evaluate_foundation_checkpoint<P: AsRef<Path>>(
         checkpoint_metadata.trainer_config.seed,
         &sampling_config,
     )?;
-    let property_metrics =
-        trainer.evaluate_property_epoch_indices(&corpus.records, &sampling.indices)?;
+    let property_diagnostics =
+        trainer.evaluate_property_diagnostics_indices(&corpus.records, &sampling.indices)?;
+    let property_metrics = property_diagnostics.epoch;
 
     let mut by_source = BTreeMap::<String, Vec<usize>>::new();
     for &index in &sampling.indices {
@@ -223,9 +229,12 @@ pub fn evaluate_foundation_checkpoint<P: AsRef<Path>>(
             .push(index);
     }
     let mut property_metrics_by_source = BTreeMap::new();
+    let mut property_diagnostics_by_source = BTreeMap::new();
     for (source, indices) in by_source {
-        let metrics = trainer.evaluate_property_epoch_indices(&corpus.records, &indices)?;
-        property_metrics_by_source.insert(source, metrics);
+        let diagnostics =
+            trainer.evaluate_property_diagnostics_indices(&corpus.records, &indices)?;
+        property_metrics_by_source.insert(source.clone(), diagnostics.epoch);
+        property_diagnostics_by_source.insert(source, diagnostics);
     }
 
     Ok(FoundationCheckpointEvaluationSummary {
@@ -236,7 +245,9 @@ pub fn evaluate_foundation_checkpoint<P: AsRef<Path>>(
         sampling,
         checkpoint_metadata,
         property_metrics,
+        property_diagnostics,
         property_metrics_by_source,
+        property_diagnostics_by_source,
     })
 }
 

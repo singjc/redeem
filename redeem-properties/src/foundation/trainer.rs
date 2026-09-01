@@ -373,6 +373,56 @@ pub struct FoundationEpochMetrics {
     pub final_learning_rate: Option<f64>,
 }
 
+/// Native-unit calibration and baseline diagnostics for one continuous property.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FoundationRegressionEvaluationMetrics {
+    /// Number of labelled examples.
+    pub label_count: usize,
+    /// Mean observed target in native units.
+    pub target_mean_native: Option<f64>,
+    /// Mean model prediction in native units.
+    pub prediction_mean_native: Option<f64>,
+    /// Mean signed prediction error (`prediction - target`) in native units.
+    pub mean_error_native: Option<f64>,
+    /// Population standard deviation of held-out targets in native units.
+    pub target_std_native: Option<f64>,
+    /// Population standard deviation of model predictions in native units.
+    pub prediction_std_native: Option<f64>,
+    /// Exact model MAE in native units.
+    pub mae_native: Option<f64>,
+    /// Exact model RMSE in native units.
+    pub rmse_native: Option<f64>,
+    /// Exact label-weighted MSE in the regression space used during training.
+    pub exact_regression_mse: Option<f64>,
+    /// RMSE of a constant predictor fixed to the stored training-partition mean.
+    pub train_mean_baseline_rmse_native: Option<f64>,
+    /// RMSE of the best constant predictor for this evaluated sample (its target mean).
+    pub sample_mean_baseline_rmse_native: Option<f64>,
+    /// Fractional squared-error improvement over the stored train-mean predictor.
+    pub skill_vs_train_mean: Option<f64>,
+    /// Conventional R-squared relative to the evaluated sample's target mean.
+    pub r_squared: Option<f64>,
+    /// Pearson correlation between native-unit prediction and target.
+    pub pearson_r: Option<f64>,
+    /// Least-squares slope for `target ~= intercept + slope * prediction`.
+    pub calibration_slope: Option<f64>,
+    /// Least-squares intercept for `target ~= intercept + slope * prediction`.
+    pub calibration_intercept: Option<f64>,
+    /// Difference between the evaluated target mean and the stored training mean.
+    pub target_mean_shift_from_train_native: Option<f64>,
+}
+
+/// Clean-property evaluation together with regression calibration diagnostics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FoundationPropertyEvaluationMetrics {
+    /// Existing RT/CCS/MS2 loss and exact native-error summary.
+    pub epoch: FoundationEpochMetrics,
+    /// RT calibration/baseline diagnostics when RT labels are present.
+    pub rt: Option<FoundationRegressionEvaluationMetrics>,
+    /// CCS calibration/baseline diagnostics when CCS labels are present.
+    pub ccs: Option<FoundationRegressionEvaluationMetrics>,
+}
+
 /// One completed fit epoch.
 #[derive(Debug, Clone, Copy)]
 pub struct FoundationFitEpochMetrics {
@@ -731,6 +781,23 @@ impl FoundationTrainer {
         records: &[FoundationTrainingRecord],
         indices: &[usize],
     ) -> Result<FoundationEpochMetrics> {
+        Ok(self
+            .evaluate_property_diagnostics_indices(records, indices)?
+            .epoch)
+    }
+
+    /// Evaluate clean RT/CCS/MS2 properties and collect native-unit calibration diagnostics.
+    ///
+    /// This performs the same single model pass as
+    /// [`FoundationTrainer::evaluate_property_epoch_indices`]. Regression
+    /// calibration sufficient statistics are accumulated while each batch is
+    /// already resident, so enabling these diagnostics does not require a
+    /// second forward pass.
+    pub fn evaluate_property_diagnostics_indices(
+        &self,
+        records: &[FoundationTrainingRecord],
+        indices: &[usize],
+    ) -> Result<FoundationPropertyEvaluationMetrics> {
         if indices.is_empty() {
             candle_core::bail!(
                 "cannot evaluate clean foundation properties with zero selected records"
@@ -747,6 +814,8 @@ impl FoundationTrainer {
             },
         )?;
         let mut accumulator = EpochAccumulator::default();
+        let mut rt_calibration = RegressionCalibrationAccumulator::default();
+        let mut ccs_calibration = RegressionCalibrationAccumulator::default();
         for batch_indices in indices.chunks(self.config.batch_size) {
             let mut records_batch = Vec::with_capacity(batch_indices.len());
             for &index in batch_indices {
@@ -764,12 +833,54 @@ impl FoundationTrainer {
                 self.config.seed.wrapping_add(0x5052_4f50_4552_5459),
             )?;
             self.normalize_batch_regression_targets(&mut batch)?;
-            let (total, losses, regression) = self.property_loss_for_batch(&batch)?;
+            let output = self
+                .wrapper
+                .model()
+                .forward_t_with_rt_encoder_gradient_scale(
+                    &batch.input,
+                    &batch.context,
+                    false,
+                    self.config.shared_gradient_scales.rt_encoder,
+                )?;
+            let regression = RegressionDiagnostics {
+                rt: regression_native_sufficient_statistics(
+                    &output.rt,
+                    batch.targets.rt.as_ref(),
+                    batch.targets.rt_mask.as_ref(),
+                    &self.config.target_normalization.rt,
+                )?,
+                ccs: regression_native_sufficient_statistics(
+                    &output.ccs,
+                    batch.targets.ccs.as_ref(),
+                    batch.targets.ccs_mask.as_ref(),
+                    &self.config.target_normalization.ccs,
+                )?,
+            };
+            accumulate_regression_calibration(
+                &mut rt_calibration,
+                &output.rt,
+                batch.targets.rt.as_ref(),
+                batch.targets.rt_mask.as_ref(),
+                &self.config.target_normalization.rt,
+            )?;
+            accumulate_regression_calibration(
+                &mut ccs_calibration,
+                &output.ccs,
+                batch.targets.ccs.as_ref(),
+                batch.targets.ccs_mask.as_ref(),
+                &self.config.target_normalization.ccs,
+            )?;
+            let losses = multi_task_loss(&output, &batch.targets, self.config.loss_weights)?;
+            let total = losses.total.clone();
             accumulator.push(metrics_from_tensors(
                 &total, &losses, None, regression, None, None,
             )?);
         }
-        Ok(accumulator.finish())
+        Ok(FoundationPropertyEvaluationMetrics {
+            epoch: accumulator.finish(),
+            rt: rt_calibration.finish(self.config.target_normalization.rt),
+            ccs: ccs_calibration.finish(self.config.target_normalization.ccs),
+        })
     }
 
     /// Evaluate a materialized record slice with the same clean property-only
@@ -1386,6 +1497,144 @@ fn regression_native_scalars(
 }
 
 #[derive(Default)]
+struct RegressionCalibrationAccumulator {
+    label_count: usize,
+    target_sum: f64,
+    prediction_sum: f64,
+    target_squared_sum: f64,
+    prediction_squared_sum: f64,
+    target_prediction_sum: f64,
+    absolute_error_sum: f64,
+    squared_error_sum: f64,
+}
+
+impl RegressionCalibrationAccumulator {
+    fn push_value(&mut self, prediction: f64, target: f64) {
+        if !(prediction.is_finite() && target.is_finite()) {
+            return;
+        }
+        let error = prediction - target;
+        self.label_count = self.label_count.saturating_add(1);
+        self.target_sum += target;
+        self.prediction_sum += prediction;
+        self.target_squared_sum += target * target;
+        self.prediction_squared_sum += prediction * prediction;
+        self.target_prediction_sum += target * prediction;
+        self.absolute_error_sum += error.abs();
+        self.squared_error_sum += error * error;
+    }
+
+    fn finish(
+        self,
+        normalization: FoundationRegressionNormalization,
+    ) -> Option<FoundationRegressionEvaluationMetrics> {
+        let n = self.label_count;
+        if n == 0 {
+            return None;
+        }
+        let n_f = n as f64;
+        let target_mean = self.target_sum / n_f;
+        let prediction_mean = self.prediction_sum / n_f;
+        let target_centered_ss =
+            (self.target_squared_sum - self.target_sum * self.target_sum / n_f).max(0.0);
+        let prediction_centered_ss = (self.prediction_squared_sum
+            - self.prediction_sum * self.prediction_sum / n_f)
+            .max(0.0);
+        let covariance_sum =
+            self.target_prediction_sum - self.target_sum * self.prediction_sum / n_f;
+        let target_std = (target_centered_ss / n_f).sqrt();
+        let prediction_std = (prediction_centered_ss / n_f).sqrt();
+        let rmse = (self.squared_error_sum / n_f).sqrt();
+        let mae = self.absolute_error_sum / n_f;
+        let regression_scale = if normalization.is_active() {
+            normalization.standard_deviation.unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let exact_regression_mse =
+            self.squared_error_sum / n_f / (regression_scale * regression_scale);
+        let sample_mean_baseline_rmse = (target_centered_ss / n_f).sqrt();
+        let r_squared =
+            (target_centered_ss > 1e-12).then(|| 1.0 - self.squared_error_sum / target_centered_ss);
+        let pearson_r = (target_centered_ss > 1e-12 && prediction_centered_ss > 1e-12)
+            .then(|| covariance_sum / (target_centered_ss * prediction_centered_ss).sqrt());
+        let calibration_slope =
+            (prediction_centered_ss > 1e-12).then(|| covariance_sum / prediction_centered_ss);
+        let calibration_intercept =
+            calibration_slope.map(|slope| target_mean - slope * prediction_mean);
+
+        let (train_mean_baseline_rmse, skill_vs_train_mean, target_mean_shift_from_train) =
+            if let Some(training_mean) = normalization.mean.filter(|value| value.is_finite()) {
+                let baseline_sse = self.target_squared_sum - 2.0 * training_mean * self.target_sum
+                    + n_f * training_mean * training_mean;
+                let baseline_sse = baseline_sse.max(0.0);
+                let baseline_rmse = (baseline_sse / n_f).sqrt();
+                let skill =
+                    (baseline_sse > 1e-12).then(|| 1.0 - self.squared_error_sum / baseline_sse);
+                (
+                    Some(baseline_rmse),
+                    skill,
+                    Some(target_mean - training_mean),
+                )
+            } else {
+                (None, None, None)
+            };
+
+        Some(FoundationRegressionEvaluationMetrics {
+            label_count: n,
+            target_mean_native: Some(target_mean),
+            prediction_mean_native: Some(prediction_mean),
+            mean_error_native: Some(prediction_mean - target_mean),
+            target_std_native: Some(target_std),
+            prediction_std_native: Some(prediction_std),
+            mae_native: Some(mae),
+            rmse_native: Some(rmse),
+            exact_regression_mse: Some(exact_regression_mse),
+            train_mean_baseline_rmse_native: train_mean_baseline_rmse,
+            sample_mean_baseline_rmse_native: Some(sample_mean_baseline_rmse),
+            skill_vs_train_mean,
+            r_squared,
+            pearson_r,
+            calibration_slope,
+            calibration_intercept,
+            target_mean_shift_from_train_native: target_mean_shift_from_train,
+        })
+    }
+}
+
+fn accumulate_regression_calibration(
+    accumulator: &mut RegressionCalibrationAccumulator,
+    prediction: &Tensor,
+    target: Option<&Tensor>,
+    mask: Option<&Tensor>,
+    normalization: &FoundationRegressionNormalization,
+) -> Result<()> {
+    let (Some(target), Some(mask)) = (target, mask) else {
+        if target.is_some() || mask.is_some() {
+            candle_core::bail!("foundation regression target and mask must be supplied together");
+        }
+        return Ok(());
+    };
+    let prediction = normalization.denormalize_tensor(prediction)?;
+    let target = normalization.denormalize_tensor(target)?;
+    let mask = mask.broadcast_as(prediction.dims())?;
+    let predictions = prediction.flatten_all()?.to_vec1::<f32>()?;
+    let targets = target.flatten_all()?.to_vec1::<f32>()?;
+    let masks = mask.flatten_all()?.to_vec1::<f32>()?;
+    if predictions.len() != targets.len() || predictions.len() != masks.len() {
+        candle_core::bail!(
+            "foundation regression calibration tensors have mismatched flattened lengths"
+        );
+    }
+    for ((prediction, target), mask) in predictions.into_iter().zip(targets).zip(masks) {
+        if mask > 0.0 {
+            accumulator.push_value(f64::from(prediction), f64::from(target));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
 struct EpochAccumulator {
     steps: usize,
     total: f64,
@@ -1658,6 +1907,34 @@ mod tests {
         assert!(metrics.gradient_norm.is_finite());
         assert_eq!(trainer.global_step(), 1);
         assert_eq!(trainer.optimizer_step(), 1);
+    }
+
+    #[test]
+    fn regression_calibration_reports_baselines_and_skill() {
+        let mut accumulator = RegressionCalibrationAccumulator::default();
+        for (prediction, target) in [(1.0, 1.0), (2.0, 2.0), (4.0, 3.0)] {
+            accumulator.push_value(prediction, target);
+        }
+        let metrics = accumulator
+            .finish(FoundationRegressionNormalization {
+                mean: Some(2.0),
+                standard_deviation: Some(1.0),
+                label_count: 3,
+                ..FoundationRegressionNormalization::default()
+            })
+            .unwrap();
+        assert_eq!(metrics.label_count, 3);
+        assert!((metrics.rmse_native.unwrap() - (1.0f64 / 3.0).sqrt()).abs() < 1e-10);
+        assert!((metrics.exact_regression_mse.unwrap() - 1.0 / 3.0).abs() < 1e-10);
+        assert!(
+            (metrics.train_mean_baseline_rmse_native.unwrap() - (2.0f64 / 3.0).sqrt()).abs()
+                < 1e-10
+        );
+        assert!((metrics.skill_vs_train_mean.unwrap() - 0.5).abs() < 1e-10);
+        assert!((metrics.r_squared.unwrap() - 0.5).abs() < 1e-10);
+        assert!(metrics.pearson_r.unwrap() > 0.98);
+        assert!(metrics.calibration_slope.unwrap().is_finite());
+        assert!(metrics.calibration_intercept.unwrap().is_finite());
     }
 
     fn training_record(sequence: &str, charge: i32, rt: f32, ccs: f32) -> FoundationTrainingRecord {

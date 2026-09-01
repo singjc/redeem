@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use redeem_properties::foundation::{
     evaluate_foundation_checkpoint, read_foundation_training_run_config, FoundationEpochMetrics,
-    FoundationPartition,
+    FoundationPartition, FoundationRegressionEvaluationMetrics,
 };
 use std::{env, fs, path::PathBuf};
 
@@ -97,8 +97,32 @@ fn main() -> Result<()> {
         lines.push(format!("sampling_source\t{source}\t{count}"));
     }
     push_metrics(&mut lines, "property", &summary.property_metrics);
+    push_regression_diagnostics(
+        &mut lines,
+        "property_rt",
+        summary.property_diagnostics.rt.as_ref(),
+    );
+    push_regression_diagnostics(
+        &mut lines,
+        "property_ccs",
+        summary.property_diagnostics.ccs.as_ref(),
+    );
     for (source, metrics) in &summary.property_metrics_by_source {
         push_source_metrics(&mut lines, "property_source", source, metrics);
+        if let Some(diagnostics) = summary.property_diagnostics_by_source.get(source) {
+            push_source_regression_diagnostics(
+                &mut lines,
+                "property_source_rt",
+                source,
+                diagnostics.rt.as_ref(),
+            );
+            push_source_regression_diagnostics(
+                &mut lines,
+                "property_source_ccs",
+                source,
+                diagnostics.ccs.as_ref(),
+            );
+        }
     }
 
     for line in &lines {
@@ -203,4 +227,134 @@ fn push_source_metrics(
         "{prefix}_ms2_loss\t{source}\t{}",
         option(metrics.mean_ms2_loss)
     ));
+}
+
+fn push_regression_diagnostics(
+    lines: &mut Vec<String>,
+    prefix: &str,
+    metrics: Option<&FoundationRegressionEvaluationMetrics>,
+) {
+    let Some(metrics) = metrics else {
+        push(lines, &format!("{prefix}_calibration_labels"), 0);
+        return;
+    };
+    push(
+        lines,
+        &format!("{prefix}_calibration_labels"),
+        metrics.label_count,
+    );
+    push(
+        lines,
+        &format!("{prefix}_target_mean_native"),
+        option(metrics.target_mean_native),
+    );
+    push(
+        lines,
+        &format!("{prefix}_prediction_mean_native"),
+        option(metrics.prediction_mean_native),
+    );
+    push(
+        lines,
+        &format!("{prefix}_mean_error_native"),
+        option(metrics.mean_error_native),
+    );
+    push(
+        lines,
+        &format!("{prefix}_target_std_native"),
+        option(metrics.target_std_native),
+    );
+    push(
+        lines,
+        &format!("{prefix}_prediction_std_native"),
+        option(metrics.prediction_std_native),
+    );
+    push(
+        lines,
+        &format!("{prefix}_exact_mse"),
+        option(metrics.exact_regression_mse),
+    );
+    push(
+        lines,
+        &format!("{prefix}_train_mean_baseline_rmse_native"),
+        option(metrics.train_mean_baseline_rmse_native),
+    );
+    push(
+        lines,
+        &format!("{prefix}_sample_mean_baseline_rmse_native"),
+        option(metrics.sample_mean_baseline_rmse_native),
+    );
+    push(
+        lines,
+        &format!("{prefix}_skill_vs_train_mean"),
+        option(metrics.skill_vs_train_mean),
+    );
+    push(
+        lines,
+        &format!("{prefix}_r_squared"),
+        option(metrics.r_squared),
+    );
+    push(
+        lines,
+        &format!("{prefix}_pearson_r"),
+        option(metrics.pearson_r),
+    );
+    push(
+        lines,
+        &format!("{prefix}_calibration_slope"),
+        option(metrics.calibration_slope),
+    );
+    push(
+        lines,
+        &format!("{prefix}_calibration_intercept"),
+        option(metrics.calibration_intercept),
+    );
+    push(
+        lines,
+        &format!("{prefix}_target_mean_shift_from_train_native"),
+        option(metrics.target_mean_shift_from_train_native),
+    );
+}
+
+fn push_source_regression_diagnostics(
+    lines: &mut Vec<String>,
+    prefix: &str,
+    source: &str,
+    metrics: Option<&FoundationRegressionEvaluationMetrics>,
+) {
+    let Some(metrics) = metrics else {
+        lines.push(format!("{prefix}_calibration_labels\t{source}\t0"));
+        return;
+    };
+    macro_rules! source_metric {
+        ($name:literal, $value:expr) => {
+            lines.push(format!("{prefix}_{}\t{source}\t{}", $name, option($value)));
+        };
+    }
+    lines.push(format!(
+        "{prefix}_calibration_labels\t{source}\t{}",
+        metrics.label_count
+    ));
+    source_metric!("target_mean_native", metrics.target_mean_native);
+    source_metric!("prediction_mean_native", metrics.prediction_mean_native);
+    source_metric!("mean_error_native", metrics.mean_error_native);
+    source_metric!("target_std_native", metrics.target_std_native);
+    source_metric!("prediction_std_native", metrics.prediction_std_native);
+    source_metric!("exact_mse", metrics.exact_regression_mse);
+    source_metric!(
+        "train_mean_baseline_rmse_native",
+        metrics.train_mean_baseline_rmse_native
+    );
+    source_metric!(
+        "sample_mean_baseline_rmse_native",
+        metrics.sample_mean_baseline_rmse_native
+    );
+    source_metric!("skill_vs_train_mean", metrics.skill_vs_train_mean);
+    source_metric!("r_squared", metrics.r_squared);
+    source_metric!("pearson_r", metrics.pearson_r);
+    source_metric!("calibration_slope", metrics.calibration_slope);
+    source_metric!("calibration_intercept", metrics.calibration_intercept);
+    source_metric!(
+        "target_mean_shift_from_train_native",
+        metrics.target_mean_shift_from_train_native
+    );
 }
