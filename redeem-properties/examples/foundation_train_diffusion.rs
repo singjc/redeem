@@ -7,8 +7,8 @@
 //! random-timestep and maximum-noise x0 denoising metrics.
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder, VarMap};
+use candle_core::{backprop::GradStore, DType, Device, Tensor};
+use candle_nn::{linear, Linear, Module, VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_diffusion_dataset_fingerprint, foundation_diffusion_length_loss,
     foundation_diffusion_record_fingerprint, foundation_diffusion_x0_loss,
@@ -49,6 +49,8 @@ struct DiffusionPilotMetadata {
     alignment_every: usize,
     initial_diffusion_checkpoint: Option<String>,
     peptide_encoder_checkpoint: Option<String>,
+    alignment_target: String,
+    alignment_projection_dim: usize,
     best_step: usize,
     best_validation_spectrum_only_loss: f64,
     diffusion: FoundationDiffusionConfig,
@@ -83,10 +85,18 @@ struct AlignmentMetrics {
     pairs: usize,
 }
 
+#[derive(Debug, Clone)]
+struct TeacherEmbeddings {
+    pooled: Tensor,
+    contrastive: Tensor,
+}
+
 struct FrozenPeptideTeacher {
     _varmap: VarMap,
     encoder: PeptideFoundationEncoder,
+    contrastive_head: Linear,
     featurizer: PeptideGraphFeaturizer,
+    contrastive_dim: usize,
 }
 
 impl FrozenPeptideTeacher {
@@ -99,14 +109,22 @@ impl FrozenPeptideTeacher {
         let mut varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
         let encoder = PeptideFoundationEncoder::new(model_config.clone(), vb.pp("encoder"))?;
+        let contrastive_head = linear(
+            model_config.model_dim,
+            model_config.contrastive_dim,
+            vb.pp("heads.contrastive"),
+        )?;
         varmap.load(&model_path).with_context(|| {
-            format!("failed to load frozen peptide encoder from {model_path:?}")
+            format!("failed to load frozen peptide encoder/contrastive head from {model_path:?}")
         })?;
+        let contrastive_dim = model_config.contrastive_dim;
         let featurizer = PeptideGraphFeaturizer::new(model_config)?;
         Ok(Self {
             _varmap: varmap,
             encoder,
+            contrastive_head,
             featurizer,
+            contrastive_dim,
         })
     }
 
@@ -114,17 +132,22 @@ impl FrozenPeptideTeacher {
         &self,
         records: &[&FoundationTrainingRecord],
         device: &Device,
-    ) -> Result<Tensor> {
+    ) -> Result<TeacherEmbeddings> {
         let peptides: Vec<PeptidoformInput> = records
             .iter()
             .map(|record| record.peptidoform.clone())
             .collect();
         let batch = self.featurizer.featurize(&peptides, device)?;
-        Ok(self
+        let pooled = self
             .encoder
             .forward_t(&batch, false)?
             .peptide_embedding
-            .detach())
+            .detach();
+        let contrastive = self.contrastive_head.forward(&pooled)?.detach();
+        Ok(TeacherEmbeddings {
+            pooled,
+            contrastive,
+        })
     }
 }
 
@@ -331,27 +354,31 @@ fn main() -> Result<()> {
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = PeptideSpectrumDiffusionModel::new(config.clone(), vb)?;
-    if let Some(checkpoint) = initial_diffusion_checkpoint.as_ref() {
-        let model_path = resolve_model_safetensors(checkpoint);
-        varmap
-            .load(&model_path)
-            .with_context(|| format!("failed to warm-start diffusion model from {model_path:?}"))?;
-    }
-    varmap.save(initial_dir.join("model.safetensors"))?;
 
     let peptide_teacher = peptide_encoder_checkpoint
         .as_ref()
         .map(|path| FrozenPeptideTeacher::load(run.model.clone(), path, &device))
         .transpose()?;
-    if let Some(teacher) = peptide_teacher.as_ref() {
-        if teacher.encoder.config().model_dim != config.model_dim {
-            anyhow::bail!(
-                "peptide teacher model_dim {} does not match diffusion model_dim {}",
-                teacher.encoder.config().model_dim,
-                config.model_dim
-            );
-        }
+    let alignment_projection = if let Some(teacher) = peptide_teacher.as_ref() {
+        let alignment_vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        Some(linear(
+            config.model_dim,
+            teacher.contrastive_dim,
+            alignment_vb.pp("alignment.spectrum_projection"),
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(checkpoint) = initial_diffusion_checkpoint.as_ref() {
+        let model_path = resolve_model_safetensors(checkpoint);
+        let (loaded, missing_alignment) =
+            load_matching_diffusion_checkpoint(&varmap, &model_path, &device)?;
+        println!(
+            "warm_start	loaded_variables={loaded}	missing_alignment_projection_variables={missing_alignment}"
+        );
     }
+    varmap.save(initial_dir.join("model.safetensors"))?;
 
     let learning_rate = 1.0e-4;
     let max_gradient_norm = 1.0;
@@ -370,6 +397,34 @@ fn main() -> Result<()> {
         validation_batches * batch_size,
         seed ^ 0xa7f4_39d1_2e68_5c0b,
     );
+
+    if let Some(teacher) = peptide_teacher.as_ref() {
+        let geometry_count = validation_selection.len().min(256);
+        let geometry_records: Vec<&FoundationTrainingRecord> = validation_selection
+            .iter()
+            .take(geometry_count)
+            .map(|&index| &corpus.records[index])
+            .collect();
+        let embeddings = teacher.encode_records(&geometry_records, &device)?;
+        let raw_geometry = embedding_geometry(&embeddings.pooled)?;
+        let contrastive_geometry = embedding_geometry(&embeddings.contrastive)?;
+        println!(
+            "teacher_geometry\traw_dim={}\traw_mean_norm={:.6}\traw_mean_rotated_cosine={:.6}\traw_mean_dimension_std={:.6}\tcontrastive_dim={}\tcontrastive_mean_norm={:.6}\tcontrastive_mean_rotated_cosine={:.6}\tcontrastive_mean_dimension_std={:.6}\tpairs={}",
+            embeddings.pooled.dims2()?.1,
+            raw_geometry.mean_norm,
+            raw_geometry.mean_rotated_cosine,
+            raw_geometry.mean_dimension_std,
+            embeddings.contrastive.dims2()?.1,
+            contrastive_geometry.mean_norm,
+            contrastive_geometry.mean_rotated_cosine,
+            contrastive_geometry.mean_dimension_std,
+            geometry_count,
+        );
+        println!(
+            "alignment_target\tforward_contrastive_projection\tprojection_dim={}",
+            teacher.contrastive_dim
+        );
+    }
 
     let mut best_spectrum_only = f64::INFINITY;
     let mut best_step = 0usize;
@@ -414,12 +469,26 @@ fn main() -> Result<()> {
             let teacher = peptide_teacher
                 .as_ref()
                 .expect("alignment configuration validated before training");
-            let peptide_embedding = teacher.encode_records(&records, &device)?;
+            let projection = alignment_projection
+                .as_ref()
+                .expect("alignment projection constructed with peptide teacher");
+            let teacher_embeddings = teacher.encode_records(&records, &device)?;
+            let spectrum_projection = projection.forward(&output.spectrum_embedding)?;
             let alignment_loss = foundation_spectrum_peptide_alignment_loss(
-                &output.spectrum_embedding,
-                &peptide_embedding,
+                &spectrum_projection,
+                &teacher_embeddings.contrastive,
                 alignment_temperature,
             )?;
+            if step == 1 {
+                let gradients = alignment_loss.backward()?;
+                let projection_gradient_norm =
+                    gradient_norm_for_prefix(&varmap, &gradients, "alignment.spectrum_projection")?;
+                let spectrum_encoder_gradient_norm =
+                    gradient_norm_for_prefix(&varmap, &gradients, "spectrum_encoder")?;
+                println!(
+                    "alignment_gradient_probe\tprojection_gradient_norm={projection_gradient_norm:.8}\tspectrum_encoder_gradient_norm={spectrum_encoder_gradient_norm:.8}"
+                );
+            }
             alignment_loss_value = Some(f64::from(alignment_loss.to_scalar::<f32>()?));
             loss = (&loss + &alignment_loss.affine(alignment_weight, 0.0)?)?;
         }
@@ -509,9 +578,12 @@ fn main() -> Result<()> {
                 spectrum_only_metrics.length_accuracy - shuffled_spectrum_metrics.length_accuracy,
             );
 
-            if let Some(teacher) = peptide_teacher.as_ref() {
-                let alignment_metrics = evaluate_alignment(
+            if let (Some(teacher), Some(projection)) =
+                (peptide_teacher.as_ref(), alignment_projection.as_ref())
+            {
+                let matched_alignment = evaluate_alignment(
                     &model,
+                    projection,
                     teacher,
                     &corpus.records,
                     &validation_selection,
@@ -519,17 +591,32 @@ fn main() -> Result<()> {
                     &config,
                     &diffusion_collator,
                     &spectrum_collator,
+                    false,
                     alignment_temperature,
                     &device,
                 )?;
+                let shuffled_alignment = evaluate_alignment(
+                    &model,
+                    projection,
+                    teacher,
+                    &corpus.records,
+                    &validation_selection,
+                    batch_size,
+                    &config,
+                    &diffusion_collator,
+                    &spectrum_collator,
+                    true,
+                    alignment_temperature,
+                    &device,
+                )?;
+                print_alignment("matched", step, matched_alignment);
+                print_alignment("shuffled", step, shuffled_alignment);
                 println!(
-                    "validation_alignment\tstep={step}\tloss={:.6}\tretrieval_top1={:.6}\tmean_positive_cosine={:.6}\tmean_rotated_cosine={:.6}\tcosine_delta={:.6}\tpairs={}",
-                    alignment_metrics.loss,
-                    alignment_metrics.retrieval_top1,
-                    alignment_metrics.mean_positive_cosine,
-                    alignment_metrics.mean_rotated_cosine,
-                    alignment_metrics.mean_positive_cosine - alignment_metrics.mean_rotated_cosine,
-                    alignment_metrics.pairs,
+                    "validation_alignment_ablation\tstep={step}\tloss_delta={:.6}\tretrieval_top1_delta={:.6}\tpositive_cosine_delta={:.6}",
+                    shuffled_alignment.loss - matched_alignment.loss,
+                    matched_alignment.retrieval_top1 - shuffled_alignment.retrieval_top1,
+                    matched_alignment.mean_positive_cosine
+                        - shuffled_alignment.mean_positive_cosine,
                 );
             }
 
@@ -541,7 +628,7 @@ fn main() -> Result<()> {
                     &varmap,
                     &optimizer,
                     &DiffusionPilotMetadata {
-                        version: 3,
+                        version: 4,
                         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
                         benchmark_manifest_fingerprint: format!(
                             "fnv1a64:{:016x}",
@@ -570,6 +657,15 @@ fn main() -> Result<()> {
                         peptide_encoder_checkpoint: peptide_encoder_checkpoint
                             .as_ref()
                             .map(|path| path.display().to_string()),
+                        alignment_target: if peptide_teacher.is_some() {
+                            "forward_contrastive_projection".into()
+                        } else {
+                            "none".into()
+                        },
+                        alignment_projection_dim: peptide_teacher
+                            .as_ref()
+                            .map(|teacher| teacher.contrastive_dim)
+                            .unwrap_or(0),
                         best_step,
                         best_validation_spectrum_only_loss: best_spectrum_only,
                         diffusion: config.clone(),
@@ -582,7 +678,7 @@ fn main() -> Result<()> {
                 &varmap,
                 &optimizer,
                 &DiffusionPilotMetadata {
-                    version: 3,
+                    version: 4,
                     corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
                     benchmark_manifest_fingerprint: format!(
                         "fnv1a64:{:016x}",
@@ -611,6 +707,15 @@ fn main() -> Result<()> {
                     peptide_encoder_checkpoint: peptide_encoder_checkpoint
                         .as_ref()
                         .map(|path| path.display().to_string()),
+                    alignment_target: if peptide_teacher.is_some() {
+                        "forward_contrastive_projection".into()
+                    } else {
+                        "none".into()
+                    },
+                    alignment_projection_dim: peptide_teacher
+                        .as_ref()
+                        .map(|teacher| teacher.contrastive_dim)
+                        .unwrap_or(0),
                     best_step,
                     best_validation_spectrum_only_loss: best_spectrum_only,
                     diffusion: config.clone(),
@@ -633,6 +738,77 @@ fn resolve_model_safetensors(path: &Path) -> PathBuf {
     }
 }
 
+/// Load every checkpoint tensor that matches the current diffusion VarMap.
+///
+/// Historical v0.11.3 checkpoints do not contain the v0.11.8 spectrum
+/// alignment projection, so those two variables are allowed to remain freshly
+/// initialized. Any other missing current-model variable is treated as an
+/// incompatible warm start.
+fn load_matching_diffusion_checkpoint(
+    varmap: &VarMap,
+    path: &Path,
+    device: &Device,
+) -> Result<(usize, usize)> {
+    let tensors = candle_core::safetensors::load(path, device)
+        .with_context(|| format!("failed to read diffusion checkpoint {path:?}"))?;
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("diffusion VarMap lock poisoned"))?;
+    let mut loaded = 0usize;
+    let mut missing_alignment = 0usize;
+    let mut missing_required = Vec::<String>::new();
+    for (name, variable) in data.iter() {
+        let Some(checkpoint_tensor) = tensors.get(name) else {
+            if name.starts_with("alignment.spectrum_projection.") {
+                missing_alignment += 1;
+            } else {
+                missing_required.push(name.clone());
+            }
+            continue;
+        };
+        if variable.as_tensor().dims() != checkpoint_tensor.dims() {
+            anyhow::bail!(
+                "diffusion warm-start shape mismatch for '{name}': current {:?}, checkpoint {:?}",
+                variable.as_tensor().dims(),
+                checkpoint_tensor.dims()
+            );
+        }
+        variable.set(checkpoint_tensor)?;
+        loaded += 1;
+    }
+    drop(data);
+    if !missing_required.is_empty() {
+        anyhow::bail!(
+            "diffusion warm start {path:?} is missing required variables: {}",
+            missing_required.join(", ")
+        );
+    }
+    Ok((loaded, missing_alignment))
+}
+
+fn gradient_norm_for_prefix(varmap: &VarMap, gradients: &GradStore, prefix: &str) -> Result<f64> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("diffusion VarMap lock poisoned"))?;
+    let mut squared_norm = 0.0f64;
+    let mut matched = 0usize;
+    for (name, variable) in data.iter() {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        matched += 1;
+        if let Some(gradient) = gradients.get(variable) {
+            squared_norm += f64::from(gradient.sqr()?.sum_all()?.to_scalar::<f32>()?);
+        }
+    }
+    if matched == 0 {
+        anyhow::bail!("alignment gradient probe matched no variables for prefix '{prefix}'");
+    }
+    Ok(squared_norm.sqrt())
+}
+
 fn optional_path(args: &[String], index: usize) -> Option<PathBuf> {
     args.get(index).and_then(|value| {
         let trimmed = value.trim();
@@ -644,6 +820,7 @@ fn optional_path(args: &[String], index: usize) -> Option<PathBuf> {
 #[allow(clippy::too_many_arguments)]
 fn evaluate_alignment(
     model: &PeptideSpectrumDiffusionModel,
+    projection: &Linear,
     teacher: &FrozenPeptideTeacher,
     all_records: &[FoundationTrainingRecord],
     indices: &[usize],
@@ -651,6 +828,7 @@ fn evaluate_alignment(
     config: &FoundationDiffusionConfig,
     diffusion_collator: &FoundationDiffusionCollator,
     spectrum_collator: &FoundationSpectrumCollator,
+    shuffle_spectra: bool,
     temperature: f64,
     device: &Device,
 ) -> Result<AlignmentMetrics> {
@@ -673,7 +851,7 @@ fn evaluate_alignment(
             diffusion_collator,
             spectrum_collator,
             CorruptionMode::SpectrumOnlyMasked,
-            false,
+            shuffle_spectra,
             0x73d1_f581_2a94_bc06 ^ pairs as u64,
             device,
         )?;
@@ -683,17 +861,18 @@ fn evaluate_alignment(
             &packed.precursor,
             false,
         )?;
-        let peptide_embedding = teacher.encode_records(&records, device)?;
+        let teacher_embeddings = teacher.encode_records(&records, device)?;
+        let spectrum_projection = projection.forward(&output.spectrum_embedding)?;
         let loss = foundation_spectrum_peptide_alignment_loss(
-            &output.spectrum_embedding,
-            &peptide_embedding,
+            &spectrum_projection,
+            &teacher_embeddings.contrastive,
             temperature,
         )?;
         loss_sum += f64::from(loss.to_scalar::<f32>()?);
         batches += 1;
 
-        let spectrum = output.spectrum_embedding.to_vec2::<f32>()?;
-        let peptide = peptide_embedding.to_vec2::<f32>()?;
+        let spectrum = spectrum_projection.to_vec2::<f32>()?;
+        let peptide = teacher_embeddings.contrastive.to_vec2::<f32>()?;
         for row in 0..spectrum.len() {
             let mut best_index = 0usize;
             let mut best_cosine = f64::NEG_INFINITY;
@@ -721,6 +900,68 @@ fn evaluate_alignment(
         mean_positive_cosine: positive_sum / pairs as f64,
         mean_rotated_cosine: rotated_sum / pairs as f64,
         pairs,
+    })
+}
+
+fn print_alignment(label: &str, step: usize, metrics: AlignmentMetrics) {
+    println!(
+        "validation_alignment\tmode={label}\tstep={step}\tloss={:.6}\tretrieval_top1={:.6}\tmean_positive_cosine={:.6}\tmean_rotated_cosine={:.6}\tcosine_delta={:.6}\tpairs={}",
+        metrics.loss,
+        metrics.retrieval_top1,
+        metrics.mean_positive_cosine,
+        metrics.mean_rotated_cosine,
+        metrics.mean_positive_cosine - metrics.mean_rotated_cosine,
+        metrics.pairs,
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EmbeddingGeometry {
+    mean_norm: f64,
+    mean_rotated_cosine: f64,
+    mean_dimension_std: f64,
+}
+
+fn embedding_geometry(values: &Tensor) -> Result<EmbeddingGeometry> {
+    let rows = values.to_vec2::<f32>()?;
+    if rows.is_empty() || rows[0].is_empty() {
+        anyhow::bail!("embedding geometry requires a non-empty rank-2 tensor");
+    }
+    let dim = rows[0].len();
+    let mut norm_sum = 0.0f64;
+    let mut rotated_sum = 0.0f64;
+    let mut means = vec![0.0f64; dim];
+    for (row_index, row) in rows.iter().enumerate() {
+        let norm = row
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        norm_sum += norm;
+        rotated_sum += cosine_similarity(row, &rows[(row_index + 1) % rows.len()]);
+        for (index, &value) in row.iter().enumerate() {
+            means[index] += f64::from(value);
+        }
+    }
+    for mean in &mut means {
+        *mean /= rows.len() as f64;
+    }
+    let mut variance_sum = vec![0.0f64; dim];
+    for row in &rows {
+        for (index, &value) in row.iter().enumerate() {
+            let delta = f64::from(value) - means[index];
+            variance_sum[index] += delta * delta;
+        }
+    }
+    let mean_dimension_std = variance_sum
+        .into_iter()
+        .map(|sum| (sum / rows.len() as f64).sqrt())
+        .sum::<f64>()
+        / dim as f64;
+    Ok(EmbeddingGeometry {
+        mean_norm: norm_sum / rows.len() as f64,
+        mean_rotated_cosine: rotated_sum / rows.len() as f64,
+        mean_dimension_std,
     })
 }
 
