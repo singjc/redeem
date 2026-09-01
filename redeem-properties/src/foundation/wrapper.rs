@@ -138,6 +138,20 @@ pub(crate) fn context_batch(
         .iter()
         .map(|context| if context.charge.is_some() { 1.0 } else { 0.0 })
         .collect();
+    let precursor_mz: Vec<f32> = contexts
+        .iter()
+        .map(|context| context.precursor_mz.unwrap_or(0.0))
+        .collect();
+    let precursor_mz_present: Vec<f32> = contexts
+        .iter()
+        .map(|context| {
+            if context.precursor_mz.is_some() {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
     let nce: Vec<f32> = contexts
         .iter()
         .map(|context| context.nce.unwrap_or(0.0))
@@ -168,6 +182,8 @@ pub(crate) fn context_batch(
     Ok(PrecursorContextBatch {
         charge: Tensor::from_vec(charge, contexts.len(), device)?,
         charge_present: Tensor::from_vec(charge_present, contexts.len(), device)?,
+        precursor_mz: Tensor::from_vec(precursor_mz, contexts.len(), device)?,
+        precursor_mz_present: Tensor::from_vec(precursor_mz_present, contexts.len(), device)?,
         nce: Tensor::from_vec(nce, contexts.len(), device)?,
         nce_present: Tensor::from_vec(nce_present, contexts.len(), device)?,
         instrument_ids: Tensor::from_vec(instrument_ids, contexts.len(), device)?

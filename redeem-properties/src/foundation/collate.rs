@@ -273,6 +273,20 @@ impl FoundationCollator {
                 }
             })
             .collect();
+        let precursor_mz: Vec<f32> = records
+            .iter()
+            .map(|record| record.context.precursor_mz.unwrap_or(0.0))
+            .collect();
+        let precursor_mz_present: Vec<f32> = records
+            .iter()
+            .map(|record| {
+                if record.context.precursor_mz.is_some() {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         let nce: Vec<f32> = records
             .iter()
             .map(|record| record.context.nce.unwrap_or(0.0))
@@ -310,6 +324,8 @@ impl FoundationCollator {
         Ok(PrecursorContextBatch {
             charge: Tensor::from_vec(charge, records.len(), device)?,
             charge_present: Tensor::from_vec(charge_present, records.len(), device)?,
+            precursor_mz: Tensor::from_vec(precursor_mz, records.len(), device)?,
+            precursor_mz_present: Tensor::from_vec(precursor_mz_present, records.len(), device)?,
             nce: Tensor::from_vec(nce, records.len(), device)?,
             nce_present: Tensor::from_vec(nce_present, records.len(), device)?,
             instrument_ids: Tensor::from_vec(instrument_ids, records.len(), device)?

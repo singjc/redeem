@@ -1,7 +1,7 @@
 //! Hierarchical chemistry-aware peptide encoder and multi-task prediction heads.
 
 use super::chemistry::ATOM_FEATURE_DIM;
-use super::config::FoundationConfig;
+use super::config::{FoundationCcsContextMode, FoundationConfig};
 use super::featurize::FoundationBatch;
 use super::layers::{GraphMessageLayer, PeptideTransformerBlock};
 use candle_core::{DType, Module, Result, Tensor};
@@ -187,6 +187,10 @@ pub struct PrecursorContextBatch {
     pub charge: Tensor,
     /// One where precursor charge is known, zero where it is unavailable.
     pub charge_present: Tensor,
+    /// Precursor m/z as `[batch]` floating-point values. Missing values are zero-filled.
+    pub precursor_mz: Tensor,
+    /// One where precursor m/z is known, zero where it is unavailable.
+    pub precursor_mz_present: Tensor,
     /// Normalized collision energy as `[batch]` floating-point values. Missing values are zero-filled.
     pub nce: Tensor,
     /// One where NCE is known, zero where it is unavailable.
@@ -207,6 +211,8 @@ impl PrecursorContextBatch {
         Ok(Self {
             charge: Tensor::zeros(batch_size, DType::F32, device)?,
             charge_present: Tensor::zeros(batch_size, DType::F32, device)?,
+            precursor_mz: Tensor::zeros(batch_size, DType::F32, device)?,
+            precursor_mz_present: Tensor::zeros(batch_size, DType::F32, device)?,
             nce: Tensor::zeros(batch_size, DType::F32, device)?,
             nce_present: Tensor::zeros(batch_size, DType::F32, device)?,
             instrument_ids: Tensor::zeros(batch_size, DType::U32, device)?,
@@ -340,8 +346,27 @@ impl PeptideFoundationMultiTaskModel {
         let ccs_embedding =
             gradient_scaled_identity(&foundation.peptide_embedding, ccs_encoder_gradient_scale)?;
         let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
-        let charge_present = context.charge_present.unsqueeze(1)?;
-        let ccs_features = Tensor::cat(&[&ccs_embedding, &scaled_charge, &charge_present], 1)?;
+        let ccs_scalar_context = match self.config.ccs_context_mode {
+            FoundationCcsContextMode::ChargePresence => {
+                let charge_present = context.charge_present.unsqueeze(1)?;
+                Tensor::cat(&[&scaled_charge, &charge_present], 1)?
+            }
+            FoundationCcsContextMode::NeutralMassCharge => {
+                // `m/z * z` is a stable neutral-mass proxy; the proton correction is tiny
+                // relative to peptide mass and can be learned as part of the scalar affine
+                // head. Missing m/z is zero-filled, so unknown context remains a valid path.
+                let neutral_mass = context.precursor_mz.broadcast_mul(&context.charge)?;
+                let physical_present = context
+                    .precursor_mz_present
+                    .broadcast_mul(&context.charge_present)?;
+                let scaled_neutral_mass = neutral_mass
+                    .broadcast_mul(&physical_present)?
+                    .affine(1.0 / 3000.0, 0.0)?
+                    .unsqueeze(1)?;
+                Tensor::cat(&[&scaled_neutral_mass, &scaled_charge], 1)?
+            }
+        };
+        let ccs_features = Tensor::cat(&[&ccs_embedding, &ccs_scalar_context], 1)?;
         let ccs = self.ccs_head.forward(&ccs_features)?;
 
         let (batch_size, sequence_len, _) = foundation.residue_embeddings.dims3()?;

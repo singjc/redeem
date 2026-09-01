@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Scalar context supplied to the CCS prediction head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FoundationCcsContextMode {
+    /// Historical CCS context: scaled charge plus an explicit charge-presence mask.
+    #[default]
+    ChargePresence,
+    /// Physics-conditioned CCS context: scaled neutral-mass proxy (`m/z * charge`) plus charge.
+    ///
+    /// This keeps the intrinsic peptide embedding acquisition-independent while giving the
+    /// CCS head direct access to precursor size and charge without changing parameter shapes.
+    NeutralMassCharge,
+}
+
 /// Hyperparameters for [`crate::foundation::PeptideFoundationEncoder`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -32,6 +46,8 @@ pub struct FoundationConfig {
     pub instrument_vocab_size: usize,
     /// Number of MS2 fragment-intensity channels emitted per cleavage.
     pub ms2_fragment_channels: usize,
+    /// Scalar precursor context supplied only to the CCS head.
+    pub ccs_context_mode: FoundationCcsContextMode,
 }
 
 impl Default for FoundationConfig {
@@ -50,6 +66,7 @@ impl Default for FoundationConfig {
             contrastive_dim: 128,
             instrument_vocab_size: 16,
             ms2_fragment_channels: 8,
+            ccs_context_mode: FoundationCcsContextMode::ChargePresence,
         }
     }
 }

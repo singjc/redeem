@@ -45,6 +45,8 @@ fn multi_task_heads_have_expected_shapes() {
     let context = PrecursorContextBatch {
         charge: Tensor::from_vec(vec![2.0f32], 1, &device).unwrap(),
         charge_present: Tensor::from_vec(vec![1.0f32], 1, &device).unwrap(),
+        precursor_mz: Tensor::from_vec(vec![650.0f32], 1, &device).unwrap(),
+        precursor_mz_present: Tensor::from_vec(vec![1.0f32], 1, &device).unwrap(),
         nce: Tensor::from_vec(vec![27.0f32], 1, &device).unwrap(),
         nce_present: Tensor::from_vec(vec![1.0f32], 1, &device).unwrap(),
         instrument_ids: Tensor::from_vec(vec![0u32], 1, &device).unwrap(),
@@ -85,6 +87,8 @@ fn normalized_regression_heads_start_from_zero_prediction() {
     let context = PrecursorContextBatch {
         charge: Tensor::from_vec(vec![2.0f32, 4.0], 2, &device).unwrap(),
         charge_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
+        precursor_mz: Tensor::from_vec(vec![650.0f32, 800.0], 2, &device).unwrap(),
+        precursor_mz_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
         nce: Tensor::from_vec(vec![25.0f32, 35.0], 2, &device).unwrap(),
         nce_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
         instrument_ids: Tensor::from_vec(vec![0u32, 0], 2, &device).unwrap(),
@@ -153,6 +157,10 @@ fn all_unknown_acquisition_context_is_a_valid_forward_path() {
         .unwrap();
     let context = PrecursorContextBatch::unknown(1, &device).unwrap();
     assert_eq!(context.charge_present.to_vec1::<f32>().unwrap(), vec![0.0]);
+    assert_eq!(
+        context.precursor_mz_present.to_vec1::<f32>().unwrap(),
+        vec![0.0]
+    );
     assert_eq!(context.nce_present.to_vec1::<f32>().unwrap(), vec![0.0]);
     assert_eq!(
         context.instrument_present.to_vec1::<f32>().unwrap(),
@@ -333,4 +341,60 @@ fn ccs_encoder_gradient_gate_preserves_forward_values() {
 #[test]
 fn ccs_encoder_gradient_gate_scales_encoder_but_not_ccs_head_gradients() {
     assert_gradient_scale_primitive(0.5);
+}
+
+#[test]
+fn neutral_mass_charge_ccs_context_uses_precursor_mz_without_changing_head_width() {
+    use redeem_properties::foundation::FoundationCcsContextMode;
+
+    let device = Device::Cpu;
+    let config = FoundationConfig {
+        max_sequence_len: 12,
+        transformer_layers: 1,
+        dropout: 0.0,
+        ccs_context_mode: FoundationCcsContextMode::NeutralMassCharge,
+        ..FoundationConfig::default()
+    };
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let batch = featurizer
+        .featurize(
+            &[
+                PeptidoformInput::unmodified("PEPTIDEK"),
+                PeptidoformInput::unmodified("PEPTIDEK"),
+            ],
+            &device,
+        )
+        .unwrap();
+    let context = PrecursorContextBatch {
+        charge: Tensor::from_vec(vec![2.0f32, 2.0], 2, &device).unwrap(),
+        charge_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
+        precursor_mz: Tensor::from_vec(vec![500.0f32, 1000.0], 2, &device).unwrap(),
+        precursor_mz_present: Tensor::from_vec(vec![1.0f32, 1.0], 2, &device).unwrap(),
+        nce: Tensor::zeros(2, DType::F32, &device).unwrap(),
+        nce_present: Tensor::zeros(2, DType::F32, &device).unwrap(),
+        instrument_ids: Tensor::zeros(2, DType::U32, &device).unwrap(),
+        instrument_present: Tensor::zeros(2, DType::F32, &device).unwrap(),
+    };
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultiTaskModel::new(config.clone(), vb).unwrap();
+
+    // Isolate the first scalar CCS-context channel. The head width stays
+    // `model_dim + 2`, so historical model-only initialization snapshots remain
+    // shape-compatible across the two context modes.
+    let ccs_weight = {
+        let data = varmap.data().lock().unwrap();
+        data.get("heads.ccs.weight").unwrap().clone()
+    };
+    let mut weights = vec![0.0f32; config.model_dim + 2];
+    weights[config.model_dim] = 1.0;
+    ccs_weight
+        .set(&Tensor::from_vec(weights, (1, config.model_dim + 2), &device).unwrap())
+        .unwrap();
+
+    let output = model.forward_t(&batch, &context, false).unwrap();
+    let values = output.ccs.squeeze(1).unwrap().to_vec1::<f32>().unwrap();
+    assert!((values[0] - 1.0 / 3.0).abs() < 1e-5);
+    assert!((values[1] - 2.0 / 3.0).abs() < 1e-5);
 }
