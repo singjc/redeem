@@ -118,6 +118,153 @@ pub struct FoundationTrainingRunSummary {
     pub fit: FoundationFitSummary,
 }
 
+/// Result of evaluating a frozen foundation checkpoint on one benchmark partition.
+#[derive(Debug, Clone)]
+pub struct FoundationCheckpointEvaluationSummary {
+    /// Combined source/corpus fingerprint.
+    pub corpus_fingerprint: u64,
+    /// Number of combined grouped precursor records.
+    pub corpus_records: usize,
+    /// Benchmark partition evaluated.
+    pub partition: FoundationPartition,
+    /// Number of records in the complete requested partition.
+    pub partition_records: usize,
+    /// Deterministic sampled records consumed by this evaluation.
+    pub sampling: FoundationSamplePlan,
+    /// Checkpoint metadata used to reconstruct the model and target normalization.
+    pub checkpoint_metadata: FoundationCheckpointMetadata,
+    /// Clean RT/CCS/MS2 metrics on the sampled partition.
+    pub property_metrics: FoundationEpochMetrics,
+    /// Clean property metrics separately by source represented in the sample.
+    pub property_metrics_by_source: BTreeMap<String, FoundationEpochMetrics>,
+}
+
+/// Evaluate a frozen checkpoint without optimizer updates.
+///
+/// The checkpoint is the authority for model architecture, target normalization,
+/// gradient-gate/trainer settings, and model weights. The supplied training-run
+/// configuration is used only to reconstruct the exact corpus and benchmark.
+/// Corpus and benchmark fingerprints are checked against checkpoint provenance
+/// before any metrics are computed.
+pub fn evaluate_foundation_checkpoint<P: AsRef<Path>>(
+    training_config: &FoundationTrainingRunConfig,
+    checkpoint_dir: P,
+    partition: FoundationPartition,
+    evaluation_steps: Option<usize>,
+    stratify_with_validation_source_weights: bool,
+    device: Device,
+) -> Result<FoundationCheckpointEvaluationSummary> {
+    training_config.validate()?;
+    if partition == FoundationPartition::Train {
+        anyhow::bail!(
+            "foundation frozen-checkpoint evaluation is intended for validation or test partitions, not train"
+        );
+    }
+    if evaluation_steps == Some(0) {
+        anyhow::bail!("foundation evaluation_steps must be at least 1 when set");
+    }
+
+    let corpus = load_foundation_corpus(&training_config.corpus)?;
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&training_config.benchmark_manifest)?;
+    benchmark
+        .validate_against_records(&corpus.records)
+        .context("foundation benchmark does not match the assembled corpus")?;
+
+    let partition_indices = benchmark.partition_indices(partition);
+    if partition_indices.is_empty() {
+        anyhow::bail!("foundation requested evaluation partition is empty");
+    }
+
+    let (trainer, checkpoint_metadata) =
+        FoundationTrainer::from_checkpoint(checkpoint_dir.as_ref(), device)?;
+    validate_evaluation_checkpoint_provenance(
+        &checkpoint_metadata,
+        corpus.corpus_fingerprint,
+        benchmark.dataset_fingerprint,
+        benchmark.manifest_fingerprint(),
+    )?;
+
+    if training_config.corpus.instrument_vocab_size
+        != checkpoint_metadata.model_config.instrument_vocab_size
+    {
+        anyhow::bail!(
+            "foundation corpus instrument_vocab_size {} does not match checkpoint model instrument_vocab_size {}",
+            training_config.corpus.instrument_vocab_size,
+            checkpoint_metadata.model_config.instrument_vocab_size
+        );
+    }
+
+    let mut sampling_config = checkpoint_metadata.trainer_config.sampling.clone();
+    sampling_config.validation_steps = evaluation_steps;
+    sampling_config.report_validation_by_source = true;
+    if !stratify_with_validation_source_weights {
+        sampling_config.validation_source_weights.clear();
+    }
+
+    let sampling = sample_foundation_validation_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &partition_indices,
+        checkpoint_metadata.trainer_config.batch_size,
+        checkpoint_metadata.trainer_config.seed,
+        &sampling_config,
+    )?;
+    let property_metrics =
+        trainer.evaluate_property_epoch_indices(&corpus.records, &sampling.indices)?;
+
+    let mut by_source = BTreeMap::<String, Vec<usize>>::new();
+    for &index in &sampling.indices {
+        let source = corpus.provenance.get(index).ok_or_else(|| {
+            anyhow::anyhow!("foundation evaluation provenance index {index} is out of bounds")
+        })?;
+        by_source
+            .entry(source.source_id.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut property_metrics_by_source = BTreeMap::new();
+    for (source, indices) in by_source {
+        let metrics = trainer.evaluate_property_epoch_indices(&corpus.records, &indices)?;
+        property_metrics_by_source.insert(source, metrics);
+    }
+
+    Ok(FoundationCheckpointEvaluationSummary {
+        corpus_fingerprint: corpus.corpus_fingerprint,
+        corpus_records: corpus.records.len(),
+        partition,
+        partition_records: partition_indices.len(),
+        sampling,
+        checkpoint_metadata,
+        property_metrics,
+        property_metrics_by_source,
+    })
+}
+
+fn validate_evaluation_checkpoint_provenance(
+    checkpoint: &FoundationCheckpointMetadata,
+    corpus_fingerprint: u64,
+    benchmark_dataset_fingerprint: u64,
+    benchmark_manifest_fingerprint: u64,
+) -> Result<()> {
+    if checkpoint.provenance.corpus_fingerprint != Some(corpus_fingerprint) {
+        anyhow::bail!(
+            "foundation checkpoint corpus fingerprint does not match the assembled evaluation corpus"
+        );
+    }
+    if checkpoint.provenance.benchmark_dataset_fingerprint != Some(benchmark_dataset_fingerprint) {
+        anyhow::bail!(
+            "foundation checkpoint benchmark dataset fingerprint does not match evaluation benchmark"
+        );
+    }
+    if checkpoint.provenance.benchmark_manifest_fingerprint != Some(benchmark_manifest_fingerprint)
+    {
+        anyhow::bail!(
+            "foundation checkpoint benchmark manifest fingerprint does not match evaluation benchmark"
+        );
+    }
+    Ok(())
+}
+
 /// Execute one multi-source pretraining run from a materialized benchmark.
 pub fn run_foundation_pretraining(
     config: &FoundationTrainingRunConfig,

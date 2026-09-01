@@ -89,7 +89,8 @@ pub use normalization::{
 };
 pub use optimizer::{FoundationAdamW, FoundationAdamWConfig, FoundationOptimizerStep};
 pub use run::{
-    read_foundation_training_run_config, run_foundation_pretraining, FoundationTrainingRunConfig,
+    evaluate_foundation_checkpoint, read_foundation_training_run_config,
+    run_foundation_pretraining, FoundationCheckpointEvaluationSummary, FoundationTrainingRunConfig,
     FoundationTrainingRunSummary,
 };
 pub use sampling::{
