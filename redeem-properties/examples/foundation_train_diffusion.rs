@@ -461,6 +461,21 @@ fn main() -> Result<()> {
             model.forward_t(&packed.diffusion, &packed.spectrum, &packed.precursor, true)?;
         let x0_loss = foundation_diffusion_x0_loss(&output, &packed.diffusion)?;
         let length_loss = foundation_diffusion_length_loss(&output, &packed.diffusion)?;
+        if step == 1 {
+            let x0_gradients = x0_loss.backward()?;
+            let decoder_layer_gradient_norm =
+                gradient_norm_for_prefix(&varmap, &x0_gradients, "decoder.layers")?;
+            let token_embedding_gradient_norm =
+                gradient_norm_for_prefix(&varmap, &x0_gradients, "decoder.token_embedding")?;
+            let x0_spectrum_encoder_gradient_norm =
+                gradient_norm_for_prefix(&varmap, &x0_gradients, "spectrum_encoder")?;
+            let length_gradients = length_loss.backward()?;
+            let length_spectrum_encoder_gradient_norm =
+                gradient_norm_for_prefix(&varmap, &length_gradients, "spectrum_encoder")?;
+            println!(
+                "diffusion_gradient_probe\tdecoder_layer_gradient_norm={decoder_layer_gradient_norm:.8}\ttoken_embedding_gradient_norm={token_embedding_gradient_norm:.8}\tx0_spectrum_encoder_gradient_norm={x0_spectrum_encoder_gradient_norm:.8}\tlength_spectrum_encoder_gradient_norm={length_spectrum_encoder_gradient_norm:.8}"
+            );
+        }
         let weighted_length = length_loss.affine(length_loss_weight, 0.0)?;
         let mut loss = (&x0_loss + &weighted_length)?;
         let use_alignment = alignment_weight > 0.0 && step % alignment_every == 0;

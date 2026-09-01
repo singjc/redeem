@@ -6,9 +6,9 @@ use super::config::{
     FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, FoundationConfig,
 };
 use super::featurize::FoundationBatch;
-use super::layers::{GraphMessageLayer, PeptideTransformerBlock};
+use super::layers::{FoundationLayerNorm, GraphMessageLayer, PeptideTransformerBlock};
 use candle_core::{DType, Module, Result, Tensor};
-use candle_nn::{self as nn, Embedding, LayerNorm, Linear, VarBuilder};
+use candle_nn::{self as nn, Embedding, Linear, VarBuilder};
 
 /// Foundation representation shared by all downstream peptide-property heads.
 #[derive(Debug, Clone)]
@@ -32,9 +32,9 @@ pub struct PeptideFoundationEncoder {
     graph_to_model: Linear,
     residue_embedding: Embedding,
     position_embedding: Embedding,
-    input_norm: LayerNorm,
+    input_norm: FoundationLayerNorm,
     transformer_layers: Vec<PeptideTransformerBlock>,
-    output_norm: LayerNorm,
+    output_norm: FoundationLayerNorm,
 }
 
 impl PeptideFoundationEncoder {
@@ -62,7 +62,7 @@ impl PeptideFoundationEncoder {
             config.model_dim,
             vb.pp("position_embedding"),
         )?;
-        let input_norm = nn::layer_norm(config.model_dim, 1e-5, vb.pp("input_norm"))?;
+        let input_norm = FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("input_norm"))?;
         let transformer_layers = (0..config.transformer_layers)
             .map(|index| {
                 PeptideTransformerBlock::new(
@@ -74,7 +74,7 @@ impl PeptideFoundationEncoder {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let output_norm = nn::layer_norm(config.model_dim, 1e-5, vb.pp("output_norm"))?;
+        let output_norm = FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("output_norm"))?;
 
         Ok(Self {
             config,

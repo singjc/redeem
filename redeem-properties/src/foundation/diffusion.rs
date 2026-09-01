@@ -15,12 +15,14 @@ use super::featurize::{
     exact_graph_modification_for, FoundationModification, FoundationModificationSite,
     PeptidoformInput,
 };
-use super::layers::{MultiHeadCrossAttention, MultiHeadSelfAttention, PeptideTransformerBlock};
+use super::layers::{
+    FoundationLayerNorm, MultiHeadCrossAttention, MultiHeadSelfAttention, PeptideTransformerBlock,
+};
 use super::loss::contrastive_info_nce_loss;
 use super::model::PrecursorContextBatch;
 use super::spectrum::{FoundationSpectrumBatch, FoundationSpectrumConfig};
 use candle_core::{DType, Device, Module, ModuleT, Result, Tensor};
-use candle_nn::{self as nn, loss, Dropout, Embedding, LayerNorm, Linear, VarBuilder};
+use candle_nn::{self as nn, loss, Dropout, Embedding, Linear, VarBuilder};
 use serde::{Deserialize, Serialize};
 
 /// Padding token; never diffused or scored.
@@ -861,7 +863,7 @@ pub struct FoundationSpectrumEncoding {
 pub struct FoundationSpectrumEncoder {
     input_projection: Linear,
     layers: Vec<PeptideTransformerBlock>,
-    output_norm: LayerNorm,
+    output_norm: FoundationLayerNorm,
 }
 
 impl FoundationSpectrumEncoder {
@@ -884,7 +886,7 @@ impl FoundationSpectrumEncoder {
                 vb.pp("input_projection"),
             )?,
             layers,
-            output_norm: nn::layer_norm(config.model_dim, 1e-5, vb.pp("output_norm"))?,
+            output_norm: FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("output_norm"))?,
         })
     }
 
@@ -919,11 +921,11 @@ impl FoundationSpectrumEncoder {
 /// One pre-norm spectrum-conditioned denoising block.
 #[derive(Clone)]
 struct SpectrumConditionedDiffusionBlock {
-    self_norm: LayerNorm,
+    self_norm: FoundationLayerNorm,
     self_attention: MultiHeadSelfAttention,
-    cross_norm: LayerNorm,
+    cross_norm: FoundationLayerNorm,
     cross_attention: MultiHeadCrossAttention,
-    ff_norm: LayerNorm,
+    ff_norm: FoundationLayerNorm,
     ff_in: Linear,
     ff_out: Linear,
     dropout: Dropout,
@@ -932,19 +934,19 @@ struct SpectrumConditionedDiffusionBlock {
 impl SpectrumConditionedDiffusionBlock {
     fn new(config: &FoundationDiffusionConfig, vb: VarBuilder<'_>) -> Result<Self> {
         Ok(Self {
-            self_norm: nn::layer_norm(config.model_dim, 1e-5, vb.pp("self_norm"))?,
+            self_norm: FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("self_norm"))?,
             self_attention: MultiHeadSelfAttention::new(
                 config.model_dim,
                 config.num_attention_heads,
                 vb.pp("self_attention"),
             )?,
-            cross_norm: nn::layer_norm(config.model_dim, 1e-5, vb.pp("cross_norm"))?,
+            cross_norm: FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("cross_norm"))?,
             cross_attention: MultiHeadCrossAttention::new(
                 config.model_dim,
                 config.num_attention_heads,
                 vb.pp("cross_attention"),
             )?,
-            ff_norm: nn::layer_norm(config.model_dim, 1e-5, vb.pp("ff_norm"))?,
+            ff_norm: FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("ff_norm"))?,
             ff_in: nn::linear(config.model_dim, config.feed_forward_dim, vb.pp("ff_in"))?,
             ff_out: nn::linear(config.feed_forward_dim, config.model_dim, vb.pp("ff_out"))?,
             dropout: Dropout::new(config.dropout),
@@ -1003,7 +1005,7 @@ pub struct PeptideSpectrumDiffusionModel {
     precursor_projection: Linear,
     timestep_projection: Linear,
     layers: Vec<SpectrumConditionedDiffusionBlock>,
-    output_norm: LayerNorm,
+    output_norm: FoundationLayerNorm,
     token_head: Linear,
     length_head: Linear,
 }
@@ -1032,7 +1034,8 @@ impl PeptideSpectrumDiffusionModel {
                 vb.pp(format!("decoder.layers.{index}")),
             )?);
         }
-        let output_norm = nn::layer_norm(config.model_dim, 1e-5, vb.pp("decoder.output_norm"))?;
+        let output_norm =
+            FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("decoder.output_norm"))?;
         let token_head = nn::linear(
             config.model_dim,
             FOUNDATION_DIFFUSION_VOCAB_SIZE,

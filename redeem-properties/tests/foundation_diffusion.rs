@@ -191,3 +191,116 @@ fn diffusion_fingerprint_tracks_explicit_product_mz() {
     let second = foundation_diffusion_record_fingerprint(&record);
     assert_ne!(first, second);
 }
+
+#[test]
+fn diffusion_x0_and_alignment_losses_reach_spectrum_and_decoder_backbones() {
+    let device = Device::Cpu;
+    let config = FoundationDiffusionConfig {
+        max_tokens: 16,
+        model_dim: 32,
+        num_attention_heads: 4,
+        feed_forward_dim: 64,
+        spectrum_layers: 1,
+        decoder_layers: 1,
+        spectrum: FoundationSpectrumConfig {
+            max_peaks: 8,
+            ..FoundationSpectrumConfig::default()
+        },
+        ..FoundationDiffusionConfig::default()
+    };
+    let spectra = vec![
+        FoundationSpectrum::from_pairs([(101.1, 3.0), (247.2, 10.0), (504.3, 6.0)]),
+        FoundationSpectrum::from_pairs([(120.2, 5.0), (333.3, 9.0), (701.4, 2.0)]),
+    ];
+    let spectrum_batch = FoundationSpectrumCollator::new(config.spectrum.clone())
+        .unwrap()
+        .collate(&spectra, &device)
+        .unwrap();
+    let peptides = vec![
+        PeptidoformInput::unmodified("PEPTIDEK"),
+        PeptidoformInput::unmodified("MELTQK"),
+    ];
+    let diffusion_batch = FoundationDiffusionCollator::new(config.clone())
+        .unwrap()
+        .collate_all_masked(&peptides, config.diffusion_steps, &device)
+        .unwrap();
+    let precursor = PrecursorContextBatch {
+        charge: Tensor::new(&[2.0f32, 3.0], &device).unwrap(),
+        charge_present: Tensor::ones(2, DType::F32, &device).unwrap(),
+        precursor_mz: Tensor::new(&[500.0f32, 600.0], &device).unwrap(),
+        precursor_mz_present: Tensor::ones(2, DType::F32, &device).unwrap(),
+        nce: Tensor::zeros(2, DType::F32, &device).unwrap(),
+        nce_present: Tensor::zeros(2, DType::F32, &device).unwrap(),
+        instrument_ids: Tensor::zeros(2, DType::U32, &device).unwrap(),
+        instrument_present: Tensor::zeros(2, DType::F32, &device).unwrap(),
+    };
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideSpectrumDiffusionModel::new(config, vb).unwrap();
+    let output = model
+        .forward_t(&diffusion_batch, &spectrum_batch, &precursor, true)
+        .unwrap();
+
+    let x0_loss = foundation_diffusion_x0_loss(&output, &diffusion_batch).unwrap();
+    let x0_gradients = x0_loss.backward().unwrap();
+    let data = varmap.data().lock().unwrap();
+    let spectrum_input = data
+        .get("spectrum_encoder.input_projection.weight")
+        .expect("spectrum input projection variable");
+    let decoder_attention = data
+        .get("decoder.layers.0.self_attention.query.weight")
+        .expect("decoder self-attention query variable");
+    let spectrum_gradient = x0_gradients
+        .get(spectrum_input)
+        .expect("x0 loss must reach spectrum encoder");
+    let decoder_gradient = x0_gradients
+        .get(decoder_attention)
+        .expect("x0 loss must reach decoder layer");
+    assert!(
+        spectrum_gradient
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        decoder_gradient
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            > 0.0
+    );
+    drop(data);
+
+    let alignment = foundation_spectrum_peptide_alignment_loss(
+        &output.spectrum_embedding,
+        &output.spectrum_embedding.detach(),
+        0.1,
+    )
+    .unwrap();
+    let alignment_gradients = alignment.backward().unwrap();
+    let data = varmap.data().lock().unwrap();
+    let spectrum_input = data
+        .get("spectrum_encoder.input_projection.weight")
+        .expect("spectrum input projection variable");
+    let spectrum_alignment_gradient = alignment_gradients
+        .get(spectrum_input)
+        .expect("alignment loss must reach spectrum encoder");
+    assert!(
+        spectrum_alignment_gradient
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            > 0.0
+    );
+}

@@ -1,7 +1,43 @@
 //! Candle layers used by the hierarchical graph/Transformer encoder.
 
 use candle_core::{Module, ModuleT, Result, Tensor, D};
-use candle_nn::{self as nn, ops, Dropout, LayerNorm, Linear, VarBuilder};
+use candle_nn::{self as nn, ops, Dropout, Linear, VarBuilder};
+
+/// Differentiable LayerNorm for foundation training on Candle 0.8.x.
+///
+/// Candle 0.8.x fused `LayerNorm` uses a forward-only custom op that can sever
+/// autograd upstream. This implementation uses ordinary tensor operations while
+/// retaining the exact historical `weight`/`bias` parameter names and shapes.
+#[derive(Clone)]
+pub struct FoundationLayerNorm {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+impl FoundationLayerNorm {
+    /// Construct a checkpoint-compatible differentiable LayerNorm.
+    pub fn new(size: usize, eps: f64, vb: VarBuilder<'_>) -> Result<Self> {
+        Ok(Self {
+            weight: vb.get_with_hints(size, "weight", nn::Init::Const(1.0))?,
+            bias: vb.get_with_hints(size, "bias", nn::Init::Const(0.0))?,
+            eps,
+        })
+    }
+}
+
+impl Module for FoundationLayerNorm {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let mean = xs.mean_keepdim(D::Minus1)?;
+        let centered = xs.broadcast_sub(&mean)?;
+        let variance = centered.sqr()?.mean_keepdim(D::Minus1)?;
+        let denominator = (variance + self.eps)?.sqrt()?;
+        let normalized = centered.broadcast_div(&denominator)?;
+        normalized
+            .broadcast_mul(&self.weight)?
+            .broadcast_add(&self.bias)
+    }
+}
 
 /// One residual graph-message-passing layer operating on dense residue graphs.
 #[derive(Clone)]
@@ -9,7 +45,7 @@ pub struct GraphMessageLayer {
     self_projection: Linear,
     neighbor_projection: Linear,
     output_projection: Linear,
-    norm: LayerNorm,
+    norm: FoundationLayerNorm,
 }
 
 impl GraphMessageLayer {
@@ -19,7 +55,7 @@ impl GraphMessageLayer {
             self_projection: nn::linear(hidden_dim, hidden_dim, vb.pp("self"))?,
             neighbor_projection: nn::linear(hidden_dim, hidden_dim, vb.pp("neighbor"))?,
             output_projection: nn::linear(hidden_dim, hidden_dim, vb.pp("output"))?,
-            norm: nn::layer_norm(hidden_dim, 1e-5, vb.pp("norm"))?,
+            norm: FoundationLayerNorm::new(hidden_dim, 1e-5, vb.pp("norm"))?,
         })
     }
 
@@ -201,9 +237,9 @@ impl MultiHeadCrossAttention {
 /// Pre-norm Transformer encoder block for peptide-level sequence modelling.
 #[derive(Clone)]
 pub struct PeptideTransformerBlock {
-    attention_norm: LayerNorm,
+    attention_norm: FoundationLayerNorm,
     attention: MultiHeadSelfAttention,
-    feed_forward_norm: LayerNorm,
+    feed_forward_norm: FoundationLayerNorm,
     feed_forward_in: Linear,
     feed_forward_out: Linear,
     dropout: Dropout,
@@ -219,9 +255,9 @@ impl PeptideTransformerBlock {
         vb: VarBuilder<'_>,
     ) -> Result<Self> {
         Ok(Self {
-            attention_norm: nn::layer_norm(model_dim, 1e-5, vb.pp("attention_norm"))?,
+            attention_norm: FoundationLayerNorm::new(model_dim, 1e-5, vb.pp("attention_norm"))?,
             attention: MultiHeadSelfAttention::new(model_dim, num_heads, vb.pp("attention"))?,
-            feed_forward_norm: nn::layer_norm(model_dim, 1e-5, vb.pp("ff_norm"))?,
+            feed_forward_norm: FoundationLayerNorm::new(model_dim, 1e-5, vb.pp("ff_norm"))?,
             feed_forward_in: nn::linear(model_dim, ff_dim, vb.pp("ff_in"))?,
             feed_forward_out: nn::linear(ff_dim, model_dim, vb.pp("ff_out"))?,
             dropout: Dropout::new(dropout),
@@ -244,5 +280,38 @@ impl PeptideTransformerBlock {
             .unsqueeze(2)?
             .broadcast_as((batch, sequence, model_dim))?;
         hidden.broadcast_mul(&mask)
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use candle_nn::{linear, VarBuilder, VarMap};
+
+    #[test]
+    fn differentiable_layer_norm_propagates_to_upstream_linear() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let upstream = linear(4, 4, vb.pp("upstream"))?;
+        let norm = FoundationLayerNorm::new(4, 1e-5, vb.pp("norm"))?;
+        let input = Tensor::new(&[[1.0f32, 2.0, 4.0, 8.0], [2.0, 3.0, 5.0, 7.0]], &device)?;
+        let hidden = upstream.forward(&input)?;
+        let normalized = norm.forward(&hidden)?;
+        let weights = Tensor::new(
+            &[[1.0f32, -0.5, 0.25, 2.0], [-1.0, 0.75, 1.5, -0.25]],
+            &device,
+        )?;
+        let loss = normalized.broadcast_mul(&weights)?.sum_all()?;
+        let gradients = loss.backward()?;
+        let data = varmap.data().lock().unwrap();
+        let upstream_weight = data.get("upstream.weight").unwrap();
+        let norm_weight = data.get("norm.weight").unwrap();
+        let upstream_grad = gradients.get(upstream_weight).expect("upstream gradient");
+        let norm_grad = gradients.get(norm_weight).expect("norm gradient");
+        assert!(upstream_grad.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
+        assert!(norm_grad.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
+        Ok(())
     }
 }
