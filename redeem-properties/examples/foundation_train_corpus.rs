@@ -59,6 +59,10 @@ fn main() -> Result<()> {
         summary.train_sampling_preview.coverage.observed_rt_records
     );
     println!(
+        "train_sampling_ccs_records\t{}",
+        summary.train_sampling_preview.coverage.ccs_records
+    );
+    println!(
         "train_sampling_ms2_records\t{}",
         summary.train_sampling_preview.coverage.ms2_records
     );
@@ -80,6 +84,10 @@ fn main() -> Result<()> {
     println!(
         "validation_sampling_observed_rt_records\t{}",
         summary.validation_sampling.coverage.observed_rt_records
+    );
+    println!(
+        "validation_sampling_ccs_records\t{}",
+        summary.validation_sampling.coverage.ccs_records
     );
     println!(
         "validation_sampling_ms2_records\t{}",

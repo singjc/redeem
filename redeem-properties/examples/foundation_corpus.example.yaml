@@ -1,6 +1,10 @@
 instrument_vocab_size: 16
 loader:
   strict: true
+  # Opt in for Bruker/timsTOF inverse mobility (1/K0) sources. Existing
+  # corpora remain disabled unless this is explicitly set so fingerprints are
+  # not silently changed. Use `disabled` to keep raw ion mobility only.
+  ccs_derivation: auto-bruker
   fragment_normalization: Max
 sources:
   # `id:` is canonical; `name:` is accepted as an alias.

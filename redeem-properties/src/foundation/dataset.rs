@@ -18,6 +18,7 @@ use super::featurize::{
     exact_graph_modification_for, FoundationModification, FoundationModificationSite,
     PeptidoformInput,
 };
+use crate::utils::peptdeep_utils::ion_mobility_to_ccs_bruker;
 use anyhow::{anyhow, Context, Result};
 use csv::{ReaderBuilder, StringRecord};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,22 @@ pub enum FragmentIntensityNormalization {
     Sum,
 }
 
+/// How missing CCS labels should be derived from ion mobility.
+///
+/// ReDeeM's existing PeptDeep-compatible conversion assumes Bruker/timsTOF
+/// inverse reduced mobility (`1/K0`). Explicit CCS columns always take
+/// precedence over derived values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FoundationCcsDerivationMode {
+    /// Preserve legacy behavior and never synthesize CCS labels.
+    #[default]
+    Disabled,
+    /// Fill missing CCS from ion mobility, precursor m/z, and positive charge
+    /// using ReDeeM's Bruker/timsTOF `1/K0 -> CCS` conversion.
+    AutoBruker,
+}
+
 /// Options controlling schema inference and default acquisition context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,6 +73,12 @@ pub struct FoundationTableLoaderConfig {
     /// Optional LC gradient duration in seconds supplied at source level.
     /// This is retained for future observed-RT conditioning and may remain unknown.
     pub default_gradient_seconds: Option<f32>,
+    /// Optional derivation of missing CCS labels from ion mobility.
+    ///
+    /// The default is `disabled` for backward compatibility with existing
+    /// corpus fingerprints/checkpoints. New Bruker/timsTOF corpora should set
+    /// this to `auto-bruker`; it can be disabled globally or per source.
+    pub ccs_derivation: FoundationCcsDerivationMode,
     /// Per-precursor fragment-intensity normalization.
     pub fragment_normalization: FragmentIntensityNormalization,
     /// When true, malformed peptide/modification annotations return an error;
@@ -71,6 +94,7 @@ impl Default for FoundationTableLoaderConfig {
             default_instrument: None,
             default_run_id: None,
             default_gradient_seconds: None,
+            ccs_derivation: FoundationCcsDerivationMode::Disabled,
             fragment_normalization: FragmentIntensityNormalization::Max,
             strict: true,
         }
@@ -253,8 +277,19 @@ pub struct FoundationTableLoadStats {
     pub normalized_rt_records: usize,
     /// Records carrying observed chromatographic RT.
     pub observed_rt_records: usize,
-    /// Records carrying CCS.
+    /// Records carrying CCS from either an explicit source column or derivation.
     pub ccs_records: usize,
+    /// Records carrying CCS directly from an explicit source column.
+    pub explicit_ccs_records: usize,
+    /// Records whose missing CCS was derived from ion mobility, precursor m/z,
+    /// and charge using the Bruker/timsTOF conversion.
+    pub derived_ccs_records: usize,
+    /// Minimum finite positive CCS among grouped records.
+    pub min_ccs: Option<f64>,
+    /// Maximum finite positive CCS among grouped records.
+    pub max_ccs: Option<f64>,
+    /// Mean finite positive CCS among grouped records.
+    pub mean_ccs: Option<f64>,
     /// Records carrying at least one supported fragment target.
     pub ms2_records: usize,
     /// Distinct non-empty run identifiers.
@@ -373,6 +408,8 @@ impl FoundationDatasetLoader {
         }
         let mut records = Vec::<FoundationTrainingRecord>::new();
         let mut group_to_index = HashMap::<String, usize>::new();
+        let mut explicit_ccs_groups = BTreeSet::<String>::new();
+        let mut derived_ccs_groups = BTreeSet::<String>::new();
         let mut stats = FoundationTableLoadStats::default();
 
         for row_result in csv.records() {
@@ -415,6 +452,7 @@ impl FoundationDatasetLoader {
                 peptidoform,
                 retention_time,
                 ccs,
+                ccs_derived,
                 fragment,
                 context,
                 run_id,
@@ -423,7 +461,7 @@ impl FoundationDatasetLoader {
                 index
             } else {
                 let index = records.len();
-                group_to_index.insert(group_key, index);
+                group_to_index.insert(group_key.clone(), index);
                 records.push(FoundationTrainingRecord {
                     peptidoform,
                     retention_time,
@@ -434,6 +472,22 @@ impl FoundationDatasetLoader {
                 });
                 index
             };
+            if ccs.is_some() {
+                if ccs_derived {
+                    if !explicit_ccs_groups.contains(&group_key) {
+                        derived_ccs_groups.insert(group_key.clone());
+                        if records[index].ccs.is_none() {
+                            records[index].ccs = ccs;
+                        }
+                    }
+                } else {
+                    explicit_ccs_groups.insert(group_key.clone());
+                    derived_ccs_groups.remove(&group_key);
+                    // Explicit source CCS always wins over a value derived from
+                    // another row belonging to the same precursor group.
+                    records[index].ccs = ccs;
+                }
+            }
             if let Some(fragment) = fragment {
                 records[index].fragments.push(fragment);
             }
@@ -444,6 +498,8 @@ impl FoundationDatasetLoader {
             normalize_fragment_intensities(record, config.fragment_normalization);
         }
         finalize_load_stats(&mut stats, &records);
+        stats.explicit_ccs_records = explicit_ccs_groups.len();
+        stats.derived_ccs_records = derived_ccs_groups.len();
 
         Ok(FoundationTableLoadReport {
             records,
@@ -498,9 +554,16 @@ impl FoundationDatasetLoader {
             .or_else(|| config.default_run_id.clone());
         let normalized_rt = parse_f32(field(row, schema.normalized_rt));
         let observed_rt = parse_f32(field(row, schema.observed_rt));
-        let ccs = parse_f32(field(row, schema.ccs));
+        let explicit_ccs = parse_f32(field(row, schema.ccs));
         let precursor_mz = parse_f32(field(row, schema.precursor_mz));
         let ion_mobility = parse_f32(field(row, schema.ion_mobility));
+        let (ccs, ccs_derived) = resolve_ccs(
+            explicit_ccs,
+            ion_mobility,
+            charge,
+            precursor_mz,
+            config.ccs_derivation,
+        );
         let gradient_seconds =
             parse_f32(field(row, schema.gradient_seconds)).or(config.default_gradient_seconds);
 
@@ -522,6 +585,7 @@ impl FoundationDatasetLoader {
                 observed_seconds: observed_rt,
             },
             ccs,
+            ccs_derived,
             fragment,
             context: TrainingContext {
                 charge,
@@ -537,12 +601,48 @@ impl FoundationDatasetLoader {
     }
 }
 
+fn resolve_ccs(
+    explicit_ccs: Option<f32>,
+    ion_mobility: Option<f32>,
+    charge: Option<i32>,
+    precursor_mz: Option<f32>,
+    mode: FoundationCcsDerivationMode,
+) -> (Option<f32>, bool) {
+    // Preserve explicit source labels exactly as historical loader behavior did.
+    // Derivation is only a fill-missing operation.
+    if let Some(ccs) = explicit_ccs {
+        return (Some(ccs), false);
+    }
+    if mode == FoundationCcsDerivationMode::Disabled {
+        return (None, false);
+    }
+    let (Some(mobility), Some(charge), Some(precursor_mz)) = (ion_mobility, charge, precursor_mz)
+    else {
+        return (None, false);
+    };
+    if !mobility.is_finite()
+        || mobility <= 0.0
+        || charge <= 0
+        || !precursor_mz.is_finite()
+        || precursor_mz <= 0.0
+    {
+        return (None, false);
+    }
+    let ccs = ion_mobility_to_ccs_bruker(f64::from(mobility), charge, f64::from(precursor_mz));
+    if ccs.is_finite() && ccs > 0.0 {
+        (Some(ccs), true)
+    } else {
+        (None, false)
+    }
+}
+
 #[derive(Debug)]
 struct ParsedRow {
     group_key: String,
     peptidoform: PeptidoformInput,
     retention_time: RetentionTimeLabels,
     ccs: Option<f32>,
+    ccs_derived: bool,
     fragment: Option<FragmentTarget>,
     context: TrainingContext,
     run_id: Option<String>,
@@ -902,6 +1002,8 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
     let mut runs = BTreeSet::<String>::new();
     let mut instruments = BTreeSet::<String>::new();
     let mut total_sequence_len = 0usize;
+    let mut ccs_sum = 0.0f64;
+    let mut finite_positive_ccs_count = 0usize;
 
     for record in records {
         let sequence_len = record.peptidoform.sequence.len();
@@ -1011,8 +1113,15 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
         if record.retention_time.observed_seconds.is_some() {
             stats.observed_rt_records += 1;
         }
-        if record.ccs.is_some() {
+        if let Some(ccs) = record.ccs {
             stats.ccs_records += 1;
+            if ccs.is_finite() && ccs > 0.0 {
+                let ccs = f64::from(ccs);
+                finite_positive_ccs_count += 1;
+                ccs_sum += ccs;
+                stats.min_ccs = Some(stats.min_ccs.map_or(ccs, |current| current.min(ccs)));
+                stats.max_ccs = Some(stats.max_ccs.map_or(ccs, |current| current.max(ccs)));
+            }
         }
         if !record.fragments.is_empty() {
             stats.ms2_records += 1;
@@ -1042,6 +1151,8 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
     stats.unique_instruments = instruments.len();
     stats.mean_sequence_len =
         (!records.is_empty()).then_some(total_sequence_len as f64 / records.len() as f64);
+    stats.mean_ccs =
+        (finite_positive_ccs_count > 0).then_some(ccs_sum / finite_positive_ccs_count as f64);
 }
 
 pub(crate) fn canonical_peptidoform_label(peptidoform: &PeptidoformInput) -> String {

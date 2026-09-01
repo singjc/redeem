@@ -57,10 +57,10 @@ pub use data::{
     TrainingContext,
 };
 pub use dataset::{
-    parse_modified_peptide, FoundationDataset, FoundationDatasetLoader, FoundationSchemaCollision,
-    FoundationSchemaField, FoundationTableLoadReport, FoundationTableLoadStats,
-    FoundationTableLoaderConfig, FoundationTableSchemaReport, FragmentIntensityNormalization,
-    InstrumentVocabulary,
+    parse_modified_peptide, FoundationCcsDerivationMode, FoundationDataset,
+    FoundationDatasetLoader, FoundationSchemaCollision, FoundationSchemaField,
+    FoundationTableLoadReport, FoundationTableLoadStats, FoundationTableLoaderConfig,
+    FoundationTableSchemaReport, FragmentIntensityNormalization, InstrumentVocabulary,
 };
 pub use experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,

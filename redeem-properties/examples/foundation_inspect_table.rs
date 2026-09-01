@@ -8,7 +8,9 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
-use redeem_properties::foundation::{FoundationDatasetLoader, FoundationTableLoaderConfig};
+use redeem_properties::foundation::{
+    FoundationCcsDerivationMode, FoundationDatasetLoader, FoundationTableLoaderConfig,
+};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -16,7 +18,7 @@ use std::path::PathBuf;
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let Some(input) = args.next() else {
-        bail!("usage: foundation_inspect_table <PATH|-> [--delimiter tab|comma] [--strict]");
+        bail!("usage: foundation_inspect_table <PATH|-> [--delimiter tab|comma] [--strict] [--ccs-derivation disabled|auto-bruker]");
     };
 
     let mut config = FoundationTableLoaderConfig {
@@ -35,6 +37,18 @@ fn main() -> Result<()> {
                     "comma" | "csv" => b',',
                     other => bail!("unsupported delimiter '{other}'; use tab or comma"),
                 });
+            }
+            "--ccs-derivation" => {
+                let value = args
+                    .next()
+                    .context("--ccs-derivation requires disabled or auto-bruker")?;
+                config.ccs_derivation = match value.as_str() {
+                    "disabled" | "off" => FoundationCcsDerivationMode::Disabled,
+                    "auto" | "auto-bruker" | "bruker" => FoundationCcsDerivationMode::AutoBruker,
+                    other => {
+                        bail!("unsupported CCS derivation '{other}'; use disabled or auto-bruker")
+                    }
+                };
             }
             other => bail!("unknown argument '{other}'"),
         }

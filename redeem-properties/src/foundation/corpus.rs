@@ -7,8 +7,8 @@
 //! sequence cannot leak across sources.
 
 use super::dataset::{
-    FoundationDatasetLoader, FoundationTableLoadReport, FoundationTableLoadStats,
-    FoundationTableLoaderConfig,
+    FoundationCcsDerivationMode, FoundationDatasetLoader, FoundationTableLoadReport,
+    FoundationTableLoadStats, FoundationTableLoaderConfig,
 };
 use super::experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,
@@ -75,6 +75,11 @@ pub struct FoundationCorpusSourceSpec {
     pub metadata: FoundationSourceMetadata,
     /// Optional per-source strictness override.
     pub strict: Option<bool>,
+    /// Optional per-source override for CCS derivation from ion mobility.
+    ///
+    /// This is useful for mixed corpora where only some sources contain
+    /// Bruker/timsTOF inverse reduced mobility (`1/K0`).
+    pub ccs_derivation: Option<FoundationCcsDerivationMode>,
 }
 
 impl Default for FoundationCorpusSourceSpec {
@@ -85,6 +90,7 @@ impl Default for FoundationCorpusSourceSpec {
             delimiter: FoundationCorpusDelimiter::Auto,
             metadata: FoundationSourceMetadata::default(),
             strict: None,
+            ccs_derivation: None,
         }
     }
 }
@@ -229,6 +235,9 @@ pub fn load_foundation_corpus(config: &FoundationCorpusConfig) -> Result<Foundat
         loader_config.delimiter = Some(source.delimiter.byte(&source.path));
         if let Some(strict) = source.strict {
             loader_config.strict = strict;
+        }
+        if let Some(ccs_derivation) = source.ccs_derivation {
+            loader_config.ccs_derivation = ccs_derivation;
         }
         if let Some(nce) = source.metadata.nce {
             loader_config.default_nce = Some(nce);

@@ -53,6 +53,9 @@ corpus:
   instrument_vocab_size: 16
   loader:
     strict: true
+    # Derive missing CCS from ion mobility + precursor m/z + charge using the
+    # existing ReDeeM/PeptDeep Bruker conversion. Explicit CCS columns win.
+    ccs_derivation: auto-bruker
     fragment_normalization: Max
   sources:
     - id: openswath

@@ -1,8 +1,9 @@
 use redeem_properties::foundation::{
-    apply_source_metadata, split_foundation_records, FoundationDatasetLoader,
-    FoundationMetadataMergePolicy, FoundationSourceMetadata, FoundationSplitConfig,
-    FoundationSplitMode, FoundationTableLoaderConfig,
+    apply_source_metadata, split_foundation_records, FoundationCcsDerivationMode,
+    FoundationDatasetLoader, FoundationMetadataMergePolicy, FoundationSourceMetadata,
+    FoundationSplitConfig, FoundationSplitMode, FoundationTableLoaderConfig,
 };
+use redeem_properties::utils::peptdeep_utils::ion_mobility_to_ccs_bruker;
 
 fn inspection_table() -> &'static [u8] {
     concat!(
@@ -168,6 +169,73 @@ fn ip2_profile_prefers_modified_peptide_sequence() {
         Some(&1)
     );
     assert_eq!(report.records[0].retention_time.normalized, Some(42.5));
+}
+
+#[test]
+fn auto_bruker_derives_ccs_from_ion_mobility() {
+    let table = concat!(
+        "sequence\tprecursor_mz\tprecursor_charge\tfragment_type\tfragment_series_number\tproduct_charge\tretention_time\tion_mobility\tintensity\n",
+        "PEPTIDEK\t500.2\t2\tb\t3\t1\t1234.5\t1.05\t1000\n",
+    );
+    let config = FoundationTableLoaderConfig {
+        ccs_derivation: FoundationCcsDerivationMode::AutoBruker,
+        ..FoundationTableLoaderConfig::default()
+    };
+    let mut loader = FoundationDatasetLoader::new(16);
+    let report = loader
+        .load_reader_with_report(table.as_bytes(), b'\t', &config)
+        .unwrap();
+
+    let expected = ion_mobility_to_ccs_bruker(1.05, 2, 500.2);
+    assert_eq!(report.records.len(), 1);
+    assert!((report.records[0].ccs.unwrap() - expected).abs() < 1e-5);
+    assert_eq!(report.stats.ccs_records, 1);
+    assert_eq!(report.stats.explicit_ccs_records, 0);
+    assert_eq!(report.stats.derived_ccs_records, 1);
+    assert!((report.stats.min_ccs.unwrap() - f64::from(expected)).abs() < 1e-5);
+    assert!((report.stats.mean_ccs.unwrap() - f64::from(expected)).abs() < 1e-5);
+    assert!((report.stats.max_ccs.unwrap() - f64::from(expected)).abs() < 1e-5);
+}
+
+#[test]
+fn explicit_ccs_wins_over_ion_mobility_derivation() {
+    let table = concat!(
+        "ModifiedPeptide\tPrecursorCharge\tPrecursorMz\tIonMobility\tCCS\n",
+        "PEPTIDEK\t2\t500.2\t1.05\t499.5\n",
+    );
+    let config = FoundationTableLoaderConfig {
+        ccs_derivation: FoundationCcsDerivationMode::AutoBruker,
+        ..FoundationTableLoaderConfig::default()
+    };
+    let mut loader = FoundationDatasetLoader::new(16);
+    let report = loader
+        .load_reader_with_report(table.as_bytes(), b'\t', &config)
+        .unwrap();
+
+    assert_eq!(report.records[0].ccs, Some(499.5));
+    assert_eq!(report.stats.explicit_ccs_records, 1);
+    assert_eq!(report.stats.derived_ccs_records, 0);
+}
+
+#[test]
+fn ccs_derivation_can_be_disabled() {
+    let table = concat!(
+        "sequence\tprecursor_mz\tprecursor_charge\tfragment_type\tfragment_series_number\tproduct_charge\tretention_time\tion_mobility\tintensity\n",
+        "PEPTIDEK\t500.2\t2\tb\t3\t1\t1234.5\t1.05\t1000\n",
+    );
+    let mut loader = FoundationDatasetLoader::new(16);
+    let report = loader
+        .load_reader_with_report(
+            table.as_bytes(),
+            b'\t',
+            &FoundationTableLoaderConfig::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.records[0].ccs, None);
+    assert_eq!(report.stats.ccs_records, 0);
+    assert_eq!(report.stats.explicit_ccs_records, 0);
+    assert_eq!(report.stats.derived_ccs_records, 0);
 }
 
 #[test]

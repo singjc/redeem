@@ -92,8 +92,18 @@ fn main() -> Result<()> {
     println!("sources\t{}", corpus.sources.len());
     for source in &corpus.sources {
         println!(
-            "source\t{}\tprofile={}\trecords={}\tfingerprint=fnv1a64:{:016x}",
-            source.id, source.profile, source.record_count, source.dataset_fingerprint
+            "source\t{}\tprofile={}\trecords={}\tfingerprint=fnv1a64:{:016x}\tccs={}\texplicit_ccs={}\tderived_ccs={}\tccs_min={:?}\tccs_mean={:?}\tccs_max={:?}\tion_mobility={}",
+            source.id,
+            source.profile,
+            source.record_count,
+            source.dataset_fingerprint,
+            source.stats.ccs_records,
+            source.stats.explicit_ccs_records,
+            source.stats.derived_ccs_records,
+            source.stats.min_ccs,
+            source.stats.mean_ccs,
+            source.stats.max_ccs,
+            source.stats.ion_mobility_records,
         );
     }
     println!("instrument_vocab\t{}", corpus.instrument_names.join(","));
