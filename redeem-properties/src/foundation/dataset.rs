@@ -206,6 +206,8 @@ pub struct FoundationTableSchemaReport {
     pub fragment_series: Option<FoundationSchemaField>,
     /// Product/fragment charge column.
     pub fragment_charge: Option<FoundationSchemaField>,
+    /// Observed/library product-ion m/z column.
+    pub fragment_mz: Option<FoundationSchemaField>,
     /// Fragment intensity column.
     pub fragment_intensity: Option<FoundationSchemaField>,
     /// Fragment neutral-loss column.
@@ -228,6 +230,8 @@ pub struct FoundationTableLoadStats {
     pub skipped_error_rows: usize,
     /// Parsed rows that mapped to a supported MS2 output channel.
     pub supported_fragment_rows: usize,
+    /// Supported fragment rows carrying an explicitly observed/library product m/z.
+    pub observed_fragment_mz_rows: usize,
     /// Number of grouped precursor-level records after aggregation.
     pub precursor_records: usize,
     /// Number of unique unmodified peptide sequences.
@@ -292,6 +296,8 @@ pub struct FoundationTableLoadStats {
     pub mean_ccs: Option<f64>,
     /// Records carrying at least one supported fragment target.
     pub ms2_records: usize,
+    /// Records carrying at least one supported fragment with observed/library m/z.
+    pub observed_spectrum_records: usize,
     /// Distinct non-empty run identifiers.
     pub unique_runs: usize,
     /// Distinct non-empty instrument labels.
@@ -443,8 +449,11 @@ impl FoundationDatasetLoader {
                 Err(error) => return Err(error),
             };
             stats.parsed_rows += 1;
-            if parsed.fragment.is_some() {
+            if let Some(fragment) = parsed.fragment.as_ref() {
                 stats.supported_fragment_rows += 1;
+                if fragment.product_mz.is_some() {
+                    stats.observed_fragment_mz_rows += 1;
+                }
             }
 
             let ParsedRow {
@@ -665,6 +674,7 @@ struct TableSchema {
     fragment_type: Option<usize>,
     fragment_series: Option<usize>,
     fragment_charge: Option<usize>,
+    fragment_mz: Option<usize>,
     fragment_intensity: Option<usize>,
     fragment_loss: Option<usize>,
 }
@@ -697,6 +707,7 @@ impl TableSchema {
             fragment_type: exact_header(headers, "fragment_type"),
             fragment_series: exact_header(headers, "fragment_series_number"),
             fragment_charge: exact_header(headers, "product_charge"),
+            fragment_mz: None,
             fragment_intensity: exact_header(headers, "intensity"),
             fragment_loss: None,
         })
@@ -722,6 +733,7 @@ impl TableSchema {
             fragment_type: exact_header(headers, "FragmentType"),
             fragment_series: exact_header(headers, "FragmentSeriesNumber"),
             fragment_charge: exact_header(headers, "FragmentCharge"),
+            fragment_mz: exact_header(headers, "ProductMz"),
             fragment_intensity: exact_header(headers, "LibraryIntensity"),
             fragment_loss: exact_header(headers, "FragmentLossType"),
         })
@@ -827,6 +839,10 @@ impl TableSchema {
                     "fragment_charge",
                 ],
             ),
+            fragment_mz: find_header(
+                headers,
+                &["productmz", "product_mz", "fragmentmz", "fragment_mz"],
+            ),
             fragment_intensity: find_header(
                 headers,
                 &[
@@ -870,6 +886,7 @@ impl TableSchema {
             fragment_type: schema_field(headers, self.fragment_type),
             fragment_series: schema_field(headers, self.fragment_series),
             fragment_charge: schema_field(headers, self.fragment_charge),
+            fragment_mz: schema_field(headers, self.fragment_mz),
             fragment_intensity: schema_field(headers, self.fragment_intensity),
             fragment_loss: schema_field(headers, self.fragment_loss),
             collisions: schema_collisions(self, headers),
@@ -971,6 +988,7 @@ fn schema_collisions(
         ("fragment_type", schema.fragment_type),
         ("fragment_series", schema.fragment_series),
         ("fragment_charge", schema.fragment_charge),
+        ("fragment_mz", schema.fragment_mz),
         ("fragment_intensity", schema.fragment_intensity),
         ("fragment_loss", schema.fragment_loss),
     ];
@@ -1125,6 +1143,13 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
         }
         if !record.fragments.is_empty() {
             stats.ms2_records += 1;
+            if record
+                .fragments
+                .iter()
+                .any(|fragment| fragment.product_mz.is_some())
+            {
+                stats.observed_spectrum_records += 1;
+            }
         }
         if let Some(run_id) = record
             .run_id
@@ -1328,10 +1353,12 @@ fn parse_fragment(
     else {
         return Ok(None);
     };
+    let product_mz = parse_f32(field(row, schema.fragment_mz)).filter(|value| *value > 0.0);
     Ok(Some(FragmentTarget {
         cleavage_index,
         channel,
         intensity,
+        product_mz,
     }))
 }
 
@@ -1360,19 +1387,28 @@ fn fragment_channel(fragment_type: &str, charge: usize, loss: &str) -> Result<Op
 }
 
 fn aggregate_duplicate_fragments(record: &mut FoundationTrainingRecord) {
-    let mut merged = HashMap::<(usize, usize), f32>::new();
+    let mut merged = HashMap::<(usize, usize), (f32, f64, f64)>::new();
     for fragment in record.fragments.drain(..) {
-        *merged
+        let entry = merged
             .entry((fragment.cleavage_index, fragment.channel))
-            .or_insert(0.0) += fragment.intensity;
+            .or_insert((0.0, 0.0, 0.0));
+        entry.0 += fragment.intensity;
+        if let Some(mz) = fragment.product_mz.filter(|mz| mz.is_finite() && *mz > 0.0) {
+            let weight = f64::from(fragment.intensity.max(f32::EPSILON));
+            entry.1 += f64::from(mz) * weight;
+            entry.2 += weight;
+        }
     }
     let mut fragments: Vec<_> = merged
         .into_iter()
-        .map(|((cleavage_index, channel), intensity)| FragmentTarget {
-            cleavage_index,
-            channel,
-            intensity,
-        })
+        .map(
+            |((cleavage_index, channel), (intensity, weighted_mz, mz_weight))| FragmentTarget {
+                cleavage_index,
+                channel,
+                intensity,
+                product_mz: (mz_weight > 0.0).then_some((weighted_mz / mz_weight) as f32),
+            },
+        )
         .collect();
     fragments.sort_by_key(|fragment| (fragment.cleavage_index, fragment.channel));
     record.fragments = fragments;

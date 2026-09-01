@@ -26,6 +26,12 @@ pub struct FragmentTarget {
     pub channel: usize,
     /// Relative or normalized fragment intensity.
     pub intensity: f32,
+    /// Observed/library product-ion m/z when the source explicitly provides it.
+    ///
+    /// This is retained for the inverse spectrum-to-peptide lane. It is never
+    /// reconstructed from the known peptide sequence by the loader, because
+    /// doing so would leak the training target into the inverse input.
+    pub product_mz: Option<f32>,
 }
 
 /// Optional experiment context that may condition property-specific heads.

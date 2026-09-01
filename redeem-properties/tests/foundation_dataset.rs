@@ -151,6 +151,14 @@ fn ip2_profile_prefers_modified_peptide_sequence() {
 
     assert_eq!(report.schema.profile, "ip2_bruker_spectral_library");
     assert_eq!(report.schema.sequence.header, "ModifiedPeptideSequence");
+    assert_eq!(
+        report
+            .schema
+            .fragment_mz
+            .as_ref()
+            .map(|field| field.header.as_str()),
+        Some("ProductMz")
+    );
     assert!(report.schema.nce.is_none());
     assert!(report.schema.collisions.is_empty());
     assert_eq!(report.stats.modified_records, 1);
@@ -169,6 +177,9 @@ fn ip2_profile_prefers_modified_peptide_sequence() {
         Some(&1)
     );
     assert_eq!(report.records[0].retention_time.normalized, Some(42.5));
+    assert_eq!(report.records[0].fragments[0].product_mz, Some(300.1));
+    assert_eq!(report.stats.observed_fragment_mz_rows, 1);
+    assert_eq!(report.stats.observed_spectrum_records, 1);
 }
 
 #[test]

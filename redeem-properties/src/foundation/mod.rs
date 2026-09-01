@@ -20,6 +20,7 @@ pub mod control;
 pub mod corpus;
 pub mod data;
 pub mod dataset;
+pub mod diffusion;
 pub mod experiment;
 pub mod featurize;
 pub mod layers;
@@ -30,6 +31,7 @@ pub mod normalization;
 pub mod optimizer;
 pub mod run;
 pub mod sampling;
+pub mod spectrum;
 pub mod split;
 pub mod trainer;
 pub mod wrapper;
@@ -72,6 +74,18 @@ pub use dataset::{
     FoundationTableLoadReport, FoundationTableLoadStats, FoundationTableLoaderConfig,
     FoundationTableSchemaReport, FragmentIntensityNormalization, InstrumentVocabulary,
 };
+pub use diffusion::{
+    foundation_diffusion_x0_loss, foundation_peptidoform_neutral_mass,
+    foundation_precursor_mass_consistent, foundation_precursor_mass_error_da,
+    foundation_precursor_neutral_mass, foundation_spectrum_peptide_alignment_loss,
+    FoundationDiffusionBatch, FoundationDiffusionCollator, FoundationDiffusionConfig,
+    FoundationDiffusionOutput, FoundationDiffusionVocabulary, FoundationSpectrumEncoder,
+    FoundationSpectrumEncoding, PeptideSpectrumDiffusionModel,
+    FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
+    FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_FIRST_RESIDUE, FOUNDATION_DIFFUSION_MASK,
+    FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD,
+    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+};
 pub use experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,
     foundation_record_fingerprint, FoundationBenchmarkEntry, FoundationBenchmarkManifest,
@@ -107,6 +121,10 @@ pub use sampling::{
     sample_foundation_training_indices, sample_foundation_validation_indices,
     FoundationSampleCoverage, FoundationSamplePlan, FoundationSamplingConfig,
     FoundationSamplingStrategy,
+};
+pub use spectrum::{
+    FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator,
+    FoundationSpectrumConfig, FoundationSpectrumPeak,
 };
 pub use split::{
     foundation_split_group_key, split_foundation_record_indices, split_foundation_records,

@@ -120,6 +120,84 @@ impl MultiHeadSelfAttention {
     }
 }
 
+/// Multi-head cross-attention from a query sequence into an encoded memory.
+#[derive(Clone)]
+pub struct MultiHeadCrossAttention {
+    query: Linear,
+    key: Linear,
+    value: Linear,
+    output: Linear,
+    num_heads: usize,
+    head_dim: usize,
+}
+
+impl MultiHeadCrossAttention {
+    /// Build a cross-attention layer.
+    pub fn new(model_dim: usize, num_heads: usize, vb: VarBuilder<'_>) -> Result<Self> {
+        let head_dim = model_dim / num_heads;
+        Ok(Self {
+            query: nn::linear_no_bias(model_dim, model_dim, vb.pp("query"))?,
+            key: nn::linear_no_bias(model_dim, model_dim, vb.pp("key"))?,
+            value: nn::linear_no_bias(model_dim, model_dim, vb.pp("value"))?,
+            output: nn::linear(model_dim, model_dim, vb.pp("output"))?,
+            num_heads,
+            head_dim,
+        })
+    }
+
+    /// Attend from `[batch, query_len, model_dim]` into
+    /// `[batch, memory_len, model_dim]` using `memory_mask` as the key mask.
+    pub fn forward(
+        &self,
+        query_hidden: &Tensor,
+        memory: &Tensor,
+        memory_mask: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch, query_len, model_dim) = query_hidden.dims3()?;
+        let (memory_batch, memory_len, memory_dim) = memory.dims3()?;
+        if batch != memory_batch || model_dim != memory_dim {
+            candle_core::bail!(
+                "cross-attention shape mismatch: query [{batch}, {query_len}, {model_dim}], memory [{memory_batch}, {memory_len}, {memory_dim}]"
+            );
+        }
+        let q = self
+            .query
+            .forward(query_hidden)?
+            .reshape((batch, query_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .key
+            .forward(memory)?
+            .reshape((batch, memory_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .value
+            .forward(memory)?
+            .reshape((batch, memory_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let key_transposed = k.transpose(2, 3)?.contiguous()?;
+        let scores = q
+            .matmul(&key_transposed)?
+            .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?;
+        let key_mask = memory_mask
+            .affine(-1.0, 1.0)?
+            .affine(-10_000.0, 0.0)?
+            .unsqueeze(1)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, self.num_heads, query_len, memory_len))?;
+        let probabilities = ops::softmax(&(scores + key_mask)?, D::Minus1)?;
+        let context = probabilities
+            .matmul(&v)?
+            .transpose(1, 2)?
+            .reshape((batch, query_len, model_dim))?;
+        self.output.forward(&context)
+    }
+}
+
 /// Pre-norm Transformer encoder block for peptide-level sequence modelling.
 #[derive(Clone)]
 pub struct PeptideTransformerBlock {

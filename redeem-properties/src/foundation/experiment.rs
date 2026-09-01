@@ -505,6 +505,10 @@ pub fn foundation_record_fingerprint(record: &FoundationTrainingRecord) -> u64 {
     hash.option_f32(record.context.gradient_seconds);
     hash.option_str(record.run_id.as_deref());
 
+    // Keep the historical forward-training fingerprint contract stable when
+    // observed/library product m/z is retained for the new inverse lane.
+    // Diffusion datasets will receive a separate spectrum-aware fingerprint
+    // once their observed-spectrum manifests are materialized.
     let mut fragments: Vec<(usize, usize, u32)> = record
         .fragments
         .iter()

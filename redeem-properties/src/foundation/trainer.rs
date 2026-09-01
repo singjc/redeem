@@ -2011,6 +2011,7 @@ mod tests {
                 cleavage_index: 1,
                 channel: 0,
                 intensity: 1.0,
+                product_mz: None,
             }],
             context: TrainingContext {
                 charge: Some(charge),
