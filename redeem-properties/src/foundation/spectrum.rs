@@ -77,7 +77,7 @@ impl Default for FoundationSpectrumConfig {
         Self {
             max_peaks: 256,
             mz_scale: 2_000.0,
-            peak_feature_dim: 8,
+            peak_feature_dim: 32,
         }
     }
 }
@@ -91,8 +91,8 @@ impl FoundationSpectrumConfig {
         if !(self.mz_scale > 0.0 && self.mz_scale.is_finite()) {
             return Err("foundation spectrum mz_scale must be positive and finite".into());
         }
-        if self.peak_feature_dim != 8 {
-            return Err("foundation spectrum peak_feature_dim is currently fixed at 8".into());
+        if self.peak_feature_dim != 32 {
+            return Err("foundation spectrum peak_feature_dim is currently fixed at 32".into());
         }
         Ok(())
     }
@@ -101,7 +101,7 @@ impl FoundationSpectrumConfig {
 /// Tensorized observed spectra.
 #[derive(Debug, Clone)]
 pub struct FoundationSpectrumBatch {
-    /// Continuous peak features `[batch, peaks, 8]`.
+    /// Continuous peak features `[batch, peaks, 32]`.
     pub peak_features: Tensor,
     /// One for retained observed peaks, zero for padding `[batch, peaks]`.
     pub peak_mask: Tensor,
@@ -134,9 +134,9 @@ impl FoundationSpectrumCollator {
     /// Invalid/non-positive m/z values and non-finite/non-positive intensities
     /// are discarded. If a spectrum has more than `max_peaks`, the most intense
     /// peaks are retained and then ordered by m/z. Intensities are max-normalized
-    /// per spectrum. The eight continuous features intentionally provide a small
-    /// stable first implementation; later iterations can replace them with the
-    /// multi-scale sinusoidal peak embedding used by modern de-novo models.
+    /// per spectrum. The current 32-dimensional representation
+    /// includes a multi-scale Fourier m/z embedding so self-attention can resolve
+    /// chemically meaningful peak-to-peak mass differences across sparse spectra.
     pub fn collate(
         &self,
         spectra: &[FoundationSpectrum],
@@ -191,16 +191,27 @@ impl FoundationSpectrumCollator {
             for (peak_idx, peak) in peaks.iter().enumerate() {
                 let normalized_intensity = (peak.intensity / max_intensity).clamp(0.0, 1.0);
                 let scaled_mz = peak.mz / self.config.mz_scale;
-                let feature = [
-                    scaled_mz,
-                    scaled_mz * scaled_mz,
-                    (peak.mz / 10.0).sin(),
-                    (peak.mz / 10.0).cos(),
-                    (peak.mz / 100.0).sin(),
-                    (peak.mz / 100.0).cos(),
-                    normalized_intensity.sqrt(),
-                    (1.0 + 9.0 * normalized_intensity).ln() / 10.0f32.ln(),
+                let mut feature = [0.0f32; 32];
+                feature[0] = scaled_mz;
+                feature[1] = scaled_mz * scaled_mz;
+                feature[2] = normalized_intensity.sqrt();
+                feature[3] = (1.0 + 9.0 * normalized_intensity).ln() / 10.0f32.ln();
+
+                // Multi-scale Fourier m/z features. Dot products between these
+                // encodings expose peak-to-peak mass differences at resolutions
+                // ranging from sub-Da to whole-spectrum scale, which is a much
+                // stronger inductive bias for sparse fragment ladders than the
+                // original two arbitrary sinusoidal frequencies.
+                const WAVELENGTHS_DA: [f32; 14] = [
+                    0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0,
+                    2_048.0, 4_096.0,
                 ];
+                for (scale_index, wavelength) in WAVELENGTHS_DA.iter().enumerate() {
+                    let angle = std::f32::consts::TAU * peak.mz / *wavelength;
+                    feature[4 + 2 * scale_index] = angle.sin();
+                    feature[5 + 2 * scale_index] = angle.cos();
+                }
+
                 let feature_base = (batch_idx * p + peak_idx) * f;
                 features[feature_base..feature_base + f].copy_from_slice(&feature);
                 mask[batch_idx * p + peak_idx] = 1.0;

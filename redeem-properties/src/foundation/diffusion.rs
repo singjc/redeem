@@ -749,7 +749,8 @@ impl SpectrumConditionedDiffusionBlock {
 pub struct FoundationDiffusionOutput {
     /// Clean-token logits `[batch, max_tokens, vocabulary]`.
     pub token_logits: Tensor,
-    /// Contextualized observed-spectrum peaks `[batch, peaks, model_dim]`.
+    /// Cross-attention memory `[batch, 1 + peaks, model_dim]`, with the
+    /// precursor summary prepended to the contextualized observed peaks.
     pub spectrum_memory: Tensor,
     /// Mask-aware pooled observed-spectrum embedding `[batch, model_dim]`.
     pub spectrum_embedding: Tensor,
@@ -787,7 +788,7 @@ impl PeptideSpectrumDiffusionModel {
             config.model_dim,
             vb.pp("decoder.position_embedding"),
         )?;
-        let precursor_projection = nn::linear(4, config.model_dim, vb.pp("decoder.precursor"))?;
+        let precursor_projection = nn::linear(6, config.model_dim, vb.pp("decoder.precursor"))?;
         let timestep_projection = nn::linear(4, config.model_dim, vb.pp("decoder.timestep"))?;
         let mut layers = Vec::with_capacity(config.decoder_layers);
         for index in 0..config.decoder_layers {
@@ -844,7 +845,6 @@ impl PeptideSpectrumDiffusionModel {
         }
 
         let spectrum_encoding = self.spectrum_encoder.forward_t(spectrum, train)?;
-        let spectrum_memory = spectrum_encoding.peak_embeddings.clone();
         let token_embedding = self.token_embedding.forward(&diffusion.noisy_tokens)?;
         let positions: Vec<u32> = (0..token_len as u32).collect();
         let position_ids = Tensor::from_vec(positions, token_len, diffusion.noisy_tokens.device())?
@@ -860,18 +860,47 @@ impl PeptideSpectrumDiffusionModel {
             .affine(1.0 / 2_000.0, 0.0)?
             .unsqueeze(1)?;
         let scaled_charge = precursor.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
+        let charge_squared = precursor
+            .charge
+            .broadcast_mul(&precursor.charge)?
+            .affine(1.0 / 36.0, 0.0)?
+            .unsqueeze(1)?;
+        let physical_present = precursor
+            .precursor_mz_present
+            .broadcast_mul(&precursor.charge_present)?;
+        let neutral_mass_proxy = precursor
+            .precursor_mz
+            .broadcast_mul(&precursor.charge)?
+            .broadcast_mul(&physical_present)?
+            .affine(1.0 / 6_000.0, 0.0)?
+            .unsqueeze(1)?;
         let precursor_mz_present = precursor.precursor_mz_present.unsqueeze(1)?;
         let charge_present = precursor.charge_present.unsqueeze(1)?;
         let precursor_features = Tensor::cat(
             &[
                 &scaled_precursor_mz,
                 &scaled_charge,
+                &neutral_mass_proxy,
+                &charge_squared,
                 &precursor_mz_present,
                 &charge_present,
             ],
             1,
         )?;
         let precursor_summary = self.precursor_projection.forward(&precursor_features)?;
+
+        // Give cross-attention an explicit precursor token, matching the
+        // information-flow pattern used by successful spectrum-to-peptide
+        // encoder/decoder models. The shuffled-spectrum ablation keeps this
+        // token matched, so any matched-vs-shuffled gain still isolates the
+        // observed peak memory rather than precursor context.
+        let precursor_memory = precursor_summary.unsqueeze(1)?;
+        let spectrum_memory =
+            Tensor::cat(&[&precursor_memory, &spectrum_encoding.peak_embeddings], 1)?;
+        let precursor_memory_mask =
+            Tensor::ones((batch, 1), DType::F32, diffusion.noisy_tokens.device())?;
+        let spectrum_memory_mask = Tensor::cat(&[&precursor_memory_mask, &spectrum.peak_mask], 1)?;
+
         let length_hidden = (&spectrum_encoding.spectrum_embedding + &precursor_summary)?;
         let length_logits = self.length_head.forward(&length_hidden)?;
         let precursor_embedding = precursor_summary.unsqueeze(1)?.broadcast_as((
@@ -898,7 +927,7 @@ impl PeptideSpectrumDiffusionModel {
                 &hidden,
                 &diffusion.token_mask,
                 &spectrum_memory,
-                &spectrum.peak_mask,
+                &spectrum_memory_mask,
                 train,
             )?;
         }

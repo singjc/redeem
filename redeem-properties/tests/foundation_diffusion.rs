@@ -35,6 +35,15 @@ fn diffusion_model_executes_one_real_backward_update() {
         .unwrap()
         .collate(&spectra, &device)
         .unwrap();
+    assert_eq!(
+        spectrum_batch.peak_features.dims(),
+        &[
+            2,
+            config.spectrum.max_peaks,
+            config.spectrum.peak_feature_dim
+        ]
+    );
+    assert_eq!(config.spectrum.peak_feature_dim, 32);
     let peptides = vec![
         PeptidoformInput::unmodified("PEPTIDEK"),
         PeptidoformInput::unmodified("MELTQK"),
@@ -65,6 +74,10 @@ fn diffusion_model_executes_one_real_backward_update() {
         &[2, config.max_tokens, FOUNDATION_DIFFUSION_VOCAB_SIZE]
     );
     assert_eq!(output.length_logits.dims(), &[2, config.max_tokens]);
+    assert_eq!(
+        output.spectrum_memory.dims(),
+        &[2, config.spectrum.max_peaks + 1, config.model_dim]
+    );
     let x0_loss = foundation_diffusion_x0_loss(&output, &diffusion_batch).unwrap();
     let length_loss = foundation_diffusion_length_loss(&output, &diffusion_batch).unwrap();
     let loss = (&x0_loss + &length_loss.affine(0.1, 0.0).unwrap()).unwrap();

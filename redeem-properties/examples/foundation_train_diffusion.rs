@@ -164,6 +164,10 @@ fn main() -> Result<()> {
     println!("spectrum_layers\t{}", config.spectrum_layers);
     println!("decoder_layers\t{}", config.decoder_layers);
     println!("spectrum_max_peaks\t{}", config.spectrum.max_peaks);
+    println!(
+        "spectrum_peak_feature_dim\t{}",
+        config.spectrum.peak_feature_dim
+    );
     println!("max_tokens\t{}", config.max_tokens);
     println!("diffusion_steps\t{}", config.diffusion_steps);
     println!("train_steps\t{train_steps}");
@@ -189,12 +193,27 @@ fn main() -> Result<()> {
         config.max_tokens,
     )?;
     println!(
-        "baseline\tuniform_active_classes\tloss={:.6}\tperplexity={:.4}\ttoken_accuracy={:.6}",
+        "baseline\tuniform_clean_classes\tloss={:.6}\tperplexity={:.4}\ttoken_accuracy={:.6}",
         baseline.uniform_loss,
         baseline.uniform_loss.exp(),
         baseline.uniform_accuracy
     );
     println!("baseline\ttrain_unigram\tloss={:.6}\tperplexity={:.4}\ttoken_accuracy={:.6}\tmode_token={}", baseline.unigram_loss, baseline.unigram_loss.exp(), baseline.unigram_accuracy, baseline.mode_token);
+    let length_baseline = length_baseline(
+        &corpus.records,
+        &train_indices,
+        &validation_indices,
+        vocabulary,
+        config.max_tokens,
+    )?;
+    println!(
+        "baseline\ttrain_length_unigram\tloss={:.6}\tperplexity={:.4}\tmode_active_tokens={}\tmode_accuracy={:.6}\tmode_mae_tokens={:.4}",
+        length_baseline.unigram_loss,
+        length_baseline.unigram_loss.exp(),
+        length_baseline.mode_active_tokens,
+        length_baseline.mode_accuracy,
+        length_baseline.mode_mae_tokens,
+    );
 
     fs::create_dir_all(&output_root)?;
     write_pair_manifest(
@@ -793,7 +812,8 @@ fn token_baselines(
         &mut validation_counts,
     )?;
 
-    let active_classes = FOUNDATION_DIFFUSION_VOCAB_SIZE - 1;
+    // Clean x0 targets never contain PAD or MASK.
+    let active_classes = FOUNDATION_DIFFUSION_VOCAB_SIZE - 2;
     let uniform_loss = (active_classes as f64).ln();
     let uniform_accuracy = 1.0 / active_classes as f64;
 
@@ -804,12 +824,12 @@ fn token_baselines(
     }
     let smoothed_total = train_total as f64 + active_classes as f64;
     let mut unigram_loss = 0.0f64;
-    for token in 1..FOUNDATION_DIFFUSION_VOCAB_SIZE {
+    for token in 2..FOUNDATION_DIFFUSION_VOCAB_SIZE {
         let probability = (train_counts[token] as f64 + 1.0) / smoothed_total;
         unigram_loss -= validation_counts[token] as f64 * probability.ln();
     }
     unigram_loss /= validation_total as f64;
-    let mode_token = (1..FOUNDATION_DIFFUSION_VOCAB_SIZE)
+    let mode_token = (2..FOUNDATION_DIFFUSION_VOCAB_SIZE)
         .max_by_key(|&token| train_counts[token])
         .unwrap_or(1);
     let unigram_accuracy = validation_counts[mode_token] as f64 / validation_total as f64;
@@ -821,6 +841,103 @@ fn token_baselines(
         unigram_accuracy,
         mode_token,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LengthBaselineMetrics {
+    unigram_loss: f64,
+    mode_active_tokens: usize,
+    mode_accuracy: f64,
+    mode_mae_tokens: f64,
+}
+
+fn length_baseline(
+    records: &[FoundationTrainingRecord],
+    train_indices: &[usize],
+    validation_indices: &[usize],
+    vocabulary: FoundationDiffusionVocabulary,
+    max_tokens: usize,
+) -> Result<LengthBaselineMetrics> {
+    let mut train_counts = vec![0u64; max_tokens];
+    let mut validation_counts = vec![0u64; max_tokens];
+    accumulate_length_counts(
+        records,
+        train_indices,
+        vocabulary,
+        max_tokens,
+        &mut train_counts,
+    )?;
+    accumulate_length_counts(
+        records,
+        validation_indices,
+        vocabulary,
+        max_tokens,
+        &mut validation_counts,
+    )?;
+
+    let train_total: u64 = train_counts.iter().sum();
+    let validation_total: u64 = validation_counts.iter().sum();
+    if train_total == 0 || validation_total == 0 {
+        anyhow::bail!("diffusion length baseline contains no train/validation sequences");
+    }
+
+    let smoothed_total = train_total as f64 + max_tokens as f64;
+    let mut unigram_loss = 0.0f64;
+    for class in 0..max_tokens {
+        let probability = (train_counts[class] as f64 + 1.0) / smoothed_total;
+        unigram_loss -= validation_counts[class] as f64 * probability.ln();
+    }
+    unigram_loss /= validation_total as f64;
+
+    let mode_class = (0..max_tokens)
+        .max_by_key(|&class| train_counts[class])
+        .unwrap_or(0);
+    let mode_active_tokens = mode_class + 1;
+    let mode_accuracy = validation_counts[mode_class] as f64 / validation_total as f64;
+    let mode_mae_tokens = validation_counts
+        .iter()
+        .enumerate()
+        .map(|(class, &count)| {
+            let active_tokens = class + 1;
+            (active_tokens.abs_diff(mode_active_tokens) as f64) * count as f64
+        })
+        .sum::<f64>()
+        / validation_total as f64;
+
+    Ok(LengthBaselineMetrics {
+        unigram_loss,
+        mode_active_tokens,
+        mode_accuracy,
+        mode_mae_tokens,
+    })
+}
+
+fn accumulate_length_counts(
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    vocabulary: FoundationDiffusionVocabulary,
+    max_tokens: usize,
+    counts: &mut [u64],
+) -> Result<()> {
+    for &index in indices {
+        let record = records.get(index).ok_or_else(|| {
+            anyhow::anyhow!("diffusion length baseline index {index} out of bounds")
+        })?;
+        let tokens = vocabulary
+            .encode(&record.peptidoform, max_tokens)
+            .map_err(anyhow::Error::msg)?;
+        let active_tokens = tokens
+            .iter()
+            .take_while(|&&token| token != FOUNDATION_DIFFUSION_PAD)
+            .count();
+        if active_tokens == 0 || active_tokens > max_tokens {
+            anyhow::bail!(
+                "diffusion length baseline observed invalid active-token length {active_tokens}"
+            );
+        }
+        counts[active_tokens - 1] += 1;
+    }
+    Ok(())
 }
 
 fn accumulate_token_counts(
