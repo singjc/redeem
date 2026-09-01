@@ -517,6 +517,96 @@ impl FoundationDiffusionCollator {
         self.collate_impl(peptides, &timesteps, 0, true, device)
     }
 
+    /// Build an inference batch from externally supplied noisy token rows.
+    ///
+    /// `active_lengths` define the non-padding prefix for each row. This is the
+    /// generation-time counterpart of the training collator: no clean peptide is
+    /// required, and the clean/target tensors are populated only as inert shape-
+    /// compatible placeholders for the shared model input structure.
+    pub fn collate_inference_tokens(
+        &self,
+        noisy_token_rows: &[Vec<u32>],
+        active_lengths: &[usize],
+        timestep: usize,
+        device: &Device,
+    ) -> Result<FoundationDiffusionBatch> {
+        if noisy_token_rows.is_empty() || noisy_token_rows.len() != active_lengths.len() {
+            candle_core::bail!(
+                "diffusion inference collation requires non-empty token/length arrays of equal size"
+            );
+        }
+        let alpha_bar = self
+            .config
+            .alpha_bar(timestep)
+            .map_err(candle_core::Error::Msg)?;
+        let batch = noisy_token_rows.len();
+        let width = self.config.max_tokens;
+        let mut noisy = Vec::<u32>::with_capacity(batch * width);
+        let mut clean = vec![FOUNDATION_DIFFUSION_PAD; batch * width];
+        let mut mask = vec![0.0f32; batch * width];
+        let mut active_indices = Vec::<u32>::new();
+        let mut target_classes = Vec::<u32>::new();
+        let mut length_targets = Vec::<u32>::with_capacity(batch);
+        let mut timesteps = Vec::<u32>::with_capacity(batch);
+        let mut timestep_features = Vec::<f32>::with_capacity(batch * 4);
+
+        for (batch_index, (row, &active_length)) in
+            noisy_token_rows.iter().zip(active_lengths).enumerate()
+        {
+            if row.len() != width {
+                candle_core::bail!(
+                    "diffusion inference token row width {} does not match configured {width}",
+                    row.len()
+                );
+            }
+            if active_length == 0 || active_length > width {
+                candle_core::bail!(
+                    "diffusion inference active length {active_length} is outside 1..={width}"
+                );
+            }
+            for (position, &token) in row.iter().enumerate() {
+                if position < active_length {
+                    if token == FOUNDATION_DIFFUSION_PAD {
+                        candle_core::bail!(
+                            "diffusion inference active token position {position} contains PAD"
+                        );
+                    }
+                    mask[batch_index * width + position] = 1.0;
+                    active_indices.push((batch_index * width + position) as u32);
+                    target_classes.push(token);
+                    clean[batch_index * width + position] = token;
+                } else if token != FOUNDATION_DIFFUSION_PAD {
+                    candle_core::bail!(
+                        "diffusion inference padded token position {position} must contain PAD"
+                    );
+                }
+            }
+            noisy.extend_from_slice(row);
+            length_targets.push((active_length - 1) as u32);
+            timesteps.push(timestep as u32);
+            timestep_features.extend_from_slice(&diffusion_timestep_features(
+                timestep,
+                self.config.diffusion_steps,
+                alpha_bar,
+            ));
+        }
+
+        let active_count = active_indices.len();
+        Ok(FoundationDiffusionBatch {
+            noisy_tokens: Tensor::from_vec(noisy, (batch, width), device)?.to_dtype(DType::U32)?,
+            clean_tokens: Tensor::from_vec(clean, (batch, width), device)?.to_dtype(DType::U32)?,
+            token_mask: Tensor::from_vec(mask, (batch, width), device)?,
+            timesteps: Tensor::from_vec(timesteps, batch, device)?.to_dtype(DType::U32)?,
+            timestep_features: Tensor::from_vec(timestep_features, (batch, 4), device)?,
+            active_indices: Tensor::from_vec(active_indices, active_count, device)?
+                .to_dtype(DType::U32)?,
+            target_classes: Tensor::from_vec(target_classes, active_count, device)?
+                .to_dtype(DType::U32)?,
+            length_targets: Tensor::from_vec(length_targets, batch, device)?
+                .to_dtype(DType::U32)?,
+        })
+    }
+
     fn collate_impl(
         &self,
         peptides: &[PeptidoformInput],
@@ -600,6 +690,104 @@ impl FoundationDiffusionCollator {
             length_targets: Tensor::from_vec(length_targets, b, device)?.to_dtype(DType::U32)?,
         })
     }
+}
+
+/// Exact one-position reverse probabilities for the categorical forward process.
+///
+/// The forward process operates on the 27 non-padding states (`MASK`, `EOS`,
+/// residues and PTM markers) with
+/// `Q_t = (1 - beta_t) I + beta_t U`. The model predicts `p_theta(x0 | x_t)`.
+/// This helper marginalizes the analytical posterior
+/// `q(x_{t-1} | x_t, x0)` over that predicted clean-token distribution.
+///
+/// `x0_probabilities` must contain one value for every vocabulary id. PAD and
+/// MASK are ignored as clean targets because neither occurs in a clean active
+/// peptide sequence.
+pub fn foundation_diffusion_reverse_probabilities(
+    config: &FoundationDiffusionConfig,
+    xt_token: u32,
+    x0_probabilities: &[f64],
+    timestep: usize,
+) -> std::result::Result<Vec<f64>, String> {
+    if x0_probabilities.len() != FOUNDATION_DIFFUSION_VOCAB_SIZE {
+        return Err(format!(
+            "reverse diffusion expected {} x0 probabilities, received {}",
+            FOUNDATION_DIFFUSION_VOCAB_SIZE,
+            x0_probabilities.len()
+        ));
+    }
+    if xt_token == FOUNDATION_DIFFUSION_PAD || xt_token as usize >= FOUNDATION_DIFFUSION_VOCAB_SIZE
+    {
+        return Err(format!(
+            "reverse diffusion x_t token {xt_token} is not a valid non-padding category"
+        ));
+    }
+
+    let mut clean_probabilities = vec![0.0f64; FOUNDATION_DIFFUSION_VOCAB_SIZE];
+    let mut clean_sum = 0.0f64;
+    for token in FOUNDATION_DIFFUSION_EOS as usize..FOUNDATION_DIFFUSION_VOCAB_SIZE {
+        let probability = x0_probabilities[token];
+        if !(probability.is_finite() && probability >= 0.0) {
+            return Err("reverse diffusion x0 probabilities must be finite/non-negative".into());
+        }
+        clean_probabilities[token] = probability;
+        clean_sum += probability;
+    }
+    if !(clean_sum > 0.0 && clean_sum.is_finite()) {
+        return Err("reverse diffusion x0 clean-target probability mass is zero".into());
+    }
+    for probability in &mut clean_probabilities {
+        *probability /= clean_sum;
+    }
+
+    let beta_t = config.beta(timestep)?;
+    let alpha_t = 1.0 - beta_t;
+    let alpha_bar_t = config.alpha_bar(timestep)?;
+    let alpha_bar_prev = if timestep == 1 {
+        1.0
+    } else {
+        config.alpha_bar(timestep - 1)?
+    };
+    let categories = (FOUNDATION_DIFFUSION_VOCAB_SIZE - 1) as f64;
+    let uniform = 1.0 / categories;
+    let xt = xt_token as usize;
+
+    let mut reverse = vec![0.0f64; FOUNDATION_DIFFUSION_VOCAB_SIZE];
+    for previous in 1..FOUNDATION_DIFFUSION_VOCAB_SIZE {
+        let step_probability = if previous == xt {
+            alpha_t + beta_t * uniform
+        } else {
+            beta_t * uniform
+        };
+        let mut mixture = 0.0f64;
+        for clean in FOUNDATION_DIFFUSION_EOS as usize..FOUNDATION_DIFFUSION_VOCAB_SIZE {
+            let p_clean = clean_probabilities[clean];
+            if p_clean == 0.0 {
+                continue;
+            }
+            let previous_given_clean = if previous == clean {
+                alpha_bar_prev + (1.0 - alpha_bar_prev) * uniform
+            } else {
+                (1.0 - alpha_bar_prev) * uniform
+            };
+            let xt_given_clean = if xt == clean {
+                alpha_bar_t + (1.0 - alpha_bar_t) * uniform
+            } else {
+                (1.0 - alpha_bar_t) * uniform
+            };
+            mixture += p_clean * step_probability * previous_given_clean / xt_given_clean;
+        }
+        reverse[previous] = mixture;
+    }
+
+    let total: f64 = reverse.iter().sum();
+    if !(total > 0.0 && total.is_finite()) {
+        return Err("reverse diffusion posterior normalization is invalid".into());
+    }
+    for probability in &mut reverse {
+        *probability /= total;
+    }
+    Ok(reverse)
 }
 
 fn diffusion_timestep_features(timestep: usize, total_steps: usize, alpha_bar: f64) -> [f32; 4] {
@@ -1162,6 +1350,56 @@ mod tests {
             early.noisy_tokens.to_vec2::<u32>().unwrap(),
             early_again.noisy_tokens.to_vec2::<u32>().unwrap()
         );
+    }
+
+    #[test]
+    fn inference_collator_accepts_predicted_length_without_clean_peptide() {
+        let device = Device::Cpu;
+        let config = FoundationDiffusionConfig {
+            max_tokens: 8,
+            ..FoundationDiffusionConfig::default()
+        };
+        let collator = FoundationDiffusionCollator::new(config.clone()).unwrap();
+        let mut row = vec![FOUNDATION_DIFFUSION_PAD; config.max_tokens];
+        row[0] = FOUNDATION_DIFFUSION_MASK;
+        row[1] = FOUNDATION_DIFFUSION_MASK;
+        row[2] = FOUNDATION_DIFFUSION_EOS;
+        let batch = collator
+            .collate_inference_tokens(&[row], &[3], config.diffusion_steps, &device)
+            .unwrap();
+        assert_eq!(batch.noisy_tokens.dims(), &[1, 8]);
+        assert_eq!(
+            batch.token_mask.to_vec2::<f32>().unwrap()[0],
+            vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(batch.length_targets.to_vec1::<u32>().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn reverse_categorical_posterior_is_normalized_and_t1_returns_clean_distribution() {
+        let config = FoundationDiffusionConfig::default();
+        let mut x0 = vec![0.0f64; FOUNDATION_DIFFUSION_VOCAB_SIZE];
+        x0[3] = 0.7;
+        x0[11] = 0.3;
+
+        let posterior =
+            foundation_diffusion_reverse_probabilities(&config, FOUNDATION_DIFFUSION_MASK, &x0, 1)
+                .unwrap();
+        let total: f64 = posterior.iter().sum();
+        assert!((total - 1.0).abs() < 1e-10);
+        assert!((posterior[3] - 0.7).abs() < 1e-10);
+        assert!((posterior[11] - 0.3).abs() < 1e-10);
+        assert_eq!(posterior[FOUNDATION_DIFFUSION_MASK as usize], 0.0);
+
+        let later = foundation_diffusion_reverse_probabilities(
+            &config,
+            FOUNDATION_DIFFUSION_MASK,
+            &x0,
+            config.diffusion_steps,
+        )
+        .unwrap();
+        assert!((later.iter().sum::<f64>() - 1.0).abs() < 1e-10);
+        assert!(later[FOUNDATION_DIFFUSION_MASK as usize] > 0.0);
     }
 
     #[test]

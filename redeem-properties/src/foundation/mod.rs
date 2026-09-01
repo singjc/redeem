@@ -75,16 +75,17 @@ pub use dataset::{
     FoundationTableSchemaReport, FragmentIntensityNormalization, InstrumentVocabulary,
 };
 pub use diffusion::{
-    foundation_diffusion_length_loss, foundation_diffusion_x0_loss,
-    foundation_peptidoform_neutral_mass, foundation_precursor_mass_consistent,
-    foundation_precursor_mass_error_da, foundation_precursor_neutral_mass,
-    foundation_spectrum_peptide_alignment_loss, FoundationDiffusionBatch,
-    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionOutput,
-    FoundationDiffusionVocabulary, FoundationSpectrumEncoder, FoundationSpectrumEncoding,
-    PeptideSpectrumDiffusionModel, FOUNDATION_DIFFUSION_CARBAMIDOMETHYL,
-    FOUNDATION_DIFFUSION_DEAMIDATED, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_FIRST_RESIDUE,
-    FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_OXIDATION,
-    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    foundation_diffusion_length_loss, foundation_diffusion_reverse_probabilities,
+    foundation_diffusion_x0_loss, foundation_peptidoform_neutral_mass,
+    foundation_precursor_mass_consistent, foundation_precursor_mass_error_da,
+    foundation_precursor_neutral_mass, foundation_spectrum_peptide_alignment_loss,
+    FoundationDiffusionBatch, FoundationDiffusionCollator, FoundationDiffusionConfig,
+    FoundationDiffusionOutput, FoundationDiffusionVocabulary, FoundationSpectrumEncoder,
+    FoundationSpectrumEncoding, PeptideSpectrumDiffusionModel,
+    FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
+    FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_FIRST_RESIDUE, FOUNDATION_DIFFUSION_MASK,
+    FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD,
+    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 pub use experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,
