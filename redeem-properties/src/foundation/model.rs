@@ -289,7 +289,7 @@ impl PeptideFoundationMultiTaskModel {
         context: &PrecursorContextBatch,
         train: bool,
     ) -> Result<FoundationMultiTaskOutput> {
-        self.forward_t_with_rt_encoder_gradient_scale(batch, context, train, 1.0)
+        self.forward_t_with_shared_gradient_scales(batch, context, train, 1.0, 1.0)
     }
 
     /// Forward pass with independent control over the RT gradient entering the shared encoder.
@@ -306,28 +306,42 @@ impl PeptideFoundationMultiTaskModel {
         train: bool,
         rt_encoder_gradient_scale: f64,
     ) -> Result<FoundationMultiTaskOutput> {
-        if !(0.0..=1.0).contains(&rt_encoder_gradient_scale)
-            || !rt_encoder_gradient_scale.is_finite()
-        {
-            candle_core::bail!(
-                "RT encoder gradient scale must be finite and within [0, 1], got {rt_encoder_gradient_scale}"
-            );
-        }
+        self.forward_t_with_shared_gradient_scales(
+            batch,
+            context,
+            train,
+            rt_encoder_gradient_scale,
+            1.0,
+        )
+    }
+
+    /// Forward pass with independent RT and CCS gradient control at the shared encoder.
+    ///
+    /// Forward predictions and head-parameter gradients are unchanged. The supplied
+    /// scales only multiply the gradients that flow from the RT/CCS heads back into
+    /// the shared peptide embedding. A value of `1` is ordinary training; `0` trains
+    /// the corresponding property head on a detached foundation representation.
+    pub fn forward_t_with_shared_gradient_scales(
+        &self,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+        rt_encoder_gradient_scale: f64,
+        ccs_encoder_gradient_scale: f64,
+    ) -> Result<FoundationMultiTaskOutput> {
+        validate_encoder_gradient_scale("RT", rt_encoder_gradient_scale)?;
+        validate_encoder_gradient_scale("CCS", ccs_encoder_gradient_scale)?;
+
         let foundation = self.encoder.forward_t(batch, train)?;
         let rt_features =
             gradient_scaled_identity(&foundation.peptide_embedding, rt_encoder_gradient_scale)?;
         let rt = self.rt_head.forward(&rt_features)?;
 
+        let ccs_embedding =
+            gradient_scaled_identity(&foundation.peptide_embedding, ccs_encoder_gradient_scale)?;
         let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
         let charge_present = context.charge_present.unsqueeze(1)?;
-        let ccs_features = Tensor::cat(
-            &[
-                &foundation.peptide_embedding,
-                &scaled_charge,
-                &charge_present,
-            ],
-            1,
-        )?;
+        let ccs_features = Tensor::cat(&[&ccs_embedding, &scaled_charge, &charge_present], 1)?;
         let ccs = self.ccs_head.forward(&ccs_features)?;
 
         let (batch_size, sequence_len, _) = foundation.residue_embeddings.dims3()?;
@@ -404,6 +418,15 @@ impl PeptideFoundationMultiTaskModel {
 ///
 /// `detached + scale * (input - detached)` is numerically equal to `input`, while
 /// only the second term participates in backpropagation to `input`.
+fn validate_encoder_gradient_scale(label: &str, scale: f64) -> Result<()> {
+    if !(0.0..=1.0).contains(&scale) || !scale.is_finite() {
+        candle_core::bail!(
+            "{label} encoder gradient scale must be finite and within [0, 1], got {scale}"
+        );
+    }
+    Ok(())
+}
+
 fn gradient_scaled_identity(input: &Tensor, scale: f64) -> Result<Tensor> {
     if scale == 1.0 {
         return Ok(input.clone());

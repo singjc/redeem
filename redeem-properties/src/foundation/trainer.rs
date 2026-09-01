@@ -104,20 +104,27 @@ impl FoundationGradientDiagnosticsConfig {
 pub struct FoundationSharedGradientScalesConfig {
     /// Multiplier for the RT gradient entering the shared encoder.
     pub rt_encoder: f64,
+    /// Multiplier for the CCS gradient entering the shared encoder.
+    pub ccs_encoder: f64,
 }
 
 impl Default for FoundationSharedGradientScalesConfig {
     fn default() -> Self {
-        Self { rt_encoder: 1.0 }
+        Self {
+            rt_encoder: 1.0,
+            ccs_encoder: 1.0,
+        }
     }
 }
 
 impl FoundationSharedGradientScalesConfig {
     fn validate(self) -> Result<Self> {
-        if !(0.0..=1.0).contains(&self.rt_encoder) || !self.rt_encoder.is_finite() {
-            candle_core::bail!(
-                "foundation RT encoder gradient scale must be finite and within [0, 1]"
-            );
+        for (label, scale) in [("RT", self.rt_encoder), ("CCS", self.ccs_encoder)] {
+            if !(0.0..=1.0).contains(&scale) || !scale.is_finite() {
+                candle_core::bail!(
+                    "foundation {label} encoder gradient scale must be finite and within [0, 1]"
+                );
+            }
         }
         Ok(self)
     }
@@ -833,15 +840,13 @@ impl FoundationTrainer {
                 self.config.seed.wrapping_add(0x5052_4f50_4552_5459),
             )?;
             self.normalize_batch_regression_targets(&mut batch)?;
-            let output = self
-                .wrapper
-                .model()
-                .forward_t_with_rt_encoder_gradient_scale(
-                    &batch.input,
-                    &batch.context,
-                    false,
-                    self.config.shared_gradient_scales.rt_encoder,
-                )?;
+            let output = self.wrapper.model().forward_t_with_shared_gradient_scales(
+                &batch.input,
+                &batch.context,
+                false,
+                self.config.shared_gradient_scales.rt_encoder,
+                self.config.shared_gradient_scales.ccs_encoder,
+            )?;
             let regression = RegressionDiagnostics {
                 rt: regression_native_sufficient_statistics(
                     &output.rt,
@@ -1269,15 +1274,13 @@ impl FoundationTrainer {
         &self,
         batch: &FoundationTrainingBatch,
     ) -> Result<(Tensor, FoundationLosses, RegressionDiagnostics)> {
-        let output = self
-            .wrapper
-            .model()
-            .forward_t_with_rt_encoder_gradient_scale(
-                &batch.input,
-                &batch.context,
-                false,
-                self.config.shared_gradient_scales.rt_encoder,
-            )?;
+        let output = self.wrapper.model().forward_t_with_shared_gradient_scales(
+            &batch.input,
+            &batch.context,
+            false,
+            self.config.shared_gradient_scales.rt_encoder,
+            self.config.shared_gradient_scales.ccs_encoder,
+        )?;
         let regression = RegressionDiagnostics {
             rt: regression_native_sufficient_statistics(
                 &output.rt,
@@ -1368,24 +1371,20 @@ impl FoundationTrainer {
         Option<Tensor>,
         RegressionDiagnostics,
     )> {
-        let first = self
-            .wrapper
-            .model()
-            .forward_t_with_rt_encoder_gradient_scale(
-                &views.first.input,
-                &views.first.context,
-                train,
-                self.config.shared_gradient_scales.rt_encoder,
-            )?;
-        let second = self
-            .wrapper
-            .model()
-            .forward_t_with_rt_encoder_gradient_scale(
-                &views.second.input,
-                &views.second.context,
-                train,
-                self.config.shared_gradient_scales.rt_encoder,
-            )?;
+        let first = self.wrapper.model().forward_t_with_shared_gradient_scales(
+            &views.first.input,
+            &views.first.context,
+            train,
+            self.config.shared_gradient_scales.rt_encoder,
+            self.config.shared_gradient_scales.ccs_encoder,
+        )?;
+        let second = self.wrapper.model().forward_t_with_shared_gradient_scales(
+            &views.second.input,
+            &views.second.context,
+            train,
+            self.config.shared_gradient_scales.rt_encoder,
+            self.config.shared_gradient_scales.ccs_encoder,
+        )?;
         let regression = RegressionDiagnostics {
             rt: regression_native_sufficient_statistics(
                 &first.rt,

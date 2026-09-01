@@ -12,6 +12,7 @@ trainer:
   max_gradient_norm: 1.0
   shared_gradient_scales:
     rt_encoder: 1.0
+    ccs_encoder: 1.0
   gradient_diagnostics:
     enabled: false
     every_n_steps: 100

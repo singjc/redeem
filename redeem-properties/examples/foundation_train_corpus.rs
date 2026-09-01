@@ -31,6 +31,10 @@ fn main() -> Result<()> {
         config.trainer.shared_gradient_scales.rt_encoder
     );
     println!(
+        "ccs_encoder_gradient_scale\t{}",
+        config.trainer.shared_gradient_scales.ccs_encoder
+    );
+    println!(
         "clean_property_validation\t{}",
         config.trainer.evaluation.clean_property_validation
     );

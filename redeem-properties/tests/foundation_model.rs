@@ -237,3 +237,115 @@ fn rt_encoder_gradient_gate_scales_encoder_but_not_rt_head_gradients() {
     assert!((encoder_half / encoder_full - 0.5).abs() < 1e-3);
     assert!((head_half / head_full - 1.0).abs() < 1e-3);
 }
+
+#[test]
+fn ccs_encoder_gradient_gate_preserves_forward_values() {
+    let device = Device::Cpu;
+    let config = FoundationConfig {
+        max_sequence_len: 12,
+        transformer_layers: 1,
+        dropout: 0.0,
+        ..FoundationConfig::default()
+    };
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let batch = featurizer
+        .featurize(&[PeptidoformInput::unmodified("PEPTIDEK")], &device)
+        .unwrap();
+    let context = PrecursorContextBatch::unknown(1, &device).unwrap();
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultiTaskModel::new(config, vb).unwrap();
+
+    let full = model
+        .forward_t_with_shared_gradient_scales(&batch, &context, false, 1.0, 1.0)
+        .unwrap();
+    let gated = model
+        .forward_t_with_shared_gradient_scales(&batch, &context, false, 1.0, 0.5)
+        .unwrap();
+
+    let full_ccs = full.ccs.to_vec2::<f32>().unwrap();
+    let gated_ccs = gated.ccs.to_vec2::<f32>().unwrap();
+    assert_eq!(full_ccs.len(), gated_ccs.len());
+    for (full_row, gated_row) in full_ccs.iter().zip(gated_ccs.iter()) {
+        for (left, right) in full_row.iter().zip(gated_row.iter()) {
+            assert!((left - right).abs() <= 1e-6);
+        }
+    }
+}
+
+#[test]
+fn ccs_encoder_gradient_gate_scales_encoder_but_not_ccs_head_gradients() {
+    fn squared_norm(tensor: &Tensor) -> f64 {
+        f64::from(
+            tensor
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap(),
+        )
+    }
+
+    let device = Device::Cpu;
+    let config = FoundationConfig {
+        max_sequence_len: 12,
+        transformer_layers: 1,
+        dropout: 0.0,
+        ..FoundationConfig::default()
+    };
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let batch = featurizer
+        .featurize(&[PeptidoformInput::unmodified("PEPTIDEK")], &device)
+        .unwrap();
+    let context = PrecursorContextBatch::unknown(1, &device).unwrap();
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultiTaskModel::new(config, vb).unwrap();
+
+    let full = model
+        .forward_t_with_shared_gradient_scales(&batch, &context, false, 1.0, 1.0)
+        .unwrap();
+    let half = model
+        .forward_t_with_shared_gradient_scales(&batch, &context, false, 1.0, 0.5)
+        .unwrap();
+    let gradients_full = full.ccs.sum_all().unwrap().backward().unwrap();
+    let gradients_half = half.ccs.sum_all().unwrap().backward().unwrap();
+
+    let data = varmap.data().lock().unwrap();
+    let encoder = data
+        .get("encoder.output_norm.weight")
+        .cloned()
+        .expect("foundation encoder output-norm weight");
+    let ccs_head = data
+        .get("heads.ccs.weight")
+        .cloned()
+        .expect("foundation CCS-head weight");
+    drop(data);
+
+    let encoder_full = gradients_full
+        .get(&encoder)
+        .map(squared_norm)
+        .unwrap_or(0.0)
+        .sqrt();
+    let encoder_half = gradients_half
+        .get(&encoder)
+        .map(squared_norm)
+        .unwrap_or(0.0)
+        .sqrt();
+    let head_full = gradients_full
+        .get(&ccs_head)
+        .map(squared_norm)
+        .unwrap_or(0.0)
+        .sqrt();
+    let head_half = gradients_half
+        .get(&ccs_head)
+        .map(squared_norm)
+        .unwrap_or(0.0)
+        .sqrt();
+
+    assert!(encoder_full > 0.0);
+    assert!(head_full > 0.0);
+    assert!((encoder_half / encoder_full - 0.5).abs() < 1e-3);
+    assert!((head_half / head_full - 1.0).abs() < 1e-3);
+}
