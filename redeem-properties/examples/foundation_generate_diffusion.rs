@@ -38,6 +38,8 @@ struct GeneratedCandidate {
     tokens: Vec<u32>,
     peptide: PeptidoformInput,
     reverse_log_probability: f64,
+    fragment_score: f64,
+    matched_cleavages: usize,
     mass_error_da: Option<f64>,
     mass_valid: bool,
 }
@@ -60,16 +62,23 @@ struct GenerationMetrics {
     mass_topk_sequence_exact: usize,
     mass_top1_il_sequence_exact: usize,
     mass_topk_il_sequence_exact: usize,
+    fragment_top1_peptidoform_exact: usize,
+    fragment_top1_sequence_exact: usize,
+    fragment_top1_il_sequence_exact: usize,
     records_with_candidate: usize,
     best_abs_mass_error_sum: f64,
     best_abs_mass_error_records: usize,
+    target_fragment_score_sum: f64,
+    top1_fragment_score_sum: f64,
+    target_matched_cleavages: usize,
+    top1_matched_cleavages: usize,
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 || args.len() > 11 {
+    if args.len() < 4 || args.len() > 13 {
         anyhow::bail!(
-            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4]"
+            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=2.0]"
         );
     }
 
@@ -83,6 +92,8 @@ fn main() -> Result<()> {
     let temperature = parse_or(&args, 8, 1.0f64)?;
     let mass_beam_width = parse_or(&args, 9, 512usize)?;
     let final_candidates_per_chain = parse_or(&args, 10, 4usize)?;
+    let fragment_tolerance_ppm = parse_or(&args, 11, 20.0f64)?;
+    let spectral_beam_weight = parse_or(&args, 12, 2.0f64)?;
     if validation_records == 0
         || samples_per_record == 0
         || mass_beam_width == 0
@@ -97,6 +108,12 @@ fn main() -> Result<()> {
     }
     if !(temperature > 0.0 && temperature.is_finite()) {
         anyhow::bail!("temperature must be positive and finite");
+    }
+    if !(fragment_tolerance_ppm > 0.0 && fragment_tolerance_ppm.is_finite()) {
+        anyhow::bail!("fragment_tolerance_ppm must be positive and finite");
+    }
+    if !(spectral_beam_weight >= 0.0 && spectral_beam_weight.is_finite()) {
+        anyhow::bail!("spectral_beam_weight must be finite and non-negative");
     }
 
     let device = Device::Cpu;
@@ -153,6 +170,9 @@ fn main() -> Result<()> {
     println!("temperature\t{temperature}");
     println!("mass_beam_width\t{mass_beam_width}");
     println!("final_candidates_per_chain\t{final_candidates_per_chain}");
+    println!("fragment_tolerance_ppm\t{fragment_tolerance_ppm}");
+    println!("spectral_beam_weight\t{spectral_beam_weight}");
+    println!("primary_candidate_ranking\tfragment_mass");
     println!("seed\t{seed}");
 
     if let Some(parent) = output_tsv.parent() {
@@ -164,7 +184,7 @@ fn main() -> Result<()> {
     let mut output = BufWriter::new(file);
     writeln!(
         output,
-        "record_index\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tmass_error_da\tmass_valid\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
+        "record_index\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tmass_error_da\tmass_valid\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
     )?;
 
     let mut metrics = GenerationMetrics::default();
@@ -201,6 +221,22 @@ fn main() -> Result<()> {
         let mut rng =
             GenerationRng::new(seed ^ mix64(record_index as u64) ^ selection_index as u64);
         let target_neutral_mass = precursor_neutral_mass(record)?;
+        let fragment_charge = record
+            .context
+            .charge
+            .unwrap_or(1)
+            .unsigned_abs()
+            .clamp(1, 2) as usize;
+        let observed_peaks = normalized_observed_peaks(&spectrum);
+        let target_fragment_evidence = peptidoform_fragment_evidence(
+            &record.peptidoform,
+            target_neutral_mass,
+            &observed_peaks,
+            fragment_charge,
+            fragment_tolerance_ppm,
+        );
+        metrics.target_fragment_score_sum += target_fragment_evidence.score;
+        metrics.target_matched_cleavages += target_fragment_evidence.matched_cleavages;
         let active_lengths = sample_generation_lengths(
             &predicted_length_distribution,
             predicted_active_length,
@@ -210,7 +246,7 @@ fn main() -> Result<()> {
             &mut rng,
         );
         metrics.chains += active_lengths.len();
-        let (rows, reverse_scores) = reverse_generate(
+        let (rows, reverse_scores, fragment_scores, matched_cleavages) = reverse_generate(
             &model,
             &diffusion_collator,
             &spectrum_collator,
@@ -222,6 +258,8 @@ fn main() -> Result<()> {
             mass_tolerance_da,
             mass_beam_width,
             final_candidates_per_chain,
+            fragment_tolerance_ppm,
+            spectral_beam_weight,
             temperature,
             &mut rng,
             &device,
@@ -229,7 +267,12 @@ fn main() -> Result<()> {
         metrics.final_states += rows.len();
 
         let mut unique = HashMap::<Vec<u32>, GeneratedCandidate>::new();
-        for (tokens, reverse_log_probability) in rows.into_iter().zip(reverse_scores) {
+        for (((tokens, reverse_log_probability), fragment_score), matched_cleavages) in rows
+            .into_iter()
+            .zip(reverse_scores)
+            .zip(fragment_scores)
+            .zip(matched_cleavages)
+        {
             let peptide = match vocabulary.decode(&tokens) {
                 Ok(peptide) => peptide,
                 Err(_) => continue,
@@ -246,6 +289,8 @@ fn main() -> Result<()> {
                 tokens: tokens.clone(),
                 peptide,
                 reverse_log_probability,
+                fragment_score,
+                matched_cleavages,
                 mass_error_da,
                 mass_valid,
             };
@@ -280,11 +325,13 @@ fn main() -> Result<()> {
             metrics.raw_top1_peptidoform_exact += 1;
         }
 
-        candidates.sort_by(mass_candidate_order);
+        let mut mass_ranked = candidates.clone();
+        mass_ranked.sort_by(mass_candidate_order);
+        candidates.sort_by(fragment_mass_candidate_order);
         if candidates.iter().any(|candidate| candidate.mass_valid) {
             metrics.records_with_mass_valid_candidate += 1;
         }
-        if let Some(error) = candidates
+        if let Some(error) = mass_ranked
             .iter()
             .filter_map(|candidate| candidate.mass_error_da)
             .next()
@@ -292,10 +339,12 @@ fn main() -> Result<()> {
             metrics.best_abs_mass_error_sum += error.abs();
             metrics.best_abs_mass_error_records += 1;
         }
+        metrics.top1_fragment_score_sum += candidates[0].fragment_score;
+        metrics.top1_matched_cleavages += candidates[0].matched_cleavages;
 
         let target_sequence = &record.peptidoform.sequence;
         let target_il = normalize_il(target_sequence);
-        if candidates[0].peptide == record.peptidoform {
+        if mass_ranked[0].peptide == record.peptidoform {
             metrics.mass_top1_peptidoform_exact += 1;
         }
         if candidates
@@ -304,7 +353,7 @@ fn main() -> Result<()> {
         {
             metrics.mass_topk_peptidoform_exact += 1;
         }
-        if candidates[0].peptide.sequence.as_str() == target_sequence.as_str() {
+        if mass_ranked[0].peptide.sequence.as_str() == target_sequence.as_str() {
             metrics.mass_top1_sequence_exact += 1;
         }
         if candidates
@@ -313,7 +362,7 @@ fn main() -> Result<()> {
         {
             metrics.mass_topk_sequence_exact += 1;
         }
-        if normalize_il(&candidates[0].peptide.sequence) == target_il {
+        if normalize_il(&mass_ranked[0].peptide.sequence) == target_il {
             metrics.mass_top1_il_sequence_exact += 1;
         }
         if candidates
@@ -322,22 +371,39 @@ fn main() -> Result<()> {
         {
             metrics.mass_topk_il_sequence_exact += 1;
         }
+        if candidates[0].peptide == record.peptidoform {
+            metrics.fragment_top1_peptidoform_exact += 1;
+        }
+        if candidates[0].peptide.sequence.as_str() == target_sequence.as_str() {
+            metrics.fragment_top1_sequence_exact += 1;
+        }
+        if normalize_il(&candidates[0].peptide.sequence) == target_il {
+            metrics.fragment_top1_il_sequence_exact += 1;
+        }
 
         let reverse_rank_by_tokens: HashMap<Vec<u32>, usize> = reverse_ranked
             .iter()
             .enumerate()
             .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
             .collect();
-        for (mass_index, candidate) in candidates.iter().enumerate() {
+        let mass_rank_by_tokens: HashMap<Vec<u32>, usize> = mass_ranked
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
+            .collect();
+        for (fragment_mass_index, candidate) in candidates.iter().enumerate() {
             writeln!(
                 output,
-                "{record_index}\t{}\t{target_active_length}\t{predicted_active_length}\t{}\t{}\t{}\t{}\t{:.8}\t{}\t{}\t{}\t{}\t{}",
+                "{record_index}\t{}\t{target_active_length}\t{predicted_active_length}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}\t{}\t{}\t{}\t{}\t{}\t{}",
                 record.peptidoform.sequence,
-                mass_index + 1,
+                fragment_mass_index + 1,
+                mass_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
                 reverse_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
                 candidate.peptide.sequence,
                 format_modifications(&candidate.peptide),
                 candidate.reverse_log_probability,
+                candidate.fragment_score,
+                candidate.matched_cleavages,
                 candidate
                     .mass_error_da
                     .map(|value| format!("{value:.8}"))
@@ -350,15 +416,19 @@ fn main() -> Result<()> {
         }
 
         println!(
-            "generation_record\trecord_index={record_index}\ttarget={}\ttarget_length={target_active_length}\tpredicted_length={predicted_active_length}\tvalid_candidates={}\tmass_valid_candidates={}\tbest_mass_error_da={}\ttop1={}\ttop1_exact={}\ttopk_exact={}",
+            "generation_record\trecord_index={record_index}\ttarget={}\ttarget_length={target_active_length}\tpredicted_length={predicted_active_length}\tvalid_candidates={}\tmass_valid_candidates={}\tbest_mass_error_da={}\ttarget_fragment_score={:.4}\ttarget_matched_cleavages={}\ttop1={}\ttop1_fragment_score={:.4}\ttop1_matched_cleavages={}\ttop1_exact={}\ttopk_exact={}",
             record.peptidoform.sequence,
             candidates.len(),
             candidates.iter().filter(|candidate| candidate.mass_valid).count(),
-            candidates[0]
+            mass_ranked[0]
                 .mass_error_da
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_else(|| "NA".into()),
+            target_fragment_evidence.score,
+            target_fragment_evidence.matched_cleavages,
             candidates[0].peptide.sequence,
+            candidates[0].fragment_score,
+            candidates[0].matched_cleavages,
             candidates[0].peptide == record.peptidoform,
             candidates.iter().any(|candidate| candidate.peptide == record.peptidoform),
         );
@@ -424,12 +494,40 @@ fn main() -> Result<()> {
         "generation_summary\tmass_topk_il_sequence_exact\t{:.6}",
         metrics.mass_topk_il_sequence_exact as f64 / records
     );
+    println!(
+        "generation_summary\tfragment_top1_peptidoform_exact\t{:.6}",
+        metrics.fragment_top1_peptidoform_exact as f64 / records
+    );
+    println!(
+        "generation_summary\tfragment_top1_sequence_exact\t{:.6}",
+        metrics.fragment_top1_sequence_exact as f64 / records
+    );
+    println!(
+        "generation_summary\tfragment_top1_il_sequence_exact\t{:.6}",
+        metrics.fragment_top1_il_sequence_exact as f64 / records
+    );
     if metrics.best_abs_mass_error_records > 0 {
         println!(
             "generation_summary\tmean_best_abs_mass_error_da\t{:.6}",
             metrics.best_abs_mass_error_sum / metrics.best_abs_mass_error_records as f64
         );
     }
+    println!(
+        "generation_summary\tmean_target_fragment_score\t{:.6}",
+        metrics.target_fragment_score_sum / records
+    );
+    println!(
+        "generation_summary\tmean_top1_fragment_score\t{:.6}",
+        metrics.top1_fragment_score_sum / records
+    );
+    println!(
+        "generation_summary\tmean_target_matched_cleavages\t{:.4}",
+        metrics.target_matched_cleavages as f64 / records
+    );
+    println!(
+        "generation_summary\tmean_top1_matched_cleavages\t{:.4}",
+        metrics.top1_matched_cleavages as f64 / records
+    );
     println!("generation_candidates\t{}", output_tsv.display());
     Ok(())
 }
@@ -447,10 +545,12 @@ fn reverse_generate(
     mass_tolerance_da: f64,
     mass_beam_width: usize,
     final_candidates_per_chain: usize,
+    fragment_tolerance_ppm: f64,
+    spectral_beam_weight: f64,
     temperature: f64,
     rng: &mut GenerationRng,
     device: &Device,
-) -> Result<(Vec<Vec<u32>>, Vec<f64>)> {
+) -> Result<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>, Vec<usize>)> {
     let batch = active_lengths.len();
     let mut rows = Vec::<Vec<u32>>::with_capacity(batch);
     for &active_length in active_lengths {
@@ -503,8 +603,17 @@ fn reverse_generate(
         diffusion_collator.collate_inference_tokens(&rows, active_lengths, 1, device)?;
     let final_output = model.forward_t(&final_diffusion, &spectrum_batch, &precursor, false)?;
     let final_logits = final_output.token_logits.to_vec3::<f32>()?;
+    let observed_peaks = normalized_observed_peaks(spectrum);
+    let fragment_charge = record
+        .context
+        .charge
+        .unwrap_or(1)
+        .unsigned_abs()
+        .clamp(1, 2) as usize;
     let mut finalized_rows = Vec::new();
     let mut finalized_scores = Vec::new();
+    let mut finalized_fragment_scores = Vec::new();
+    let mut finalized_matched_cleavages = Vec::new();
 
     for batch_index in 0..batch {
         let active_length = active_lengths[batch_index];
@@ -515,15 +624,26 @@ fn reverse_generate(
             mass_tolerance_da,
             mass_beam_width,
             final_candidates_per_chain,
+            &observed_peaks,
+            fragment_charge,
+            fragment_tolerance_ppm,
+            spectral_beam_weight,
             temperature,
             config.max_tokens,
         );
-        for (row, final_log_probability) in finalized {
+        for (row, final_log_probability, fragment_score, matched_cleavages) in finalized {
             finalized_rows.push(row);
             finalized_scores.push(reverse_log_probability[batch_index] + final_log_probability);
+            finalized_fragment_scores.push(fragment_score);
+            finalized_matched_cleavages.push(matched_cleavages);
         }
     }
-    Ok((finalized_rows, finalized_scores))
+    Ok((
+        finalized_rows,
+        finalized_scores,
+        finalized_fragment_scores,
+        finalized_matched_cleavages,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +651,9 @@ struct MassBeamState {
     prefix: Vec<u32>,
     neutral_mass: f64,
     log_probability: f64,
+    fragment_score: f64,
+    matched_cleavages: usize,
+    residue_count: usize,
     priority: f64,
 }
 
@@ -542,9 +665,13 @@ fn mass_guided_final_beam(
     mass_tolerance_da: f64,
     beam_width: usize,
     final_candidates_per_chain: usize,
+    observed_peaks: &[(f64, f64)],
+    max_fragment_charge: usize,
+    fragment_tolerance_ppm: f64,
+    spectral_beam_weight: f64,
     temperature: f64,
     max_tokens: usize,
-) -> Vec<(Vec<u32>, f64)> {
+) -> Vec<(Vec<u32>, f64, f64, usize)> {
     let nonterminal_positions = active_length.saturating_sub(1);
     if nonterminal_positions == 0 {
         return Vec::new();
@@ -562,6 +689,9 @@ fn mass_guided_final_beam(
         prefix: Vec::with_capacity(nonterminal_positions),
         neutral_mass: FOUNDATION_PEPTIDE_WATER_MASS_DA,
         log_probability: 0.0,
+        fragment_score: 0.0,
+        matched_cleavages: 0,
+        residue_count: 0,
         priority: 0.0,
     }];
 
@@ -592,6 +722,23 @@ fn mass_guided_final_beam(
                     continue;
                 }
                 let log_probability = state.log_probability + probability.max(1e-300).ln();
+                let mut fragment_score = state.fragment_score;
+                let mut matched_cleavages = state.matched_cleavages;
+                let is_residue = foundation_diffusion_token_residue(token).is_some();
+                if is_residue && state.residue_count > 0 && has_mass {
+                    let prefix_mass_without_water =
+                        state.neutral_mass - FOUNDATION_PEPTIDE_WATER_MASS_DA;
+                    let evidence = cleavage_fragment_evidence(
+                        prefix_mass_without_water,
+                        target,
+                        observed_peaks,
+                        max_fragment_charge,
+                        fragment_tolerance_ppm,
+                    );
+                    fragment_score += evidence.score;
+                    matched_cleavages += usize::from(evidence.matched);
+                }
+                let residue_count = state.residue_count + usize::from(is_residue);
                 let remaining = nonterminal_positions - position - 1;
                 let projected_mass = neutral_mass + remaining as f64 * expected_per_position;
                 let mass_penalty = if has_mass {
@@ -599,13 +746,17 @@ fn mass_guided_final_beam(
                 } else {
                     0.0
                 };
-                let priority = log_probability - mass_penalty;
+                let priority =
+                    log_probability + spectral_beam_weight * fragment_score - mass_penalty;
                 let mut prefix = state.prefix.clone();
                 prefix.push(token);
                 let candidate = MassBeamState {
                     prefix,
                     neutral_mass,
                     log_probability,
+                    fragment_score,
+                    matched_cleavages,
+                    residue_count,
                     priority,
                 };
                 let bin = (neutral_mass / mass_bin_width).round() as i64;
@@ -637,6 +788,7 @@ fn mass_guided_final_beam(
             let right_valid = right_error <= mass_tolerance_da;
             right_valid
                 .cmp(&left_valid)
+                .then_with(|| right.fragment_score.total_cmp(&left.fragment_score))
                 .then_with(|| left_error.total_cmp(&right_error))
                 .then_with(|| right.log_probability.total_cmp(&left.log_probability))
         } else {
@@ -651,7 +803,12 @@ fn mass_guided_final_beam(
                 row[position] = token;
             }
             row[active_length - 1] = FOUNDATION_DIFFUSION_EOS;
-            (row, state.log_probability)
+            (
+                row,
+                state.log_probability,
+                state.fragment_score,
+                state.matched_cleavages,
+            )
         })
         .collect()
 }
@@ -883,6 +1040,168 @@ fn mass_candidate_order(left: &GeneratedCandidate, right: &GeneratedCandidate) -
         })
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct FragmentEvidence {
+    score: f64,
+    matched_cleavages: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CleavageEvidence {
+    score: f64,
+    matched: bool,
+}
+
+fn fragment_mass_candidate_order(
+    left: &GeneratedCandidate,
+    right: &GeneratedCandidate,
+) -> Ordering {
+    right
+        .mass_valid
+        .cmp(&left.mass_valid)
+        .then_with(|| right.fragment_score.total_cmp(&left.fragment_score))
+        .then_with(|| {
+            let left_error = left.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            let right_error = right.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            left_error.total_cmp(&right_error)
+        })
+        .then_with(|| {
+            right
+                .reverse_log_probability
+                .total_cmp(&left.reverse_log_probability)
+        })
+}
+
+fn normalized_observed_peaks(spectrum: &FoundationSpectrum) -> Vec<(f64, f64)> {
+    let max_intensity = spectrum
+        .peaks
+        .iter()
+        .filter_map(|peak| {
+            (peak.intensity.is_finite() && peak.intensity > 0.0).then_some(peak.intensity as f64)
+        })
+        .fold(0.0f64, f64::max)
+        .max(f64::EPSILON);
+    let mut peaks: Vec<(f64, f64)> = spectrum
+        .peaks
+        .iter()
+        .filter_map(|peak| {
+            (peak.mz.is_finite()
+                && peak.mz > 0.0
+                && peak.intensity.is_finite()
+                && peak.intensity > 0.0)
+                .then_some((
+                    peak.mz as f64,
+                    (peak.intensity as f64 / max_intensity).clamp(0.0, 1.0),
+                ))
+        })
+        .collect();
+    peaks.sort_by(|left, right| left.0.total_cmp(&right.0));
+    peaks
+}
+
+fn peptidoform_fragment_evidence(
+    peptide: &PeptidoformInput,
+    precursor_neutral_mass: Option<f64>,
+    observed_peaks: &[(f64, f64)],
+    max_fragment_charge: usize,
+    fragment_tolerance_ppm: f64,
+) -> FragmentEvidence {
+    let Some(target_mass) = precursor_neutral_mass.filter(|value| value.is_finite()) else {
+        return FragmentEvidence::default();
+    };
+    let vocabulary = FoundationDiffusionVocabulary;
+    let Ok(tokens) = vocabulary.encode(peptide, 256) else {
+        return FragmentEvidence::default();
+    };
+    let mut prefix_mass = 0.0f64;
+    let mut residue_count = 0usize;
+    let mut total = FragmentEvidence::default();
+    for token in tokens {
+        if token == FOUNDATION_DIFFUSION_PAD || token == FOUNDATION_DIFFUSION_EOS {
+            break;
+        }
+        if foundation_diffusion_token_residue(token).is_some() {
+            if residue_count > 0 {
+                let evidence = cleavage_fragment_evidence(
+                    prefix_mass,
+                    target_mass,
+                    observed_peaks,
+                    max_fragment_charge,
+                    fragment_tolerance_ppm,
+                );
+                total.score += evidence.score;
+                total.matched_cleavages += usize::from(evidence.matched);
+            }
+            residue_count += 1;
+        }
+        if let Some(mass) = foundation_diffusion_token_mass_da(token) {
+            prefix_mass += mass;
+        }
+    }
+    total
+}
+
+fn cleavage_fragment_evidence(
+    prefix_mass_without_water: f64,
+    precursor_neutral_mass: f64,
+    observed_peaks: &[(f64, f64)],
+    max_fragment_charge: usize,
+    fragment_tolerance_ppm: f64,
+) -> CleavageEvidence {
+    if !(prefix_mass_without_water > 0.0
+        && precursor_neutral_mass > prefix_mass_without_water
+        && !observed_peaks.is_empty())
+    {
+        return CleavageEvidence::default();
+    }
+    let suffix_with_water = precursor_neutral_mass - prefix_mass_without_water;
+    let mut best_b = 0.0f64;
+    let mut best_y = 0.0f64;
+    for charge in 1..=max_fragment_charge.max(1) {
+        let z = charge as f64;
+        let b_mz = (prefix_mass_without_water + z * 1.007_276_466_77) / z;
+        let y_mz = (suffix_with_water + z * 1.007_276_466_77) / z;
+        best_b = best_b.max(theoretical_peak_match_score(
+            b_mz,
+            observed_peaks,
+            fragment_tolerance_ppm,
+        ));
+        best_y = best_y.max(theoretical_peak_match_score(
+            y_mz,
+            observed_peaks,
+            fragment_tolerance_ppm,
+        ));
+    }
+    let score = best_b + best_y;
+    CleavageEvidence {
+        score,
+        matched: score > 0.0,
+    }
+}
+
+fn theoretical_peak_match_score(
+    theoretical_mz: f64,
+    observed_peaks: &[(f64, f64)],
+    tolerance_ppm: f64,
+) -> f64 {
+    if !(theoretical_mz > 0.0 && theoretical_mz.is_finite()) {
+        return 0.0;
+    }
+    let sigma = (theoretical_mz * tolerance_ppm * 1e-6).max(0.0025);
+    let cutoff = 3.0 * sigma;
+    let mut best = 0.0f64;
+    for &(observed_mz, normalized_intensity) in observed_peaks {
+        let error = (observed_mz - theoretical_mz).abs();
+        if error > cutoff {
+            continue;
+        }
+        let mass_weight = (-0.5 * (error / sigma).powi(2)).exp();
+        let intensity_weight = normalized_intensity.sqrt();
+        best = best.max(mass_weight * intensity_weight);
+    }
+    best
+}
+
 fn format_modifications(peptide: &PeptidoformInput) -> String {
     peptide
         .modifications
@@ -1046,5 +1365,53 @@ impl GenerationRng {
     fn next_f64(&mut self) -> f64 {
         let value = self.next_u64() >> 11;
         value as f64 / ((1u64 << 53) - 1) as f64
+    }
+}
+
+#[cfg(test)]
+mod fragment_evidence_tests {
+    use super::*;
+    use redeem_properties::foundation::FoundationSpectrumPeak;
+
+    #[test]
+    fn target_fragment_ladder_scores_above_mass_scrambled_sequence() {
+        let target = PeptidoformInput {
+            sequence: "PEPTIDEK".into(),
+            modifications: Vec::new(),
+        };
+        let scrambled = PeptidoformInput {
+            sequence: "KEDITPEP".into(),
+            modifications: Vec::new(),
+        };
+        let target_mass =
+            redeem_properties::foundation::foundation_peptidoform_neutral_mass(&target).unwrap();
+        let vocabulary = FoundationDiffusionVocabulary;
+        let tokens = vocabulary.encode(&target, 32).unwrap();
+        let mut prefix_mass = 0.0;
+        let mut residue_count = 0usize;
+        let mut peaks = Vec::new();
+        for token in tokens {
+            if token == FOUNDATION_DIFFUSION_EOS || token == FOUNDATION_DIFFUSION_PAD {
+                break;
+            }
+            if foundation_diffusion_token_residue(token).is_some() {
+                if residue_count > 0 {
+                    peaks.push(FoundationSpectrumPeak {
+                        mz: (prefix_mass + 1.007_276_466_77) as f32,
+                        intensity: 1.0,
+                    });
+                }
+                residue_count += 1;
+            }
+            prefix_mass += foundation_diffusion_token_mass_da(token).unwrap();
+        }
+        let spectrum = FoundationSpectrum { peaks };
+        let observed = normalized_observed_peaks(&spectrum);
+        let target_score =
+            peptidoform_fragment_evidence(&target, Some(target_mass), &observed, 1, 20.0);
+        let scrambled_score =
+            peptidoform_fragment_evidence(&scrambled, Some(target_mass), &observed, 1, 20.0);
+        assert!(target_score.score > scrambled_score.score);
+        assert!(target_score.matched_cleavages >= 4);
     }
 }
