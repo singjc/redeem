@@ -486,6 +486,33 @@ impl FoundationTrainer {
         })
     }
 
+    /// Create a trainer from a model-only SafeTensors initialization.
+    ///
+    /// The model snapshot is loaded before AdamW is constructed, so paired
+    /// experiments can share exactly the same initial parameters while each
+    /// run starts with independent zero-valued optimizer moments. This is the
+    /// preferred CPU reproducibility path because Candle CPU random
+    /// initialization is not controlled by the trainer sampling seed.
+    pub fn new_from_safetensors<P: AsRef<Path>>(
+        model_config: FoundationConfig,
+        config: FoundationTrainerConfig,
+        device: Device,
+        path: P,
+    ) -> Result<Self> {
+        config.validate()?;
+        let mut wrapper = FoundationModelWrapper::new(model_config.clone(), device)?;
+        wrapper.varmap_mut().load(path)?;
+        let optimizer = FoundationAdamW::new(wrapper.varmap(), config.optimizer_config())?;
+        let collator = FoundationCollator::new(model_config, config.collator.clone())?;
+        Ok(Self {
+            wrapper,
+            optimizer,
+            collator,
+            config,
+            global_step: 0,
+        })
+    }
+
     /// Load only model weights from a SafeTensors file.
     ///
     /// This intentionally does not claim to be an exact training resume. Use

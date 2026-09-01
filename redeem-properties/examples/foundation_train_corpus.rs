@@ -27,6 +27,14 @@ fn main() -> Result<()> {
     println!("test_records\t{}", summary.test_records);
     println!("resumed\t{}", summary.resumed);
     println!(
+        "initialized_from_model\t{}",
+        summary
+            .initialized_from_model
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "NA".to_owned())
+    );
+    println!(
         "rt_encoder_gradient_scale\t{}",
         config.trainer.shared_gradient_scales.rt_encoder
     );

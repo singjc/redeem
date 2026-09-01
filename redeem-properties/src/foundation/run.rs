@@ -41,6 +41,13 @@ pub struct FoundationTrainingRunConfig {
     pub checkpoint_root: PathBuf,
     /// Resume from `checkpoint_root/latest` when it exists.
     pub resume: bool,
+    /// Optional model-only SafeTensors snapshot used for a fresh-run initialization.
+    ///
+    /// This is mutually exclusive with `resume`. It exists so controlled CPU
+    /// experiments can begin from byte-identical model parameters even when
+    /// backend random initialization itself is not seedable. Optimizer moments
+    /// are always initialized fresh when this field is used.
+    pub initial_model_safetensors: Option<PathBuf>,
     /// Optional experiment identifier stored in checkpoint provenance.
     pub experiment_id: Option<String>,
 }
@@ -55,6 +62,7 @@ impl Default for FoundationTrainingRunConfig {
             benchmark_manifest: PathBuf::new(),
             checkpoint_root: PathBuf::new(),
             resume: false,
+            initial_model_safetensors: None,
             experiment_id: None,
         }
     }
@@ -81,6 +89,16 @@ impl FoundationTrainingRunConfig {
         if self.checkpoint_root.as_os_str().is_empty() {
             anyhow::bail!("foundation checkpoint_root path cannot be empty");
         }
+        if self.resume && self.initial_model_safetensors.is_some() {
+            anyhow::bail!("foundation resume and initial_model_safetensors are mutually exclusive");
+        }
+        if self
+            .initial_model_safetensors
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            anyhow::bail!("foundation initial_model_safetensors path cannot be empty");
+        }
         Ok(())
     }
 }
@@ -100,6 +118,8 @@ pub struct FoundationTrainingRunSummary {
     pub test_records: usize,
     /// Whether a checkpoint was loaded before fitting.
     pub resumed: bool,
+    /// Model-only initialization snapshot used for a fresh run, when configured.
+    pub initialized_from_model: Option<PathBuf>,
     /// Metadata loaded when resuming.
     pub resume_metadata: Option<FoundationCheckpointMetadata>,
     /// Preview of the first/current training epoch sampling mixture.
@@ -324,16 +344,24 @@ pub fn run_foundation_pretraining(
         let progress = metadata.progress.clone();
         (trainer, progress, Some(metadata), true)
     } else {
-        (
+        let trainer = if let Some(path) = &config.initial_model_safetensors {
+            FoundationTrainer::new_from_safetensors(
+                config.model.clone(),
+                resolved_trainer_config.clone(),
+                device,
+                path,
+            )
+            .with_context(|| {
+                format!("failed to initialize foundation model from SafeTensors snapshot {path:?}")
+            })?
+        } else {
             FoundationTrainer::new(
                 config.model.clone(),
                 resolved_trainer_config.clone(),
                 device,
-            )?,
-            Default::default(),
-            None,
-            false,
-        )
+            )?
+        };
+        (trainer, Default::default(), None, false)
     };
 
     if resumed && config.model.dropout > 0.0 {
@@ -410,6 +438,11 @@ pub fn run_foundation_pretraining(
         validation_records: validation_indices.len(),
         test_records: test_indices.len(),
         resumed,
+        initialized_from_model: if resumed {
+            None
+        } else {
+            config.initial_model_safetensors.clone()
+        },
         resume_metadata,
         train_sampling_preview,
         validation_sampling,
