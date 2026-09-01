@@ -466,6 +466,40 @@ pub struct FoundationTrainer {
     global_step: u64,
 }
 
+fn validate_ccs_physics_target_space(
+    model_config: &FoundationConfig,
+    trainer_config: &FoundationTrainerConfig,
+) -> Result<()> {
+    let Some(baseline) = &model_config.ccs_physics_baseline else {
+        return Ok(());
+    };
+    let normalization = &trainer_config.target_normalization.ccs;
+    if !normalization.is_active() {
+        candle_core::bail!(
+            "foundation CCS physics baseline requires resolved train-standardized CCS normalization"
+        );
+    }
+    let mean = normalization.mean.unwrap_or(f64::NAN);
+    let standard_deviation = normalization.standard_deviation.unwrap_or(f64::NAN);
+    if !nearly_equal(mean, baseline.target_mean_native)
+        || !nearly_equal(standard_deviation, baseline.target_std_native)
+    {
+        candle_core::bail!(
+            "foundation CCS physics baseline target-space statistics do not match resolved training normalization: baseline mean/std={}/{}, normalization mean/std={}/{}",
+            baseline.target_mean_native,
+            baseline.target_std_native,
+            mean,
+            standard_deviation
+        );
+    }
+    Ok(())
+}
+
+fn nearly_equal(left: f64, right: f64) -> bool {
+    let scale = left.abs().max(right.abs()).max(1.0);
+    (left - right).abs() <= 1e-10 * scale
+}
+
 impl FoundationTrainer {
     /// Create a randomly initialized trainer.
     pub fn new(
@@ -474,6 +508,7 @@ impl FoundationTrainer {
         device: Device,
     ) -> Result<Self> {
         config.validate()?;
+        validate_ccs_physics_target_space(&model_config, &config)?;
         let wrapper = FoundationModelWrapper::new(model_config.clone(), device)?;
         let optimizer = FoundationAdamW::new(wrapper.varmap(), config.optimizer_config())?;
         let collator = FoundationCollator::new(model_config, config.collator.clone())?;
@@ -500,6 +535,7 @@ impl FoundationTrainer {
         path: P,
     ) -> Result<Self> {
         config.validate()?;
+        validate_ccs_physics_target_space(&model_config, &config)?;
         let mut wrapper = FoundationModelWrapper::new(model_config.clone(), device)?;
         wrapper.varmap_mut().load(path)?;
         let optimizer = FoundationAdamW::new(wrapper.varmap(), config.optimizer_config())?;

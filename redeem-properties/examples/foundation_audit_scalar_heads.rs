@@ -6,9 +6,9 @@
 use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use redeem_properties::foundation::{
-    load_foundation_corpus, read_foundation_training_run_config,
-    sample_foundation_validation_indices, FoundationBenchmarkManifest, FoundationPartition,
-    FoundationTrainer,
+    foundation_ccs_physics_features_from_values, load_foundation_corpus,
+    read_foundation_training_run_config, sample_foundation_validation_indices,
+    FoundationBenchmarkManifest, FoundationPartition, FoundationTrainer,
 };
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
@@ -291,29 +291,12 @@ fn fit_affine(observations: &[CcsObservation]) -> (f64, f64) {
 }
 
 fn physics_features(observation: &CcsObservation, include_model_prediction: bool) -> Vec<f64> {
-    let charge = observation.charge.unwrap_or(0) as f64;
-    let mz = f64::from(observation.precursor_mz.unwrap_or(0.0));
-    let charge_present = if observation.charge.is_some() {
-        1.0
-    } else {
-        0.0
-    };
-    let mz_present = if observation.precursor_mz.is_some() {
-        1.0
-    } else {
-        0.0
-    };
-    let neutral_mass_proxy = charge * mz;
-    let mut features = vec![
-        1.0,
-        charge / 4.0,
-        charge * charge / 16.0,
-        mz / 1000.0,
-        neutral_mass_proxy / 3000.0,
-        observation.sequence_len as f64 / 30.0,
-        charge_present,
-        mz_present,
-    ];
+    let mut features = foundation_ccs_physics_features_from_values(
+        observation.sequence_len,
+        observation.charge,
+        observation.precursor_mz,
+    )
+    .to_vec();
     if include_model_prediction {
         features.push(observation.model_prediction / 500.0);
     }

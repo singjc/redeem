@@ -11,6 +11,7 @@
 //! are represented with masks, and two independently corrupted graph/sequence
 //! views provide masked reconstruction plus contrastive self-supervision.
 
+pub mod ccs_physics;
 pub mod checkpoint;
 pub mod chemistry;
 pub mod collate;
@@ -33,6 +34,13 @@ pub mod split;
 pub mod trainer;
 pub mod wrapper;
 
+pub use ccs_physics::{
+    evaluate_foundation_ccs_physics_baseline, fit_foundation_ccs_physics_baseline,
+    foundation_ccs_physics_features, foundation_ccs_physics_features_from_values,
+    predict_foundation_ccs_physics_native, FoundationCcsPhysicsFeatureSummary,
+    FoundationCcsPhysicsFitConfig, FoundationCcsPhysicsFitResult, FoundationCcsPhysicsMetrics,
+    FOUNDATION_CCS_PHYSICS_FEATURE_COUNT, FOUNDATION_CCS_PHYSICS_FEATURE_NAMES,
+};
 pub use checkpoint::{
     foundation_checkpoint_paths, FoundationCheckpointMetadata, FoundationCheckpointProvenance,
     FoundationTrainingProgress, FOUNDATION_CHECKPOINT_VERSION, FOUNDATION_MODEL_FILE,

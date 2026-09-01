@@ -1,5 +1,6 @@
 //! Hierarchical chemistry-aware peptide encoder and multi-task prediction heads.
 
+use super::ccs_physics::FOUNDATION_CCS_PHYSICS_FEATURE_COUNT;
 use super::chemistry::ATOM_FEATURE_DIM;
 use super::config::{
     FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, FoundationConfig,
@@ -495,7 +496,7 @@ fn standardized_ccs_physics_baseline(
             .iter()
             .map(|value| *value as f32)
             .collect::<Vec<_>>(),
-        (8, 1),
+        (FOUNDATION_CCS_PHYSICS_FEATURE_COUNT, 1),
         device,
     )?;
     let native = features.matmul(&coefficients)?;
