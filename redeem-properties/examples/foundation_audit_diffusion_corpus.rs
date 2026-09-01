@@ -3,9 +3,9 @@
 
 use anyhow::{Context, Result};
 use redeem_properties::foundation::{
-    load_foundation_corpus, read_foundation_training_run_config, FoundationBenchmarkManifest,
-    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
-    FoundationSpectrum,
+    foundation_diffusion_dataset_fingerprint, load_foundation_corpus,
+    read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationDiffusionConfig,
+    FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -34,6 +34,7 @@ fn main() -> Result<()> {
     let vocabulary = FoundationDiffusionVocabulary;
     let mut overall = BTreeMap::<String, Counts>::new();
     let mut by_source = BTreeMap::<(String, String), Counts>::new();
+    let mut usable_indices = BTreeMap::<String, Vec<usize>>::new();
     let mut unsupported_examples = Vec::<String>::new();
 
     for entry in &manifest.entries {
@@ -56,6 +57,12 @@ fn main() -> Result<()> {
                     provenance.source_id, record.peptidoform.sequence, error
                 ));
             }
+        }
+        if spectrum.is_some() && tokenizable {
+            usable_indices
+                .entry(partition.clone())
+                .or_default()
+                .push(entry.record_index);
         }
         update(
             overall.entry(partition.clone()).or_default(),
@@ -80,6 +87,10 @@ fn main() -> Result<()> {
     println!("diffusion_vocab_size\t{}", vocabulary.size());
     for (partition, counts) in overall {
         print_counts("partition", &partition, &counts);
+        if let Some(indices) = usable_indices.get(&partition) {
+            let fingerprint = foundation_diffusion_dataset_fingerprint(&corpus.records, indices)?;
+            println!("partition_diffusion_fingerprint\t{partition}\tfnv1a64:{fingerprint:016x}");
+        }
     }
     for ((partition, source), counts) in by_source {
         print_counts(&format!("partition_source\t{partition}"), &source, &counts);
@@ -113,4 +124,10 @@ fn print_counts(prefix: &str, name: &str, counts: &Counts) {
         counts.usable_pairs,
         counts.observed_peaks,
     );
+    if counts.observed_spectra > 0 {
+        println!(
+            "{prefix}_mean_peaks\t{name}\t{}",
+            counts.observed_peaks as f64 / counts.observed_spectra as f64
+        );
+    }
 }

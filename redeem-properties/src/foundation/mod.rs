@@ -123,6 +123,7 @@ pub use sampling::{
     FoundationSamplingStrategy,
 };
 pub use spectrum::{
+    foundation_diffusion_dataset_fingerprint, foundation_diffusion_record_fingerprint,
     FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator,
     FoundationSpectrumConfig, FoundationSpectrumPeak,
 };

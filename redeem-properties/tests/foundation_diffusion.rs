@@ -98,3 +98,33 @@ fn diffusion_token_mass_round_trip_matches_precursor_constraint() {
     let error = foundation_precursor_mass_error_da(&decoded, precursor_mz, charge).unwrap();
     assert!(error.abs() < 1e-8);
 }
+
+#[test]
+fn diffusion_fingerprint_tracks_explicit_product_mz() {
+    use redeem_properties::foundation::{
+        foundation_diffusion_record_fingerprint, FoundationTrainingRecord, FragmentTarget,
+        RetentionTimeLabels, TrainingContext,
+    };
+
+    let mut record = FoundationTrainingRecord {
+        peptidoform: PeptidoformInput::unmodified("PEPTIDEK"),
+        retention_time: RetentionTimeLabels::default(),
+        ccs: None,
+        fragments: vec![FragmentTarget {
+            cleavage_index: 1,
+            channel: 0,
+            intensity: 1.0,
+            product_mz: Some(250.2),
+        }],
+        context: TrainingContext {
+            charge: Some(2),
+            precursor_mz: Some(500.0),
+            ..TrainingContext::default()
+        },
+        run_id: None,
+    };
+    let first = foundation_diffusion_record_fingerprint(&record);
+    record.fragments[0].product_mz = Some(250.3);
+    let second = foundation_diffusion_record_fingerprint(&record);
+    assert_ne!(first, second);
+}

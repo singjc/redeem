@@ -218,6 +218,89 @@ impl FoundationSpectrumCollator {
     }
 }
 
+/// Stable spectrum-aware fingerprint for one inverse-training record.
+///
+/// This extends the historical forward record fingerprint with the explicit
+/// observed/library product-m/z content retained for the inverse lane. Fragment
+/// annotations are not used as inverse-model features, but m/z and intensity are
+/// part of the data-integrity contract because changing either changes the
+/// spectrum observed by the diffusion model.
+pub fn foundation_diffusion_record_fingerprint(record: &FoundationTrainingRecord) -> u64 {
+    let mut hash = SpectrumFnv64::new();
+    hash.u64(super::experiment::foundation_record_fingerprint(record));
+    let mut peaks: Vec<(u32, u32)> = record
+        .fragments
+        .iter()
+        .filter_map(|fragment| {
+            fragment
+                .product_mz
+                .map(|mz| (mz.to_bits(), fragment.intensity.to_bits()))
+        })
+        .collect();
+    peaks.sort_unstable();
+    hash.usize(peaks.len());
+    for (mz, intensity) in peaks {
+        hash.u32(mz);
+        hash.u32(intensity);
+    }
+    hash.finish()
+}
+
+/// Stable order-independent fingerprint over a selected inverse dataset.
+///
+/// Unlike [`super::experiment::foundation_dataset_fingerprint`], this hash
+/// changes when explicitly observed/library product m/z values change.
+pub fn foundation_diffusion_dataset_fingerprint(
+    records: &[FoundationTrainingRecord],
+    selected_indices: &[usize],
+) -> anyhow::Result<u64> {
+    let mut record_hashes = Vec::with_capacity(selected_indices.len());
+    for &index in selected_indices {
+        let record = records.get(index).ok_or_else(|| {
+            anyhow::anyhow!("foundation diffusion fingerprint index {index} is out of bounds")
+        })?;
+        record_hashes.push(foundation_diffusion_record_fingerprint(record));
+    }
+    record_hashes.sort_unstable();
+    let mut hash = SpectrumFnv64::new();
+    hash.usize(record_hashes.len());
+    for value in record_hashes {
+        hash.u64(value);
+    }
+    Ok(hash.finish())
+}
+
+struct SpectrumFnv64(u64);
+
+impl SpectrumFnv64 {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.u64(value as u64);
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
