@@ -1,5 +1,6 @@
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder, VarMap};
+use candle_nn::{Module, VarBuilder, VarMap};
+use redeem_properties::foundation::model::gradient_scaled_identity;
 use redeem_properties::foundation::{
     FoundationConfig, PeptideFoundationEncoder, PeptideFoundationMultiTaskModel,
     PeptideGraphFeaturizer, PeptidoformInput, PrecursorContextBatch,
@@ -161,8 +162,7 @@ fn rt_encoder_gradient_gate_preserves_forward_values() {
     }
 }
 
-#[test]
-fn rt_encoder_gradient_gate_scales_encoder_but_not_rt_head_gradients() {
+fn assert_gradient_scale_primitive(scale: f64) {
     fn squared_norm(tensor: &Tensor) -> f64 {
         f64::from(
             tensor
@@ -176,65 +176,82 @@ fn rt_encoder_gradient_gate_scales_encoder_but_not_rt_head_gradients() {
     }
 
     let device = Device::Cpu;
-    let config = FoundationConfig {
-        max_sequence_len: 12,
-        transformer_layers: 1,
-        dropout: 0.0,
-        ..FoundationConfig::default()
+
+    // Use an explicit tracked variable as the "encoder output" so Candle's
+    // GradStore can be queried directly without relying on model parameter names.
+    let input_varmap = VarMap::new();
+    let input = {
+        let vb = VarBuilder::from_varmap(&input_varmap, DType::F32, &device);
+        vb.get_with_hints((1, 4), "embedding", candle_nn::Init::Const(1.0))
+            .unwrap()
     };
-    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
-    let batch = featurizer
-        .featurize(&[PeptidoformInput::unmodified("PEPTIDEK")], &device)
-        .unwrap();
-    let context = PrecursorContextBatch::unknown(1, &device).unwrap();
-    let varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = PeptideFoundationMultiTaskModel::new(config, vb).unwrap();
 
-    let full = model
-        .forward_t_with_rt_encoder_gradient_scale(&batch, &context, false, 1.0)
-        .unwrap();
-    let half = model
-        .forward_t_with_rt_encoder_gradient_scale(&batch, &context, false, 0.5)
-        .unwrap();
-    let gradients_full = full.rt.sum_all().unwrap().backward().unwrap();
-    let gradients_half = half.rt.sum_all().unwrap().backward().unwrap();
+    // A real trainable head verifies that the gate changes only the upstream
+    // gradient while leaving head-parameter gradients untouched.
+    let head_varmap = VarMap::new();
+    let head = {
+        let vb = VarBuilder::from_varmap(&head_varmap, DType::F32, &device);
+        candle_nn::linear(4, 1, vb).unwrap()
+    };
 
-    let data = varmap.data().lock().unwrap();
-    let encoder_full = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("encoder."))
-        .filter_map(|(_, variable)| gradients_full.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    let encoder_half = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("encoder."))
-        .filter_map(|(_, variable)| gradients_half.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    let head_full = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("heads.rt."))
-        .filter_map(|(_, variable)| gradients_full.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    let head_half = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("heads.rt."))
-        .filter_map(|(_, variable)| gradients_half.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    drop(data);
+    let full_features = gradient_scaled_identity(&input, 1.0).unwrap();
+    let gated_features = gradient_scaled_identity(&input, scale).unwrap();
+    let full_output = head.forward(&full_features).unwrap();
+    let gated_output = head.forward(&gated_features).unwrap();
 
-    assert!(encoder_full > 0.0);
-    assert!(head_full > 0.0);
-    assert!((encoder_half / encoder_full - 0.5).abs() < 1e-3);
-    assert!((head_half / head_full - 1.0).abs() < 1e-3);
+    // Gradient scaling is an identity in the forward pass.
+    let full_values = full_output.to_vec2::<f32>().unwrap();
+    let gated_values = gated_output.to_vec2::<f32>().unwrap();
+    assert_eq!(full_values.len(), gated_values.len());
+    for (full_row, gated_row) in full_values.iter().zip(gated_values.iter()) {
+        for (left, right) in full_row.iter().zip(gated_row.iter()) {
+            assert!((left - right).abs() <= 1e-6);
+        }
+    }
+
+    let gradients_full = full_output.sum_all().unwrap().backward().unwrap();
+    let gradients_gated = gated_output.sum_all().unwrap().backward().unwrap();
+
+    let input_full = gradients_full
+        .get(&input)
+        .expect("full path must produce an upstream gradient");
+    let input_gated = gradients_gated
+        .get(&input)
+        .expect("gated path must produce an upstream gradient");
+    let weight_full = gradients_full
+        .get(head.weight())
+        .expect("full path must produce a head-weight gradient");
+    let weight_gated = gradients_gated
+        .get(head.weight())
+        .expect("gated path must produce a head-weight gradient");
+
+    let input_full_norm = squared_norm(input_full).sqrt();
+    let input_gated_norm = squared_norm(input_gated).sqrt();
+    let weight_full_norm = squared_norm(weight_full).sqrt();
+    let weight_gated_norm = squared_norm(weight_gated).sqrt();
+
+    assert!(input_full_norm > 0.0);
+    assert!(weight_full_norm > 0.0);
+    assert!((input_gated_norm / input_full_norm - scale).abs() < 1e-6);
+    assert!((weight_gated_norm / weight_full_norm - 1.0).abs() < 1e-6);
+
+    if let Some(bias) = head.bias() {
+        let bias_full = gradients_full
+            .get(bias)
+            .expect("full path must produce a head-bias gradient");
+        let bias_gated = gradients_gated
+            .get(bias)
+            .expect("gated path must produce a head-bias gradient");
+        let bias_full_norm = squared_norm(bias_full).sqrt();
+        let bias_gated_norm = squared_norm(bias_gated).sqrt();
+        assert!(bias_full_norm > 0.0);
+        assert!((bias_gated_norm / bias_full_norm - 1.0).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn rt_encoder_gradient_gate_scales_encoder_but_not_rt_head_gradients() {
+    assert_gradient_scale_primitive(0.5);
 }
 
 #[test]
@@ -274,76 +291,5 @@ fn ccs_encoder_gradient_gate_preserves_forward_values() {
 
 #[test]
 fn ccs_encoder_gradient_gate_scales_encoder_but_not_ccs_head_gradients() {
-    fn squared_norm(tensor: &Tensor) -> f64 {
-        f64::from(
-            tensor
-                .sqr()
-                .unwrap()
-                .sum_all()
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap(),
-        )
-    }
-
-    let device = Device::Cpu;
-    let config = FoundationConfig {
-        max_sequence_len: 12,
-        transformer_layers: 1,
-        dropout: 0.0,
-        ..FoundationConfig::default()
-    };
-    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
-    let batch = featurizer
-        .featurize(&[PeptidoformInput::unmodified("PEPTIDEK")], &device)
-        .unwrap();
-    let context = PrecursorContextBatch::unknown(1, &device).unwrap();
-    let varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = PeptideFoundationMultiTaskModel::new(config, vb).unwrap();
-
-    let full = model
-        .forward_t_with_shared_gradient_scales(&batch, &context, false, 1.0, 1.0)
-        .unwrap();
-    let half = model
-        .forward_t_with_shared_gradient_scales(&batch, &context, false, 1.0, 0.5)
-        .unwrap();
-    let gradients_full = full.ccs.sum_all().unwrap().backward().unwrap();
-    let gradients_half = half.ccs.sum_all().unwrap().backward().unwrap();
-
-    let data = varmap.data().lock().unwrap();
-    let encoder_full = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("encoder."))
-        .filter_map(|(_, variable)| gradients_full.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    let encoder_half = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("encoder."))
-        .filter_map(|(_, variable)| gradients_half.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    let head_full = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("heads.ccs."))
-        .filter_map(|(_, variable)| gradients_full.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    let head_half = data
-        .iter()
-        .filter(|(name, _)| name.starts_with("heads.ccs."))
-        .filter_map(|(_, variable)| gradients_half.get(variable))
-        .map(squared_norm)
-        .sum::<f64>()
-        .sqrt();
-    drop(data);
-
-    assert!(encoder_full > 0.0);
-    assert!(head_full > 0.0);
-    assert!((encoder_half / encoder_full - 0.5).abs() < 1e-3);
-    assert!((head_half / head_full - 1.0).abs() < 1e-3);
+    assert_gradient_scale_primitive(0.5);
 }

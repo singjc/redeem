@@ -427,7 +427,8 @@ fn validate_encoder_gradient_scale(label: &str, scale: f64) -> Result<()> {
     Ok(())
 }
 
-fn gradient_scaled_identity(input: &Tensor, scale: f64) -> Result<Tensor> {
+#[doc(hidden)]
+pub fn gradient_scaled_identity(input: &Tensor, scale: f64) -> Result<Tensor> {
     if scale == 1.0 {
         return Ok(input.clone());
     }
