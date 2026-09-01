@@ -201,36 +201,35 @@ fn rt_encoder_gradient_gate_scales_encoder_but_not_rt_head_gradients() {
     let gradients_half = half.rt.sum_all().unwrap().backward().unwrap();
 
     let data = varmap.data().lock().unwrap();
-    let encoder = data
-        .get("encoder.output_norm.weight")
-        .cloned()
-        .expect("foundation encoder output-norm weight");
-    let rt_head = data
-        .get("heads.rt.weight")
-        .cloned()
-        .expect("foundation RT-head weight");
+    let encoder_full = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("encoder."))
+        .filter_map(|(_, variable)| gradients_full.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
+    let encoder_half = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("encoder."))
+        .filter_map(|(_, variable)| gradients_half.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
+    let head_full = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("heads.rt."))
+        .filter_map(|(_, variable)| gradients_full.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
+    let head_half = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("heads.rt."))
+        .filter_map(|(_, variable)| gradients_half.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
     drop(data);
-
-    let encoder_full = gradients_full
-        .get(&encoder)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
-    let encoder_half = gradients_half
-        .get(&encoder)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
-    let head_full = gradients_full
-        .get(&rt_head)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
-    let head_half = gradients_half
-        .get(&rt_head)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
 
     assert!(encoder_full > 0.0);
     assert!(head_full > 0.0);
@@ -313,36 +312,35 @@ fn ccs_encoder_gradient_gate_scales_encoder_but_not_ccs_head_gradients() {
     let gradients_half = half.ccs.sum_all().unwrap().backward().unwrap();
 
     let data = varmap.data().lock().unwrap();
-    let encoder = data
-        .get("encoder.output_norm.weight")
-        .cloned()
-        .expect("foundation encoder output-norm weight");
-    let ccs_head = data
-        .get("heads.ccs.weight")
-        .cloned()
-        .expect("foundation CCS-head weight");
+    let encoder_full = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("encoder."))
+        .filter_map(|(_, variable)| gradients_full.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
+    let encoder_half = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("encoder."))
+        .filter_map(|(_, variable)| gradients_half.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
+    let head_full = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("heads.ccs."))
+        .filter_map(|(_, variable)| gradients_full.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
+    let head_half = data
+        .iter()
+        .filter(|(name, _)| name.starts_with("heads.ccs."))
+        .filter_map(|(_, variable)| gradients_half.get(variable))
+        .map(squared_norm)
+        .sum::<f64>()
+        .sqrt();
     drop(data);
-
-    let encoder_full = gradients_full
-        .get(&encoder)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
-    let encoder_half = gradients_half
-        .get(&encoder)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
-    let head_full = gradients_full
-        .get(&ccs_head)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
-    let head_half = gradients_half
-        .get(&ccs_head)
-        .map(squared_norm)
-        .unwrap_or(0.0)
-        .sqrt();
 
     assert!(encoder_full > 0.0);
     assert!(head_full > 0.0);

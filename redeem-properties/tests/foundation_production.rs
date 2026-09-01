@@ -536,15 +536,29 @@ fn task_gradient_diagnostics_report_weighted_objective_norms() {
     assert!(gradients
         .contrastive
         .is_some_and(|value| value.is_finite() && value >= 0.0));
-    for cosine in [
-        gradients.rt_cosine_to_total,
-        gradients.ccs_cosine_to_total,
-        gradients.ms2_cosine_to_total,
-        gradients.masked_residue_cosine_to_total,
-        gradients.chemistry_cosine_to_total,
-        gradients.contrastive_cosine_to_total,
+    for (norm, cosine) in [
+        (gradients.rt, gradients.rt_cosine_to_total),
+        (gradients.ccs, gradients.ccs_cosine_to_total),
+        (gradients.ms2, gradients.ms2_cosine_to_total),
+        (
+            gradients.masked_residue,
+            gradients.masked_residue_cosine_to_total,
+        ),
+        (gradients.chemistry, gradients.chemistry_cosine_to_total),
+        (gradients.contrastive, gradients.contrastive_cosine_to_total),
     ] {
-        assert!(cosine.is_some_and(|value| value.is_finite() && (-1.0..=1.0).contains(&value)));
+        match norm {
+            Some(norm) => {
+                assert!(norm.is_finite() && norm >= 0.0);
+                if norm > f64::EPSILON {
+                    assert!(cosine
+                        .is_some_and(|value| value.is_finite() && (-1.0..=1.0).contains(&value)));
+                } else {
+                    assert!(cosine.is_none());
+                }
+            }
+            None => assert!(cosine.is_none()),
+        }
     }
 }
 
