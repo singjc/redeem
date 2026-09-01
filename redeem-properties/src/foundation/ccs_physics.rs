@@ -7,10 +7,12 @@
 //! coefficients cannot silently drift away from the model-side feature definition.
 
 use super::config::FoundationCcsPhysicsBaselineConfig;
+use super::corpus::FoundationRecordProvenance;
 use super::data::{FoundationTrainingRecord, TrainingContext};
 use super::featurize::PeptidoformInput;
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Number of scalar features in the frozen CCS physical prior.
 pub const FOUNDATION_CCS_PHYSICS_FEATURE_COUNT: usize = 8;
@@ -70,6 +72,21 @@ pub struct FoundationCcsPhysicsFeatureSummary {
     pub max: f64,
 }
 
+/// Source-level weighting applied while fitting a production CCS prior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationCcsPhysicsSourceWeightSummary {
+    /// Logical corpus source identifier.
+    pub source_id: String,
+    /// Number of finite CCS-labelled training records from this source.
+    pub label_count: usize,
+    /// Requested source weight before normalization.
+    pub requested_weight: f64,
+    /// Normalized fraction of the regression objective assigned to this source.
+    pub normalized_weight: f64,
+    /// Per-record weight after scaling total fit weight back to the label count.
+    pub per_record_weight: f64,
+}
+
 /// Native-unit regression diagnostics for a frozen physical CCS prior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct FoundationCcsPhysicsMetrics {
@@ -106,6 +123,11 @@ pub struct FoundationCcsPhysicsFitResult {
     pub train_metrics: FoundationCcsPhysicsMetrics,
     /// Feature distributions on the training labels.
     pub feature_summaries: Vec<FoundationCcsPhysicsFeatureSummary>,
+    /// Source-weighting diagnostics. Empty for a uniform-record fit.
+    pub source_weight_summaries: Vec<FoundationCcsPhysicsSourceWeightSummary>,
+    /// Sum of per-record regression weights. Equals the finite-label count for
+    /// both uniform fits and normalized source-weighted fits.
+    pub effective_weight_sum: f64,
 }
 
 /// Build the documented eight-feature physical CCS vector.
@@ -169,9 +191,147 @@ pub fn fit_foundation_ccs_physics_baseline(
     indices: &[usize],
     config: FoundationCcsPhysicsFitConfig,
 ) -> Result<FoundationCcsPhysicsFitResult> {
+    fit_foundation_ccs_physics_baseline_internal(records, indices, None, config)
+}
+
+/// Fit the physical CCS prior using all supplied training labels while assigning
+/// an explicit fraction of the regression objective to each corpus source.
+///
+/// This is the production companion to source-weighted foundation training. If,
+/// for example, the corpus is 98% source A by record count but the trainer samples
+/// 75% A / 25% B, a uniform full-corpus ridge would optimize a different objective
+/// from the model. This routine preserves every train label while reweighting each
+/// source so its *total* regression weight matches `source_weights`.
+///
+/// Per-record weights are rescaled to sum to the number of finite training labels,
+/// keeping the ridge penalty on the same numerical scale as the uniform fit. The
+/// baseline target mean/std remain the ordinary unweighted train-partition values
+/// because they must exactly match the trainer's train-only CCS normalization.
+pub fn fit_foundation_ccs_physics_baseline_source_weighted(
+    records: &[FoundationTrainingRecord],
+    provenance: &[FoundationRecordProvenance],
+    indices: &[usize],
+    source_weights: &BTreeMap<String, f64>,
+    config: FoundationCcsPhysicsFitConfig,
+) -> Result<FoundationCcsPhysicsFitResult> {
+    if provenance.len() != records.len() {
+        bail!(
+            "CCS physics source-weighted fit requires provenance for every record ({} records, {} provenance rows)",
+            records.len(),
+            provenance.len()
+        );
+    }
+    if indices.is_empty() {
+        bail!("CCS physics fit requires at least one training record index");
+    }
+
+    let mut label_counts = BTreeMap::<String, usize>::new();
+    for &index in indices {
+        let record = records
+            .get(index)
+            .ok_or_else(|| anyhow!("CCS physics fit record index {index} is out of bounds"))?;
+        let source = provenance
+            .get(index)
+            .ok_or_else(|| anyhow!("CCS physics provenance index {index} is out of bounds"))?;
+        if record.ccs.is_some_and(|value| value.is_finite()) {
+            *label_counts.entry(source.source_id.clone()).or_default() += 1;
+        }
+    }
+    if label_counts.is_empty() {
+        bail!("CCS physics source-weighted fit found no finite CCS labels");
+    }
+
+    for source in label_counts.keys() {
+        if !source_weights.contains_key(source) {
+            bail!("CCS physics source-weighted fit is missing weight for source '{source}'");
+        }
+    }
+    for (source, &weight) in source_weights {
+        if !weight.is_finite() || weight < 0.0 {
+            bail!("CCS physics source weight for '{source}' must be finite and non-negative");
+        }
+        if weight > 0.0 && !label_counts.contains_key(source) {
+            bail!(
+                "CCS physics source '{source}' has positive requested weight but no finite train CCS labels"
+            );
+        }
+    }
+
+    let total_requested_weight = label_counts
+        .keys()
+        .map(|source| source_weights.get(source).copied().unwrap_or(0.0))
+        .sum::<f64>();
+    if !(total_requested_weight > 0.0 && total_requested_weight.is_finite()) {
+        bail!("CCS physics source-weighted fit requires at least one positive source weight");
+    }
+    let total_labels = label_counts.values().sum::<usize>();
+    let total_labels_f64 = total_labels as f64;
+
+    let mut per_source_weight = BTreeMap::<String, f64>::new();
+    let mut source_weight_summaries = Vec::with_capacity(label_counts.len());
+    for (source, &label_count) in &label_counts {
+        let requested_weight = source_weights.get(source).copied().unwrap_or(0.0);
+        let normalized_weight = requested_weight / total_requested_weight;
+        let per_record_weight = if label_count == 0 {
+            0.0
+        } else {
+            normalized_weight * total_labels_f64 / label_count as f64
+        };
+        per_source_weight.insert(source.clone(), per_record_weight);
+        source_weight_summaries.push(FoundationCcsPhysicsSourceWeightSummary {
+            source_id: source.clone(),
+            label_count,
+            requested_weight,
+            normalized_weight,
+            per_record_weight,
+        });
+    }
+
+    let mut weights = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let record = records
+            .get(index)
+            .ok_or_else(|| anyhow!("CCS physics fit record index {index} is out of bounds"))?;
+        let source = provenance
+            .get(index)
+            .ok_or_else(|| anyhow!("CCS physics provenance index {index} is out of bounds"))?;
+        let weight = if record.ccs.is_some_and(|value| value.is_finite()) {
+            *per_source_weight.get(&source.source_id).ok_or_else(|| {
+                anyhow!(
+                    "CCS physics source '{}' has no resolved fit weight",
+                    source.source_id
+                )
+            })?
+        } else {
+            0.0
+        };
+        weights.push(weight);
+    }
+
+    let mut fit =
+        fit_foundation_ccs_physics_baseline_internal(records, indices, Some(&weights), config)?;
+    fit.source_weight_summaries = source_weight_summaries;
+    Ok(fit)
+}
+
+fn fit_foundation_ccs_physics_baseline_internal(
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    weights: Option<&[f64]>,
+    config: FoundationCcsPhysicsFitConfig,
+) -> Result<FoundationCcsPhysicsFitResult> {
     let config = config.validate()?;
     if indices.is_empty() {
         bail!("CCS physics fit requires at least one training record index");
+    }
+    if let Some(weights) = weights {
+        if weights.len() != indices.len() {
+            bail!(
+                "CCS physics fit weight count {} does not match index count {}",
+                weights.len(),
+                indices.len()
+            );
+        }
     }
 
     let mut normal =
@@ -180,26 +340,40 @@ pub fn fit_foundation_ccs_physics_baseline(
     let mut target_stats = RunningStats::default();
     let mut feature_stats = [RunningStats::default(); FOUNDATION_CCS_PHYSICS_FEATURE_COUNT];
     let mut labelled_indices = Vec::new();
+    let mut effective_weight_sum = 0.0f64;
+    let mut positive_weight_labels = 0usize;
 
-    for &index in indices {
+    for (position, &index) in indices.iter().enumerate() {
         let record = records
             .get(index)
             .ok_or_else(|| anyhow!("CCS physics fit record index {index} is out of bounds"))?;
         let Some(target) = record.ccs.filter(|value| value.is_finite()) else {
             continue;
         };
+        let weight = weights.map_or(1.0, |weights| weights[position]);
+        if !weight.is_finite() || weight < 0.0 {
+            bail!("CCS physics fit encountered invalid weight {weight} at record {index}");
+        }
         let features = foundation_ccs_physics_features(&record.peptidoform, &record.context);
         if features.iter().any(|value| !value.is_finite()) {
             bail!("CCS physics fit encountered non-finite features at record {index}");
         }
         let target = f64::from(target);
+        // Target normalization and feature audits remain ordinary train-partition
+        // statistics even when the regression objective is source-weighted.
         target_stats.push(target);
         for (feature_index, value) in features.iter().copied().enumerate() {
             feature_stats[feature_index].push(value);
-            rhs[feature_index] += value * target;
-            for (other_index, other) in features.iter().copied().enumerate() {
-                normal[feature_index][other_index] += value * other;
+            if weight > 0.0 {
+                rhs[feature_index] += weight * value * target;
+                for (other_index, other) in features.iter().copied().enumerate() {
+                    normal[feature_index][other_index] += weight * value * other;
+                }
             }
+        }
+        if weight > 0.0 {
+            positive_weight_labels += 1;
+            effective_weight_sum += weight;
         }
         labelled_indices.push(index);
     }
@@ -208,6 +382,12 @@ pub fn fit_foundation_ccs_physics_baseline(
         bail!(
             "CCS physics fit found only {} finite labels; at least {} are required",
             labelled_indices.len(),
+            FOUNDATION_CCS_PHYSICS_FEATURE_COUNT
+        );
+    }
+    if positive_weight_labels < FOUNDATION_CCS_PHYSICS_FEATURE_COUNT {
+        bail!(
+            "CCS physics fit found only {positive_weight_labels} positive-weight labels; at least {} are required",
             FOUNDATION_CCS_PHYSICS_FEATURE_COUNT
         );
     }
@@ -255,6 +435,8 @@ pub fn fit_foundation_ccs_physics_baseline(
         ridge_lambda: config.ridge_lambda,
         train_metrics,
         feature_summaries,
+        source_weight_summaries: Vec::new(),
+        effective_weight_sum,
     })
 }
 

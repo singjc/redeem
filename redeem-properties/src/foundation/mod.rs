@@ -36,10 +36,12 @@ pub mod wrapper;
 
 pub use ccs_physics::{
     evaluate_foundation_ccs_physics_baseline, fit_foundation_ccs_physics_baseline,
-    foundation_ccs_physics_features, foundation_ccs_physics_features_from_values,
-    predict_foundation_ccs_physics_native, FoundationCcsPhysicsFeatureSummary,
-    FoundationCcsPhysicsFitConfig, FoundationCcsPhysicsFitResult, FoundationCcsPhysicsMetrics,
-    FOUNDATION_CCS_PHYSICS_FEATURE_COUNT, FOUNDATION_CCS_PHYSICS_FEATURE_NAMES,
+    fit_foundation_ccs_physics_baseline_source_weighted, foundation_ccs_physics_features,
+    foundation_ccs_physics_features_from_values, predict_foundation_ccs_physics_native,
+    FoundationCcsPhysicsFeatureSummary, FoundationCcsPhysicsFitConfig,
+    FoundationCcsPhysicsFitResult, FoundationCcsPhysicsMetrics,
+    FoundationCcsPhysicsSourceWeightSummary, FOUNDATION_CCS_PHYSICS_FEATURE_COUNT,
+    FOUNDATION_CCS_PHYSICS_FEATURE_NAMES,
 };
 pub use checkpoint::{
     foundation_checkpoint_paths, FoundationCheckpointMetadata, FoundationCheckpointProvenance,
