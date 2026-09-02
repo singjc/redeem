@@ -35,6 +35,7 @@ pub mod sampling;
 pub mod spectrum;
 pub mod split;
 pub mod trainer;
+pub mod unified;
 pub mod wrapper;
 
 pub use causal::{
@@ -147,5 +148,9 @@ pub use trainer::{
     FoundationFitSummary, FoundationGradientDiagnosticsConfig, FoundationPropertyEvaluationMetrics,
     FoundationRegressionEvaluationMetrics, FoundationSharedGradientScalesConfig,
     FoundationStepMetrics, FoundationTaskGradientNorms, FoundationTrainer, FoundationTrainerConfig,
+};
+pub use unified::{
+    load_unified_foundation_components, FoundationUnifiedWarmStartReport,
+    PeptideFoundationUnifiedModel,
 };
 pub use wrapper::FoundationModelWrapper;
