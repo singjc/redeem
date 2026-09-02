@@ -3,7 +3,9 @@
 //! This is the first true inverse-generation evaluator: sequence length is predicted from
 //! spectrum/precursor context, active tokens start from MASK, and categorical reverse refinement
 //! proceeds without access to the clean peptide. The clean validation peptidoform is used only
-//! after generation for metrics.
+//! after generation for metrics. Generated candidates are additionally reranked with an
+//! all-MASK x0 score from the trained inverse model: candidate identity is never supplied to the
+//! decoder input and is used only to read the candidate token probabilities after inference.
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -40,6 +42,9 @@ struct GeneratedCandidate {
     reverse_log_probability: f64,
     fragment_score: f64,
     matched_cleavages: usize,
+    neural_all_mask_log_probability: f64,
+    neural_length_log_probability: f64,
+    hybrid_score: f64,
     mass_error_da: Option<f64>,
     mass_valid: bool,
 }
@@ -65,20 +70,42 @@ struct GenerationMetrics {
     fragment_top1_peptidoform_exact: usize,
     fragment_top1_sequence_exact: usize,
     fragment_top1_il_sequence_exact: usize,
+    candidate_pool_mass_valid_peptidoform_exact: usize,
+    candidate_pool_mass_valid_sequence_exact: usize,
+    candidate_pool_mass_valid_il_sequence_exact: usize,
+    neural_top1_peptidoform_exact: usize,
+    neural_top1_sequence_exact: usize,
+    neural_top1_il_sequence_exact: usize,
+    hybrid_top1_peptidoform_exact: usize,
+    hybrid_top1_sequence_exact: usize,
+    hybrid_top1_il_sequence_exact: usize,
     records_with_candidate: usize,
     best_abs_mass_error_sum: f64,
     best_abs_mass_error_records: usize,
+    best_abs_mass_errors_mass_valid: Vec<f64>,
+    best_abs_mass_errors_no_mass_valid: Vec<f64>,
     target_fragment_score_sum: f64,
     top1_fragment_score_sum: f64,
     target_matched_cleavages: usize,
     top1_matched_cleavages: usize,
+    target_neural_all_mask_log_probability_sum: f64,
+    target_neural_length_log_probability_sum: f64,
+    fragment_top1_neural_all_mask_log_probability_sum: f64,
+    neural_top1_neural_all_mask_log_probability_sum: f64,
+    hybrid_top1_neural_all_mask_log_probability_sum: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AllMaskCandidateScore {
+    mean_token_log_probability: f64,
+    length_log_probability: f64,
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 || args.len() > 13 {
+    if args.len() < 4 || args.len() > 14 {
         anyhow::bail!(
-            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=2.0]"
+            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=2.0] [neural_rerank_weight=1.0]"
         );
     }
 
@@ -94,6 +121,7 @@ fn main() -> Result<()> {
     let final_candidates_per_chain = parse_or(&args, 10, 4usize)?;
     let fragment_tolerance_ppm = parse_or(&args, 11, 20.0f64)?;
     let spectral_beam_weight = parse_or(&args, 12, 2.0f64)?;
+    let neural_rerank_weight = parse_or(&args, 13, 1.0f64)?;
     if validation_records == 0
         || samples_per_record == 0
         || mass_beam_width == 0
@@ -114,6 +142,9 @@ fn main() -> Result<()> {
     }
     if !(spectral_beam_weight >= 0.0 && spectral_beam_weight.is_finite()) {
         anyhow::bail!("spectral_beam_weight must be finite and non-negative");
+    }
+    if !neural_rerank_weight.is_finite() {
+        anyhow::bail!("neural_rerank_weight must be finite");
     }
 
     let device = Device::Cpu;
@@ -172,7 +203,11 @@ fn main() -> Result<()> {
     println!("final_candidates_per_chain\t{final_candidates_per_chain}");
     println!("fragment_tolerance_ppm\t{fragment_tolerance_ppm}");
     println!("spectral_beam_weight\t{spectral_beam_weight}");
+    println!("neural_rerank_weight\t{neural_rerank_weight}");
     println!("primary_candidate_ranking\tfragment_mass");
+    println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass");
+    println!("candidate_reranker\tall_mask_x0_v1");
+    println!("neural_candidate_input\tspectrum+precursor+length_all_masked");
     println!("seed\t{seed}");
 
     if let Some(parent) = output_tsv.parent() {
@@ -184,7 +219,7 @@ fn main() -> Result<()> {
     let mut output = BufWriter::new(file);
     writeln!(
         output,
-        "record_index\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tmass_error_da\tmass_valid\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
+        "record_index\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tneural_mass_rank\thybrid_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tneural_all_mask_log_probability\tneural_all_mask_perplexity\tneural_length_log_probability\thybrid_score\tmass_error_da\tmass_valid\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
     )?;
 
     let mut metrics = GenerationMetrics::default();
@@ -291,6 +326,9 @@ fn main() -> Result<()> {
                 reverse_log_probability,
                 fragment_score,
                 matched_cleavages,
+                neural_all_mask_log_probability: f64::NEG_INFINITY,
+                neural_length_log_probability: f64::NEG_INFINITY,
+                hybrid_score: f64::NEG_INFINITY,
                 mass_error_da,
                 mass_valid,
             };
@@ -315,6 +353,39 @@ fn main() -> Result<()> {
         }
         metrics.records_with_candidate += 1;
 
+        let target_all_mask_score = score_all_mask_token_row(
+            &model,
+            &diffusion_collator,
+            &spectrum_collator,
+            &config,
+            record,
+            &spectrum,
+            &target_tokens,
+            target_active_length,
+            &device,
+        )?;
+        metrics.target_neural_all_mask_log_probability_sum +=
+            target_all_mask_score.mean_token_log_probability;
+        metrics.target_neural_length_log_probability_sum +=
+            target_all_mask_score.length_log_probability;
+
+        let candidate_scores = score_all_mask_candidates(
+            &model,
+            &diffusion_collator,
+            &spectrum_collator,
+            &config,
+            record,
+            &spectrum,
+            &candidates,
+            &device,
+        )?;
+        for (candidate, score) in candidates.iter_mut().zip(candidate_scores) {
+            candidate.neural_all_mask_log_probability = score.mean_token_log_probability;
+            candidate.neural_length_log_probability = score.length_log_probability;
+            candidate.hybrid_score = candidate.fragment_score
+                + neural_rerank_weight * candidate.neural_all_mask_log_probability;
+        }
+
         let mut reverse_ranked = candidates.clone();
         reverse_ranked.sort_by(|left, right| {
             right
@@ -327,6 +398,10 @@ fn main() -> Result<()> {
 
         let mut mass_ranked = candidates.clone();
         mass_ranked.sort_by(mass_candidate_order);
+        let mut neural_ranked = candidates.clone();
+        neural_ranked.sort_by(neural_mass_candidate_order);
+        let mut hybrid_ranked = candidates.clone();
+        hybrid_ranked.sort_by(hybrid_mass_candidate_order);
         candidates.sort_by(fragment_mass_candidate_order);
         if candidates.iter().any(|candidate| candidate.mass_valid) {
             metrics.records_with_mass_valid_candidate += 1;
@@ -339,11 +414,53 @@ fn main() -> Result<()> {
             metrics.best_abs_mass_error_sum += error.abs();
             metrics.best_abs_mass_error_records += 1;
         }
+        if let Some(error) = mass_ranked
+            .iter()
+            .filter(|candidate| candidate.mass_valid)
+            .filter_map(|candidate| candidate.mass_error_da)
+            .next()
+        {
+            metrics.best_abs_mass_errors_mass_valid.push(error.abs());
+        } else if let Some(error) = mass_ranked
+            .iter()
+            .filter_map(|candidate| candidate.mass_error_da)
+            .next()
+        {
+            metrics.best_abs_mass_errors_no_mass_valid.push(error.abs());
+        }
         metrics.top1_fragment_score_sum += candidates[0].fragment_score;
         metrics.top1_matched_cleavages += candidates[0].matched_cleavages;
+        metrics.fragment_top1_neural_all_mask_log_probability_sum +=
+            candidates[0].neural_all_mask_log_probability;
+        metrics.neural_top1_neural_all_mask_log_probability_sum +=
+            neural_ranked[0].neural_all_mask_log_probability;
+        metrics.hybrid_top1_neural_all_mask_log_probability_sum +=
+            hybrid_ranked[0].neural_all_mask_log_probability;
 
         let target_sequence = &record.peptidoform.sequence;
         let target_il = normalize_il(target_sequence);
+        let mass_valid_pool: Vec<&GeneratedCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.mass_valid)
+            .collect();
+        if mass_valid_pool
+            .iter()
+            .any(|candidate| candidate.peptide == record.peptidoform)
+        {
+            metrics.candidate_pool_mass_valid_peptidoform_exact += 1;
+        }
+        if mass_valid_pool
+            .iter()
+            .any(|candidate| candidate.peptide.sequence.as_str() == target_sequence.as_str())
+        {
+            metrics.candidate_pool_mass_valid_sequence_exact += 1;
+        }
+        if mass_valid_pool
+            .iter()
+            .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il)
+        {
+            metrics.candidate_pool_mass_valid_il_sequence_exact += 1;
+        }
         if mass_ranked[0].peptide == record.peptidoform {
             metrics.mass_top1_peptidoform_exact += 1;
         }
@@ -380,6 +497,14 @@ fn main() -> Result<()> {
         if normalize_il(&candidates[0].peptide.sequence) == target_il {
             metrics.fragment_top1_il_sequence_exact += 1;
         }
+        let neural_exact = ranking_exact_flags(&neural_ranked[0], record, &target_il);
+        metrics.neural_top1_peptidoform_exact += neural_exact.0;
+        metrics.neural_top1_sequence_exact += neural_exact.1;
+        metrics.neural_top1_il_sequence_exact += neural_exact.2;
+        let hybrid_exact = ranking_exact_flags(&hybrid_ranked[0], record, &target_il);
+        metrics.hybrid_top1_peptidoform_exact += hybrid_exact.0;
+        metrics.hybrid_top1_sequence_exact += hybrid_exact.1;
+        metrics.hybrid_top1_il_sequence_exact += hybrid_exact.2;
 
         let reverse_rank_by_tokens: HashMap<Vec<u32>, usize> = reverse_ranked
             .iter()
@@ -391,12 +516,24 @@ fn main() -> Result<()> {
             .enumerate()
             .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
             .collect();
+        let neural_rank_by_tokens: HashMap<Vec<u32>, usize> = neural_ranked
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
+            .collect();
+        let hybrid_rank_by_tokens: HashMap<Vec<u32>, usize> = hybrid_ranked
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
+            .collect();
         for (fragment_mass_index, candidate) in candidates.iter().enumerate() {
             writeln!(
                 output,
-                "{record_index}\t{}\t{target_active_length}\t{predicted_active_length}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{record_index}\t{}\t{target_active_length}\t{predicted_active_length}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}\t{}\t{:.8}\t{:.8}\t{:.8}\t{:.8}\t{}\t{}\t{}\t{}\t{}",
                 record.peptidoform.sequence,
                 fragment_mass_index + 1,
+                neural_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
+                hybrid_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
                 mass_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
                 reverse_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
                 candidate.peptide.sequence,
@@ -404,6 +541,10 @@ fn main() -> Result<()> {
                 candidate.reverse_log_probability,
                 candidate.fragment_score,
                 candidate.matched_cleavages,
+                candidate.neural_all_mask_log_probability,
+                (-candidate.neural_all_mask_log_probability).exp(),
+                candidate.neural_length_log_probability,
+                candidate.hybrid_score,
                 candidate
                     .mass_error_da
                     .map(|value| format!("{value:.8}"))
@@ -416,7 +557,7 @@ fn main() -> Result<()> {
         }
 
         println!(
-            "generation_record\trecord_index={record_index}\ttarget={}\ttarget_length={target_active_length}\tpredicted_length={predicted_active_length}\tvalid_candidates={}\tmass_valid_candidates={}\tbest_mass_error_da={}\ttarget_fragment_score={:.4}\ttarget_matched_cleavages={}\ttop1={}\ttop1_fragment_score={:.4}\ttop1_matched_cleavages={}\ttop1_exact={}\ttopk_exact={}",
+            "generation_record\trecord_index={record_index}\ttarget={}\ttarget_length={target_active_length}\tpredicted_length={predicted_active_length}\tvalid_candidates={}\tmass_valid_candidates={}\tbest_mass_error_da={}\ttarget_fragment_score={:.4}\ttarget_matched_cleavages={}\ttarget_neural_all_mask_logp={:.4}\tfragment_top1={}\tfragment_top1_score={:.4}\tfragment_top1_neural_logp={:.4}\tneural_top1={}\tneural_top1_logp={:.4}\thybrid_top1={}\thybrid_top1_score={:.4}\ttopk_exact={}\ttopk_il_exact={}",
             record.peptidoform.sequence,
             candidates.len(),
             candidates.iter().filter(|candidate| candidate.mass_valid).count(),
@@ -426,11 +567,18 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "NA".into()),
             target_fragment_evidence.score,
             target_fragment_evidence.matched_cleavages,
+            target_all_mask_score.mean_token_log_probability,
             candidates[0].peptide.sequence,
             candidates[0].fragment_score,
-            candidates[0].matched_cleavages,
-            candidates[0].peptide == record.peptidoform,
+            candidates[0].neural_all_mask_log_probability,
+            neural_ranked[0].peptide.sequence,
+            neural_ranked[0].neural_all_mask_log_probability,
+            hybrid_ranked[0].peptide.sequence,
+            hybrid_ranked[0].hybrid_score,
             candidates.iter().any(|candidate| candidate.peptide == record.peptidoform),
+            candidates
+                .iter()
+                .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il),
         );
     }
     output.flush()?;
@@ -506,10 +654,70 @@ fn main() -> Result<()> {
         "generation_summary\tfragment_top1_il_sequence_exact\t{:.6}",
         metrics.fragment_top1_il_sequence_exact as f64 / records
     );
+    println!(
+        "generation_summary\tcandidate_pool_mass_valid_peptidoform_exact\t{:.6}",
+        metrics.candidate_pool_mass_valid_peptidoform_exact as f64 / records
+    );
+    println!(
+        "generation_summary\tcandidate_pool_mass_valid_sequence_exact\t{:.6}",
+        metrics.candidate_pool_mass_valid_sequence_exact as f64 / records
+    );
+    println!(
+        "generation_summary\tcandidate_pool_mass_valid_il_sequence_exact\t{:.6}",
+        metrics.candidate_pool_mass_valid_il_sequence_exact as f64 / records
+    );
+    println!(
+        "generation_summary\tneural_top1_peptidoform_exact\t{:.6}",
+        metrics.neural_top1_peptidoform_exact as f64 / records
+    );
+    println!(
+        "generation_summary\tneural_top1_sequence_exact\t{:.6}",
+        metrics.neural_top1_sequence_exact as f64 / records
+    );
+    println!(
+        "generation_summary\tneural_top1_il_sequence_exact\t{:.6}",
+        metrics.neural_top1_il_sequence_exact as f64 / records
+    );
+    println!(
+        "generation_summary\thybrid_top1_peptidoform_exact\t{:.6}",
+        metrics.hybrid_top1_peptidoform_exact as f64 / records
+    );
+    println!(
+        "generation_summary\thybrid_top1_sequence_exact\t{:.6}",
+        metrics.hybrid_top1_sequence_exact as f64 / records
+    );
+    println!(
+        "generation_summary\thybrid_top1_il_sequence_exact\t{:.6}",
+        metrics.hybrid_top1_il_sequence_exact as f64 / records
+    );
     if metrics.best_abs_mass_error_records > 0 {
         println!(
             "generation_summary\tmean_best_abs_mass_error_da\t{:.6}",
             metrics.best_abs_mass_error_sum / metrics.best_abs_mass_error_records as f64
+        );
+    }
+    println!(
+        "generation_summary\tmass_valid_record_count\t{}",
+        metrics.best_abs_mass_errors_mass_valid.len()
+    );
+    println!(
+        "generation_summary\tno_mass_valid_record_count\t{}",
+        metrics.best_abs_mass_errors_no_mass_valid.len()
+    );
+    if !metrics.best_abs_mass_errors_mass_valid.is_empty() {
+        println!(
+            "generation_summary\tmean_best_abs_mass_error_da_mass_valid_only\t{:.6}",
+            mean(&metrics.best_abs_mass_errors_mass_valid)
+        );
+        println!(
+            "generation_summary\tmedian_best_abs_mass_error_da_mass_valid_only\t{:.6}",
+            median(&metrics.best_abs_mass_errors_mass_valid)
+        );
+    }
+    if !metrics.best_abs_mass_errors_no_mass_valid.is_empty() {
+        println!(
+            "generation_summary\tmean_fallback_abs_mass_error_da_no_mass_valid\t{:.6}",
+            mean(&metrics.best_abs_mass_errors_no_mass_valid)
         );
     }
     println!(
@@ -527,6 +735,26 @@ fn main() -> Result<()> {
     println!(
         "generation_summary\tmean_top1_matched_cleavages\t{:.4}",
         metrics.top1_matched_cleavages as f64 / records
+    );
+    println!(
+        "generation_summary\tmean_target_neural_all_mask_log_probability\t{:.6}",
+        metrics.target_neural_all_mask_log_probability_sum / records
+    );
+    println!(
+        "generation_summary\tmean_target_neural_length_log_probability\t{:.6}",
+        metrics.target_neural_length_log_probability_sum / records
+    );
+    println!(
+        "generation_summary\tmean_fragment_top1_neural_all_mask_log_probability\t{:.6}",
+        metrics.fragment_top1_neural_all_mask_log_probability_sum / records
+    );
+    println!(
+        "generation_summary\tmean_neural_top1_neural_all_mask_log_probability\t{:.6}",
+        metrics.neural_top1_neural_all_mask_log_probability_sum / records
+    );
+    println!(
+        "generation_summary\tmean_hybrid_top1_neural_all_mask_log_probability\t{:.6}",
+        metrics.hybrid_top1_neural_all_mask_log_probability_sum / records
     );
     println!("generation_candidates\t{}", output_tsv.display());
     Ok(())
@@ -860,6 +1088,180 @@ fn predict_length_distribution(
     Ok(softmax(&logits[0], 1.0))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn score_all_mask_token_row(
+    model: &PeptideSpectrumDiffusionModel,
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    config: &FoundationDiffusionConfig,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    candidate_tokens: &[u32],
+    active_length: usize,
+    device: &Device,
+) -> Result<AllMaskCandidateScore> {
+    let rows = all_mask_inference_rows(&[active_length], config.max_tokens)?;
+    let diffusion = diffusion_collator.collate_inference_tokens(
+        &rows,
+        &[active_length],
+        config.diffusion_steps,
+        device,
+    )?;
+    let spectrum_batch = spectrum_collator.collate(&[spectrum.clone()], device)?;
+    let precursor = precursor_context(&[record], device)?;
+    let output = model.forward_t(&diffusion, &spectrum_batch, &precursor, false)?;
+    let token_logits = output.token_logits.to_vec3::<f32>()?;
+    let length_logits = output.length_logits.to_vec2::<f32>()?;
+    score_candidate_from_logits(
+        &token_logits[0],
+        &length_logits[0],
+        candidate_tokens,
+        active_length,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_all_mask_candidates(
+    model: &PeptideSpectrumDiffusionModel,
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    config: &FoundationDiffusionConfig,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    candidates: &[GeneratedCandidate],
+    device: &Device,
+) -> Result<Vec<AllMaskCandidateScore>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let active_lengths: Vec<usize> = candidates
+        .iter()
+        .map(|candidate| active_token_length(&candidate.tokens, config.max_tokens))
+        .collect::<Result<_>>()?;
+    let rows = all_mask_inference_rows(&active_lengths, config.max_tokens)?;
+    let diffusion = diffusion_collator.collate_inference_tokens(
+        &rows,
+        &active_lengths,
+        config.diffusion_steps,
+        device,
+    )?;
+    let spectra = vec![spectrum.clone(); candidates.len()];
+    let spectrum_batch = spectrum_collator.collate(&spectra, device)?;
+    let record_refs = vec![record; candidates.len()];
+    let precursor = precursor_context(&record_refs, device)?;
+    let output = model.forward_t(&diffusion, &spectrum_batch, &precursor, false)?;
+    let token_logits = output.token_logits.to_vec3::<f32>()?;
+    let length_logits = output.length_logits.to_vec2::<f32>()?;
+
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            score_candidate_from_logits(
+                &token_logits[index],
+                &length_logits[index],
+                &candidate.tokens,
+                active_lengths[index],
+            )
+        })
+        .collect()
+}
+
+fn all_mask_inference_rows(active_lengths: &[usize], max_tokens: usize) -> Result<Vec<Vec<u32>>> {
+    active_lengths
+        .iter()
+        .map(|&active_length| {
+            if active_length == 0 || active_length > max_tokens {
+                anyhow::bail!(
+                    "all-MASK candidate active length {active_length} is outside 1..={max_tokens}"
+                );
+            }
+            let mut row = vec![FOUNDATION_DIFFUSION_PAD; max_tokens];
+            // Match the spectrum-only training objective exactly: every active clean
+            // token, including EOS, is hidden behind MASK. Candidate identity is not
+            // present in the model input; it is used only after inference to index the
+            // returned x0 probability distribution.
+            for token in row.iter_mut().take(active_length) {
+                *token = FOUNDATION_DIFFUSION_MASK;
+            }
+            Ok(row)
+        })
+        .collect()
+}
+
+fn active_token_length(tokens: &[u32], max_tokens: usize) -> Result<usize> {
+    if tokens.len() != max_tokens {
+        anyhow::bail!(
+            "candidate token width {} does not match configured {max_tokens}",
+            tokens.len()
+        );
+    }
+    let active_length = tokens
+        .iter()
+        .position(|&token| token == FOUNDATION_DIFFUSION_PAD)
+        .unwrap_or(max_tokens);
+    if active_length == 0 || tokens[active_length - 1] != FOUNDATION_DIFFUSION_EOS {
+        anyhow::bail!("candidate token row must end its active prefix with EOS");
+    }
+    Ok(active_length)
+}
+
+fn score_candidate_from_logits(
+    token_logits: &[Vec<f32>],
+    length_logits: &[f32],
+    candidate_tokens: &[u32],
+    active_length: usize,
+) -> Result<AllMaskCandidateScore> {
+    if active_length == 0
+        || active_length > token_logits.len()
+        || active_length > candidate_tokens.len()
+    {
+        anyhow::bail!("candidate active length is incompatible with neural reranking logits");
+    }
+    let mut token_log_probability_sum = 0.0f64;
+    for position in 0..active_length {
+        let token = candidate_tokens[position] as usize;
+        if token == FOUNDATION_DIFFUSION_PAD as usize || token == FOUNDATION_DIFFUSION_MASK as usize
+        {
+            anyhow::bail!("clean reranking candidate contains PAD/MASK in its active prefix");
+        }
+        token_log_probability_sum += selected_log_softmax(&token_logits[position], token)?;
+    }
+    let length_class = active_length - 1;
+    let length_log_probability = selected_log_softmax(length_logits, length_class)?;
+    Ok(AllMaskCandidateScore {
+        mean_token_log_probability: token_log_probability_sum / active_length as f64,
+        length_log_probability,
+    })
+}
+
+fn selected_log_softmax(logits: &[f32], selected: usize) -> Result<f64> {
+    if selected >= logits.len() || logits.is_empty() {
+        anyhow::bail!("selected neural-reranking class {selected} is outside logits");
+    }
+    let max = logits
+        .iter()
+        .copied()
+        .map(f64::from)
+        .filter(|value| value.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !max.is_finite() {
+        anyhow::bail!("neural-reranking logits contain no finite values");
+    }
+    let normalizer: f64 = logits
+        .iter()
+        .copied()
+        .map(f64::from)
+        .filter(|value| value.is_finite())
+        .map(|value| (value - max).exp())
+        .sum();
+    let selected_value = f64::from(logits[selected]);
+    if !selected_value.is_finite() || !(normalizer > 0.0 && normalizer.is_finite()) {
+        anyhow::bail!("selected neural-reranking logit is not finite");
+    }
+    Ok(selected_value - max - normalizer.ln())
+}
+
 fn sample_generation_lengths(
     probabilities: &[f64],
     argmax_length: usize,
@@ -1070,6 +1472,75 @@ fn fragment_mass_candidate_order(
                 .reverse_log_probability
                 .total_cmp(&left.reverse_log_probability)
         })
+}
+
+fn neural_mass_candidate_order(left: &GeneratedCandidate, right: &GeneratedCandidate) -> Ordering {
+    right
+        .mass_valid
+        .cmp(&left.mass_valid)
+        .then_with(|| {
+            right
+                .neural_all_mask_log_probability
+                .total_cmp(&left.neural_all_mask_log_probability)
+        })
+        .then_with(|| {
+            let left_error = left.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            let right_error = right.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            left_error.total_cmp(&right_error)
+        })
+        .then_with(|| right.fragment_score.total_cmp(&left.fragment_score))
+        .then_with(|| {
+            right
+                .reverse_log_probability
+                .total_cmp(&left.reverse_log_probability)
+        })
+}
+
+fn hybrid_mass_candidate_order(left: &GeneratedCandidate, right: &GeneratedCandidate) -> Ordering {
+    right
+        .mass_valid
+        .cmp(&left.mass_valid)
+        .then_with(|| right.hybrid_score.total_cmp(&left.hybrid_score))
+        .then_with(|| {
+            let left_error = left.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            let right_error = right.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            left_error.total_cmp(&right_error)
+        })
+        .then_with(|| {
+            right
+                .reverse_log_probability
+                .total_cmp(&left.reverse_log_probability)
+        })
+}
+
+fn ranking_exact_flags(
+    candidate: &GeneratedCandidate,
+    record: &FoundationTrainingRecord,
+    target_il: &str,
+) -> (usize, usize, usize) {
+    (
+        (candidate.peptide == record.peptidoform) as usize,
+        (candidate.peptide.sequence == record.peptidoform.sequence) as usize,
+        (normalize_il(&candidate.peptide.sequence) == target_il) as usize,
+    )
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len().max(1) as f64
+}
+
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
 }
 
 fn normalized_observed_peaks(spectrum: &FoundationSpectrum) -> Vec<(f64, f64)> {
@@ -1372,6 +1843,88 @@ impl GenerationRng {
 mod fragment_evidence_tests {
     use super::*;
     use redeem_properties::foundation::FoundationSpectrumPeak;
+
+    #[test]
+    fn all_mask_reranker_input_depends_on_length_not_candidate_identity() {
+        let vocabulary = FoundationDiffusionVocabulary;
+        let first = vocabulary
+            .encode(
+                &PeptidoformInput {
+                    sequence: "PEPTIDEK".into(),
+                    modifications: Vec::new(),
+                },
+                16,
+            )
+            .unwrap();
+        let second = vocabulary
+            .encode(
+                &PeptidoformInput {
+                    sequence: "KEDITPEP".into(),
+                    modifications: Vec::new(),
+                },
+                16,
+            )
+            .unwrap();
+        assert_ne!(first, second);
+        let first_length = active_token_length(&first, 16).unwrap();
+        let second_length = active_token_length(&second, 16).unwrap();
+        assert_eq!(first_length, second_length);
+
+        let rows = all_mask_inference_rows(&[first_length, second_length], 16).unwrap();
+        assert_eq!(rows[0], rows[1]);
+        assert!(rows[0][..first_length]
+            .iter()
+            .all(|&token| token == FOUNDATION_DIFFUSION_MASK));
+        assert!(rows[0][first_length..]
+            .iter()
+            .all(|&token| token == FOUNDATION_DIFFUSION_PAD));
+    }
+
+    #[test]
+    fn neural_reranker_uses_candidate_only_to_read_post_inference_logits() {
+        let vocabulary = FoundationDiffusionVocabulary;
+        let supported = vocabulary
+            .encode(
+                &PeptidoformInput {
+                    sequence: "AC".into(),
+                    modifications: Vec::new(),
+                },
+                8,
+            )
+            .unwrap();
+        let alternative = vocabulary
+            .encode(
+                &PeptidoformInput {
+                    sequence: "CA".into(),
+                    modifications: Vec::new(),
+                },
+                8,
+            )
+            .unwrap();
+        let active_length = active_token_length(&supported, 8).unwrap();
+        assert_eq!(active_length, active_token_length(&alternative, 8).unwrap());
+
+        let mut token_logits = vec![vec![0.0f32; FOUNDATION_DIFFUSION_VOCAB_SIZE]; 8];
+        for position in 0..active_length {
+            token_logits[position][supported[position] as usize] = 4.0;
+        }
+        let mut length_logits = vec![0.0f32; 8];
+        length_logits[active_length - 1] = 2.0;
+        let supported_score =
+            score_candidate_from_logits(&token_logits, &length_logits, &supported, active_length)
+                .unwrap();
+        let alternative_score =
+            score_candidate_from_logits(&token_logits, &length_logits, &alternative, active_length)
+                .unwrap();
+        assert!(
+            supported_score.mean_token_log_probability
+                > alternative_score.mean_token_log_probability
+        );
+
+        // Both candidates would have produced the exact same all-MASK model input.
+        let rows = all_mask_inference_rows(&[active_length, active_length], 8).unwrap();
+        assert_eq!(rows[0], rows[1]);
+    }
 
     #[test]
     fn target_fragment_ladder_scores_above_mass_scrambled_sequence() {
