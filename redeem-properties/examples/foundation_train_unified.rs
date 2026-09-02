@@ -51,6 +51,12 @@ struct UnifiedPilotMetadata {
     diffusion_length_weight: f64,
     alignment_weight: f64,
     alignment_temperature: f64,
+    alignment_initialization: String,
+    alignment_initialization_seed: u64,
+    alignment_initialization_fingerprint: String,
+    forward_objective_weight: f64,
+    diffusion_objective_weight: f64,
+    causal_objective_weight: f64,
     completed_steps: usize,
     forward_config: redeem_properties::foundation::FoundationConfig,
     inverse_config: FoundationDiffusionConfig,
@@ -81,9 +87,9 @@ struct InverseMetrics {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 6 || args.len() > 13 {
+    if args.len() < 6 || args.len() > 16 {
         anyhow::bail!(
-            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07]"
+            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25]"
         );
     }
 
@@ -99,6 +105,9 @@ fn main() -> Result<()> {
     let learning_rate = parse_or(&args, 10, 2.0e-5f64)?;
     let alignment_weight = parse_or(&args, 11, 0.05f64)?;
     let alignment_temperature = parse_or(&args, 12, 0.07f64)?;
+    let forward_objective_weight = parse_or(&args, 13, 0.5f64)?;
+    let diffusion_objective_weight = parse_or(&args, 14, 0.25f64)?;
+    let causal_objective_weight = parse_or(&args, 15, 0.25f64)?;
     let max_gradient_norm = 1.0f64;
     let diffusion_length_weight = 0.1f64;
 
@@ -113,6 +122,22 @@ fn main() -> Result<()> {
     }
     if !(alignment_temperature > 0.0 && alignment_temperature.is_finite()) {
         anyhow::bail!("alignment_temperature must be finite and positive");
+    }
+    for (name, value) in [
+        ("forward_objective_weight", forward_objective_weight),
+        ("diffusion_objective_weight", diffusion_objective_weight),
+        ("causal_objective_weight", causal_objective_weight),
+    ] {
+        if !(value >= 0.0 && value.is_finite()) {
+            anyhow::bail!("{name} must be finite and non-negative");
+        }
+    }
+    let objective_weight_sum =
+        forward_objective_weight + diffusion_objective_weight + causal_objective_weight;
+    if (objective_weight_sum - 1.0).abs() > 1.0e-9 {
+        anyhow::bail!(
+            "forward/diffusion/causal objective weights must sum to 1.0; got {objective_weight_sum}"
+        );
     }
 
     let device = Device::Cpu;
@@ -205,6 +230,13 @@ fn main() -> Result<()> {
         &causal_model_path,
         &device,
     )?;
+    let alignment_initialization_seed = mix64(seed ^ 0xa17e_11a9_5eed_0132);
+    let alignment_initialization_fingerprint = initialize_alignment_projection_deterministically(
+        &varmap,
+        alignment_initialization_seed,
+        &device,
+    )?;
+    let alignment_initialization = "seeded_kaiming_normal_weight_uniform_bias_v0132".to_string();
 
     let forward_trainer = &forward_metadata.trainer_config;
     let forward_collator = FoundationCollator::new(
@@ -237,8 +269,10 @@ fn main() -> Result<()> {
     )?;
 
     fs::create_dir_all(&output_root)?;
-    println!("objective\tunified_forward_diffusion_causal_alignment_v1");
-    println!("schedule\tone_optimizer_update=(forward_a+forward_b+diffusion+causal)/4");
+    println!("objective\tunified_forward_diffusion_causal_alignment_v2");
+    println!(
+        "schedule\tone_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*causal"
+    );
     println!("component_batches_per_optimizer_update\t4");
     println!(
         "corpus_fingerprint\tfnv1a64:{:016x}",
@@ -266,6 +300,19 @@ fn main() -> Result<()> {
     println!("learning_rate\t{learning_rate}");
     println!("alignment_weight\t{alignment_weight}");
     println!("alignment_temperature\t{alignment_temperature}");
+    println!(
+        "alignment_initialization\talgorithm={}\tseed={}\tfingerprint={}",
+        alignment_initialization,
+        alignment_initialization_seed,
+        alignment_initialization_fingerprint,
+    );
+    println!("forward_objective_weight\t{forward_objective_weight}");
+    println!("diffusion_objective_weight\t{diffusion_objective_weight}");
+    println!("causal_objective_weight\t{causal_objective_weight}");
+    println!(
+        "forward_component_weight\t{}",
+        0.5 * forward_objective_weight
+    );
     println!("max_gradient_norm\t{max_gradient_norm}");
     println!(
         "warm_start\tforward_loaded={}\tdiffusion_loaded={}\tcausal_overlay_loaded={}\tfresh_alignment={}",
@@ -276,10 +323,11 @@ fn main() -> Result<()> {
     );
     println!("optimizer_variables\t{}", optimizer.variable_count());
 
-    let metadata = |completed_steps| UnifiedPilotMetadata {
-        version: 1,
-        objective: "unified_forward_diffusion_causal_alignment_v1".into(),
-        schedule: "one_optimizer_update=(forward_a+forward_b+diffusion+causal)/4".into(),
+    let metadata = |completed_steps| {
+        UnifiedPilotMetadata {
+        version: 3,
+        objective: "unified_forward_diffusion_causal_alignment_v2".into(),
+        schedule: "one_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*causal".into(),
         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
         benchmark_manifest_fingerprint: format!(
             "fnv1a64:{:016x}",
@@ -297,9 +345,16 @@ fn main() -> Result<()> {
         diffusion_length_weight,
         alignment_weight,
         alignment_temperature,
+        alignment_initialization: alignment_initialization.clone(),
+        alignment_initialization_seed,
+        alignment_initialization_fingerprint: alignment_initialization_fingerprint.clone(),
+        forward_objective_weight,
+        diffusion_objective_weight,
+        causal_objective_weight,
         completed_steps,
         forward_config: forward_metadata.model_config.clone(),
         inverse_config: inverse_config.clone(),
+    }
     };
 
     save_checkpoint(
@@ -442,11 +497,16 @@ fn main() -> Result<()> {
         let forward_b_value = f64::from(forward_b.to_scalar::<f32>()?);
         let diffusion_value = f64::from(diffusion.to_scalar::<f32>()?);
         let causal_value = f64::from(causal.to_scalar::<f32>()?);
-        let total = (((forward_a + forward_b)? + diffusion)? + causal)?.affine(0.25, 0.0)?;
+        let forward_a_weighted = forward_a.affine(0.5 * forward_objective_weight, 0.0)?;
+        let forward_b_weighted = forward_b.affine(0.5 * forward_objective_weight, 0.0)?;
+        let diffusion_weighted = diffusion.affine(diffusion_objective_weight, 0.0)?;
+        let causal_weighted = causal.affine(causal_objective_weight, 0.0)?;
+        let total =
+            (((forward_a_weighted + forward_b_weighted)? + diffusion_weighted)? + causal_weighted)?;
         let total_value = f64::from(total.to_scalar::<f32>()?);
         let update = optimizer.backward_step(&total, Some(max_gradient_norm))?;
         println!(
-            "train\tstep={step}\tforward_a={forward_a_value:.6}\tforward_b={forward_b_value:.6}\tdiffusion={diffusion_value:.6}\tcausal={causal_value:.6}\tdiffusion_alignment={diffusion_alignment:.6}\tcausal_alignment={causal_alignment:.6}\ttotal={total_value:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+            "train\tstep={step}\tforward_a={forward_a_value:.6}\tforward_b={forward_b_value:.6}\tdiffusion={diffusion_value:.6}\tcausal={causal_value:.6}\tdiffusion_alignment={diffusion_alignment:.6}\tcausal_alignment={causal_alignment:.6}\tforward_weight={forward_objective_weight:.6}\tdiffusion_weight={diffusion_objective_weight:.6}\tcausal_weight={causal_objective_weight:.6}\ttotal={total_value:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
             update.gradient_norm,
             update.gradient_scale,
         );
@@ -664,9 +724,9 @@ fn alignment_gradient_probe(
     let precursor = precursor_context(records, device)?;
     let inverse = model
         .diffusion()
-        .forward_t(&diffusion, &spectrum, &precursor, true)?;
+        .forward_t(&diffusion, &spectrum, &precursor, false)?;
     let peptide_projection =
-        clean_peptide_projection(model, records, clean_collator, true, device)?;
+        clean_peptide_projection(model, records, clean_collator, false, device)?;
     let spectrum_projection = model.project_spectrum_embedding(&inverse.spectrum_embedding)?;
     let alignment = foundation_spectrum_peptide_alignment_loss(
         &spectrum_projection,
@@ -683,6 +743,126 @@ fn alignment_gradient_probe(
         gradient_norm_for_prefix(varmap, &gradients, "alignment.spectrum_projection.")?,
     );
     Ok(())
+}
+
+const ALIGNMENT_WEIGHT_NAME: &str = "alignment.spectrum_projection.weight";
+const ALIGNMENT_BIAS_NAME: &str = "alignment.spectrum_projection.bias";
+const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x00000100000001b3;
+
+/// Reinitialize only the fresh spectrum->peptide projection from an explicit seed.
+///
+/// This mirrors Candle's linear-layer statistical initialization contract: Kaiming
+/// normal weights (fan-in/ReLU) and a bias uniform in +/-1/sqrt(fan_in). A tiny
+/// local PRNG is used because Candle's CPU random backend cannot be seeded.
+fn initialize_alignment_projection_deterministically(
+    varmap: &VarMap,
+    seed: u64,
+    device: &Device,
+) -> Result<String> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("unified VarMap lock poisoned"))?;
+    let weight = data
+        .get(ALIGNMENT_WEIGHT_NAME)
+        .ok_or_else(|| anyhow::anyhow!("missing {ALIGNMENT_WEIGHT_NAME}"))?;
+    let bias = data
+        .get(ALIGNMENT_BIAS_NAME)
+        .ok_or_else(|| anyhow::anyhow!("missing {ALIGNMENT_BIAS_NAME}"))?;
+
+    let (out_dim, in_dim) = weight.as_tensor().dims2()?;
+    if bias.as_tensor().dims1()? != out_dim {
+        anyhow::bail!(
+            "alignment projection bias shape {:?} is incompatible with weight shape {:?}",
+            bias.as_tensor().dims(),
+            weight.as_tensor().dims()
+        );
+    }
+
+    let mut rng = DeterministicAlignmentRng::new(seed);
+    let weight_stdev = (2.0f64 / in_dim as f64).sqrt();
+    let mut weight_values = Vec::<f32>::with_capacity(out_dim * in_dim);
+    for _ in 0..(out_dim * in_dim) {
+        weight_values.push((weight_stdev * rng.standard_normal()) as f32);
+    }
+    let bias_bound = 1.0f64 / (in_dim as f64).sqrt();
+    let mut bias_values = Vec::<f32>::with_capacity(out_dim);
+    for _ in 0..out_dim {
+        bias_values.push((bias_bound * (2.0 * rng.uniform_open01() - 1.0)) as f32);
+    }
+
+    weight.set(&Tensor::from_vec(weight_values, (out_dim, in_dim), device)?)?;
+    bias.set(&Tensor::from_vec(bias_values, out_dim, device)?)?;
+    drop(data);
+
+    alignment_projection_fingerprint(varmap)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeterministicAlignmentRng {
+    state: u64,
+    spare_normal: Option<f64>,
+}
+
+impl DeterministicAlignmentRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed,
+            spare_normal: None,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mix64(self.state)
+    }
+
+    fn uniform_open01(&mut self) -> f64 {
+        const INV_2_POW_53: f64 = 1.0 / 9_007_199_254_740_992.0;
+        (((self.next_u64() >> 11) as f64) + 0.5) * INV_2_POW_53
+    }
+
+    fn standard_normal(&mut self) -> f64 {
+        if let Some(value) = self.spare_normal.take() {
+            return value;
+        }
+        let u1 = self.uniform_open01();
+        let u2 = self.uniform_open01();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = std::f64::consts::TAU * u2;
+        let first = radius * angle.cos();
+        self.spare_normal = Some(radius * angle.sin());
+        first
+    }
+}
+
+fn alignment_projection_fingerprint(varmap: &VarMap) -> Result<String> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("unified VarMap lock poisoned"))?;
+    let mut hash = FNV1A64_OFFSET;
+    for name in [ALIGNMENT_WEIGHT_NAME, ALIGNMENT_BIAS_NAME] {
+        let variable = data
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("missing {name} while fingerprinting"))?;
+        fnv1a64_bytes(&mut hash, name.as_bytes());
+        for &dim in variable.as_tensor().dims() {
+            fnv1a64_bytes(&mut hash, &(dim as u64).to_le_bytes());
+        }
+        for value in variable.as_tensor().flatten_all()?.to_vec1::<f32>()? {
+            fnv1a64_bytes(&mut hash, &value.to_bits().to_le_bytes());
+        }
+    }
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn fnv1a64_bytes(hash: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
 }
 
 fn gradient_norm_for_prefix(
