@@ -26,7 +26,8 @@ use std::path::Path;
 pub const FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123: f64 = 0.1;
 
 /// Stable identifier for the validated v0.12.3 hybrid ranking policy.
-pub const FOUNDATION_CAUSAL_RERANK_POLICY_V0123: &str = "fragment_plus_0.1_ar_total_v1";
+pub const FOUNDATION_CAUSAL_RERANK_POLICY_V0123: &str =
+    "fragment_plus_0.1_ar_total_v1";
 
 /// Combine fragment evidence with causal total log-likelihood.
 ///
@@ -87,11 +88,7 @@ impl FoundationCausalCollator {
     }
 
     /// Encode peptidoforms and create `START,c1,... -> c1,c2,...,EOS` batches.
-    pub fn collate(
-        &self,
-        peptides: &[PeptidoformInput],
-        device: &Device,
-    ) -> Result<FoundationCausalBatch> {
+    pub fn collate(&self, peptides: &[PeptidoformInput], device: &Device) -> Result<FoundationCausalBatch> {
         if peptides.is_empty() {
             candle_core::bail!("causal collation requires at least one peptide");
         }
@@ -155,9 +152,7 @@ impl FoundationCausalCollator {
                         candle_core::bail!("causal clean target token {token} exceeds vocabulary");
                     }
                     if token == FOUNDATION_DIFFUSION_EOS && position + 1 != active_length {
-                        candle_core::bail!(
-                            "causal clean target may contain EOS only at the final active position"
-                        );
+                        candle_core::bail!("causal clean target may contain EOS only at the final active position");
                     }
                     let flat = row_index * width + position;
                     targets[flat] = token;
@@ -186,6 +181,60 @@ impl FoundationCausalCollator {
                 .to_dtype(DType::U32)?,
             target_classes: Tensor::from_vec(target_classes, active_count, device)?
                 .to_dtype(DType::U32)?,
+        })
+    }
+
+    /// Create model-visible causal inputs for arbitrary clean prefixes.
+    ///
+    /// Each prefix contains only already-emitted non-EOS tokens. Position zero
+    /// is supplied by the learned START embedding inside the model and the
+    /// final active position predicts the next token after the supplied prefix.
+    /// This is the inference contract used by the v0.12.4 left-to-right beam
+    /// generator; unlike teacher-forcing collation it does not require a
+    /// completed candidate or an EOS target.
+    pub fn collate_prefix_rows(
+        &self,
+        prefixes: &[Vec<u32>],
+        device: &Device,
+    ) -> Result<FoundationCausalInputBatch> {
+        if prefixes.is_empty() {
+            candle_core::bail!("causal prefix collation requires at least one prefix");
+        }
+        let batch = prefixes.len();
+        let width = self.config.max_tokens;
+        let mut shifted = vec![FOUNDATION_DIFFUSION_PAD; batch * width];
+        let mut mask = vec![0.0f32; batch * width];
+
+        for (row_index, prefix) in prefixes.iter().enumerate() {
+            if prefix.len() >= width {
+                candle_core::bail!(
+                    "causal prefix length {} leaves no position for next-token prediction in width {width}",
+                    prefix.len()
+                );
+            }
+            for (position, &token) in prefix.iter().enumerate() {
+                if token == FOUNDATION_DIFFUSION_PAD
+                    || token == FOUNDATION_DIFFUSION_MASK
+                    || token == FOUNDATION_DIFFUSION_EOS
+                {
+                    candle_core::bail!(
+                        "causal prefix position {position} contains PAD/MASK/EOS"
+                    );
+                }
+                if token as usize >= FOUNDATION_DIFFUSION_VOCAB_SIZE {
+                    candle_core::bail!("causal prefix token {token} exceeds vocabulary");
+                }
+                shifted[row_index * width + position + 1] = token;
+            }
+            for position in 0..=prefix.len() {
+                mask[row_index * width + position] = 1.0;
+            }
+        }
+
+        Ok(FoundationCausalInputBatch {
+            input_tokens: Tensor::from_vec(shifted, (batch, width), device)?
+                .to_dtype(DType::U32)?,
+            token_mask: Tensor::from_vec(mask, (batch, width), device)?,
         })
     }
 }
@@ -295,10 +344,7 @@ impl PeptideSpectrumCausalModel {
         // START is not a vocabulary id. The first position uses the dedicated
         // embedding directly; positions 1.. use shifted clean prefix tokens.
         let start_ids = Tensor::zeros(batch, DType::U32, input.input_tokens.device())?;
-        let start_embedding = self
-            .causal_start_embedding
-            .forward(&start_ids)?
-            .unsqueeze(1)?;
+        let start_embedding = self.causal_start_embedding.forward(&start_ids)?.unsqueeze(1)?;
         let shifted_suffix = input.input_tokens.narrow(1, 1, token_len - 1)?;
         let shifted_embedding = self.token_embedding.forward(&shifted_suffix)?;
         let token_embedding = Tensor::cat(&[&start_embedding, &shifted_embedding], 1)?;
