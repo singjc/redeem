@@ -15,12 +15,14 @@ use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_diffusion_residue_ptm_valid, foundation_diffusion_reverse_probabilities,
     foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
-    foundation_precursor_mass_error_da, foundation_precursor_neutral_mass, load_foundation_corpus,
-    read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationCausalCollator,
-    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
+    foundation_fragment_causal_rerank_score, foundation_precursor_mass_error_da,
+    foundation_precursor_neutral_mass, load_foundation_corpus, read_foundation_training_run_config,
+    FoundationBenchmarkManifest, FoundationCausalCollator, FoundationDiffusionCollator,
+    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
+    FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
     PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel, PeptidoformInput,
-    PrecursorContextBatch, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK,
+    PrecursorContextBatch, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
+    FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK,
     FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_PAD,
     FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
     FOUNDATION_PEPTIDE_WATER_MASS_DA,
@@ -137,7 +139,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 16 {
         anyhow::bail!(
-            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=2.0] [neural_rerank_weight=1.0] [causal_checkpoint=none] [causal_rerank_weight=1.0]"
+            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=2.0] [neural_rerank_weight=1.0] [causal_checkpoint=none] [causal_rerank_weight=0.1]"
         );
     }
 
@@ -155,7 +157,7 @@ fn main() -> Result<()> {
     let spectral_beam_weight = parse_or(&args, 12, 2.0f64)?;
     let neural_rerank_weight = parse_or(&args, 13, 1.0f64)?;
     let causal_checkpoint = optional_path(&args, 14);
-    let causal_rerank_weight = parse_or(&args, 15, 1.0f64)?;
+    let causal_rerank_weight = parse_or(&args, 15, FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123)?;
     if validation_records == 0
         || samples_per_record == 0
         || mass_beam_width == 0
@@ -276,6 +278,14 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "none".into())
     );
     println!("causal_rerank_weight\t{causal_rerank_weight}");
+    println!("causal_rerank_score_definition\tfragment_score+weight*ar_total_log_probability");
+    let causal_rerank_policy =
+        if (causal_rerank_weight - FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123).abs() <= f64::EPSILON {
+            FOUNDATION_CAUSAL_RERANK_POLICY_V0123
+        } else {
+            "custom_fragment_plus_weighted_ar_total"
+        };
+    println!("causal_rerank_policy\t{causal_rerank_policy}");
     println!("primary_candidate_ranking\tfragment_mass");
     println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass,causal_ar_mass,hybrid_fragment_causal_mass");
     println!("candidate_reranker\tall_mask_x0_v1+causal_next_token_v1");
@@ -494,8 +504,11 @@ fn main() -> Result<()> {
                 candidate.ar_total_log_probability = score.total_log_probability;
                 candidate.ar_mean_log_probability = score.mean_log_probability;
                 candidate.ar_perplexity = score.perplexity;
-                candidate.fragment_causal_score = candidate.fragment_score
-                    + causal_rerank_weight * candidate.ar_total_log_probability;
+                candidate.fragment_causal_score = foundation_fragment_causal_rerank_score(
+                    candidate.fragment_score,
+                    candidate.ar_total_log_probability,
+                    causal_rerank_weight,
+                );
             }
         }
 

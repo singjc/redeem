@@ -1,11 +1,12 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_causal_next_token_loss, load_causal_from_diffusion_checkpoint,
-    FoundationCausalCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationSpectrum, FoundationSpectrumCollator, FoundationSpectrumConfig,
-    PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel, PeptidoformInput,
-    PrecursorContextBatch, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_PAD,
+    foundation_causal_next_token_loss, foundation_fragment_causal_rerank_score,
+    load_causal_from_diffusion_checkpoint, FoundationCausalCollator, FoundationDiffusionConfig,
+    FoundationDiffusionVocabulary, FoundationSpectrum, FoundationSpectrumCollator,
+    FoundationSpectrumConfig, PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel,
+    PeptidoformInput, PrecursorContextBatch, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
+    FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_PAD,
     FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 use std::fs;
@@ -200,4 +201,17 @@ fn historical_diffusion_checkpoint_warm_starts_all_shared_causal_variables() {
     drop(new_data);
     drop(old_data);
     fs::remove_file(path).ok();
+}
+
+#[test]
+fn validated_v0123_fragment_causal_policy_uses_locked_total_probability_weight() {
+    assert_eq!(FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123, 0.1);
+    assert_eq!(
+        FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
+        "fragment_plus_0.1_ar_total_v1"
+    );
+
+    let score =
+        foundation_fragment_causal_rerank_score(7.0, -30.0, FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123);
+    assert!((score - 4.0).abs() < 1e-12);
 }

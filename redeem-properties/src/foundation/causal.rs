@@ -20,6 +20,27 @@ use candle_nn::{self as nn, loss, Embedding, Linear, VarBuilder, VarMap};
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Validated v0.12.3 coefficient for combining fragment evidence with causal
+/// sequence likelihood. The coefficient was frozen before the 512-record
+/// confirmation slice and recovered every literal candidate-pool oracle there.
+pub const FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123: f64 = 0.1;
+
+/// Stable identifier for the validated v0.12.3 hybrid ranking policy.
+pub const FOUNDATION_CAUSAL_RERANK_POLICY_V0123: &str = "fragment_plus_0.1_ar_total_v1";
+
+/// Combine fragment evidence with causal total log-likelihood.
+///
+/// The total autoregressive log-likelihood is deliberately retained rather
+/// than length-normalized here. At the small validated coefficient it acts as
+/// a sequence-plausibility regularizer without overwhelming fragment evidence.
+pub fn foundation_fragment_causal_rerank_score(
+    fragment_score: f64,
+    ar_total_log_probability: f64,
+    weight: f64,
+) -> f64 {
+    fragment_score + weight * ar_total_log_probability
+}
+
 /// Model inputs for causal decoding.
 ///
 /// Targets are intentionally absent from this structure. Candidate/target tokens
