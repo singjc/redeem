@@ -467,3 +467,43 @@ fn source_metadata_is_optional_and_fill_missing_preserves_row_values() {
     );
     assert_eq!(dataset.records[0].context.nce, Some(30.0));
 }
+
+#[test]
+fn loads_pan_human_library_packed_annotations_as_observed_fragments() {
+    use redeem_properties::foundation::{FoundationDatasetLoader, FoundationTableLoaderConfig};
+    use std::fs;
+
+    // Real PHL/DPHL exports may carry a `.csv` suffix while using tabs, and the
+    // packed Annotation field itself may contain commas.
+    let path = std::env::temp_dir().join("redeem_foundation_pan_human_profile.csv");
+    let table = concat!(
+        "PrecursorMz\tProductMz\tTr_recalibrated\ttransition_name\tCE\tLibraryIntensity\ttransition_group_id\tdecoy\tPeptideSequence\tProteinName\tAnnotation\tFullUniModPeptideName\tMissedCleavages\tReplicates\tNrModifications\tPrecursorCharge\tGroupLabel\tUniprotID\n",
+        "778.4129855\t427.22995924\t57.3\t4_AAAAAAAAAAAAAAAASAGGK_2\t-1\t8319.7\t1_AAAAAAAAAAAAAAAASAGGK_2\t0\tAAAAAAAAAAAAAAAASAGGK\t1/P0CG40\tb6/-0.006,b12^2/-0.006,m11:16/-0.006\tAAAAAAAAAAAAAAAASAGGK\t0\t0\t0\t2\tlight\t1/P0CG40\n",
+    );
+    fs::write(&path, table).unwrap();
+
+    let mut loader = FoundationDatasetLoader::new(8);
+    let config = FoundationTableLoaderConfig {
+        delimiter: Some(b'\t'),
+        ..FoundationTableLoaderConfig::default()
+    };
+    let report = loader.load_path_with_report(&path, &config).unwrap();
+    assert_eq!(report.schema.profile, "pan_human_transition_library");
+    assert_eq!(report.schema.sequence.header, "FullUniModPeptideName");
+    assert_eq!(
+        report.schema.fragment_annotation.as_ref().unwrap().header,
+        "Annotation"
+    );
+    assert_eq!(
+        report.schema.fragment_mz.as_ref().unwrap().header,
+        "ProductMz"
+    );
+    assert_eq!(report.records.len(), 1);
+    assert_eq!(report.records[0].fragments.len(), 1);
+    let fragment = &report.records[0].fragments[0];
+    assert_eq!(fragment.cleavage_index, 5);
+    assert_eq!(fragment.channel, 0);
+    assert!((fragment.product_mz.unwrap() - 427.22995).abs() < 1e-3);
+    assert_eq!(report.stats.observed_spectrum_records, 1);
+    fs::remove_file(path).unwrap();
+}

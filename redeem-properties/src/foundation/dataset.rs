@@ -206,6 +206,8 @@ pub struct FoundationTableSchemaReport {
     pub fragment_series: Option<FoundationSchemaField>,
     /// Product/fragment charge column.
     pub fragment_charge: Option<FoundationSchemaField>,
+    /// Packed fragment annotation column used by library dialects such as PHL/DPHL.
+    pub fragment_annotation: Option<FoundationSchemaField>,
     /// Observed/library product-ion m/z column.
     pub fragment_mz: Option<FoundationSchemaField>,
     /// Fragment intensity column.
@@ -674,6 +676,7 @@ struct TableSchema {
     fragment_type: Option<usize>,
     fragment_series: Option<usize>,
     fragment_charge: Option<usize>,
+    fragment_annotation: Option<usize>,
     fragment_mz: Option<usize>,
     fragment_intensity: Option<usize>,
     fragment_loss: Option<usize>,
@@ -683,6 +686,9 @@ impl TableSchema {
     fn infer(headers: &StringRecord) -> Result<Self> {
         if is_ip2_bruker_spectral_library(headers) {
             return Self::ip2_bruker(headers);
+        }
+        if is_pan_human_transition_library(headers) {
+            return Self::pan_human_transition_library(headers);
         }
         if is_openswath_finetuning_table(headers) {
             return Self::openswath_finetuning(headers);
@@ -707,6 +713,7 @@ impl TableSchema {
             fragment_type: exact_header(headers, "fragment_type"),
             fragment_series: exact_header(headers, "fragment_series_number"),
             fragment_charge: exact_header(headers, "product_charge"),
+            fragment_annotation: None,
             fragment_mz: None,
             fragment_intensity: exact_header(headers, "intensity"),
             fragment_loss: None,
@@ -733,9 +740,34 @@ impl TableSchema {
             fragment_type: exact_header(headers, "FragmentType"),
             fragment_series: exact_header(headers, "FragmentSeriesNumber"),
             fragment_charge: exact_header(headers, "FragmentCharge"),
+            fragment_annotation: None,
             fragment_mz: exact_header(headers, "ProductMz"),
             fragment_intensity: exact_header(headers, "LibraryIntensity"),
             fragment_loss: exact_header(headers, "FragmentLossType"),
+        })
+    }
+
+    fn pan_human_transition_library(headers: &StringRecord) -> Result<Self> {
+        Ok(Self {
+            profile: "pan_human_transition_library",
+            sequence: require_header(headers, "FullUniModPeptideName")?,
+            charge: exact_header(headers, "PrecursorCharge"),
+            normalized_rt: exact_header(headers, "Tr_recalibrated"),
+            observed_rt: None,
+            ccs: None,
+            precursor_mz: exact_header(headers, "PrecursorMz"),
+            ion_mobility: None,
+            nce: None,
+            instrument: None,
+            run_id: None,
+            gradient_seconds: None,
+            fragment_type: None,
+            fragment_series: None,
+            fragment_charge: None,
+            fragment_annotation: exact_header(headers, "Annotation"),
+            fragment_mz: exact_header(headers, "ProductMz"),
+            fragment_intensity: exact_header(headers, "LibraryIntensity"),
+            fragment_loss: None,
         })
     }
 
@@ -839,6 +871,10 @@ impl TableSchema {
                     "fragment_charge",
                 ],
             ),
+            fragment_annotation: find_header(
+                headers,
+                &["annotation", "fragmentannotation", "fragment_annotation"],
+            ),
             fragment_mz: find_header(
                 headers,
                 &["productmz", "product_mz", "fragmentmz", "fragment_mz"],
@@ -886,6 +922,7 @@ impl TableSchema {
             fragment_type: schema_field(headers, self.fragment_type),
             fragment_series: schema_field(headers, self.fragment_series),
             fragment_charge: schema_field(headers, self.fragment_charge),
+            fragment_annotation: schema_field(headers, self.fragment_annotation),
             fragment_mz: schema_field(headers, self.fragment_mz),
             fragment_intensity: schema_field(headers, self.fragment_intensity),
             fragment_loss: schema_field(headers, self.fragment_loss),
@@ -896,6 +933,21 @@ impl TableSchema {
 
 fn normalized_headers(headers: &StringRecord) -> BTreeSet<String> {
     headers.iter().map(normalize_header).collect()
+}
+
+fn is_pan_human_transition_library(headers: &StringRecord) -> bool {
+    let headers = normalized_headers(headers);
+    [
+        "precursormz",
+        "productmz",
+        "trrecalibrated",
+        "libraryintensity",
+        "annotation",
+        "fullunimodpeptidename",
+        "precursorcharge",
+    ]
+    .iter()
+    .all(|header| headers.contains(*header))
 }
 
 fn is_openswath_finetuning_table(headers: &StringRecord) -> bool {
@@ -988,6 +1040,7 @@ fn schema_collisions(
         ("fragment_type", schema.fragment_type),
         ("fragment_series", schema.fragment_series),
         ("fragment_charge", schema.fragment_charge),
+        ("fragment_annotation", schema.fragment_annotation),
         ("fragment_mz", schema.fragment_mz),
         ("fragment_intensity", schema.fragment_intensity),
         ("fragment_loss", schema.fragment_loss),
@@ -1309,6 +1362,19 @@ fn parse_fragment(
     schema: &TableSchema,
     peptide_len: usize,
 ) -> Result<Option<FragmentTarget>> {
+    if schema.fragment_type.is_none() || schema.fragment_series.is_none() {
+        if let (Some(annotation_index), Some(intensity_index)) =
+            (schema.fragment_annotation, schema.fragment_intensity)
+        {
+            return parse_packed_fragment_annotation(
+                row,
+                annotation_index,
+                intensity_index,
+                schema.fragment_mz,
+                peptide_len,
+            );
+        }
+    }
     let (Some(type_index), Some(series_index), Some(intensity_index)) = (
         schema.fragment_type,
         schema.fragment_series,
@@ -1360,6 +1426,76 @@ fn parse_fragment(
         intensity,
         product_mz,
     }))
+}
+
+fn parse_packed_fragment_annotation(
+    row: &StringRecord,
+    annotation_index: usize,
+    intensity_index: usize,
+    fragment_mz_index: Option<usize>,
+    peptide_len: usize,
+) -> Result<Option<FragmentTarget>> {
+    let intensity = row
+        .get(intensity_index)
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+    if !intensity.is_finite() || intensity < 0.0 {
+        return Ok(None);
+    }
+    let product_mz = parse_f32(field(row, fragment_mz_index)).filter(|value| *value > 0.0);
+    let annotation = row.get(annotation_index).unwrap_or("").trim();
+
+    for candidate in annotation.split(',') {
+        let ion = candidate.split('/').next().unwrap_or("").trim();
+        if ion.len() < 2 {
+            continue;
+        }
+        let mut chars = ion.chars();
+        let ion_type = chars.next().unwrap().to_ascii_lowercase();
+        if ion_type != 'b' && ion_type != 'y' {
+            continue;
+        }
+        let rest: String = chars.collect();
+        if rest.contains('-') || rest.contains('+') || rest.contains(':') {
+            continue;
+        }
+        let (ordinal_text, charge_text) = rest
+            .split_once('^')
+            .map_or((rest.as_str(), None), |(ordinal, charge)| {
+                (ordinal, Some(charge))
+            });
+        let Some(ordinal) = ordinal_text
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+        else {
+            continue;
+        };
+        let charge = charge_text
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let fragment_type = ion_type.to_string();
+        let Some(channel) = fragment_channel(&fragment_type, charge, "")? else {
+            continue;
+        };
+        let cleavage_index = match ion_type {
+            'b' => ordinal.checked_sub(1),
+            'y' => peptide_len.checked_sub(ordinal + 1),
+            _ => None,
+        };
+        let Some(cleavage_index) =
+            cleavage_index.filter(|index| *index < peptide_len.saturating_sub(1))
+        else {
+            continue;
+        };
+        return Ok(Some(FragmentTarget {
+            cleavage_index,
+            channel,
+            intensity,
+            product_mz,
+        }));
+    }
+    Ok(None)
 }
 
 fn fragment_channel(fragment_type: &str, charge: usize, loss: &str) -> Result<Option<usize>> {
