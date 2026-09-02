@@ -20,13 +20,13 @@ use redeem_properties::foundation::{
     foundation_fragment_causal_rerank_score, foundation_precursor_mass_error_da,
     foundation_precursor_neutral_mass, load_foundation_corpus, read_foundation_training_run_config,
     FoundationBenchmarkManifest, FoundationCausalCollator, FoundationDiffusionCollator,
-    FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
+    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
+    FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
     PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel, PeptidoformInput,
     PrecursorContextBatch, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
     FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK,
-    FOUNDATION_DIFFUSION_NTERM_ACETYL,
-    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_PAD,
+    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
     FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
 use serde::Deserialize;
@@ -193,11 +193,7 @@ fn main() -> Result<()> {
     let spectral_beam_weight = parse_or(&args, 12, 2.0f64)?;
     let neural_rerank_weight = parse_or(&args, 13, 1.0f64)?;
     let causal_checkpoint = optional_path(&args, 14);
-    let causal_rerank_weight = parse_or(
-        &args,
-        15,
-        FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123,
-    )?;
+    let causal_rerank_weight = parse_or(&args, 15, FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123)?;
     let causal_generation_beam_width = parse_or(&args, 16, 0usize)?;
     let causal_generation_final_candidates = parse_or(&args, 17, 16usize)?;
     if validation_records == 0
@@ -228,7 +224,9 @@ fn main() -> Result<()> {
         anyhow::bail!("causal_rerank_weight must be finite");
     }
     if causal_generation_beam_width > 0 && causal_generation_final_candidates == 0 {
-        anyhow::bail!("causal_generation_final_candidates must be positive when causal generation is enabled");
+        anyhow::bail!(
+            "causal_generation_final_candidates must be positive when causal generation is enabled"
+        );
     }
     if causal_generation_beam_width > 0 && causal_checkpoint.is_none() {
         anyhow::bail!("causal generation requires a causal checkpoint");
@@ -276,10 +274,10 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|checkpoint| -> Result<CausalReranker> {
             let metadata_path = checkpoint.join("metadata.yaml");
-            let metadata: DiffusionCheckpointMetadata = serde_yaml::from_str(
-                &fs::read_to_string(&metadata_path)
-                    .with_context(|| format!("failed to read causal metadata {metadata_path:?}"))?,
-            )?;
+            let metadata: DiffusionCheckpointMetadata =
+                serde_yaml::from_str(&fs::read_to_string(&metadata_path).with_context(|| {
+                    format!("failed to read causal metadata {metadata_path:?}")
+                })?)?;
             if metadata.diffusion != config {
                 anyhow::bail!(
                     "causal checkpoint architecture differs from frozen diffusion generator config"
@@ -318,20 +316,21 @@ fn main() -> Result<()> {
     println!("fragment_tolerance_ppm\t{fragment_tolerance_ppm}");
     println!("spectral_beam_weight\t{spectral_beam_weight}");
     println!("neural_rerank_weight\t{neural_rerank_weight}");
-    println!("causal_checkpoint\t{}", causal_checkpoint.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "none".into()));
-    println!("causal_rerank_weight\t{causal_rerank_weight}");
     println!(
-        "causal_rerank_score_definition\tfragment_score+weight*ar_total_log_probability"
+        "causal_checkpoint\t{}",
+        causal_checkpoint
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".into())
     );
-    let causal_rerank_policy = if (causal_rerank_weight
-        - FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123)
-        .abs()
-        <= f64::EPSILON
-    {
-        FOUNDATION_CAUSAL_RERANK_POLICY_V0123
-    } else {
-        "custom_fragment_plus_weighted_ar_total"
-    };
+    println!("causal_rerank_weight\t{causal_rerank_weight}");
+    println!("causal_rerank_score_definition\tfragment_score+weight*ar_total_log_probability");
+    let causal_rerank_policy =
+        if (causal_rerank_weight - FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123).abs() <= f64::EPSILON {
+            FOUNDATION_CAUSAL_RERANK_POLICY_V0123
+        } else {
+            "custom_fragment_plus_weighted_ar_total"
+        };
     println!("causal_rerank_policy\t{causal_rerank_policy}");
     println!("causal_generation_beam_width\t{causal_generation_beam_width}");
     println!("causal_generation_final_candidates\t{causal_generation_final_candidates}");
@@ -899,12 +898,36 @@ fn main() -> Result<()> {
                 target_active_length.to_string(),
                 predicted_active_length.to_string(),
                 (fragment_mass_index + 1).to_string(),
-                neural_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0).to_string(),
-                hybrid_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0).to_string(),
-                causal_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0).to_string(),
-                fragment_causal_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0).to_string(),
-                mass_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0).to_string(),
-                reverse_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0).to_string(),
+                neural_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                hybrid_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                causal_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                fragment_causal_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                mass_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                reverse_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
                 candidate.peptide.sequence.clone(),
                 format_modifications(&candidate.peptide),
                 format!("{:.8}", candidate.reverse_log_probability),
@@ -918,12 +941,16 @@ fn main() -> Result<()> {
                 format_finite(candidate.ar_mean_log_probability),
                 format_finite(candidate.ar_perplexity),
                 format_finite(candidate.fragment_causal_score),
-                candidate.mass_error_da.map(|value| format!("{value:.8}")).unwrap_or_default(),
+                candidate
+                    .mass_error_da
+                    .map(|value| format!("{value:.8}"))
+                    .unwrap_or_default(),
                 candidate.mass_valid.to_string(),
                 candidate.from_diffusion.to_string(),
                 candidate.from_causal_beam.to_string(),
                 (candidate.peptide == record.peptidoform).to_string(),
-                (candidate.peptide.sequence.as_str() == record.peptidoform.sequence.as_str()).to_string(),
+                (candidate.peptide.sequence.as_str() == record.peptidoform.sequence.as_str())
+                    .to_string(),
                 (normalize_il(&candidate.peptide.sequence) == target_il).to_string(),
             ];
             writeln!(output, "{}", fields.join("\t"))?;
@@ -1448,8 +1475,7 @@ fn causal_prefix_mass_beam(
             if state.residue_count > 0 && abs_mass_error <= mass_tolerance_da {
                 let eos_log_probability =
                     selected_log_softmax(next_logits, FOUNDATION_DIFFUSION_EOS as usize)?;
-                let ar_total_log_probability =
-                    state.ar_total_log_probability + eos_log_probability;
+                let ar_total_log_probability = state.ar_total_log_probability + eos_log_probability;
                 let fragment_causal_score = foundation_fragment_causal_rerank_score(
                     state.fragment_score,
                     ar_total_log_probability,
@@ -1483,18 +1509,14 @@ fn causal_prefix_mass_beam(
             }
 
             let mut token_order: Vec<usize> =
-                (FOUNDATION_DIFFUSION_EOS as usize + 1..FOUNDATION_DIFFUSION_VOCAB_SIZE)
-                    .collect();
-            token_order.sort_by(|&left, &right| {
-                next_logits[right].total_cmp(&next_logits[left])
-            });
+                (FOUNDATION_DIFFUSION_EOS as usize + 1..FOUNDATION_DIFFUSION_VOCAB_SIZE).collect();
+            token_order.sort_by(|&left, &right| next_logits[right].total_cmp(&next_logits[left]));
             for token_index in token_order {
                 if !next_logits[token_index].is_finite() {
                     continue;
                 }
                 let token = token_index as u32;
-                if !mass_beam_token_allowed(&state.prefix, token, position, config.max_tokens - 1)
-                {
+                if !mass_beam_token_allowed(&state.prefix, token, position, config.max_tokens - 1) {
                     continue;
                 }
                 let Some(token_mass) = foundation_diffusion_token_mass_da(token) else {
@@ -1505,8 +1527,7 @@ fn causal_prefix_mass_beam(
                     continue;
                 }
                 let remaining_slots = config.max_tokens - 1 - (state.prefix.len() + 1);
-                let maximum_reachable_mass =
-                    neutral_mass + remaining_slots as f64 * max_token_mass;
+                let maximum_reachable_mass = neutral_mass + remaining_slots as f64 * max_token_mass;
                 if maximum_reachable_mass + mass_tolerance_da < target {
                     continue;
                 }
@@ -1875,7 +1896,6 @@ fn score_all_mask_candidates(
         .collect()
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn score_causal_token_row(
     model: &PeptideSpectrumCausalModel,
@@ -1921,7 +1941,9 @@ fn score_causal_candidates(
     candidates
         .iter()
         .enumerate()
-        .map(|(index, candidate)| score_causal_candidate_from_logits(&logits[index], &candidate.tokens))
+        .map(|(index, candidate)| {
+            score_causal_candidate_from_logits(&logits[index], &candidate.tokens)
+        })
         .collect()
 }
 
@@ -1942,7 +1964,8 @@ fn score_causal_candidate_from_logits(
     let mut total = 0.0f64;
     for position in 0..active_length {
         let token = candidate_tokens[position] as usize;
-        if token == FOUNDATION_DIFFUSION_PAD as usize || token == FOUNDATION_DIFFUSION_MASK as usize {
+        if token == FOUNDATION_DIFFUSION_PAD as usize || token == FOUNDATION_DIFFUSION_MASK as usize
+        {
             anyhow::bail!("causal clean candidate contains PAD/MASK in its active prefix");
         }
         total += selected_log_softmax(&token_logits[position], token)?;
@@ -2635,7 +2658,10 @@ fn optional_path(args: &[String], index: usize) -> Option<PathBuf> {
 }
 
 fn format_finite(value: f64) -> String {
-    value.is_finite().then(|| format!("{value:.8}")).unwrap_or_default()
+    value
+        .is_finite()
+        .then(|| format!("{value:.8}"))
+        .unwrap_or_default()
 }
 
 fn parse_or<T: std::str::FromStr>(args: &[String], index: usize, default: T) -> Result<T>

@@ -3,10 +3,9 @@ use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_causal_next_token_loss, foundation_fragment_causal_rerank_score,
     load_causal_from_diffusion_checkpoint, FoundationCausalCollator, FoundationDiffusionConfig,
-    FoundationDiffusionVocabulary,
-    FoundationSpectrum, FoundationSpectrumCollator, FoundationSpectrumConfig,
-    PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel, PeptidoformInput,
-    PrecursorContextBatch, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
+    FoundationDiffusionVocabulary, FoundationSpectrum, FoundationSpectrumCollator,
+    FoundationSpectrumConfig, PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel,
+    PeptidoformInput, PrecursorContextBatch, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
     FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_PAD,
     FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
@@ -85,7 +84,9 @@ fn causal_prefix_collation_exposes_exactly_one_next_token_position() {
     let shifted = input.input_tokens.to_vec2::<u32>().unwrap();
     let mask = input.token_mask.to_vec2::<f32>().unwrap();
 
-    assert!(shifted[0].iter().all(|&token| token == FOUNDATION_DIFFUSION_PAD));
+    assert!(shifted[0]
+        .iter()
+        .all(|&token| token == FOUNDATION_DIFFUSION_PAD));
     assert_eq!(mask[0][0], 1.0);
     assert!(mask[0][1..].iter().all(|&value| value == 0.0));
 
@@ -214,9 +215,23 @@ fn historical_diffusion_checkpoint_warm_starts_all_shared_causal_variables() {
         "decoder.output_norm.weight",
         "decoder.token_head.weight",
     ] {
-        let old = old_data.get(name).unwrap().as_tensor().flatten_all().unwrap();
-        let new = new_data.get(name).unwrap().as_tensor().flatten_all().unwrap();
-        assert_eq!(old.to_vec1::<f32>().unwrap(), new.to_vec1::<f32>().unwrap(), "{name}");
+        let old = old_data
+            .get(name)
+            .unwrap()
+            .as_tensor()
+            .flatten_all()
+            .unwrap();
+        let new = new_data
+            .get(name)
+            .unwrap()
+            .as_tensor()
+            .flatten_all()
+            .unwrap();
+        assert_eq!(
+            old.to_vec1::<f32>().unwrap(),
+            new.to_vec1::<f32>().unwrap(),
+            "{name}"
+        );
     }
     drop(new_data);
     drop(old_data);
@@ -231,10 +246,7 @@ fn validated_v0123_fragment_causal_policy_uses_locked_total_probability_weight()
         "fragment_plus_0.1_ar_total_v1"
     );
 
-    let score = foundation_fragment_causal_rerank_score(
-        7.0,
-        -30.0,
-        FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123,
-    );
+    let score =
+        foundation_fragment_causal_rerank_score(7.0, -30.0, FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123);
     assert!((score - 4.0).abs() < 1e-12);
 }

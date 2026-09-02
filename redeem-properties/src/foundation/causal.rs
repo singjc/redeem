@@ -26,8 +26,7 @@ use std::path::Path;
 pub const FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123: f64 = 0.1;
 
 /// Stable identifier for the validated v0.12.3 hybrid ranking policy.
-pub const FOUNDATION_CAUSAL_RERANK_POLICY_V0123: &str =
-    "fragment_plus_0.1_ar_total_v1";
+pub const FOUNDATION_CAUSAL_RERANK_POLICY_V0123: &str = "fragment_plus_0.1_ar_total_v1";
 
 /// Combine fragment evidence with causal total log-likelihood.
 ///
@@ -88,7 +87,11 @@ impl FoundationCausalCollator {
     }
 
     /// Encode peptidoforms and create `START,c1,... -> c1,c2,...,EOS` batches.
-    pub fn collate(&self, peptides: &[PeptidoformInput], device: &Device) -> Result<FoundationCausalBatch> {
+    pub fn collate(
+        &self,
+        peptides: &[PeptidoformInput],
+        device: &Device,
+    ) -> Result<FoundationCausalBatch> {
         if peptides.is_empty() {
             candle_core::bail!("causal collation requires at least one peptide");
         }
@@ -152,7 +155,9 @@ impl FoundationCausalCollator {
                         candle_core::bail!("causal clean target token {token} exceeds vocabulary");
                     }
                     if token == FOUNDATION_DIFFUSION_EOS && position + 1 != active_length {
-                        candle_core::bail!("causal clean target may contain EOS only at the final active position");
+                        candle_core::bail!(
+                            "causal clean target may contain EOS only at the final active position"
+                        );
                     }
                     let flat = row_index * width + position;
                     targets[flat] = token;
@@ -217,9 +222,7 @@ impl FoundationCausalCollator {
                     || token == FOUNDATION_DIFFUSION_MASK
                     || token == FOUNDATION_DIFFUSION_EOS
                 {
-                    candle_core::bail!(
-                        "causal prefix position {position} contains PAD/MASK/EOS"
-                    );
+                    candle_core::bail!("causal prefix position {position} contains PAD/MASK/EOS");
                 }
                 if token as usize >= FOUNDATION_DIFFUSION_VOCAB_SIZE {
                     candle_core::bail!("causal prefix token {token} exceeds vocabulary");
@@ -344,7 +347,10 @@ impl PeptideSpectrumCausalModel {
         // START is not a vocabulary id. The first position uses the dedicated
         // embedding directly; positions 1.. use shifted clean prefix tokens.
         let start_ids = Tensor::zeros(batch, DType::U32, input.input_tokens.device())?;
-        let start_embedding = self.causal_start_embedding.forward(&start_ids)?.unsqueeze(1)?;
+        let start_embedding = self
+            .causal_start_embedding
+            .forward(&start_ids)?
+            .unsqueeze(1)?;
         let shifted_suffix = input.input_tokens.narrow(1, 1, token_len - 1)?;
         let shifted_embedding = self.token_embedding.forward(&shifted_suffix)?;
         let token_embedding = Tensor::cat(&[&start_embedding, &shifted_embedding], 1)?;
