@@ -240,6 +240,57 @@ impl FoundationCausalCollator {
             token_mask: Tensor::from_vec(mask, (batch, width), device)?,
         })
     }
+
+    /// Create a compact causal input containing only active prefix positions.
+    ///
+    /// All prefixes in one batch must have the same length, as they do at one
+    /// beam-search depth. The returned width is `prefix.len() + 1` rather than
+    /// `config.max_tokens`, eliminating inactive future positions during
+    /// inference while preserving START + shifted-prefix semantics.
+    pub fn collate_compact_prefix_rows(
+        &self,
+        prefixes: &[Vec<u32>],
+        device: &Device,
+    ) -> Result<FoundationCausalInputBatch> {
+        if prefixes.is_empty() {
+            candle_core::bail!("compact causal prefix collation requires at least one prefix");
+        }
+        let prefix_len = prefixes[0].len();
+        if prefix_len >= self.config.max_tokens {
+            candle_core::bail!(
+                "causal prefix length {prefix_len} leaves no position for next-token prediction in configured width {}",
+                self.config.max_tokens
+            );
+        }
+        if prefixes.iter().any(|prefix| prefix.len() != prefix_len) {
+            candle_core::bail!("compact causal prefix batches require equal prefix lengths");
+        }
+
+        let batch = prefixes.len();
+        let width = prefix_len + 1;
+        let mut shifted = vec![FOUNDATION_DIFFUSION_PAD; batch * width];
+        let mask = vec![1.0f32; batch * width];
+        for (row_index, prefix) in prefixes.iter().enumerate() {
+            for (position, &token) in prefix.iter().enumerate() {
+                if token == FOUNDATION_DIFFUSION_PAD
+                    || token == FOUNDATION_DIFFUSION_MASK
+                    || token == FOUNDATION_DIFFUSION_EOS
+                {
+                    candle_core::bail!("causal prefix position {position} contains PAD/MASK/EOS");
+                }
+                if token as usize >= FOUNDATION_DIFFUSION_VOCAB_SIZE {
+                    candle_core::bail!("causal prefix token {token} exceeds vocabulary");
+                }
+                shifted[row_index * width + position + 1] = token;
+            }
+        }
+
+        Ok(FoundationCausalInputBatch {
+            input_tokens: Tensor::from_vec(shifted, (batch, width), device)?
+                .to_dtype(DType::U32)?,
+            token_mask: Tensor::from_vec(mask, (batch, width), device)?,
+        })
+    }
 }
 
 /// Output from a teacher-forced causal next-token prediction.
@@ -417,9 +468,9 @@ impl PeptideSpectrumCausalModel {
         train: bool,
     ) -> Result<FoundationCausalOutput> {
         let (batch, token_len) = input.input_tokens.dims2()?;
-        if token_len != self.config.max_tokens {
+        if token_len == 0 || token_len > self.config.max_tokens {
             candle_core::bail!(
-                "causal token width {token_len} does not match configured {}",
+                "causal token width {token_len} must be within 1..={} ",
                 self.config.max_tokens
             );
         }
@@ -469,9 +520,13 @@ impl PeptideSpectrumCausalModel {
             .causal_start_embedding
             .forward(&start_ids)?
             .unsqueeze(1)?;
-        let shifted_suffix = input.input_tokens.narrow(1, 1, token_len - 1)?;
-        let shifted_embedding = self.token_embedding.forward(&shifted_suffix)?;
-        let token_embedding = Tensor::cat(&[&start_embedding, &shifted_embedding], 1)?;
+        let token_embedding = if token_len == 1 {
+            start_embedding
+        } else {
+            let shifted_suffix = input.input_tokens.narrow(1, 1, token_len - 1)?;
+            let shifted_embedding = self.token_embedding.forward(&shifted_suffix)?;
+            Tensor::cat(&[&start_embedding, &shifted_embedding], 1)?
+        };
 
         let positions: Vec<u32> = (0..token_len as u32).collect();
         let position_ids = Tensor::from_vec(positions, token_len, input.input_tokens.device())?
@@ -513,6 +568,24 @@ impl PeptideSpectrumCausalModel {
             spectrum_memory,
             spectrum_embedding,
         })
+    }
+
+    /// Predict only the next-token logits at the final active compact-prefix position.
+    ///
+    /// This inference-only helper preserves the historical causal decoder but
+    /// avoids transferring or consuming logits for earlier prefix positions.
+    pub fn forward_next_t_with_context(
+        &self,
+        input: &FoundationCausalInputBatch,
+        context: &FoundationCausalContext,
+        train: bool,
+    ) -> Result<Tensor> {
+        let (_, token_len) = input.input_tokens.dims2()?;
+        if token_len == 0 {
+            candle_core::bail!("causal next-token inference requires at least START position");
+        }
+        let output = self.forward_t_with_context(input, context, train)?;
+        output.token_logits.narrow(1, token_len - 1, 1)?.squeeze(1)
     }
 
     /// Predict every next token in one shifted, teacher-forced causal pass.

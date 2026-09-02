@@ -350,6 +350,14 @@ fn main() -> Result<()> {
             "disabled"
         }
     );
+    println!(
+        "causal_generation_prefix_execution\t{}",
+        if causal_generation_beam_width > 0 {
+            "compact_active_prefix_last_logits_v0128"
+        } else {
+            "disabled"
+        }
+    );
     println!("primary_candidate_ranking\tfragment_mass");
     println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass,causal_ar_mass,hybrid_fragment_causal_mass");
     println!(
@@ -1475,15 +1483,17 @@ fn causal_prefix_mass_beam(
         }
         debug_assert!(beam.iter().all(|state| state.prefix.len() == position));
         let prefixes: Vec<Vec<u32>> = beam.iter().map(|state| state.prefix.clone()).collect();
-        let input = causal.collator.collate_prefix_rows(&prefixes, device)?;
-        let output = causal
+        let input = causal
+            .collator
+            .collate_compact_prefix_rows(&prefixes, device)?;
+        let logits = causal
             .model
-            .forward_t_with_context(&input, &causal_context, false)?;
-        let logits = output.token_logits.to_vec3::<f32>()?;
+            .forward_next_t_with_context(&input, &causal_context, false)?
+            .to_vec2::<f32>()?;
 
         let mut binned = HashMap::<(i64, u32), CausalBeamState>::new();
         for (state_index, state) in beam.iter().enumerate() {
-            let next_logits = &logits[state_index][position];
+            let next_logits = &logits[state_index];
             let abs_mass_error = (state.neutral_mass - target).abs();
             if state.residue_count > 0 && abs_mass_error <= mass_tolerance_da {
                 let eos_log_probability =

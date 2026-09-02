@@ -200,7 +200,7 @@ fn cached_single_record_context_matches_repeated_context_logits() {
         )
         .unwrap();
     let single_spectrum = spectrum_collator.collate(&[spectrum], &device).unwrap();
-    let repeated_precursor = repeated_precursor(prefixes.len(), &device);
+    let repeated_precursor_batch = repeated_precursor(prefixes.len(), &device);
     let single_precursor = repeated_precursor(1, &device);
 
     let varmap = VarMap::new();
@@ -208,7 +208,7 @@ fn cached_single_record_context_matches_repeated_context_logits() {
     let model = PeptideSpectrumCausalModel::new(config, vb).unwrap();
 
     let direct = model
-        .forward_t(&input, &repeated_spectra, &repeated_precursor, false)
+        .forward_t(&input, &repeated_spectra, &repeated_precursor_batch, false)
         .unwrap();
     let context = model
         .prepare_context(&single_spectrum, &single_precursor, false)
@@ -235,6 +235,58 @@ fn cached_single_record_context_matches_repeated_context_logits() {
             (left - right).abs() < 1e-5,
             "cached causal context changed logit {index}: direct={left} cached={right}"
         );
+    }
+}
+
+#[test]
+fn compact_prefix_next_logits_match_full_width_prefix_logits() {
+    let device = Device::Cpu;
+    let config = tiny_config();
+    let vocabulary = FoundationDiffusionVocabulary;
+    let encoded = vocabulary
+        .encode(&PeptidoformInput::unmodified("ACDE"), config.max_tokens)
+        .unwrap();
+    let spectrum = FoundationSpectrum::from_pairs([(101.0, 3.0), (250.0, 9.0), (500.0, 4.0)]);
+    let spectrum_collator = FoundationSpectrumCollator::new(config.spectrum.clone()).unwrap();
+    let single_spectrum = spectrum_collator.collate(&[spectrum], &device).unwrap();
+    let single_precursor = repeated_precursor(1, &device);
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideSpectrumCausalModel::new(config.clone(), vb).unwrap();
+    let context = model
+        .prepare_context(&single_spectrum, &single_precursor, false)
+        .unwrap();
+    let collator = FoundationCausalCollator::new(config.clone()).unwrap();
+
+    for prefix_len in 0..=encoded.len().min(4) {
+        let prefix = encoded[..prefix_len].to_vec();
+        let prefixes = vec![prefix.clone(), prefix];
+        let full = collator.collate_prefix_rows(&prefixes, &device).unwrap();
+        let compact = collator
+            .collate_compact_prefix_rows(&prefixes, &device)
+            .unwrap();
+
+        let full_output = model
+            .forward_t_with_context(&full, &context, false)
+            .unwrap();
+        let full_logits = full_output.token_logits.to_vec3::<f32>().unwrap();
+        let compact_logits = model
+            .forward_next_t_with_context(&compact, &context, false)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        for row in 0..prefixes.len() {
+            for class in 0..FOUNDATION_DIFFUSION_VOCAB_SIZE {
+                let left = full_logits[row][prefix_len][class];
+                let right = compact_logits[row][class];
+                assert!(
+                    (left - right).abs() < 1e-5,
+                    "compact prefix changed prefix_len={prefix_len} row={row} class={class}: full={left} compact={right}"
+                );
+            }
+        }
     }
 }
 
