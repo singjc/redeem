@@ -107,8 +107,27 @@ impl MultiHeadSelfAttention {
         })
     }
 
-    /// Apply masked self-attention to `[batch, sequence, model_dim]` states.
+    /// Apply bidirectional masked self-attention to `[batch, sequence, model_dim]` states.
     pub fn forward(&self, hidden: &Tensor, residue_mask: &Tensor) -> Result<Tensor> {
+        self.forward_with_causal_mask(hidden, residue_mask, false)
+    }
+
+    /// Apply strict left-to-right causal self-attention.
+    ///
+    /// Query position `i` may attend only to key positions `<= i`; padding keys are
+    /// still masked by `residue_mask`. This is used by the spectrum-conditioned
+    /// next-token lane and deliberately leaves the historical bidirectional path
+    /// unchanged.
+    pub fn forward_causal(&self, hidden: &Tensor, residue_mask: &Tensor) -> Result<Tensor> {
+        self.forward_with_causal_mask(hidden, residue_mask, true)
+    }
+
+    fn forward_with_causal_mask(
+        &self,
+        hidden: &Tensor,
+        residue_mask: &Tensor,
+        causal: bool,
+    ) -> Result<Tensor> {
         let (batch, sequence, model_dim) = hidden.dims3()?;
         let q = self
             .query
@@ -147,7 +166,20 @@ impl MultiHeadSelfAttention {
             .unsqueeze(1)?
             .unsqueeze(1)?
             .broadcast_as((batch, self.num_heads, sequence, sequence))?;
-        let probabilities = ops::softmax(&(scores + key_mask)?, D::Minus1)?;
+        let mut masked_scores = (scores + key_mask)?;
+        if causal {
+            let mut causal_values = vec![0.0f32; sequence * sequence];
+            for query in 0..sequence {
+                for key in (query + 1)..sequence {
+                    causal_values[query * sequence + key] = -10_000.0;
+                }
+            }
+            let causal_mask =
+                Tensor::from_vec(causal_values, (1, 1, sequence, sequence), hidden.device())?
+                    .broadcast_as((batch, self.num_heads, sequence, sequence))?;
+            masked_scores = (masked_scores + causal_mask)?;
+        }
+        let probabilities = ops::softmax(&masked_scores, D::Minus1)?;
         let context = probabilities
             .matmul(&v)?
             .transpose(1, 2)?
@@ -312,6 +344,49 @@ mod gradient_tests {
         let norm_grad = gradients.get(norm_weight).expect("norm gradient");
         assert!(upstream_grad.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
         assert!(norm_grad.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn causal_self_attention_prevents_future_token_access() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let attention = MultiHeadSelfAttention::new(4, 1, vb.pp("attention"))?;
+        let first = Tensor::new(
+            &[[
+                [1.0f32, 0.0, 0.5, -0.5],
+                [0.0, 1.0, -0.5, 0.5],
+                [0.5, 0.5, 1.0, 0.0],
+                [0.25, -0.25, 0.0, 1.0],
+            ]],
+            &device,
+        )?;
+        let changed_future = Tensor::new(
+            &[[
+                [1.0f32, 0.0, 0.5, -0.5],
+                [0.0, 1.0, -0.5, 0.5],
+                [50.0, -40.0, 30.0, -20.0],
+                [-70.0, 60.0, -50.0, 40.0],
+            ]],
+            &device,
+        )?;
+        let mask = Tensor::ones((1, 4), DType::F32, &device)?;
+
+        let first_causal = attention.forward_causal(&first, &mask)?.to_vec3::<f32>()?;
+        let changed_causal = attention
+            .forward_causal(&changed_future, &mask)?
+            .to_vec3::<f32>()?;
+        for position in 0..2 {
+            for dim in 0..4 {
+                assert!(
+                    (first_causal[0][position][dim] - changed_causal[0][position][dim]).abs()
+                        < 1e-5,
+                    "causal position {position} changed after future-token perturbation"
+                );
+            }
+        }
+
         Ok(())
     }
 }

@@ -11,6 +11,7 @@
 //! are represented with masks, and two independently corrupted graph/sequence
 //! views provide masked reconstruction plus contrastive self-supervision.
 
+pub mod causal;
 pub mod ccs_physics;
 pub mod checkpoint;
 pub mod chemistry;
@@ -36,6 +37,11 @@ pub mod split;
 pub mod trainer;
 pub mod wrapper;
 
+pub use causal::{
+    foundation_causal_next_token_loss, load_causal_from_diffusion_checkpoint,
+    FoundationCausalBatch, FoundationCausalCollator, FoundationCausalInputBatch,
+    FoundationCausalOutput, FoundationCausalWarmStartReport, PeptideSpectrumCausalModel,
+};
 pub use ccs_physics::{
     evaluate_foundation_ccs_physics_baseline, fit_foundation_ccs_physics_baseline,
     fit_foundation_ccs_physics_baseline_source_weighted, foundation_ccs_physics_features,

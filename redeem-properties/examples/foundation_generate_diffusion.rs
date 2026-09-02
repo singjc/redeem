@@ -6,6 +6,8 @@
 //! after generation for metrics. Generated candidates are additionally reranked with an
 //! all-MASK x0 score from the trained inverse model: candidate identity is never supplied to the
 //! decoder input and is used only to read the candidate token probabilities after inference.
+//! An optional v0.12.2 causal checkpoint adds true prefix-conditioned sequence likelihood
+//! (including EOS) as a parallel candidate ranking without changing reverse generation.
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -14,12 +16,13 @@ use redeem_properties::foundation::{
     foundation_diffusion_residue_ptm_valid, foundation_diffusion_reverse_probabilities,
     foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
     foundation_precursor_mass_error_da, foundation_precursor_neutral_mass, load_foundation_corpus,
-    read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationDiffusionCollator,
-    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
-    FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
-    PeptideSpectrumDiffusionModel, PeptidoformInput, PrecursorContextBatch,
-    FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
-    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationCausalCollator,
+    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
+    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
+    PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel, PeptidoformInput,
+    PrecursorContextBatch, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK,
+    FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_PAD,
+    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
     FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
 use serde::Deserialize;
@@ -45,6 +48,10 @@ struct GeneratedCandidate {
     neural_all_mask_log_probability: f64,
     neural_length_log_probability: f64,
     hybrid_score: f64,
+    ar_total_log_probability: f64,
+    ar_mean_log_probability: f64,
+    ar_perplexity: f64,
+    fragment_causal_score: f64,
     mass_error_da: Option<f64>,
     mass_valid: bool,
 }
@@ -79,6 +86,12 @@ struct GenerationMetrics {
     hybrid_top1_peptidoform_exact: usize,
     hybrid_top1_sequence_exact: usize,
     hybrid_top1_il_sequence_exact: usize,
+    causal_top1_peptidoform_exact: usize,
+    causal_top1_sequence_exact: usize,
+    causal_top1_il_sequence_exact: usize,
+    fragment_causal_top1_peptidoform_exact: usize,
+    fragment_causal_top1_sequence_exact: usize,
+    fragment_causal_top1_il_sequence_exact: usize,
     records_with_candidate: usize,
     best_abs_mass_error_sum: f64,
     best_abs_mass_error_records: usize,
@@ -93,6 +106,12 @@ struct GenerationMetrics {
     fragment_top1_neural_all_mask_log_probability_sum: f64,
     neural_top1_neural_all_mask_log_probability_sum: f64,
     hybrid_top1_neural_all_mask_log_probability_sum: f64,
+    target_ar_total_log_probability_sum: f64,
+    target_ar_mean_log_probability_sum: f64,
+    fragment_top1_ar_total_log_probability_sum: f64,
+    causal_top1_ar_total_log_probability_sum: f64,
+    fragment_causal_top1_ar_total_log_probability_sum: f64,
+    causal_scored_records: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,11 +120,24 @@ struct AllMaskCandidateScore {
     length_log_probability: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CausalCandidateScore {
+    total_log_probability: f64,
+    mean_log_probability: f64,
+    perplexity: f64,
+}
+
+struct CausalReranker {
+    _varmap: VarMap,
+    model: PeptideSpectrumCausalModel,
+    collator: FoundationCausalCollator,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 || args.len() > 14 {
+    if args.len() < 4 || args.len() > 16 {
         anyhow::bail!(
-            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=2.0] [neural_rerank_weight=1.0]"
+            "usage: foundation_generate_diffusion FOUNDATION_TRAINING.yaml CHECKPOINT_DIR OUTPUT.tsv [validation_records=64] [samples_per_record=16] [seed=20260901] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=2.0] [neural_rerank_weight=1.0] [causal_checkpoint=none] [causal_rerank_weight=1.0]"
         );
     }
 
@@ -122,6 +154,8 @@ fn main() -> Result<()> {
     let fragment_tolerance_ppm = parse_or(&args, 11, 20.0f64)?;
     let spectral_beam_weight = parse_or(&args, 12, 2.0f64)?;
     let neural_rerank_weight = parse_or(&args, 13, 1.0f64)?;
+    let causal_checkpoint = optional_path(&args, 14);
+    let causal_rerank_weight = parse_or(&args, 15, 1.0f64)?;
     if validation_records == 0
         || samples_per_record == 0
         || mass_beam_width == 0
@@ -145,6 +179,9 @@ fn main() -> Result<()> {
     }
     if !neural_rerank_weight.is_finite() {
         anyhow::bail!("neural_rerank_weight must be finite");
+    }
+    if !causal_rerank_weight.is_finite() {
+        anyhow::bail!("causal_rerank_weight must be finite");
     }
 
     let device = Device::Cpu;
@@ -185,6 +222,33 @@ fn main() -> Result<()> {
     let diffusion_collator = FoundationDiffusionCollator::new(config.clone())?;
     let spectrum_collator = FoundationSpectrumCollator::new(config.spectrum.clone())?;
 
+    let causal_reranker = causal_checkpoint
+        .as_ref()
+        .map(|checkpoint| -> Result<CausalReranker> {
+            let metadata_path = checkpoint.join("metadata.yaml");
+            let metadata: DiffusionCheckpointMetadata =
+                serde_yaml::from_str(&fs::read_to_string(&metadata_path).with_context(|| {
+                    format!("failed to read causal metadata {metadata_path:?}")
+                })?)?;
+            if metadata.diffusion != config {
+                anyhow::bail!(
+                    "causal checkpoint architecture differs from frozen diffusion generator config"
+                );
+            }
+            let mut causal_varmap = VarMap::new();
+            let causal_vb = VarBuilder::from_varmap(&causal_varmap, DType::F32, &device);
+            let causal_model = PeptideSpectrumCausalModel::new(config.clone(), causal_vb)?;
+            causal_varmap
+                .load(checkpoint.join("model.safetensors"))
+                .with_context(|| format!("failed to load causal checkpoint {checkpoint:?}"))?;
+            Ok(CausalReranker {
+                _varmap: causal_varmap,
+                model: causal_model,
+                collator: FoundationCausalCollator::new(config.clone())?,
+            })
+        })
+        .transpose()?;
+
     println!(
         "corpus_fingerprint\tfnv1a64:{:016x}",
         corpus.corpus_fingerprint
@@ -204,10 +268,19 @@ fn main() -> Result<()> {
     println!("fragment_tolerance_ppm\t{fragment_tolerance_ppm}");
     println!("spectral_beam_weight\t{spectral_beam_weight}");
     println!("neural_rerank_weight\t{neural_rerank_weight}");
+    println!(
+        "causal_checkpoint\t{}",
+        causal_checkpoint
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!("causal_rerank_weight\t{causal_rerank_weight}");
     println!("primary_candidate_ranking\tfragment_mass");
-    println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass");
-    println!("candidate_reranker\tall_mask_x0_v1");
+    println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass,causal_ar_mass,hybrid_fragment_causal_mass");
+    println!("candidate_reranker\tall_mask_x0_v1+causal_next_token_v1");
     println!("neural_candidate_input\tspectrum+precursor+length_all_masked");
+    println!("causal_candidate_input\tspectrum+precursor+START+shifted_candidate_prefix");
     println!("seed\t{seed}");
 
     if let Some(parent) = output_tsv.parent() {
@@ -219,7 +292,7 @@ fn main() -> Result<()> {
     let mut output = BufWriter::new(file);
     writeln!(
         output,
-        "record_index\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tneural_mass_rank\thybrid_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tneural_all_mask_log_probability\tneural_all_mask_perplexity\tneural_length_log_probability\thybrid_score\tmass_error_da\tmass_valid\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
+        "record_index\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tneural_mass_rank\thybrid_mass_rank\tcausal_mass_rank\tfragment_causal_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tneural_all_mask_log_probability\tneural_all_mask_perplexity\tneural_length_log_probability\thybrid_score\tar_total_log_probability\tar_mean_log_probability\tar_perplexity\tfragment_causal_score\tmass_error_da\tmass_valid\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
     )?;
 
     let mut metrics = GenerationMetrics::default();
@@ -329,6 +402,10 @@ fn main() -> Result<()> {
                 neural_all_mask_log_probability: f64::NEG_INFINITY,
                 neural_length_log_probability: f64::NEG_INFINITY,
                 hybrid_score: f64::NEG_INFINITY,
+                ar_total_log_probability: f64::NEG_INFINITY,
+                ar_mean_log_probability: f64::NEG_INFINITY,
+                ar_perplexity: f64::INFINITY,
+                fragment_causal_score: f64::NEG_INFINITY,
                 mass_error_da,
                 mass_valid,
             };
@@ -386,6 +463,42 @@ fn main() -> Result<()> {
                 + neural_rerank_weight * candidate.neural_all_mask_log_probability;
         }
 
+        let target_causal_score = if let Some(causal) = causal_reranker.as_ref() {
+            let score = score_causal_token_row(
+                &causal.model,
+                &causal.collator,
+                &spectrum_collator,
+                record,
+                &spectrum,
+                &target_tokens,
+                &device,
+            )?;
+            metrics.target_ar_total_log_probability_sum += score.total_log_probability;
+            metrics.target_ar_mean_log_probability_sum += score.mean_log_probability;
+            metrics.causal_scored_records += 1;
+            Some(score)
+        } else {
+            None
+        };
+        if let Some(causal) = causal_reranker.as_ref() {
+            let causal_scores = score_causal_candidates(
+                &causal.model,
+                &causal.collator,
+                &spectrum_collator,
+                record,
+                &spectrum,
+                &candidates,
+                &device,
+            )?;
+            for (candidate, score) in candidates.iter_mut().zip(causal_scores) {
+                candidate.ar_total_log_probability = score.total_log_probability;
+                candidate.ar_mean_log_probability = score.mean_log_probability;
+                candidate.ar_perplexity = score.perplexity;
+                candidate.fragment_causal_score = candidate.fragment_score
+                    + causal_rerank_weight * candidate.ar_total_log_probability;
+            }
+        }
+
         let mut reverse_ranked = candidates.clone();
         reverse_ranked.sort_by(|left, right| {
             right
@@ -402,6 +515,16 @@ fn main() -> Result<()> {
         neural_ranked.sort_by(neural_mass_candidate_order);
         let mut hybrid_ranked = candidates.clone();
         hybrid_ranked.sort_by(hybrid_mass_candidate_order);
+        let causal_ranked = causal_reranker.as_ref().map(|_| {
+            let mut ranked = candidates.clone();
+            ranked.sort_by(causal_mass_candidate_order);
+            ranked
+        });
+        let fragment_causal_ranked = causal_reranker.as_ref().map(|_| {
+            let mut ranked = candidates.clone();
+            ranked.sort_by(fragment_causal_mass_candidate_order);
+            ranked
+        });
         candidates.sort_by(fragment_mass_candidate_order);
         if candidates.iter().any(|candidate| candidate.mass_valid) {
             metrics.records_with_mass_valid_candidate += 1;
@@ -436,6 +559,16 @@ fn main() -> Result<()> {
             neural_ranked[0].neural_all_mask_log_probability;
         metrics.hybrid_top1_neural_all_mask_log_probability_sum +=
             hybrid_ranked[0].neural_all_mask_log_probability;
+        if let (Some(causal_ranked), Some(fragment_causal_ranked)) =
+            (causal_ranked.as_ref(), fragment_causal_ranked.as_ref())
+        {
+            metrics.fragment_top1_ar_total_log_probability_sum +=
+                candidates[0].ar_total_log_probability;
+            metrics.causal_top1_ar_total_log_probability_sum +=
+                causal_ranked[0].ar_total_log_probability;
+            metrics.fragment_causal_top1_ar_total_log_probability_sum +=
+                fragment_causal_ranked[0].ar_total_log_probability;
+        }
 
         let target_sequence = &record.peptidoform.sequence;
         let target_il = normalize_il(target_sequence);
@@ -505,6 +638,18 @@ fn main() -> Result<()> {
         metrics.hybrid_top1_peptidoform_exact += hybrid_exact.0;
         metrics.hybrid_top1_sequence_exact += hybrid_exact.1;
         metrics.hybrid_top1_il_sequence_exact += hybrid_exact.2;
+        if let Some(causal_ranked) = causal_ranked.as_ref() {
+            let exact = ranking_exact_flags(&causal_ranked[0], record, &target_il);
+            metrics.causal_top1_peptidoform_exact += exact.0;
+            metrics.causal_top1_sequence_exact += exact.1;
+            metrics.causal_top1_il_sequence_exact += exact.2;
+        }
+        if let Some(fragment_causal_ranked) = fragment_causal_ranked.as_ref() {
+            let exact = ranking_exact_flags(&fragment_causal_ranked[0], record, &target_il);
+            metrics.fragment_causal_top1_peptidoform_exact += exact.0;
+            metrics.fragment_causal_top1_sequence_exact += exact.1;
+            metrics.fragment_causal_top1_il_sequence_exact += exact.2;
+        }
 
         let reverse_rank_by_tokens: HashMap<Vec<u32>, usize> = reverse_ranked
             .iter()
@@ -526,34 +671,87 @@ fn main() -> Result<()> {
             .enumerate()
             .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
             .collect();
+        let causal_rank_by_tokens: HashMap<Vec<u32>, usize> = causal_ranked
+            .as_ref()
+            .map(|ranked| {
+                ranked
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fragment_causal_rank_by_tokens: HashMap<Vec<u32>, usize> = fragment_causal_ranked
+            .as_ref()
+            .map(|ranked| {
+                ranked
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
+                    .collect()
+            })
+            .unwrap_or_default();
         for (fragment_mass_index, candidate) in candidates.iter().enumerate() {
-            writeln!(
-                output,
-                "{record_index}\t{}\t{target_active_length}\t{predicted_active_length}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}\t{}\t{:.8}\t{:.8}\t{:.8}\t{:.8}\t{}\t{}\t{}\t{}\t{}",
-                record.peptidoform.sequence,
-                fragment_mass_index + 1,
-                neural_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
-                hybrid_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
-                mass_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
-                reverse_rank_by_tokens.get(&candidate.tokens).copied().unwrap_or(0),
-                candidate.peptide.sequence,
+            let fields = vec![
+                record_index.to_string(),
+                record.peptidoform.sequence.clone(),
+                target_active_length.to_string(),
+                predicted_active_length.to_string(),
+                (fragment_mass_index + 1).to_string(),
+                neural_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                hybrid_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                causal_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                fragment_causal_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                mass_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                reverse_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                candidate.peptide.sequence.clone(),
                 format_modifications(&candidate.peptide),
-                candidate.reverse_log_probability,
-                candidate.fragment_score,
-                candidate.matched_cleavages,
-                candidate.neural_all_mask_log_probability,
-                (-candidate.neural_all_mask_log_probability).exp(),
-                candidate.neural_length_log_probability,
-                candidate.hybrid_score,
+                format!("{:.8}", candidate.reverse_log_probability),
+                format!("{:.8}", candidate.fragment_score),
+                candidate.matched_cleavages.to_string(),
+                format!("{:.8}", candidate.neural_all_mask_log_probability),
+                format!("{:.8}", (-candidate.neural_all_mask_log_probability).exp()),
+                format!("{:.8}", candidate.neural_length_log_probability),
+                format!("{:.8}", candidate.hybrid_score),
+                format_finite(candidate.ar_total_log_probability),
+                format_finite(candidate.ar_mean_log_probability),
+                format_finite(candidate.ar_perplexity),
+                format_finite(candidate.fragment_causal_score),
                 candidate
                     .mass_error_da
                     .map(|value| format!("{value:.8}"))
                     .unwrap_or_default(),
-                candidate.mass_valid,
-                candidate.peptide == record.peptidoform,
-                candidate.peptide.sequence.as_str() == record.peptidoform.sequence.as_str(),
-                normalize_il(&candidate.peptide.sequence) == target_il,
-            )?;
+                candidate.mass_valid.to_string(),
+                (candidate.peptide == record.peptidoform).to_string(),
+                (candidate.peptide.sequence.as_str() == record.peptidoform.sequence.as_str())
+                    .to_string(),
+                (normalize_il(&candidate.peptide.sequence) == target_il).to_string(),
+            ];
+            writeln!(output, "{}", fields.join("\t"))?;
         }
 
         println!(
@@ -580,6 +778,23 @@ fn main() -> Result<()> {
                 .iter()
                 .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il),
         );
+        if let (Some(target_score), Some(causal_ranked), Some(fragment_causal_ranked)) = (
+            target_causal_score,
+            causal_ranked.as_ref(),
+            fragment_causal_ranked.as_ref(),
+        ) {
+            println!(
+                "generation_causal\trecord_index={record_index}\ttarget_ar_total_logp={:.4}\ttarget_ar_mean_logp={:.4}\tfragment_top1_ar_total_logp={:.4}\tcausal_top1={}\tcausal_top1_ar_total_logp={:.4}\tfragment_causal_top1={}\tfragment_causal_score={:.4}\tfragment_causal_ar_total_logp={:.4}",
+                target_score.total_log_probability,
+                target_score.mean_log_probability,
+                candidates[0].ar_total_log_probability,
+                causal_ranked[0].peptide.sequence,
+                causal_ranked[0].ar_total_log_probability,
+                fragment_causal_ranked[0].peptide.sequence,
+                fragment_causal_ranked[0].fragment_causal_score,
+                fragment_causal_ranked[0].ar_total_log_probability,
+            );
+        }
     }
     output.flush()?;
 
@@ -690,6 +905,33 @@ fn main() -> Result<()> {
         "generation_summary\thybrid_top1_il_sequence_exact\t{:.6}",
         metrics.hybrid_top1_il_sequence_exact as f64 / records
     );
+    if metrics.causal_scored_records > 0 {
+        let causal_records = metrics.causal_scored_records as f64;
+        println!(
+            "generation_summary\tcausal_top1_peptidoform_exact\t{:.6}",
+            metrics.causal_top1_peptidoform_exact as f64 / causal_records
+        );
+        println!(
+            "generation_summary\tcausal_top1_sequence_exact\t{:.6}",
+            metrics.causal_top1_sequence_exact as f64 / causal_records
+        );
+        println!(
+            "generation_summary\tcausal_top1_il_sequence_exact\t{:.6}",
+            metrics.causal_top1_il_sequence_exact as f64 / causal_records
+        );
+        println!(
+            "generation_summary\tfragment_causal_top1_peptidoform_exact\t{:.6}",
+            metrics.fragment_causal_top1_peptidoform_exact as f64 / causal_records
+        );
+        println!(
+            "generation_summary\tfragment_causal_top1_sequence_exact\t{:.6}",
+            metrics.fragment_causal_top1_sequence_exact as f64 / causal_records
+        );
+        println!(
+            "generation_summary\tfragment_causal_top1_il_sequence_exact\t{:.6}",
+            metrics.fragment_causal_top1_il_sequence_exact as f64 / causal_records
+        );
+    }
     if metrics.best_abs_mass_error_records > 0 {
         println!(
             "generation_summary\tmean_best_abs_mass_error_da\t{:.6}",
@@ -756,6 +998,29 @@ fn main() -> Result<()> {
         "generation_summary\tmean_hybrid_top1_neural_all_mask_log_probability\t{:.6}",
         metrics.hybrid_top1_neural_all_mask_log_probability_sum / records
     );
+    if metrics.causal_scored_records > 0 {
+        let causal_records = metrics.causal_scored_records as f64;
+        println!(
+            "generation_summary\tmean_target_ar_total_log_probability\t{:.6}",
+            metrics.target_ar_total_log_probability_sum / causal_records
+        );
+        println!(
+            "generation_summary\tmean_target_ar_mean_log_probability\t{:.6}",
+            metrics.target_ar_mean_log_probability_sum / causal_records
+        );
+        println!(
+            "generation_summary\tmean_fragment_top1_ar_total_log_probability\t{:.6}",
+            metrics.fragment_top1_ar_total_log_probability_sum / causal_records
+        );
+        println!(
+            "generation_summary\tmean_causal_top1_ar_total_log_probability\t{:.6}",
+            metrics.causal_top1_ar_total_log_probability_sum / causal_records
+        );
+        println!(
+            "generation_summary\tmean_fragment_causal_top1_ar_total_log_probability\t{:.6}",
+            metrics.fragment_causal_top1_ar_total_log_probability_sum / causal_records
+        );
+    }
     println!("generation_candidates\t{}", output_tsv.display());
     Ok(())
 }
@@ -1167,6 +1432,88 @@ fn score_all_mask_candidates(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn score_causal_token_row(
+    model: &PeptideSpectrumCausalModel,
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    candidate_tokens: &[u32],
+    device: &Device,
+) -> Result<CausalCandidateScore> {
+    let causal = causal_collator.collate_token_rows(&[candidate_tokens.to_vec()], device)?;
+    let spectrum_batch = spectrum_collator.collate(&[spectrum.clone()], device)?;
+    let precursor = precursor_context(&[record], device)?;
+    let output = model.forward_t(&causal.input, &spectrum_batch, &precursor, false)?;
+    let logits = output.token_logits.to_vec3::<f32>()?;
+    score_causal_candidate_from_logits(&logits[0], candidate_tokens)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_causal_candidates(
+    model: &PeptideSpectrumCausalModel,
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    candidates: &[GeneratedCandidate],
+    device: &Device,
+) -> Result<Vec<CausalCandidateScore>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target_rows: Vec<Vec<u32>> = candidates
+        .iter()
+        .map(|candidate| candidate.tokens.clone())
+        .collect();
+    let causal = causal_collator.collate_token_rows(&target_rows, device)?;
+    let spectra = vec![spectrum.clone(); candidates.len()];
+    let spectrum_batch = spectrum_collator.collate(&spectra, device)?;
+    let record_refs = vec![record; candidates.len()];
+    let precursor = precursor_context(&record_refs, device)?;
+    let output = model.forward_t(&causal.input, &spectrum_batch, &precursor, false)?;
+    let logits = output.token_logits.to_vec3::<f32>()?;
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            score_causal_candidate_from_logits(&logits[index], &candidate.tokens)
+        })
+        .collect()
+}
+
+fn score_causal_candidate_from_logits(
+    token_logits: &[Vec<f32>],
+    candidate_tokens: &[u32],
+) -> Result<CausalCandidateScore> {
+    let active_length = candidate_tokens
+        .iter()
+        .position(|&token| token == FOUNDATION_DIFFUSION_PAD)
+        .unwrap_or(candidate_tokens.len());
+    if active_length == 0
+        || active_length > token_logits.len()
+        || candidate_tokens[active_length - 1] != FOUNDATION_DIFFUSION_EOS
+    {
+        anyhow::bail!("causal candidate must have a non-empty EOS-terminated active prefix");
+    }
+    let mut total = 0.0f64;
+    for position in 0..active_length {
+        let token = candidate_tokens[position] as usize;
+        if token == FOUNDATION_DIFFUSION_PAD as usize || token == FOUNDATION_DIFFUSION_MASK as usize
+        {
+            anyhow::bail!("causal clean candidate contains PAD/MASK in its active prefix");
+        }
+        total += selected_log_softmax(&token_logits[position], token)?;
+    }
+    let mean = total / active_length as f64;
+    Ok(CausalCandidateScore {
+        total_log_probability: total,
+        mean_log_probability: mean,
+        perplexity: (-mean).exp(),
+    })
+}
+
 fn all_mask_inference_rows(active_lengths: &[usize], max_tokens: usize) -> Result<Vec<Vec<u32>>> {
     active_lengths
         .iter()
@@ -1513,6 +1860,52 @@ fn hybrid_mass_candidate_order(left: &GeneratedCandidate, right: &GeneratedCandi
         })
 }
 
+fn causal_mass_candidate_order(left: &GeneratedCandidate, right: &GeneratedCandidate) -> Ordering {
+    right
+        .mass_valid
+        .cmp(&left.mass_valid)
+        .then_with(|| {
+            right
+                .ar_total_log_probability
+                .total_cmp(&left.ar_total_log_probability)
+        })
+        .then_with(|| {
+            let left_error = left.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            let right_error = right.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            left_error.total_cmp(&right_error)
+        })
+        .then_with(|| right.fragment_score.total_cmp(&left.fragment_score))
+        .then_with(|| {
+            right
+                .reverse_log_probability
+                .total_cmp(&left.reverse_log_probability)
+        })
+}
+
+fn fragment_causal_mass_candidate_order(
+    left: &GeneratedCandidate,
+    right: &GeneratedCandidate,
+) -> Ordering {
+    right
+        .mass_valid
+        .cmp(&left.mass_valid)
+        .then_with(|| {
+            right
+                .fragment_causal_score
+                .total_cmp(&left.fragment_causal_score)
+        })
+        .then_with(|| {
+            let left_error = left.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            let right_error = right.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            left_error.total_cmp(&right_error)
+        })
+        .then_with(|| {
+            right
+                .reverse_log_probability
+                .total_cmp(&left.reverse_log_probability)
+        })
+}
+
 fn ranking_exact_flags(
     candidate: &GeneratedCandidate,
     record: &FoundationTrainingRecord,
@@ -1792,6 +2185,21 @@ fn deterministic_subset(indices: &[usize], requested: usize, seed: u64) -> Vec<u
         .collect()
 }
 
+fn optional_path(args: &[String], index: usize) -> Option<PathBuf> {
+    args.get(index).and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none"))
+            .then(|| PathBuf::from(trimmed))
+    })
+}
+
+fn format_finite(value: f64) -> String {
+    value
+        .is_finite()
+        .then(|| format!("{value:.8}"))
+        .unwrap_or_default()
+}
+
 fn parse_or<T: std::str::FromStr>(args: &[String], index: usize, default: T) -> Result<T>
 where
     T::Err: std::fmt::Display,
@@ -1924,6 +2332,34 @@ mod fragment_evidence_tests {
         // Both candidates would have produced the exact same all-MASK model input.
         let rows = all_mask_inference_rows(&[active_length, active_length], 8).unwrap();
         assert_eq!(rows[0], rows[1]);
+    }
+
+    #[test]
+    fn causal_sequence_likelihood_includes_eos_and_reports_perplexity() {
+        let vocabulary = FoundationDiffusionVocabulary;
+        let candidate = vocabulary
+            .encode(
+                &PeptidoformInput {
+                    sequence: "AC".into(),
+                    modifications: Vec::new(),
+                },
+                8,
+            )
+            .unwrap();
+        let active_length = active_token_length(&candidate, 8).unwrap();
+        assert_eq!(candidate[active_length - 1], FOUNDATION_DIFFUSION_EOS);
+
+        let mut logits = vec![vec![0.0f32; FOUNDATION_DIFFUSION_VOCAB_SIZE]; 8];
+        for position in 0..active_length {
+            logits[position][candidate[position] as usize] = 4.0;
+        }
+        let supported = score_causal_candidate_from_logits(&logits, &candidate).unwrap();
+
+        let mut bad_eos = logits.clone();
+        bad_eos[active_length - 1][FOUNDATION_DIFFUSION_EOS as usize] = -4.0;
+        let unsupported_eos = score_causal_candidate_from_logits(&bad_eos, &candidate).unwrap();
+        assert!(supported.total_log_probability > unsupported_eos.total_log_probability);
+        assert!((supported.perplexity - (-supported.mean_log_probability).exp()).abs() < 1e-12);
     }
 
     #[test]

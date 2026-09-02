@@ -920,7 +920,7 @@ impl FoundationSpectrumEncoder {
 
 /// One pre-norm spectrum-conditioned denoising block.
 #[derive(Clone)]
-struct SpectrumConditionedDiffusionBlock {
+pub(crate) struct SpectrumConditionedDiffusionBlock {
     self_norm: FoundationLayerNorm,
     self_attention: MultiHeadSelfAttention,
     cross_norm: FoundationLayerNorm,
@@ -932,7 +932,7 @@ struct SpectrumConditionedDiffusionBlock {
 }
 
 impl SpectrumConditionedDiffusionBlock {
-    fn new(config: &FoundationDiffusionConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(crate) fn new(config: &FoundationDiffusionConfig, vb: VarBuilder<'_>) -> Result<Self> {
         Ok(Self {
             self_norm: FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("self_norm"))?,
             self_attention: MultiHeadSelfAttention::new(
@@ -961,8 +961,50 @@ impl SpectrumConditionedDiffusionBlock {
         spectrum_mask: &Tensor,
         train: bool,
     ) -> Result<Tensor> {
+        self.forward_t_with_attention_mode(
+            hidden,
+            token_mask,
+            spectrum_memory,
+            spectrum_mask,
+            train,
+            false,
+        )
+    }
+
+    pub(crate) fn forward_t_causal(
+        &self,
+        hidden: &Tensor,
+        token_mask: &Tensor,
+        spectrum_memory: &Tensor,
+        spectrum_mask: &Tensor,
+        train: bool,
+    ) -> Result<Tensor> {
+        self.forward_t_with_attention_mode(
+            hidden,
+            token_mask,
+            spectrum_memory,
+            spectrum_mask,
+            train,
+            true,
+        )
+    }
+
+    fn forward_t_with_attention_mode(
+        &self,
+        hidden: &Tensor,
+        token_mask: &Tensor,
+        spectrum_memory: &Tensor,
+        spectrum_mask: &Tensor,
+        train: bool,
+        causal: bool,
+    ) -> Result<Tensor> {
         let normalized = self.self_norm.forward(hidden)?;
-        let self_attention = self.self_attention.forward(&normalized, token_mask)?;
+        let self_attention = if causal {
+            self.self_attention
+                .forward_causal(&normalized, token_mask)?
+        } else {
+            self.self_attention.forward(&normalized, token_mask)?
+        };
         let hidden = (hidden + self.dropout.forward_t(&self_attention, train)?)?;
 
         let normalized = self.cross_norm.forward(&hidden)?;
