@@ -253,6 +253,20 @@ pub struct FoundationCausalOutput {
     pub spectrum_embedding: Tensor,
 }
 
+/// Spectrum/precursor context cached independently of autoregressive prefixes.
+///
+/// v0.12.5 uses this immutable context during causal beam generation so the
+/// observed-spectrum encoder and precursor projection run once per record rather
+/// than once per beam position. Prefix tokens and decoder states are not cached,
+/// so this changes execution cost only and preserves the v0.12.4 scoring model.
+#[derive(Debug, Clone)]
+pub struct FoundationCausalContext {
+    spectrum_memory: Tensor,
+    spectrum_memory_mask: Tensor,
+    precursor_summary: Tensor,
+    spectrum_embedding: Tensor,
+}
+
 /// Spectrum-conditioned causal peptide decoder.
 ///
 /// Shape-compatible parameters deliberately use the exact historical diffusion
@@ -320,49 +334,25 @@ impl PeptideSpectrumCausalModel {
         })
     }
 
-    /// Predict every next token in one shifted, teacher-forced causal pass.
-    pub fn forward_t(
+    /// Encode the observed spectrum and precursor context once.
+    ///
+    /// The returned context contains no peptide tokens and can therefore be
+    /// safely reused across arbitrary causal prefixes for the same record.
+    pub fn prepare_context(
         &self,
-        input: &FoundationCausalInputBatch,
         spectrum: &FoundationSpectrumBatch,
         precursor: &PrecursorContextBatch,
         train: bool,
-    ) -> Result<FoundationCausalOutput> {
-        let (batch, token_len) = input.input_tokens.dims2()?;
+    ) -> Result<FoundationCausalContext> {
         let (spectrum_batch, _, _) = spectrum.peak_features.dims3()?;
-        if batch != spectrum_batch {
+        let precursor_batch = precursor.charge.dims1()?;
+        if spectrum_batch != precursor_batch {
             candle_core::bail!(
-                "causal/spectrum batch mismatch: causal {batch}, spectrum {spectrum_batch}"
-            );
-        }
-        if token_len != self.config.max_tokens {
-            candle_core::bail!(
-                "causal token width {token_len} does not match configured {}",
-                self.config.max_tokens
+                "causal spectrum/precursor batch mismatch: spectrum {spectrum_batch}, precursor {precursor_batch}"
             );
         }
 
         let spectrum_encoding = self.spectrum_encoder.forward_t(spectrum, train)?;
-
-        // START is not a vocabulary id. The first position uses the dedicated
-        // embedding directly; positions 1.. use shifted clean prefix tokens.
-        let start_ids = Tensor::zeros(batch, DType::U32, input.input_tokens.device())?;
-        let start_embedding = self
-            .causal_start_embedding
-            .forward(&start_ids)?
-            .unsqueeze(1)?;
-        let shifted_suffix = input.input_tokens.narrow(1, 1, token_len - 1)?;
-        let shifted_embedding = self.token_embedding.forward(&shifted_suffix)?;
-        let token_embedding = Tensor::cat(&[&start_embedding, &shifted_embedding], 1)?;
-
-        let positions: Vec<u32> = (0..token_len as u32).collect();
-        let position_ids = Tensor::from_vec(positions, token_len, input.input_tokens.device())?
-            .to_dtype(DType::U32)?;
-        let position_embedding = self
-            .position_embedding
-            .forward(&position_ids)?
-            .unsqueeze(0)?
-            .broadcast_as((batch, token_len, self.config.model_dim))?;
 
         let scaled_precursor_mz = precursor
             .precursor_mz
@@ -401,9 +391,96 @@ impl PeptideSpectrumCausalModel {
         let precursor_memory = precursor_summary.unsqueeze(1)?;
         let spectrum_memory =
             Tensor::cat(&[&precursor_memory, &spectrum_encoding.peak_embeddings], 1)?;
-        let precursor_memory_mask =
-            Tensor::ones((batch, 1), DType::F32, input.input_tokens.device())?;
+        let precursor_memory_mask = Tensor::ones(
+            (spectrum_batch, 1),
+            DType::F32,
+            spectrum.peak_features.device(),
+        )?;
         let spectrum_memory_mask = Tensor::cat(&[&precursor_memory_mask, &spectrum.peak_mask], 1)?;
+
+        Ok(FoundationCausalContext {
+            spectrum_memory,
+            spectrum_memory_mask,
+            precursor_summary,
+            spectrum_embedding: spectrum_encoding.spectrum_embedding,
+        })
+    }
+
+    /// Predict every next token using a precomputed spectrum/precursor context.
+    ///
+    /// A single-record context is broadcast across the prefix batch used by
+    /// beam search. A context already matching the prefix batch is also valid.
+    pub fn forward_t_with_context(
+        &self,
+        input: &FoundationCausalInputBatch,
+        context: &FoundationCausalContext,
+        train: bool,
+    ) -> Result<FoundationCausalOutput> {
+        let (batch, token_len) = input.input_tokens.dims2()?;
+        if token_len != self.config.max_tokens {
+            candle_core::bail!(
+                "causal token width {token_len} does not match configured {}",
+                self.config.max_tokens
+            );
+        }
+
+        let (context_batch, memory_len, memory_dim) = context.spectrum_memory.dims3()?;
+        if context_batch != 1 && context_batch != batch {
+            candle_core::bail!(
+                "causal/context batch mismatch: causal {batch}, context {context_batch}"
+            );
+        }
+        let spectrum_memory = if context_batch == batch {
+            context.spectrum_memory.clone()
+        } else {
+            context
+                .spectrum_memory
+                .broadcast_as((batch, memory_len, memory_dim))?
+        };
+        let (_, memory_mask_len) = context.spectrum_memory_mask.dims2()?;
+        let spectrum_memory_mask = if context_batch == batch {
+            context.spectrum_memory_mask.clone()
+        } else {
+            context
+                .spectrum_memory_mask
+                .broadcast_as((batch, memory_mask_len))?
+        };
+        let (_, precursor_dim) = context.precursor_summary.dims2()?;
+        let precursor_summary = if context_batch == batch {
+            context.precursor_summary.clone()
+        } else {
+            context
+                .precursor_summary
+                .broadcast_as((batch, precursor_dim))?
+        };
+        let (_, spectrum_embedding_dim) = context.spectrum_embedding.dims2()?;
+        let spectrum_embedding = if context_batch == batch {
+            context.spectrum_embedding.clone()
+        } else {
+            context
+                .spectrum_embedding
+                .broadcast_as((batch, spectrum_embedding_dim))?
+        };
+
+        // START is not a vocabulary id. The first position uses the dedicated
+        // embedding directly; positions 1.. use shifted clean prefix tokens.
+        let start_ids = Tensor::zeros(batch, DType::U32, input.input_tokens.device())?;
+        let start_embedding = self
+            .causal_start_embedding
+            .forward(&start_ids)?
+            .unsqueeze(1)?;
+        let shifted_suffix = input.input_tokens.narrow(1, 1, token_len - 1)?;
+        let shifted_embedding = self.token_embedding.forward(&shifted_suffix)?;
+        let token_embedding = Tensor::cat(&[&start_embedding, &shifted_embedding], 1)?;
+
+        let positions: Vec<u32> = (0..token_len as u32).collect();
+        let position_ids = Tensor::from_vec(positions, token_len, input.input_tokens.device())?
+            .to_dtype(DType::U32)?;
+        let position_embedding = self
+            .position_embedding
+            .forward(&position_ids)?
+            .unsqueeze(0)?
+            .broadcast_as((batch, token_len, self.config.model_dim))?;
 
         let precursor_embedding = precursor_summary.unsqueeze(1)?.broadcast_as((
             batch,
@@ -434,8 +511,27 @@ impl PeptideSpectrumCausalModel {
         Ok(FoundationCausalOutput {
             token_logits,
             spectrum_memory,
-            spectrum_embedding: spectrum_encoding.spectrum_embedding,
+            spectrum_embedding,
         })
+    }
+
+    /// Predict every next token in one shifted, teacher-forced causal pass.
+    pub fn forward_t(
+        &self,
+        input: &FoundationCausalInputBatch,
+        spectrum: &FoundationSpectrumBatch,
+        precursor: &PrecursorContextBatch,
+        train: bool,
+    ) -> Result<FoundationCausalOutput> {
+        let (batch, _) = input.input_tokens.dims2()?;
+        let (spectrum_batch, _, _) = spectrum.peak_features.dims3()?;
+        if batch != spectrum_batch {
+            candle_core::bail!(
+                "causal/spectrum batch mismatch: causal {batch}, spectrum {spectrum_batch}"
+            );
+        }
+        let context = self.prepare_context(spectrum, precursor, train)?;
+        self.forward_t_with_context(input, &context, train)
     }
 
     /// Shared architecture configuration inherited from the diffusion checkpoint.

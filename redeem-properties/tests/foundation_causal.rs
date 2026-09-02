@@ -178,6 +178,67 @@ fn causal_scoring_cannot_see_the_current_target_or_future_candidate_tokens() {
 }
 
 #[test]
+fn cached_single_record_context_matches_repeated_context_logits() {
+    let device = Device::Cpu;
+    let config = tiny_config();
+    let vocabulary = FoundationDiffusionVocabulary;
+    let encoded = vocabulary
+        .encode(&PeptidoformInput::unmodified("ACD"), config.max_tokens)
+        .unwrap();
+    let prefixes = vec![Vec::new(), vec![encoded[0]], vec![encoded[0], encoded[1]]];
+    let input = FoundationCausalCollator::new(config.clone())
+        .unwrap()
+        .collate_prefix_rows(&prefixes, &device)
+        .unwrap();
+
+    let spectrum = FoundationSpectrum::from_pairs([(101.0, 3.0), (250.0, 9.0), (500.0, 4.0)]);
+    let spectrum_collator = FoundationSpectrumCollator::new(config.spectrum.clone()).unwrap();
+    let repeated_spectra = spectrum_collator
+        .collate(
+            &[spectrum.clone(), spectrum.clone(), spectrum.clone()],
+            &device,
+        )
+        .unwrap();
+    let single_spectrum = spectrum_collator.collate(&[spectrum], &device).unwrap();
+    let repeated_precursor = repeated_precursor(prefixes.len(), &device);
+    let single_precursor = repeated_precursor(1, &device);
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideSpectrumCausalModel::new(config, vb).unwrap();
+
+    let direct = model
+        .forward_t(&input, &repeated_spectra, &repeated_precursor, false)
+        .unwrap();
+    let context = model
+        .prepare_context(&single_spectrum, &single_precursor, false)
+        .unwrap();
+    let cached = model
+        .forward_t_with_context(&input, &context, false)
+        .unwrap();
+
+    let direct_logits = direct
+        .token_logits
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let cached_logits = cached
+        .token_logits
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(direct_logits.len(), cached_logits.len());
+    for (index, (left, right)) in direct_logits.iter().zip(&cached_logits).enumerate() {
+        assert!(
+            (left - right).abs() < 1e-5,
+            "cached causal context changed logit {index}: direct={left} cached={right}"
+        );
+    }
+}
+
+#[test]
 fn historical_diffusion_checkpoint_warm_starts_all_shared_causal_variables() {
     let device = Device::Cpu;
     let config = tiny_config();

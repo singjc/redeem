@@ -342,6 +342,14 @@ fn main() -> Result<()> {
             "disabled"
         }
     );
+    println!(
+        "causal_generation_context_cache\t{}",
+        if causal_generation_beam_width > 0 {
+            "spectrum_encoder+precursor_once_per_record_v0125"
+        } else {
+            "disabled"
+        }
+    );
     println!("primary_candidate_ranking\tfragment_mass");
     println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass,causal_ar_mass,hybrid_fragment_causal_mass");
     println!(
@@ -1452,6 +1460,15 @@ fn causal_prefix_mass_beam(
     }];
     let mut completed = HashMap::<Vec<u32>, CausalBeamCandidate>::new();
 
+    // v0.12.5 performance lane: spectrum and precursor context are invariant
+    // across every prefix expansion for this record, so encode them once and
+    // broadcast the cached memory across each changing beam batch.
+    let spectrum_batch = spectrum_collator.collate(std::slice::from_ref(spectrum), device)?;
+    let precursor = precursor_context(&[record], device)?;
+    let causal_context = causal
+        .model
+        .prepare_context(&spectrum_batch, &precursor, false)?;
+
     for position in 0..config.max_tokens {
         if beam.is_empty() {
             break;
@@ -1459,13 +1476,9 @@ fn causal_prefix_mass_beam(
         debug_assert!(beam.iter().all(|state| state.prefix.len() == position));
         let prefixes: Vec<Vec<u32>> = beam.iter().map(|state| state.prefix.clone()).collect();
         let input = causal.collator.collate_prefix_rows(&prefixes, device)?;
-        let spectra = vec![spectrum.clone(); beam.len()];
-        let spectrum_batch = spectrum_collator.collate(&spectra, device)?;
-        let record_refs = vec![record; beam.len()];
-        let precursor = precursor_context(&record_refs, device)?;
         let output = causal
             .model
-            .forward_t(&input, &spectrum_batch, &precursor, false)?;
+            .forward_t_with_context(&input, &causal_context, false)?;
         let logits = output.token_logits.to_vec3::<f32>()?;
 
         let mut binned = HashMap::<(i64, u32), CausalBeamState>::new();
