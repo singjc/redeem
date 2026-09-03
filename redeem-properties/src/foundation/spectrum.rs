@@ -42,6 +42,24 @@ impl FoundationSpectrum {
     /// Returns `None` when the source did not provide product m/z values. This
     /// function never calculates m/z from the known peptide sequence.
     pub fn from_training_record(record: &FoundationTrainingRecord) -> Option<Self> {
+        let raw_peaks: Vec<_> = record
+            .observed_spectrum_peaks
+            .iter()
+            .filter(|peak| {
+                peak.mz.is_finite()
+                    && peak.mz > 0.0
+                    && peak.intensity.is_finite()
+                    && peak.intensity > 0.0
+            })
+            .map(|peak| FoundationSpectrumPeak {
+                mz: peak.mz,
+                intensity: peak.intensity,
+            })
+            .collect();
+        if !raw_peaks.is_empty() {
+            return Some(Self { peaks: raw_peaks });
+        }
+
         let peaks: Vec<_> = record
             .fragments
             .iter()
@@ -239,15 +257,23 @@ impl FoundationSpectrumCollator {
 pub fn foundation_diffusion_record_fingerprint(record: &FoundationTrainingRecord) -> u64 {
     let mut hash = SpectrumFnv64::new();
     hash.u64(super::experiment::foundation_record_fingerprint(record));
-    let mut peaks: Vec<(u32, u32)> = record
-        .fragments
-        .iter()
-        .filter_map(|fragment| {
-            fragment
-                .product_mz
-                .map(|mz| (mz.to_bits(), fragment.intensity.to_bits()))
-        })
-        .collect();
+    let mut peaks: Vec<(u32, u32)> = if !record.observed_spectrum_peaks.is_empty() {
+        record
+            .observed_spectrum_peaks
+            .iter()
+            .map(|peak| (peak.mz.to_bits(), peak.intensity.to_bits()))
+            .collect()
+    } else {
+        record
+            .fragments
+            .iter()
+            .filter_map(|fragment| {
+                fragment
+                    .product_mz
+                    .map(|mz| (mz.to_bits(), fragment.intensity.to_bits()))
+            })
+            .collect()
+    };
     peaks.sort_unstable();
     hash.usize(peaks.len());
     for (mz, intensity) in peaks {
@@ -340,12 +366,48 @@ mod tests {
                     product_mz: None,
                 },
             ],
+            observed_spectrum_peaks: Vec::new(),
             context: TrainingContext::default(),
             run_id: None,
         };
         let spectrum = FoundationSpectrum::from_training_record(&record).unwrap();
         assert_eq!(spectrum.peaks.len(), 1);
         assert_eq!(spectrum.peaks[0].mz, 250.2);
+    }
+
+    #[test]
+    fn training_record_spectrum_prefers_raw_observed_msp_peaks() {
+        use crate::foundation::{
+            FoundationTrainingRecord, FragmentTarget, ObservedSpectrumPeak, PeptidoformInput,
+            RetentionTimeLabels, TrainingContext,
+        };
+        let record = FoundationTrainingRecord {
+            peptidoform: PeptidoformInput::unmodified("PEPTIDEK"),
+            retention_time: RetentionTimeLabels::default(),
+            ccs: None,
+            fragments: vec![FragmentTarget {
+                cleavage_index: 1,
+                channel: 0,
+                intensity: 0.8,
+                product_mz: Some(250.2),
+            }],
+            observed_spectrum_peaks: vec![
+                ObservedSpectrumPeak {
+                    mz: 111.1,
+                    intensity: 10.0,
+                },
+                ObservedSpectrumPeak {
+                    mz: 222.2,
+                    intensity: 20.0,
+                },
+            ],
+            context: TrainingContext::default(),
+            run_id: None,
+        };
+        let spectrum = FoundationSpectrum::from_training_record(&record).unwrap();
+        assert_eq!(spectrum.peaks.len(), 2);
+        assert_eq!(spectrum.peaks[0].mz, 111.1);
+        assert_eq!(spectrum.peaks[1].mz, 222.2);
     }
 
     #[test]

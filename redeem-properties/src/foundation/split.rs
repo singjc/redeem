@@ -488,6 +488,7 @@ mod tests {
             retention_time: RetentionTimeLabels::default(),
             ccs: None,
             fragments: Vec::new(),
+            observed_spectrum_peaks: Vec::new(),
             context: TrainingContext {
                 instrument_name: Some(instrument.to_string()),
                 ..TrainingContext::default()
