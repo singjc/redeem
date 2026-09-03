@@ -17,6 +17,7 @@ fn record(
         retention_time: RetentionTimeLabels::default(),
         ccs: Some(ccs as f32),
         fragments: Vec::new(),
+        observed_spectrum_peaks: Vec::new(),
         context: TrainingContext {
             charge,
             precursor_mz: mz,

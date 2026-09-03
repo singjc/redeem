@@ -179,6 +179,7 @@ fn diffusion_fingerprint_tracks_explicit_product_mz() {
             intensity: 1.0,
             product_mz: Some(250.2),
         }],
+        observed_spectrum_peaks: Vec::new(),
         context: TrainingContext {
             charge: Some(2),
             precursor_mz: Some(500.0),
@@ -188,6 +189,35 @@ fn diffusion_fingerprint_tracks_explicit_product_mz() {
     };
     let first = foundation_diffusion_record_fingerprint(&record);
     record.fragments[0].product_mz = Some(250.3);
+    let second = foundation_diffusion_record_fingerprint(&record);
+    assert_ne!(first, second);
+}
+
+#[test]
+fn diffusion_fingerprint_tracks_raw_observed_spectrum_peaks() {
+    use redeem_properties::foundation::{
+        foundation_diffusion_record_fingerprint, FoundationTrainingRecord, ObservedSpectrumPeak,
+        RetentionTimeLabels, TrainingContext,
+    };
+
+    let mut record = FoundationTrainingRecord {
+        peptidoform: PeptidoformInput::unmodified("PEPTIDEK"),
+        retention_time: RetentionTimeLabels::default(),
+        ccs: None,
+        fragments: Vec::new(),
+        observed_spectrum_peaks: vec![ObservedSpectrumPeak {
+            mz: 250.2,
+            intensity: 1.0,
+        }],
+        context: TrainingContext {
+            charge: Some(2),
+            precursor_mz: Some(500.0),
+            ..TrainingContext::default()
+        },
+        run_id: None,
+    };
+    let first = foundation_diffusion_record_fingerprint(&record);
+    record.observed_spectrum_peaks[0].mz = 250.3;
     let second = foundation_diffusion_record_fingerprint(&record);
     assert_ne!(first, second);
 }

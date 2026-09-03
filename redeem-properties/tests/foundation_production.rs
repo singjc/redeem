@@ -622,3 +622,44 @@ fn clean_property_validation_disables_corruption_only_objectives() {
     assert_eq!(clean.rt_native_label_count, records.len());
     assert_eq!(clean.ccs_native_label_count, records.len());
 }
+
+#[test]
+fn corpus_auto_detects_msp_and_preserves_raw_inverse_spectrum() {
+    use redeem_properties::foundation::FoundationSpectrum;
+
+    let root = temp_dir("msp_corpus");
+    let path = root.join("tiny.msp");
+    fs::write(
+        &path,
+        concat!(
+            "Name: PEPTIDEK/2\n",
+            "MW: 927.0\n",
+            "Comment: Spec=Consensus Mods=0 Parent=464.2\n",
+            "Num peaks: 2\n",
+            "175.119 1000\n",
+            "300.200 500\n\n",
+        ),
+    )
+    .unwrap();
+
+    let corpus = load_foundation_corpus(&FoundationCorpusConfig {
+        instrument_vocab_size: 16,
+        loader: FoundationTableLoaderConfig::default(),
+        sources: vec![FoundationCorpusSourceSpec {
+            id: "msp".to_string(),
+            path,
+            ..FoundationCorpusSourceSpec::default()
+        }],
+    })
+    .unwrap();
+
+    assert_eq!(corpus.sources[0].profile, "msp_spectral_library");
+    assert_eq!(corpus.records.len(), 1);
+    assert!(corpus.records[0].fragments.is_empty());
+    assert_eq!(corpus.records[0].observed_spectrum_peaks.len(), 2);
+    assert_eq!(corpus.sources[0].stats.ms2_records, 0);
+    assert_eq!(corpus.sources[0].stats.observed_spectrum_records, 1);
+    assert!(FoundationSpectrum::from_training_record(&corpus.records[0]).is_some());
+
+    let _ = fs::remove_dir_all(root);
+}
