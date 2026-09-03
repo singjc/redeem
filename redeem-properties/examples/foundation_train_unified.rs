@@ -17,12 +17,13 @@ use redeem_properties::foundation::{
     FoundationBenchmarkManifest, FoundationCausalCollator, FoundationCheckpointMetadata,
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
     FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationLossWeights, FoundationMs2LossConfig, FoundationPartition,
-    FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
-    FoundationSamplePlan, FoundationSamplingConfig, FoundationSpectrum, FoundationSpectrumBatch,
-    FoundationSpectrumCollator, FoundationTargetNormalizationConfig, FoundationTrainingRecord,
-    FoundationTrainingViews, PeptideFoundationUnifiedModel, PeptidoformInput,
-    PrecursorContextBatch, RetentionTimeObjective, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FoundationLossWeights, FoundationMs2LossConfig, FoundationMs2OutputActivation,
+    FoundationPartition, FoundationRegressionNormalization,
+    FoundationRegressionNormalizationStrategy, FoundationSamplePlan, FoundationSamplingConfig,
+    FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator,
+    FoundationTargetNormalizationConfig, FoundationTrainingRecord, FoundationTrainingViews,
+    PeptideFoundationUnifiedModel, PeptidoformInput, PrecursorContextBatch, RetentionTimeObjective,
+    FOUNDATION_DIFFUSION_VOCAB_SIZE, FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -72,6 +73,7 @@ struct UnifiedPilotMetadata {
     diffusion_objective_weight: f64,
     causal_objective_weight: f64,
     ms2_loss: FoundationMs2LossConfig,
+    ms2_output_activation: FoundationMs2OutputActivation,
     completed_steps: usize,
     forward_config: redeem_properties::foundation::FoundationConfig,
     inverse_config: FoundationDiffusionConfig,
@@ -90,6 +92,9 @@ struct PropertyMetrics {
     ms2_mean_spectral_angle: Option<f64>,
     ms2_mean_pearson: Option<f64>,
     ms2_exact_zero_fraction: Option<f64>,
+    ms2_near_zero_1e4_fraction: Option<f64>,
+    ms2_near_zero_1e3_fraction: Option<f64>,
+    ms2_near_zero_1e2_fraction: Option<f64>,
     ms2_mean_predicted_intensity: Option<f64>,
     ms2_mean_target_intensity: Option<f64>,
 }
@@ -110,9 +115,9 @@ struct InverseMetrics {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 6 || args.len() > 19 {
+    if args.len() < 6 || args.len() > 20 {
         anyhow::bail!(
-            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25] [parent_unified_checkpoint] [ms2_pointwise_weight=1.0] [ms2_cosine_weight=0.0]"
+            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25] [parent_unified_checkpoint] [ms2_pointwise_weight=1.0] [ms2_cosine_weight=0.0] [ms2_output_activation=relu]"
         );
     }
 
@@ -140,6 +145,12 @@ fn main() -> Result<()> {
         ..FoundationMs2LossConfig::default()
     };
     ms2_loss.validate().map_err(anyhow::Error::msg)?;
+    let ms2_output_activation = args
+        .get(19)
+        .map(|value| value.parse::<FoundationMs2OutputActivation>())
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_default();
     let max_gradient_norm = 1.0f64;
     let diffusion_length_weight = 0.1f64;
 
@@ -183,6 +194,9 @@ fn main() -> Result<()> {
     let forward_metadata = FoundationCheckpointMetadata::read_yaml(&forward_state)
         .with_context(|| format!("failed to read corrected forward state {forward_state:?}"))?;
     let forward_model_path = resolve_model_safetensors(&forward_checkpoint);
+    let mut forward_config = forward_metadata.model_config.clone();
+    forward_config.ms2_output_activation = ms2_output_activation;
+    forward_config.validate().map_err(anyhow::Error::msg)?;
 
     let diffusion_metadata = read_inverse_metadata(&diffusion_checkpoint)?;
     let causal_metadata = read_inverse_metadata(&causal_checkpoint)?;
@@ -334,11 +348,8 @@ fn main() -> Result<()> {
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = PeptideFoundationUnifiedModel::new(
-        forward_metadata.model_config.clone(),
-        inverse_config.clone(),
-        vb,
-    )?;
+    let model =
+        PeptideFoundationUnifiedModel::new(forward_config.clone(), inverse_config.clone(), vb)?;
 
     let (
         warm_start_description,
@@ -347,8 +358,11 @@ fn main() -> Result<()> {
         alignment_initialization_fingerprint,
     ) = if let Some(parent) = &parent_unified_checkpoint {
         let parent_metadata = read_unified_parent_metadata(parent)?;
-        if parent_metadata.forward_config != forward_metadata.model_config {
-            anyhow::bail!("parent unified checkpoint forward architecture does not match the supplied forward checkpoint");
+        if !parent_metadata
+            .forward_config
+            .parameter_compatible_with(&forward_config)
+        {
+            anyhow::bail!("parent unified checkpoint forward parameterization does not match the v0.13.8 candidate");
         }
         if parent_metadata.inverse_config != inverse_config {
             anyhow::bail!("parent unified checkpoint inverse architecture does not match the supplied inverse checkpoints");
@@ -364,7 +378,7 @@ fn main() -> Result<()> {
                 parent_model.display(),
                 parent_metadata.completed_steps
             ),
-            "loaded_from_unified_parent_v0136".to_string(),
+            "loaded_from_unified_parent".to_string(),
             0u64,
             fingerprint,
         )
@@ -431,12 +445,10 @@ fn main() -> Result<()> {
         }
     }
 
-    let forward_collator = FoundationCollator::new(
-        forward_metadata.model_config.clone(),
-        forward_collator_config,
-    )?;
+    let forward_collator =
+        FoundationCollator::new(forward_config.clone(), forward_collator_config)?;
     let clean_collator = FoundationCollator::new(
-        forward_metadata.model_config.clone(),
+        forward_config.clone(),
         FoundationCollatorConfig {
             retention_time_objective: rt_objective,
             corruption: FoundationCorruptionConfig {
@@ -477,15 +489,9 @@ fn main() -> Result<()> {
     println!("forward_checkpoint\t{}", forward_model_path.display());
     println!("diffusion_checkpoint\t{}", diffusion_model_path.display());
     println!("causal_checkpoint\t{}", causal_model_path.display());
-    println!(
-        "forward_model_dim\t{}",
-        forward_metadata.model_config.model_dim
-    );
+    println!("forward_model_dim\t{}", forward_config.model_dim);
     println!("inverse_model_dim\t{}", inverse_config.model_dim);
-    println!(
-        "alignment_dim\t{}",
-        forward_metadata.model_config.contrastive_dim
-    );
+    println!("alignment_dim\t{}", forward_config.contrastive_dim);
     println!("train_steps\t{train_steps}");
     println!("batch_size\t{batch_size}");
     println!("validation_batches\t{validation_batches}");
@@ -503,6 +509,15 @@ fn main() -> Result<()> {
     println!("causal_objective_weight\t{causal_objective_weight}");
     println!("ms2_pointwise_weight\t{}", ms2_loss.pointwise_weight);
     println!("ms2_cosine_weight\t{}", ms2_loss.cosine_weight);
+    println!("ms2_output_activation\t{}", ms2_output_activation.as_str());
+    println!(
+        "ms2_softplus_beta\t{}",
+        if ms2_output_activation == FoundationMs2OutputActivation::SoftplusV0138 {
+            FOUNDATION_MS2_SOFTPLUS_BETA_V0138.to_string()
+        } else {
+            "NA".to_string()
+        }
+    );
     println!(
         "forward_component_weight\t{}",
         0.5 * forward_objective_weight
@@ -539,7 +554,7 @@ fn main() -> Result<()> {
 
     let metadata = |completed_steps| {
         UnifiedPilotMetadata {
-        version: 5,
+        version: 6,
         objective: "unified_forward_diffusion_causal_alignment_v2".into(),
         schedule: "one_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*causal".into(),
         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
@@ -572,8 +587,9 @@ fn main() -> Result<()> {
         diffusion_objective_weight,
         causal_objective_weight,
         ms2_loss,
+        ms2_output_activation,
         completed_steps,
-        forward_config: forward_metadata.model_config.clone(),
+        forward_config: forward_config.clone(),
         inverse_config: inverse_config.clone(),
     }
     };
@@ -1106,6 +1122,9 @@ struct Ms2ShapeAccumulator {
     predicted_intensity_sum: f64,
     target_intensity_sum: f64,
     exact_zero_count: usize,
+    near_zero_1e4_count: usize,
+    near_zero_1e3_count: usize,
+    near_zero_1e2_count: usize,
     spectrum_count: usize,
     cosine_sum: f64,
     spectral_angle_sum: f64,
@@ -1140,6 +1159,9 @@ impl Ms2ShapeAccumulator {
                     if pred == 0.0 {
                         self.exact_zero_count += 1;
                     }
+                    self.near_zero_1e4_count += usize::from(pred <= 1.0e-4);
+                    self.near_zero_1e3_count += usize::from(pred <= 1.0e-3);
+                    self.near_zero_1e2_count += usize::from(pred <= 1.0e-2);
                     pred_values.push(pred);
                     target_values.push(truth);
                 }
@@ -1200,6 +1222,22 @@ impl Ms2ShapeAccumulator {
 
     fn exact_zero_fraction(&self) -> Option<f64> {
         (self.fragment_count > 0).then(|| self.exact_zero_count as f64 / self.fragment_count as f64)
+    }
+
+    fn near_zero_fraction(&self, threshold: f64) -> Option<f64> {
+        if self.fragment_count == 0 {
+            return None;
+        }
+        let count = if (threshold - 1.0e-4).abs() < f64::EPSILON {
+            self.near_zero_1e4_count
+        } else if (threshold - 1.0e-3).abs() < f64::EPSILON {
+            self.near_zero_1e3_count
+        } else if (threshold - 1.0e-2).abs() < f64::EPSILON {
+            self.near_zero_1e2_count
+        } else {
+            return None;
+        };
+        Some(count as f64 / self.fragment_count as f64)
     }
 
     fn mean_predicted_intensity(&self) -> Option<f64> {
@@ -1345,6 +1383,9 @@ fn evaluate_properties(
         ms2_mean_spectral_angle: ms2_shape.mean_spectral_angle(),
         ms2_mean_pearson: ms2_shape.mean_pearson(),
         ms2_exact_zero_fraction: ms2_shape.exact_zero_fraction(),
+        ms2_near_zero_1e4_fraction: ms2_shape.near_zero_fraction(1.0e-4),
+        ms2_near_zero_1e3_fraction: ms2_shape.near_zero_fraction(1.0e-3),
+        ms2_near_zero_1e2_fraction: ms2_shape.near_zero_fraction(1.0e-2),
         ms2_mean_predicted_intensity: ms2_shape.mean_predicted_intensity(),
         ms2_mean_target_intensity: ms2_shape.mean_target_intensity(),
     })
@@ -1744,7 +1785,7 @@ fn save_checkpoint(
 fn print_evaluation(label: &str, step: usize, metrics: (PropertyMetrics, InverseMetrics)) {
     let (p, i) = metrics;
     println!(
-        "{label}_forward\tstep={step}\trt_mae_native={}\trt_rmse_native={}\tccs_mae_native={}\tccs_rmse_native={}\tms2_loss={}\tms2_pointwise_mse={}\tms2_pointwise_mae={}\tms2_cosine={}\tms2_spectral_angle={}\tms2_pearson={}\tms2_exact_zero_fraction={}\tms2_mean_predicted_intensity={}\tms2_mean_target_intensity={}",
+        "{label}_forward\tstep={step}\trt_mae_native={}\trt_rmse_native={}\tccs_mae_native={}\tccs_rmse_native={}\tms2_loss={}\tms2_pointwise_mse={}\tms2_pointwise_mae={}\tms2_cosine={}\tms2_spectral_angle={}\tms2_pearson={}\tms2_exact_zero_fraction={}\tms2_near_zero_1e4_fraction={}\tms2_near_zero_1e3_fraction={}\tms2_near_zero_1e2_fraction={}\tms2_mean_predicted_intensity={}\tms2_mean_target_intensity={}",
         fmt_opt(p.rt_mae_native),
         fmt_opt(p.rt_rmse_native),
         fmt_opt(p.ccs_mae_native),
@@ -1756,6 +1797,9 @@ fn print_evaluation(label: &str, step: usize, metrics: (PropertyMetrics, Inverse
         fmt_opt(p.ms2_mean_spectral_angle),
         fmt_opt(p.ms2_mean_pearson),
         fmt_opt(p.ms2_exact_zero_fraction),
+        fmt_opt(p.ms2_near_zero_1e4_fraction),
+        fmt_opt(p.ms2_near_zero_1e3_fraction),
+        fmt_opt(p.ms2_near_zero_1e2_fraction),
         fmt_opt(p.ms2_mean_predicted_intensity),
         fmt_opt(p.ms2_mean_target_intensity),
     );

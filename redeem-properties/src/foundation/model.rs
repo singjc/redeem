@@ -4,6 +4,7 @@ use super::ccs_physics::FOUNDATION_CCS_PHYSICS_FEATURE_COUNT;
 use super::chemistry::ATOM_FEATURE_DIM;
 use super::config::{
     FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, FoundationConfig,
+    FoundationMs2OutputActivation, FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
 };
 use super::featurize::FoundationBatch;
 use super::layers::{FoundationLayerNorm, GraphMessageLayer, PeptideTransformerBlock};
@@ -406,7 +407,8 @@ impl PeptideFoundationMultiTaskModel {
             .unsqueeze(1)?
             .broadcast_as((batch_size, sequence_len - 1, 21))?;
         let cleavage_features = Tensor::cat(&[&left, &right, &context_features], 2)?;
-        let ms2 = self.ms2_head.forward(&cleavage_features)?.relu()?;
+        let ms2_logits = self.ms2_head.forward(&cleavage_features)?;
+        let ms2 = apply_ms2_output_activation(&ms2_logits, self.config.ms2_output_activation)?;
         let left_mask = foundation.residue_mask.narrow(1, 0, sequence_len - 1)?;
         let right_mask = foundation.residue_mask.narrow(1, 1, sequence_len - 1)?;
         let cleavage_mask = left_mask
@@ -517,6 +519,33 @@ fn zero_initialized_regression_linear(in_dim: usize, vb: VarBuilder<'_>) -> Resu
     let weight = vb.get_with_hints((1, in_dim), "weight", nn::Init::Const(0.0))?;
     let bias = vb.get_with_hints(1, "bias", nn::Init::Const(0.0))?;
     Ok(Linear::new(weight, Some(bias)))
+}
+
+/// Apply the configured non-negative MS2 intensity activation.
+///
+/// The v0.13.8 Softplus uses a numerically stable decomposition:
+/// `max(x, 0) + log(1 + exp(-beta * abs(x))) / beta`.
+/// With beta=5 its value at zero is ~0.1386, keeping the activation close to
+/// ReLU while restoring non-zero gradients through negative pre-activations.
+#[doc(hidden)]
+pub fn apply_ms2_output_activation(
+    logits: &Tensor,
+    activation: FoundationMs2OutputActivation,
+) -> Result<Tensor> {
+    match activation {
+        FoundationMs2OutputActivation::Relu => logits.relu(),
+        FoundationMs2OutputActivation::SoftplusV0138 => {
+            let positive = logits.relu()?;
+            let tail = logits
+                .abs()?
+                .affine(-FOUNDATION_MS2_SOFTPLUS_BETA_V0138, 0.0)?
+                .exp()?;
+            let tail = (tail + 1.0)?
+                .log()?
+                .affine(1.0 / FOUNDATION_MS2_SOFTPLUS_BETA_V0138, 0.0)?;
+            (&positive + &tail)
+        }
+    }
 }
 
 /// Identity in the forward pass with a configurable gradient multiplier.

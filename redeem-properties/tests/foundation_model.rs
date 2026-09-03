@@ -1,10 +1,10 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Module, VarBuilder, VarMap};
-use redeem_properties::foundation::model::gradient_scaled_identity;
+use redeem_properties::foundation::model::{apply_ms2_output_activation, gradient_scaled_identity};
 use redeem_properties::foundation::{
-    FoundationCcsPhysicsBaselineConfig, FoundationConfig, PeptideFoundationEncoder,
-    PeptideFoundationMultiTaskModel, PeptideGraphFeaturizer, PeptidoformInput,
-    PrecursorContextBatch,
+    FoundationCcsPhysicsBaselineConfig, FoundationConfig, FoundationMs2OutputActivation,
+    PeptideFoundationEncoder, PeptideFoundationMultiTaskModel, PeptideGraphFeaturizer,
+    PeptidoformInput, PrecursorContextBatch, FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
 };
 
 #[test]
@@ -64,6 +64,57 @@ fn multi_task_heads_have_expected_shapes() {
         output.ms2.dims(),
         &[1, config.max_sequence_len - 1, config.ms2_fragment_channels]
     );
+}
+
+#[test]
+fn historical_foundation_config_defaults_ms2_activation_to_relu() {
+    let config: FoundationConfig = serde_yaml::from_str("{}").unwrap();
+    assert_eq!(
+        config.ms2_output_activation,
+        FoundationMs2OutputActivation::Relu
+    );
+}
+
+#[test]
+fn ms2_activation_change_is_parameter_compatible_but_semantically_distinct() {
+    let relu = FoundationConfig::default();
+    let mut softplus = relu.clone();
+    softplus.ms2_output_activation = FoundationMs2OutputActivation::SoftplusV0138;
+    assert_ne!(relu, softplus);
+    assert!(relu.parameter_compatible_with(&softplus));
+}
+
+#[test]
+fn ms2_softplus_v0138_is_positive_and_restores_negative_logit_gradient() {
+    let device = Device::Cpu;
+    let logits = Tensor::from_vec(vec![-0.5f32, 0.0, 0.5], 3, &device).unwrap();
+    let activated =
+        apply_ms2_output_activation(&logits, FoundationMs2OutputActivation::SoftplusV0138)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+    let expected_zero = (2.0f64.ln() / FOUNDATION_MS2_SOFTPLUS_BETA_V0138) as f32;
+    assert!(activated[0] > 0.01 && activated[0] < 0.02);
+    assert!((activated[1] - expected_zero).abs() < 1e-6);
+    assert!((activated[2] - 0.5).abs() < 0.02);
+
+    let varmap = VarMap::new();
+    let tracked = {
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        vb.get_with_hints(1, "negative_logit", candle_nn::Init::Const(-0.5))
+            .unwrap()
+    };
+    let softplus =
+        apply_ms2_output_activation(&tracked, FoundationMs2OutputActivation::SoftplusV0138)
+            .unwrap();
+    let gradients = softplus.sum_all().unwrap().backward().unwrap();
+    let gradient = gradients
+        .get(&tracked)
+        .expect("softplus path must retain a negative-logit gradient")
+        .to_vec1::<f32>()
+        .unwrap()[0];
+    assert!(gradient > 0.0);
 }
 
 #[test]

@@ -2,6 +2,48 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Non-negative output activation used by the forward MS2 intensity head.
+///
+/// Historical checkpoints/configs default to [`Self::Relu`]. The v0.13.8
+/// candidate uses a fixed high-beta Softplus so negative pre-activations retain
+/// a learning signal without introducing a new hyperparameter sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FoundationMs2OutputActivation {
+    /// Historical hard rectifier. Negative pre-activations have zero gradient.
+    #[default]
+    Relu,
+    /// v0.13.8 smooth positive rescue: Softplus with fixed beta=5.
+    SoftplusV0138,
+}
+
+impl FoundationMs2OutputActivation {
+    /// Stable CLI/config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Relu => "relu",
+            Self::SoftplusV0138 => "softplus-v0138",
+        }
+    }
+}
+
+impl std::str::FromStr for FoundationMs2OutputActivation {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "relu" => Ok(Self::Relu),
+            "softplus-v0138" | "softplus" => Ok(Self::SoftplusV0138),
+            other => Err(format!(
+                "unsupported foundation MS2 output activation {other:?}; expected relu or softplus-v0138"
+            )),
+        }
+    }
+}
+
+/// Fixed Softplus beta used by the v0.13.8 controlled activation rescue.
+pub const FOUNDATION_MS2_SOFTPLUS_BETA_V0138: f64 = 5.0;
+
 /// Scalar context supplied to the CCS prediction head.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,6 +115,8 @@ pub struct FoundationConfig {
     pub instrument_vocab_size: usize,
     /// Number of MS2 fragment-intensity channels emitted per cleavage.
     pub ms2_fragment_channels: usize,
+    /// Non-negative activation applied to raw MS2 head logits.
+    pub ms2_output_activation: FoundationMs2OutputActivation,
     /// Scalar precursor context supplied only to the CCS head.
     pub ccs_context_mode: FoundationCcsContextMode,
     /// Optional frozen train-derived physical CCS prior. When present, the
@@ -97,6 +141,7 @@ impl Default for FoundationConfig {
             contrastive_dim: 128,
             instrument_vocab_size: 16,
             ms2_fragment_channels: 8,
+            ms2_output_activation: FoundationMs2OutputActivation::Relu,
             ccs_context_mode: FoundationCcsContextMode::ChargePresence,
             ccs_physics_baseline: None,
         }
@@ -104,6 +149,19 @@ impl Default for FoundationConfig {
 }
 
 impl FoundationConfig {
+    /// Whether two configs instantiate the same trainable parameter shapes/names.
+    ///
+    /// MS2 output activation changes forward/autograd semantics but does not add, remove,
+    /// or resize parameters, so a historical ReLU checkpoint can be loaded into the
+    /// v0.13.8 Softplus candidate for a controlled zero-step comparison.
+    pub fn parameter_compatible_with(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.ms2_output_activation = FoundationMs2OutputActivation::Relu;
+        right.ms2_output_activation = FoundationMs2OutputActivation::Relu;
+        left == right
+    }
+
     /// Validate shape relationships that are required by the encoder.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_sequence_len < 2 {

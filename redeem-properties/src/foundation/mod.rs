@@ -69,7 +69,10 @@ pub use collate::{
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
     FoundationTrainingBatch, FoundationTrainingViews,
 };
-pub use config::{FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, FoundationConfig};
+pub use config::{
+    FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, FoundationConfig,
+    FoundationMs2OutputActivation, FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
+};
 pub use control::{FoundationFitConfig, FoundationLearningRateSchedule};
 pub use corpus::{
     load_foundation_corpus, FoundationCorpus, FoundationCorpusConfig, FoundationCorpusDelimiter,
