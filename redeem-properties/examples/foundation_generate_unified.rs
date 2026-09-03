@@ -18,7 +18,8 @@ use redeem_properties::foundation::{
     foundation_canonicalize_reverse_causal_token_row, foundation_diffusion_residue_ptm_valid,
     foundation_diffusion_reverse_probabilities, foundation_diffusion_token_mass_da,
     foundation_diffusion_token_residue, foundation_fragment_causal_rerank_score,
-    foundation_precursor_mass_error_da, foundation_precursor_neutral_mass, load_foundation_corpus,
+    foundation_precursor_mass_error_da, foundation_precursor_neutral_mass,
+    foundation_reverse_causal_token_row, load_foundation_corpus,
     read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationCausalCollator,
     FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
     FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
@@ -68,6 +69,11 @@ struct GeneratedCandidate {
     ar_mean_log_probability: f64,
     ar_perplexity: f64,
     fragment_causal_score: f64,
+    reverse_ar_total_log_probability: f64,
+    reverse_ar_mean_log_probability: f64,
+    reverse_ar_perplexity: f64,
+    bidirectional_ar_total_log_probability: f64,
+    fragment_bidirectional_causal_score: f64,
     mass_error_da: Option<f64>,
     mass_valid: bool,
     from_diffusion: bool,
@@ -130,6 +136,9 @@ struct GenerationMetrics {
     fragment_causal_top1_peptidoform_exact: usize,
     fragment_causal_top1_sequence_exact: usize,
     fragment_causal_top1_il_sequence_exact: usize,
+    fragment_bidirectional_causal_top1_peptidoform_exact: usize,
+    fragment_bidirectional_causal_top1_sequence_exact: usize,
+    fragment_bidirectional_causal_top1_il_sequence_exact: usize,
     records_with_candidate: usize,
     best_abs_mass_error_sum: f64,
     best_abs_mass_error_records: usize,
@@ -418,6 +427,16 @@ fn main() -> Result<()> {
             "custom_fragment_plus_weighted_ar_total"
         };
     println!("causal_rerank_policy\t{causal_rerank_policy}");
+    if reverse_causal_reranker.is_some() {
+        println!("bidirectional_causal_rerank_policy\tfragment_plus_0.05_n_to_c_ar_total_plus_0.05_c_to_n_ar_total_v01314");
+        println!(
+            "bidirectional_causal_rerank_direction_weight\t{}",
+            0.5 * causal_rerank_weight
+        );
+        println!(
+            "bidirectional_causal_rerank_normalization\tarithmetic_mean_total_log_probability"
+        );
+    }
     println!("causal_generation_beam_width\t{causal_generation_beam_width}");
     println!("causal_generation_final_candidates\t{causal_generation_final_candidates}");
     println!(
@@ -464,7 +483,7 @@ fn main() -> Result<()> {
         }
     );
     println!("primary_candidate_ranking\tfragment_mass");
-    println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass,causal_ar_mass,hybrid_fragment_causal_mass");
+    println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass,causal_ar_mass,hybrid_fragment_causal_mass,hybrid_fragment_bidirectional_causal_mass");
     println!(
         "candidate_pool_sources\t{}",
         if reverse_causal_reranker.is_some() && reverse_causal_generation_beam_width > 0 {
@@ -489,7 +508,7 @@ fn main() -> Result<()> {
     let mut output = BufWriter::new(file);
     writeln!(
         output,
-        "record_index\tsource_id\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tneural_mass_rank\thybrid_mass_rank\tcausal_mass_rank\tfragment_causal_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tneural_all_mask_log_probability\tneural_all_mask_perplexity\tneural_length_log_probability\thybrid_score\tar_total_log_probability\tar_mean_log_probability\tar_perplexity\tfragment_causal_score\tmass_error_da\tmass_valid\tfrom_diffusion\tfrom_causal_beam\tfrom_reverse_causal_beam\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
+        "record_index\tsource_id\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tneural_mass_rank\thybrid_mass_rank\tcausal_mass_rank\tfragment_causal_mass_rank\tfragment_bidirectional_causal_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tneural_all_mask_log_probability\tneural_all_mask_perplexity\tneural_length_log_probability\thybrid_score\tar_total_log_probability\tar_mean_log_probability\tar_perplexity\tfragment_causal_score\treverse_ar_total_log_probability\treverse_ar_mean_log_probability\treverse_ar_perplexity\tbidirectional_ar_total_log_probability\tfragment_bidirectional_causal_score\tmass_error_da\tmass_valid\tfrom_diffusion\tfrom_causal_beam\tfrom_reverse_causal_beam\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
     )?;
 
     let spectra_path = companion_spectra_path(&output_tsv);
@@ -638,6 +657,11 @@ fn main() -> Result<()> {
                 ar_mean_log_probability: f64::NEG_INFINITY,
                 ar_perplexity: f64::INFINITY,
                 fragment_causal_score: f64::NEG_INFINITY,
+                reverse_ar_total_log_probability: f64::NEG_INFINITY,
+                reverse_ar_mean_log_probability: f64::NEG_INFINITY,
+                reverse_ar_perplexity: f64::INFINITY,
+                bidirectional_ar_total_log_probability: f64::NEG_INFINITY,
+                fragment_bidirectional_causal_score: f64::NEG_INFINITY,
                 mass_error_da,
                 mass_valid,
                 from_diffusion: true,
@@ -704,6 +728,11 @@ fn main() -> Result<()> {
                         ar_mean_log_probability,
                         ar_perplexity: (-ar_mean_log_probability).exp(),
                         fragment_causal_score: generated.fragment_causal_score,
+                        reverse_ar_total_log_probability: f64::NEG_INFINITY,
+                        reverse_ar_mean_log_probability: f64::NEG_INFINITY,
+                        reverse_ar_perplexity: f64::INFINITY,
+                        bidirectional_ar_total_log_probability: f64::NEG_INFINITY,
+                        fragment_bidirectional_causal_score: f64::NEG_INFINITY,
                         mass_error_da,
                         mass_valid,
                         from_diffusion: false,
@@ -767,6 +796,11 @@ fn main() -> Result<()> {
                         ar_mean_log_probability,
                         ar_perplexity: (-ar_mean_log_probability).exp(),
                         fragment_causal_score: generated.fragment_causal_score,
+                        reverse_ar_total_log_probability: f64::NEG_INFINITY,
+                        reverse_ar_mean_log_probability: f64::NEG_INFINITY,
+                        reverse_ar_perplexity: f64::INFINITY,
+                        bidirectional_ar_total_log_probability: f64::NEG_INFINITY,
+                        fragment_bidirectional_causal_score: f64::NEG_INFINITY,
                         mass_error_da,
                         mass_valid,
                         from_diffusion: false,
@@ -866,6 +900,32 @@ fn main() -> Result<()> {
             }
         }
 
+        if let Some(reverse_causal) = reverse_causal_reranker.as_ref() {
+            let reverse_causal_scores = score_reverse_causal_candidates(
+                &reverse_causal.model,
+                &reverse_causal.collator,
+                &spectrum_collator,
+                record,
+                &spectrum,
+                &candidates,
+                &device,
+            )?;
+            for (candidate, score) in candidates.iter_mut().zip(reverse_causal_scores) {
+                candidate.reverse_ar_total_log_probability = score.total_log_probability;
+                candidate.reverse_ar_mean_log_probability = score.mean_log_probability;
+                candidate.reverse_ar_perplexity = score.perplexity;
+                candidate.bidirectional_ar_total_log_probability = 0.5
+                    * (candidate.ar_total_log_probability
+                        + candidate.reverse_ar_total_log_probability);
+                candidate.fragment_bidirectional_causal_score =
+                    foundation_fragment_causal_rerank_score(
+                        candidate.fragment_score,
+                        candidate.bidirectional_ar_total_log_probability,
+                        causal_rerank_weight,
+                    );
+            }
+        }
+
         let mut reverse_ranked = candidates.clone();
         reverse_ranked.sort_by(|left, right| {
             right
@@ -890,6 +950,11 @@ fn main() -> Result<()> {
         let fragment_causal_ranked = causal_reranker.as_ref().map(|_| {
             let mut ranked = candidates.clone();
             ranked.sort_by(fragment_causal_mass_candidate_order);
+            ranked
+        });
+        let fragment_bidirectional_causal_ranked = reverse_causal_reranker.as_ref().map(|_| {
+            let mut ranked = candidates.clone();
+            ranked.sort_by(fragment_bidirectional_causal_mass_candidate_order);
             ranked
         });
         candidates.sort_by(fragment_mass_candidate_order);
@@ -1119,6 +1184,15 @@ fn main() -> Result<()> {
                 metrics.causal_beam_top1_il_sequence_exact += causal_beam_exact.2;
             }
         }
+        if let Some(fragment_bidirectional_causal_ranked) =
+            fragment_bidirectional_causal_ranked.as_ref()
+        {
+            let exact =
+                ranking_exact_flags(&fragment_bidirectional_causal_ranked[0], record, &target_il);
+            metrics.fragment_bidirectional_causal_top1_peptidoform_exact += exact.0;
+            metrics.fragment_bidirectional_causal_top1_sequence_exact += exact.1;
+            metrics.fragment_bidirectional_causal_top1_il_sequence_exact += exact.2;
+        }
 
         let reverse_rank_by_tokens: HashMap<Vec<u32>, usize> = reverse_ranked
             .iter()
@@ -1160,6 +1234,17 @@ fn main() -> Result<()> {
                     .collect()
             })
             .unwrap_or_default();
+        let fragment_bidirectional_causal_rank_by_tokens: HashMap<Vec<u32>, usize> =
+            fragment_bidirectional_causal_ranked
+                .as_ref()
+                .map(|ranked| {
+                    ranked
+                        .iter()
+                        .enumerate()
+                        .map(|(index, candidate)| (candidate.tokens.clone(), index + 1))
+                        .collect()
+                })
+                .unwrap_or_default();
         for (fragment_mass_index, candidate) in candidates.iter().enumerate() {
             let fields = vec![
                 record_index.to_string(),
@@ -1188,6 +1273,11 @@ fn main() -> Result<()> {
                     .copied()
                     .unwrap_or(0)
                     .to_string(),
+                fragment_bidirectional_causal_rank_by_tokens
+                    .get(&candidate.tokens)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
                 mass_rank_by_tokens
                     .get(&candidate.tokens)
                     .copied()
@@ -1211,6 +1301,11 @@ fn main() -> Result<()> {
                 format_finite(candidate.ar_mean_log_probability),
                 format_finite(candidate.ar_perplexity),
                 format_finite(candidate.fragment_causal_score),
+                format_finite(candidate.reverse_ar_total_log_probability),
+                format_finite(candidate.reverse_ar_mean_log_probability),
+                format_finite(candidate.reverse_ar_perplexity),
+                format_finite(candidate.bidirectional_ar_total_log_probability),
+                format_finite(candidate.fragment_bidirectional_causal_score),
                 candidate
                     .mass_error_da
                     .map(|value| format!("{value:.8}"))
@@ -1288,6 +1383,19 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        if let Some(fragment_bidirectional_causal_ranked) =
+            fragment_bidirectional_causal_ranked.as_ref()
+        {
+            let top1 = &fragment_bidirectional_causal_ranked[0];
+            println!(
+                "generation_bidirectional_causal\trecord_index={record_index}\ttop1={}\ttop1_score={:.4}\ttop1_n_to_c_ar_total_logp={:.4}\ttop1_c_to_n_ar_total_logp={:.4}\ttop1_bidirectional_ar_total_logp={:.4}",
+                top1.peptide.sequence,
+                top1.fragment_bidirectional_causal_score,
+                top1.ar_total_log_probability,
+                top1.reverse_ar_total_log_probability,
+                top1.bidirectional_ar_total_log_probability,
+            );
         }
     }
     output.flush()?;
@@ -1440,6 +1548,40 @@ fn main() -> Result<()> {
             if branch_parity { "YES" } else { "NO" },
             if reverse_gate { "PASS" } else { "FAIL" }
         );
+        let candidate_pool_parity = metrics.candidate_pool_mass_valid_peptidoform_exact == 28
+            && metrics.candidate_pool_mass_valid_il_sequence_exact == 46;
+        let forward_ranking_parity = metrics.fragment_causal_top1_peptidoform_exact == 23
+            && metrics.fragment_causal_top1_il_sequence_exact == 37;
+        println!(
+            "frozen_v01313_candidate_pool_parity\texpected_literal=28\texpected_il=46\tobserved_literal={}\tobserved_il={}\tparity={}",
+            metrics.candidate_pool_mass_valid_peptidoform_exact,
+            metrics.candidate_pool_mass_valid_il_sequence_exact,
+            if candidate_pool_parity { "YES" } else { "NO" }
+        );
+        println!(
+            "frozen_v01313_forward_ranking_parity\texpected_literal=23\texpected_il=37\tobserved_literal={}\tobserved_il={}\tparity={}",
+            metrics.fragment_causal_top1_peptidoform_exact,
+            metrics.fragment_causal_top1_il_sequence_exact,
+            if forward_ranking_parity { "YES" } else { "NO" }
+        );
+        let bidirectional_gate = parent_parity
+            && branch_parity
+            && candidate_pool_parity
+            && forward_ranking_parity
+            && metrics.fragment_bidirectional_causal_top1_peptidoform_exact >= 25
+            && metrics.fragment_bidirectional_causal_top1_il_sequence_exact >= 40;
+        println!(
+            "bidirectional_causal_acceptance_gate\trequired_literal=25\trequired_il=40\tobserved_literal={}\tobserved_il={}\tcandidate_pool_literal={}\tcandidate_pool_il={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
+            metrics.fragment_bidirectional_causal_top1_peptidoform_exact,
+            metrics.fragment_bidirectional_causal_top1_il_sequence_exact,
+            metrics.candidate_pool_mass_valid_peptidoform_exact,
+            metrics.candidate_pool_mass_valid_il_sequence_exact,
+            if candidate_pool_parity { "YES" } else { "NO" },
+            if forward_ranking_parity { "YES" } else { "NO" },
+            if parent_parity { "YES" } else { "NO" },
+            if branch_parity { "YES" } else { "NO" },
+            if bidirectional_gate { "PASS" } else { "FAIL" }
+        );
     }
     println!(
         "generation_summary\tdiffusion_pool_mass_valid_peptidoform_exact\t{:.6}",
@@ -1545,6 +1687,22 @@ fn main() -> Result<()> {
             "generation_summary\tfragment_causal_top1_il_sequence_exact\t{:.6}",
             metrics.fragment_causal_top1_il_sequence_exact as f64 / causal_records
         );
+        if reverse_causal_reranker.is_some() {
+            println!(
+                "generation_summary\tfragment_bidirectional_causal_top1_peptidoform_exact\t{:.6}",
+                metrics.fragment_bidirectional_causal_top1_peptidoform_exact as f64
+                    / causal_records
+            );
+            println!(
+                "generation_summary\tfragment_bidirectional_causal_top1_sequence_exact\t{:.6}",
+                metrics.fragment_bidirectional_causal_top1_sequence_exact as f64 / causal_records
+            );
+            println!(
+                "generation_summary\tfragment_bidirectional_causal_top1_il_sequence_exact\t{:.6}",
+                metrics.fragment_bidirectional_causal_top1_il_sequence_exact as f64
+                    / causal_records
+            );
+        }
         if causal_generation_beam_width > 0 {
             println!(
                 "generation_summary\tcausal_beam_top1_peptidoform_exact\t{:.6}",
@@ -2531,6 +2689,39 @@ fn score_causal_candidates(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn score_reverse_causal_candidates(
+    model: &PeptideSpectrumCausalModel,
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    candidates: &[GeneratedCandidate],
+    device: &Device,
+) -> Result<Vec<CausalCandidateScore>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reverse_rows: Vec<Vec<u32>> = candidates
+        .iter()
+        .map(|candidate| {
+            foundation_reverse_causal_token_row(&candidate.tokens).map_err(anyhow::Error::msg)
+        })
+        .collect::<Result<_>>()?;
+    let causal = causal_collator.collate_token_rows(&reverse_rows, device)?;
+    let spectra = vec![spectrum.clone(); candidates.len()];
+    let spectrum_batch = spectrum_collator.collate(&spectra, device)?;
+    let record_refs = vec![record; candidates.len()];
+    let precursor = precursor_context(&record_refs, device)?;
+    let output = model.forward_t(&causal.input, &spectrum_batch, &precursor, false)?;
+    let logits = output.token_logits.to_vec3::<f32>()?;
+    reverse_rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| score_causal_candidate_from_logits(&logits[index], row))
+        .collect()
+}
+
 fn score_causal_candidate_from_logits(
     token_logits: &[Vec<f32>],
     candidate_tokens: &[u32],
@@ -2947,6 +3138,31 @@ fn fragment_causal_mass_candidate_order(
             let right_error = right.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
             left_error.total_cmp(&right_error)
         })
+        .then_with(|| {
+            right
+                .reverse_log_probability
+                .total_cmp(&left.reverse_log_probability)
+        })
+}
+
+fn fragment_bidirectional_causal_mass_candidate_order(
+    left: &GeneratedCandidate,
+    right: &GeneratedCandidate,
+) -> Ordering {
+    right
+        .mass_valid
+        .cmp(&left.mass_valid)
+        .then_with(|| {
+            right
+                .fragment_bidirectional_causal_score
+                .total_cmp(&left.fragment_bidirectional_causal_score)
+        })
+        .then_with(|| {
+            let left_error = left.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            let right_error = right.mass_error_da.map(f64::abs).unwrap_or(f64::INFINITY);
+            left_error.total_cmp(&right_error)
+        })
+        .then_with(|| right.fragment_score.total_cmp(&left.fragment_score))
         .then_with(|| {
             right
                 .reverse_log_probability
