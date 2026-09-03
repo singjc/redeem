@@ -10,19 +10,19 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     contrastive_info_nce_loss, foundation_causal_next_token_loss, foundation_diffusion_length_loss,
-    foundation_diffusion_x0_loss, foundation_spectrum_peptide_alignment_loss,
-    load_foundation_corpus, load_unified_foundation_components, multi_task_loss,
+    foundation_diffusion_x0_loss, foundation_ms2_loss, foundation_spectrum_peptide_alignment_loss,
+    load_foundation_corpus, load_unified_foundation_components, multi_task_loss_with_ms2_config,
     read_foundation_training_run_config, sample_foundation_training_indices,
     sample_foundation_validation_indices, FoundationAdamW, FoundationAdamWConfig,
     FoundationBenchmarkManifest, FoundationCausalCollator, FoundationCheckpointMetadata,
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
     FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationLossWeights, FoundationPartition, FoundationRegressionNormalization,
-    FoundationRegressionNormalizationStrategy, FoundationSamplePlan, FoundationSamplingConfig,
-    FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator,
-    FoundationTargetNormalizationConfig, FoundationTrainingRecord, FoundationTrainingViews,
-    PeptideFoundationUnifiedModel, PeptidoformInput, PrecursorContextBatch, RetentionTimeObjective,
-    FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FoundationLossWeights, FoundationMs2LossConfig, FoundationPartition,
+    FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
+    FoundationSamplePlan, FoundationSamplingConfig, FoundationSpectrum, FoundationSpectrumBatch,
+    FoundationSpectrumCollator, FoundationTargetNormalizationConfig, FoundationTrainingRecord,
+    FoundationTrainingViews, PeptideFoundationUnifiedModel, PeptidoformInput,
+    PrecursorContextBatch, RetentionTimeObjective, FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -71,6 +71,7 @@ struct UnifiedPilotMetadata {
     forward_objective_weight: f64,
     diffusion_objective_weight: f64,
     causal_objective_weight: f64,
+    ms2_loss: FoundationMs2LossConfig,
     completed_steps: usize,
     forward_config: redeem_properties::foundation::FoundationConfig,
     inverse_config: FoundationDiffusionConfig,
@@ -83,6 +84,14 @@ struct PropertyMetrics {
     ccs_mae_native: Option<f64>,
     ccs_rmse_native: Option<f64>,
     ms2_loss: Option<f64>,
+    ms2_pointwise_mse: Option<f64>,
+    ms2_pointwise_mae: Option<f64>,
+    ms2_mean_cosine: Option<f64>,
+    ms2_mean_spectral_angle: Option<f64>,
+    ms2_mean_pearson: Option<f64>,
+    ms2_exact_zero_fraction: Option<f64>,
+    ms2_mean_predicted_intensity: Option<f64>,
+    ms2_mean_target_intensity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -101,9 +110,9 @@ struct InverseMetrics {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 6 || args.len() > 17 {
+    if args.len() < 6 || args.len() > 19 {
         anyhow::bail!(
-            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25] [parent_unified_checkpoint]"
+            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25] [parent_unified_checkpoint] [ms2_pointwise_weight=1.0] [ms2_cosine_weight=0.0]"
         );
     }
 
@@ -123,6 +132,14 @@ fn main() -> Result<()> {
     let diffusion_objective_weight = parse_or(&args, 14, 0.25f64)?;
     let causal_objective_weight = parse_or(&args, 15, 0.25f64)?;
     let parent_unified_checkpoint = args.get(16).map(PathBuf::from);
+    let ms2_pointwise_weight = parse_or(&args, 17, 1.0f64)?;
+    let ms2_cosine_weight = parse_or(&args, 18, 0.0f64)?;
+    let ms2_loss = FoundationMs2LossConfig {
+        pointwise_weight: ms2_pointwise_weight,
+        cosine_weight: ms2_cosine_weight,
+        ..FoundationMs2LossConfig::default()
+    };
+    ms2_loss.validate().map_err(anyhow::Error::msg)?;
     let max_gradient_norm = 1.0f64;
     let diffusion_length_weight = 0.1f64;
 
@@ -484,6 +501,8 @@ fn main() -> Result<()> {
     println!("forward_objective_weight\t{forward_objective_weight}");
     println!("diffusion_objective_weight\t{diffusion_objective_weight}");
     println!("causal_objective_weight\t{causal_objective_weight}");
+    println!("ms2_pointwise_weight\t{}", ms2_loss.pointwise_weight);
+    println!("ms2_cosine_weight\t{}", ms2_loss.cosine_weight);
     println!(
         "forward_component_weight\t{}",
         0.5 * forward_objective_weight
@@ -520,7 +539,7 @@ fn main() -> Result<()> {
 
     let metadata = |completed_steps| {
         UnifiedPilotMetadata {
-        version: 4,
+        version: 5,
         objective: "unified_forward_diffusion_causal_alignment_v2".into(),
         schedule: "one_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*causal".into(),
         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
@@ -552,6 +571,7 @@ fn main() -> Result<()> {
         forward_objective_weight,
         diffusion_objective_weight,
         causal_objective_weight,
+        ms2_loss,
         completed_steps,
         forward_config: forward_metadata.model_config.clone(),
         inverse_config: inverse_config.clone(),
@@ -578,6 +598,7 @@ fn main() -> Result<()> {
             &causal_collator,
             &spectrum_collator,
             &target_normalization,
+            ms2_loss,
             alignment_temperature,
             &device,
         )?,
@@ -617,6 +638,7 @@ fn main() -> Result<()> {
             &forward_collator,
             &forward_a_records,
             forward_trainer.loss_weights,
+            ms2_loss,
             forward_trainer.contrastive_temperature,
             forward_trainer.shared_gradient_scales.rt_encoder,
             forward_trainer.shared_gradient_scales.ccs_encoder,
@@ -629,6 +651,7 @@ fn main() -> Result<()> {
             &forward_collator,
             &forward_b_records,
             forward_trainer.loss_weights,
+            ms2_loss,
             forward_trainer.contrastive_temperature,
             forward_trainer.shared_gradient_scales.rt_encoder,
             forward_trainer.shared_gradient_scales.ccs_encoder,
@@ -705,6 +728,7 @@ fn main() -> Result<()> {
                 &causal_collator,
                 &spectrum_collator,
                 &target_normalization,
+                ms2_loss,
                 alignment_temperature,
                 &device,
             )?;
@@ -733,6 +757,7 @@ fn forward_loss(
     collator: &FoundationCollator,
     records: &[FoundationTrainingRecord],
     weights: FoundationLossWeights,
+    ms2_loss: FoundationMs2LossConfig,
     contrastive_temperature: f64,
     rt_scale: f64,
     ccs_scale: f64,
@@ -752,7 +777,7 @@ fn forward_loss(
     let second = model
         .forward()
         .forward_t(&views.second.input, &views.second.context, true)?;
-    let losses = multi_task_loss(&first, &views.first.targets, weights)?;
+    let losses = multi_task_loss_with_ms2_config(&first, &views.first.targets, weights, ms2_loss)?;
     let contrastive = contrastive_info_nce_loss(
         &first.contrastive_projection,
         &second.contrastive_projection,
@@ -1073,6 +1098,140 @@ fn gradient_norm_for_prefix(
     Ok(squared.sqrt())
 }
 
+#[derive(Debug, Default)]
+struct Ms2ShapeAccumulator {
+    fragment_count: usize,
+    squared_error_sum: f64,
+    absolute_error_sum: f64,
+    predicted_intensity_sum: f64,
+    target_intensity_sum: f64,
+    exact_zero_count: usize,
+    spectrum_count: usize,
+    cosine_sum: f64,
+    spectral_angle_sum: f64,
+    pearson_count: usize,
+    pearson_sum: f64,
+}
+
+impl Ms2ShapeAccumulator {
+    fn accumulate(&mut self, prediction: &Tensor, target: &Tensor, mask: &Tensor) -> Result<()> {
+        let predicted = prediction.to_vec3::<f32>()?;
+        let targets = target.to_vec3::<f32>()?;
+        let masks = mask.to_vec3::<f32>()?;
+        if predicted.len() != targets.len() || predicted.len() != masks.len() {
+            anyhow::bail!("MS2 validation tensors disagree on batch dimension");
+        }
+        for batch_index in 0..predicted.len() {
+            let mut pred_values = Vec::new();
+            let mut target_values = Vec::new();
+            for residue_index in 0..predicted[batch_index].len() {
+                for channel_index in 0..predicted[batch_index][residue_index].len() {
+                    if masks[batch_index][residue_index][channel_index] <= 0.0 {
+                        continue;
+                    }
+                    let pred = f64::from(predicted[batch_index][residue_index][channel_index]);
+                    let truth = f64::from(targets[batch_index][residue_index][channel_index]);
+                    let error = pred - truth;
+                    self.fragment_count += 1;
+                    self.squared_error_sum += error * error;
+                    self.absolute_error_sum += error.abs();
+                    self.predicted_intensity_sum += pred;
+                    self.target_intensity_sum += truth;
+                    if pred == 0.0 {
+                        self.exact_zero_count += 1;
+                    }
+                    pred_values.push(pred);
+                    target_values.push(truth);
+                }
+            }
+            if pred_values.is_empty() {
+                continue;
+            }
+            let dot = pred_values
+                .iter()
+                .zip(&target_values)
+                .map(|(pred, truth)| pred * truth)
+                .sum::<f64>();
+            let pred_norm = pred_values
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            let target_norm = target_values
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            let cosine = if pred_norm > 0.0 && target_norm > 0.0 {
+                (dot / (pred_norm * target_norm)).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            self.spectrum_count += 1;
+            self.cosine_sum += cosine;
+            self.spectral_angle_sum += 1.0 - (2.0 / std::f64::consts::PI) * cosine.acos();
+            if let Some(pearson) = pearson_correlation(&pred_values, &target_values) {
+                self.pearson_count += 1;
+                self.pearson_sum += pearson;
+            }
+        }
+        Ok(())
+    }
+
+    fn pointwise_mse(&self) -> Option<f64> {
+        (self.fragment_count > 0).then(|| self.squared_error_sum / self.fragment_count as f64)
+    }
+
+    fn pointwise_mae(&self) -> Option<f64> {
+        (self.fragment_count > 0).then(|| self.absolute_error_sum / self.fragment_count as f64)
+    }
+
+    fn mean_cosine(&self) -> Option<f64> {
+        (self.spectrum_count > 0).then(|| self.cosine_sum / self.spectrum_count as f64)
+    }
+
+    fn mean_spectral_angle(&self) -> Option<f64> {
+        (self.spectrum_count > 0).then(|| self.spectral_angle_sum / self.spectrum_count as f64)
+    }
+
+    fn mean_pearson(&self) -> Option<f64> {
+        (self.pearson_count > 0).then(|| self.pearson_sum / self.pearson_count as f64)
+    }
+
+    fn exact_zero_fraction(&self) -> Option<f64> {
+        (self.fragment_count > 0).then(|| self.exact_zero_count as f64 / self.fragment_count as f64)
+    }
+
+    fn mean_predicted_intensity(&self) -> Option<f64> {
+        (self.fragment_count > 0).then(|| self.predicted_intensity_sum / self.fragment_count as f64)
+    }
+
+    fn mean_target_intensity(&self) -> Option<f64> {
+        (self.fragment_count > 0).then(|| self.target_intensity_sum / self.fragment_count as f64)
+    }
+}
+
+fn pearson_correlation(first: &[f64], second: &[f64]) -> Option<f64> {
+    if first.len() != second.len() || first.len() < 2 {
+        return None;
+    }
+    let n = first.len() as f64;
+    let first_mean = first.iter().sum::<f64>() / n;
+    let second_mean = second.iter().sum::<f64>() / n;
+    let mut numerator = 0.0;
+    let mut first_squared = 0.0;
+    let mut second_squared = 0.0;
+    for (&a, &b) in first.iter().zip(second) {
+        let da = a - first_mean;
+        let db = b - second_mean;
+        numerator += da * db;
+        first_squared += da * da;
+        second_squared += db * db;
+    }
+    let denominator = (first_squared * second_squared).sqrt();
+    (denominator > 1.0e-12).then(|| (numerator / denominator).clamp(-1.0, 1.0))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_all(
     model: &PeptideFoundationUnifiedModel,
@@ -1085,6 +1244,7 @@ fn evaluate_all(
     causal_collator: &FoundationCausalCollator,
     spectrum_collator: &FoundationSpectrumCollator,
     normalization: &FoundationTargetNormalizationConfig,
+    ms2_loss: FoundationMs2LossConfig,
     alignment_temperature: f64,
     device: &Device,
 ) -> Result<(PropertyMetrics, InverseMetrics)> {
@@ -1095,6 +1255,7 @@ fn evaluate_all(
         batch_size,
         clean_collator,
         normalization,
+        ms2_loss,
         device,
     )?;
     let inverse = evaluate_inverse(
@@ -1119,6 +1280,7 @@ fn evaluate_properties(
     batch_size: usize,
     clean_collator: &FoundationCollator,
     normalization: &FoundationTargetNormalizationConfig,
+    ms2_loss: FoundationMs2LossConfig,
     device: &Device,
 ) -> Result<PropertyMetrics> {
     let mut rt_abs = 0.0f64;
@@ -1127,8 +1289,9 @@ fn evaluate_properties(
     let mut ccs_abs = 0.0f64;
     let mut ccs_sq = 0.0f64;
     let mut ccs_n = 0usize;
-    let mut ms2_weighted = 0.0f64;
-    let mut ms2_batches = 0usize;
+    let mut ms2_objective_sum = 0.0f64;
+    let mut ms2_objective_batches = 0usize;
+    let mut ms2_shape = Ms2ShapeAccumulator::default();
 
     for chunk in indices.chunks(batch_size) {
         let owned: Vec<FoundationTrainingRecord> =
@@ -1161,18 +1324,11 @@ fn evaluate_properties(
             &mut ccs_sq,
             &mut ccs_n,
         )?;
-        let weights = FoundationLossWeights {
-            rt: 0.0,
-            ccs: 0.0,
-            ms2: 1.0,
-            masked_residue: 0.0,
-            chemistry: 0.0,
-            contrastive: 0.0,
-        };
-        let losses = multi_task_loss(&output, &batch.targets, weights)?;
-        if let Some(ms2) = losses.ms2 {
-            ms2_weighted += f64::from(ms2.to_scalar::<f32>()?);
-            ms2_batches += 1;
+        if let (Some(target), Some(mask)) = (&batch.targets.ms2, &batch.targets.ms2_mask) {
+            let components = foundation_ms2_loss(&output.ms2, target, mask, ms2_loss)?;
+            ms2_objective_sum += f64::from(components.total.to_scalar::<f32>()?);
+            ms2_objective_batches += 1;
+            ms2_shape.accumulate(&output.ms2, target, mask)?;
         }
     }
 
@@ -1181,7 +1337,16 @@ fn evaluate_properties(
         rt_rmse_native: (rt_n > 0).then(|| (rt_sq / rt_n as f64).sqrt()),
         ccs_mae_native: (ccs_n > 0).then(|| ccs_abs / ccs_n as f64),
         ccs_rmse_native: (ccs_n > 0).then(|| (ccs_sq / ccs_n as f64).sqrt()),
-        ms2_loss: (ms2_batches > 0).then(|| ms2_weighted / ms2_batches as f64),
+        ms2_loss: (ms2_objective_batches > 0)
+            .then(|| ms2_objective_sum / ms2_objective_batches as f64),
+        ms2_pointwise_mse: ms2_shape.pointwise_mse(),
+        ms2_pointwise_mae: ms2_shape.pointwise_mae(),
+        ms2_mean_cosine: ms2_shape.mean_cosine(),
+        ms2_mean_spectral_angle: ms2_shape.mean_spectral_angle(),
+        ms2_mean_pearson: ms2_shape.mean_pearson(),
+        ms2_exact_zero_fraction: ms2_shape.exact_zero_fraction(),
+        ms2_mean_predicted_intensity: ms2_shape.mean_predicted_intensity(),
+        ms2_mean_target_intensity: ms2_shape.mean_target_intensity(),
     })
 }
 
@@ -1579,12 +1744,20 @@ fn save_checkpoint(
 fn print_evaluation(label: &str, step: usize, metrics: (PropertyMetrics, InverseMetrics)) {
     let (p, i) = metrics;
     println!(
-        "{label}_forward\tstep={step}\trt_mae_native={}\trt_rmse_native={}\tccs_mae_native={}\tccs_rmse_native={}\tms2_loss={}",
+        "{label}_forward\tstep={step}\trt_mae_native={}\trt_rmse_native={}\tccs_mae_native={}\tccs_rmse_native={}\tms2_loss={}\tms2_pointwise_mse={}\tms2_pointwise_mae={}\tms2_cosine={}\tms2_spectral_angle={}\tms2_pearson={}\tms2_exact_zero_fraction={}\tms2_mean_predicted_intensity={}\tms2_mean_target_intensity={}",
         fmt_opt(p.rt_mae_native),
         fmt_opt(p.rt_rmse_native),
         fmt_opt(p.ccs_mae_native),
         fmt_opt(p.ccs_rmse_native),
         fmt_opt(p.ms2_loss),
+        fmt_opt(p.ms2_pointwise_mse),
+        fmt_opt(p.ms2_pointwise_mae),
+        fmt_opt(p.ms2_mean_cosine),
+        fmt_opt(p.ms2_mean_spectral_angle),
+        fmt_opt(p.ms2_mean_pearson),
+        fmt_opt(p.ms2_exact_zero_fraction),
+        fmt_opt(p.ms2_mean_predicted_intensity),
+        fmt_opt(p.ms2_mean_target_intensity),
     );
     println!(
         "{label}_inverse\tstep={step}\tdiffusion_loss={:.6}\tdiffusion_length_loss={:.6}\tdiffusion_token_accuracy={:.6}\tcausal_loss={:.6}\tcausal_perplexity={:.4}\tcausal_token_accuracy={:.6}\talignment_loss={:.6}\talignment_retrieval_top1={:.6}\tshuffled_alignment_loss={:.6}\tshuffled_alignment_retrieval_top1={:.6}",

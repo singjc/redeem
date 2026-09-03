@@ -111,8 +111,9 @@ pub use featurize::{
     FoundationModificationSite, PeptideGraphFeaturizer, PeptidoformInput,
 };
 pub use loss::{
-    contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,
-    FoundationTargets,
+    contrastive_info_nce_loss, foundation_ms2_loss, multi_task_loss,
+    multi_task_loss_with_ms2_config, FoundationLossWeights, FoundationLosses,
+    FoundationMs2LossConfig, FoundationMs2Losses, FoundationTargets,
 };
 pub use metadata::{
     apply_source_metadata, FoundationMetadataApplicationStats, FoundationMetadataMergePolicy,

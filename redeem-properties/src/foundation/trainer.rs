@@ -20,7 +20,8 @@ use super::corpus::FoundationRecordProvenance;
 use super::data::{FoundationTrainingRecord, TrainingContext};
 use super::featurize::PeptidoformInput;
 use super::loss::{
-    contrastive_info_nce_loss, multi_task_loss, FoundationLossWeights, FoundationLosses,
+    contrastive_info_nce_loss, multi_task_loss_with_ms2_config, FoundationLossWeights,
+    FoundationLosses, FoundationMs2LossConfig,
 };
 use super::model::FoundationMultiTaskOutput;
 use super::normalization::{
@@ -160,6 +161,8 @@ pub struct FoundationTrainerConfig {
     pub contrastive_temperature: f64,
     /// Relative task-loss contributions.
     pub loss_weights: FoundationLossWeights,
+    /// Pointwise + spectral-shape formulation for the MS2 task.
+    pub ms2_loss: FoundationMs2LossConfig,
     /// Label/corruption collation settings.
     pub collator: FoundationCollatorConfig,
     /// Train-partition-only scaling for continuous property targets. Resolved
@@ -187,6 +190,7 @@ impl Default for FoundationTrainerConfig {
             learning_rate_schedule: FoundationLearningRateSchedule::Constant,
             contrastive_temperature: 0.10,
             loss_weights: FoundationLossWeights::default(),
+            ms2_loss: FoundationMs2LossConfig::default(),
             collator: FoundationCollatorConfig::default(),
             target_normalization: FoundationTargetNormalizationConfig::default(),
             sampling: FoundationSamplingConfig::default(),
@@ -214,6 +218,7 @@ impl FoundationTrainerConfig {
         if !(self.contrastive_temperature > 0.0 && self.contrastive_temperature.is_finite()) {
             candle_core::bail!("foundation contrastive_temperature must be positive and finite");
         }
+        let _ = self.ms2_loss.validate()?;
         self.target_normalization.validate()?;
         self.sampling
             .validate()
@@ -938,7 +943,12 @@ impl FoundationTrainer {
                 batch.targets.ccs_mask.as_ref(),
                 &self.config.target_normalization.ccs,
             )?;
-            let losses = multi_task_loss(&output, &batch.targets, self.config.loss_weights)?;
+            let losses = multi_task_loss_with_ms2_config(
+                &output,
+                &batch.targets,
+                self.config.loss_weights,
+                self.config.ms2_loss,
+            )?;
             let total = losses.total.clone();
             accumulator.push(metrics_from_tensors(
                 &total, &losses, None, regression, None, None,
@@ -1358,7 +1368,12 @@ impl FoundationTrainer {
                 &self.config.target_normalization.ccs,
             )?,
         };
-        let losses = multi_task_loss(&output, &batch.targets, self.config.loss_weights)?;
+        let losses = multi_task_loss_with_ms2_config(
+            &output,
+            &batch.targets,
+            self.config.loss_weights,
+            self.config.ms2_loss,
+        )?;
         Ok((losses.total.clone(), losses, regression))
     }
 
@@ -1462,7 +1477,12 @@ impl FoundationTrainer {
                 &self.config.target_normalization.ccs,
             )?,
         };
-        let losses = multi_task_loss(&first, &views.first.targets, self.config.loss_weights)?;
+        let losses = multi_task_loss_with_ms2_config(
+            &first,
+            &views.first.targets,
+            self.config.loss_weights,
+            self.config.ms2_loss,
+        )?;
         let contrastive = if views.first.input.residue_ids.dims2()?.0 > 1
             && self.config.loss_weights.contrastive > 0.0
         {

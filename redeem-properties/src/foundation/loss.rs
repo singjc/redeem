@@ -39,6 +39,77 @@ pub struct FoundationTargets {
     pub chemistry_mask: Option<Tensor>,
 }
 
+/// Shape-aware MS2 objective configuration.
+///
+/// The historical behavior is represented by the default (`pointwise_weight=1`,
+/// `cosine_weight=0`, raw intensities). This keeps existing checkpoints/configs
+/// backward compatible while allowing controlled v0.13.7 continuation runs to
+/// add a per-spectrum cosine term without changing the prediction head.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FoundationMs2LossConfig {
+    /// Weight multiplying the masked pointwise error.
+    pub pointwise_weight: f64,
+    /// Weight multiplying mean per-spectrum `(1 - cosine_similarity)`.
+    pub cosine_weight: f64,
+    /// Numerical stabilizer for cosine norms.
+    pub cosine_epsilon: f64,
+}
+
+impl Default for FoundationMs2LossConfig {
+    fn default() -> Self {
+        Self {
+            pointwise_weight: 1.0,
+            cosine_weight: 0.0,
+            cosine_epsilon: 1.0e-8,
+        }
+    }
+}
+
+impl FoundationMs2LossConfig {
+    /// Controlled v0.13.7 first hypothesis: preserve raw calibrated MSE and add
+    /// a shape term whose initial contribution is of comparable order.
+    pub fn spectral_shape_v0137() -> Self {
+        Self {
+            pointwise_weight: 1.0,
+            cosine_weight: 0.25,
+            cosine_epsilon: 1.0e-8,
+        }
+    }
+
+    /// Validate finite/non-negative weights and a positive numerical stabilizer.
+    pub fn validate(self) -> Result<Self> {
+        for (name, value) in [
+            ("MS2 pointwise weight", self.pointwise_weight),
+            ("MS2 cosine weight", self.cosine_weight),
+        ] {
+            if !(value >= 0.0 && value.is_finite()) {
+                candle_core::bail!("foundation {name} must be finite and non-negative");
+            }
+        }
+        if self.pointwise_weight == 0.0 && self.cosine_weight == 0.0 {
+            candle_core::bail!(
+                "foundation MS2 objective requires at least one positive component weight"
+            );
+        }
+        if !(self.cosine_epsilon > 0.0 && self.cosine_epsilon.is_finite()) {
+            candle_core::bail!("foundation MS2 cosine epsilon must be finite and positive");
+        }
+        Ok(self)
+    }
+}
+
+/// Unweighted component losses for one MS2 prediction tensor.
+#[derive(Debug, Clone)]
+pub struct FoundationMs2Losses {
+    /// Configured weighted sum of pointwise and shape terms.
+    pub total: Tensor,
+    /// Historical raw max-normalized masked intensity MSE.
+    pub pointwise: Tensor,
+    /// Mean per-spectrum `(1 - cosine_similarity)` over annotated channels.
+    pub cosine: Tensor,
+}
+
 /// Relative contributions of supervised and self-supervised objectives.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,8 +151,12 @@ pub struct FoundationLosses {
     pub rt: Option<Tensor>,
     /// CCS loss when CCS labels were supplied.
     pub ccs: Option<Tensor>,
-    /// MS2 loss when fragment labels were supplied.
+    /// Configured composite MS2 loss when fragment labels were supplied.
     pub ms2: Option<Tensor>,
+    /// Pointwise component of the MS2 loss before its component weight.
+    pub ms2_pointwise: Option<Tensor>,
+    /// Per-spectrum cosine-shape component of the MS2 loss before its component weight.
+    pub ms2_cosine: Option<Tensor>,
     /// Masked-residue loss when corruption labels were supplied.
     pub masked_residue: Option<Tensor>,
     /// Chemistry reconstruction loss when targets were supplied.
@@ -94,9 +169,26 @@ pub fn multi_task_loss(
     targets: &FoundationTargets,
     weights: FoundationLossWeights,
 ) -> Result<FoundationLosses> {
+    multi_task_loss_with_ms2_config(output, targets, weights, FoundationMs2LossConfig::default())
+}
+
+/// Compose single-view losses with an explicit shape-aware MS2 objective.
+pub fn multi_task_loss_with_ms2_config(
+    output: &FoundationMultiTaskOutput,
+    targets: &FoundationTargets,
+    weights: FoundationLossWeights,
+    ms2_config: FoundationMs2LossConfig,
+) -> Result<FoundationLosses> {
+    let ms2_config = ms2_config.validate()?;
     let rt = paired_masked_mse(&output.rt, targets.rt.as_ref(), targets.rt_mask.as_ref())?;
     let ccs = paired_masked_mse(&output.ccs, targets.ccs.as_ref(), targets.ccs_mask.as_ref())?;
-    let ms2 = paired_masked_mse(&output.ms2, targets.ms2.as_ref(), targets.ms2_mask.as_ref())?;
+    let ms2_components = paired_ms2_loss(
+        &output.ms2,
+        targets.ms2.as_ref(),
+        targets.ms2_mask.as_ref(),
+        ms2_config,
+    )?;
+    let ms2 = ms2_components.as_ref().map(|losses| losses.total.clone());
     let chemistry = paired_masked_mse(
         &output.chemistry_reconstruction,
         targets.chemistry.as_ref(),
@@ -149,6 +241,10 @@ pub fn multi_task_loss(
         rt,
         ccs,
         ms2,
+        ms2_pointwise: ms2_components
+            .as_ref()
+            .map(|losses| losses.pointwise.clone()),
+        ms2_cosine: ms2_components.as_ref().map(|losses| losses.cosine.clone()),
         masked_residue,
         chemistry,
     })
@@ -189,6 +285,77 @@ pub fn contrastive_info_nce_loss(
     let loss_ab = loss::cross_entropy(&logits_ab, &labels)?;
     let loss_ba = loss::cross_entropy(&logits_ba, &labels)?;
     (loss_ab + loss_ba)?.affine(0.5, 0.0)
+}
+
+/// Compute the configured MS2 objective for one dense prediction/target/mask tensor.
+pub fn foundation_ms2_loss(
+    prediction: &Tensor,
+    target: &Tensor,
+    mask: &Tensor,
+    config: FoundationMs2LossConfig,
+) -> Result<FoundationMs2Losses> {
+    let config = config.validate()?;
+    if prediction.dims() != target.dims() {
+        candle_core::bail!(
+            "MS2 loss shape mismatch: prediction {:?}, target {:?}",
+            prediction.dims(),
+            target.dims()
+        );
+    }
+    let pointwise = masked_mse(prediction, target, mask)?;
+    if config.cosine_weight == 0.0 {
+        return Ok(FoundationMs2Losses {
+            total: pointwise.affine(config.pointwise_weight, 0.0)?,
+            cosine: pointwise.affine(0.0, 0.0)?,
+            pointwise,
+        });
+    }
+
+    let (batch, cleavage, channels) = prediction.dims3()?;
+    let mask = mask.broadcast_as(prediction.dims())?;
+    let flat_prediction = prediction.reshape((batch, cleavage * channels))?;
+    let flat_target = target.reshape((batch, cleavage * channels))?;
+    let flat_mask = mask.reshape((batch, cleavage * channels))?;
+    let masked_prediction = flat_prediction.broadcast_mul(&flat_mask)?;
+    let masked_target = flat_target.broadcast_mul(&flat_mask)?;
+    let dot = masked_prediction.broadcast_mul(&masked_target)?.sum(1)?;
+    let prediction_norm = (masked_prediction.sqr()?.sum(1)? + config.cosine_epsilon)?.sqrt()?;
+    let target_norm = (masked_target.sqr()?.sum(1)? + config.cosine_epsilon)?.sqrt()?;
+    let cosine = dot.broadcast_div(&prediction_norm.broadcast_mul(&target_norm)?)?;
+    let shape = cosine.affine(-1.0, 1.0)?;
+
+    // A spectrum contributes exactly once when it has at least one annotated channel.
+    // Since the mask is binary, clamping the annotated count to [0, 1] is a cheap
+    // differentiability-independent presence indicator.
+    let spectrum_present = flat_mask.sum(1)?.clamp(0.0, 1.0)?;
+    let cosine_numerator = shape.broadcast_mul(&spectrum_present)?.sum_all()?;
+    let cosine_denominator = spectrum_present.sum_all()?.clamp(1.0, f64::INFINITY)?;
+    let cosine_loss = cosine_numerator.broadcast_div(&cosine_denominator)?;
+
+    let total = (pointwise.affine(config.pointwise_weight, 0.0)?
+        + cosine_loss.affine(config.cosine_weight, 0.0)?)?;
+    Ok(FoundationMs2Losses {
+        total,
+        pointwise,
+        cosine: cosine_loss,
+    })
+}
+
+fn paired_ms2_loss(
+    prediction: &Tensor,
+    target: Option<&Tensor>,
+    mask: Option<&Tensor>,
+    config: FoundationMs2LossConfig,
+) -> Result<Option<FoundationMs2Losses>> {
+    match (target, mask) {
+        (Some(target), Some(mask)) => {
+            Ok(Some(foundation_ms2_loss(prediction, target, mask, config)?))
+        }
+        (None, None) => Ok(None),
+        _ => candle_core::bail!(
+            "foundation MS2 target and observation mask must be supplied together"
+        ),
+    }
 }
 
 fn paired_masked_mse(
@@ -244,5 +411,67 @@ mod tests {
             .unwrap();
         assert!(value.is_finite());
         assert!(value >= 0.0);
+    }
+
+    #[test]
+    fn ms2_cosine_term_is_per_spectrum_and_mask_aware() {
+        let device = Device::Cpu;
+        let prediction = Tensor::new(
+            &[[[1.0f32, 0.0], [0.0, 0.0]], [[0.0f32, 1.0], [9.0, 9.0]]],
+            &device,
+        )
+        .unwrap();
+        let target = Tensor::new(
+            &[[[1.0f32, 0.0], [1.0, 1.0]], [[1.0f32, 0.0], [0.0, 0.0]]],
+            &device,
+        )
+        .unwrap();
+        let mask = Tensor::new(
+            &[[[1.0f32, 1.0], [0.0, 0.0]], [[1.0f32, 1.0], [0.0, 0.0]]],
+            &device,
+        )
+        .unwrap();
+        let losses = foundation_ms2_loss(
+            &prediction,
+            &target,
+            &mask,
+            FoundationMs2LossConfig::spectral_shape_v0137(),
+        )
+        .unwrap();
+        let cosine = losses.cosine.to_scalar::<f32>().unwrap();
+        // First spectrum cosine=1, second cosine=0 -> mean shape loss 0.5.
+        assert!((cosine - 0.5).abs() < 1e-5);
+        assert!(losses.pointwise.to_scalar::<f32>().unwrap().is_finite());
+        assert!(losses.total.to_scalar::<f32>().unwrap().is_finite());
+    }
+
+    #[test]
+    fn default_ms2_objective_is_exactly_legacy_raw_masked_mse() {
+        let device = Device::Cpu;
+        let prediction = Tensor::new(&[[[0.2f32, 0.0], [0.7, 0.3]]], &device).unwrap();
+        let target = Tensor::new(&[[[0.4f32, 0.9], [0.5, 0.1]]], &device).unwrap();
+        let mask = Tensor::new(&[[[1.0f32, 0.0], [1.0, 1.0]]], &device).unwrap();
+        let legacy = masked_mse(&prediction, &target, &mask)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let configured = foundation_ms2_loss(
+            &prediction,
+            &target,
+            &mask,
+            FoundationMs2LossConfig::default(),
+        )
+        .unwrap();
+        let total = configured.total.to_scalar::<f32>().unwrap();
+        let pointwise = configured.pointwise.to_scalar::<f32>().unwrap();
+        assert!((total - legacy).abs() < 1e-7);
+        assert!((pointwise - legacy).abs() < 1e-7);
+    }
+
+    #[test]
+    fn v0137_default_preserves_raw_pointwise_calibration() {
+        let config = FoundationMs2LossConfig::spectral_shape_v0137();
+        assert_eq!(config.pointwise_weight, 1.0);
+        assert_eq!(config.cosine_weight, 0.25);
     }
 }
