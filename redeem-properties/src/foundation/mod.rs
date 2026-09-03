@@ -31,6 +31,7 @@ pub mod model;
 pub mod msp;
 pub mod normalization;
 pub mod optimizer;
+pub mod reverse_causal;
 pub mod rt_harmonization;
 pub mod run;
 pub mod sampling;
@@ -133,6 +134,12 @@ pub use normalization::{
     FoundationTargetNormalizationConfig,
 };
 pub use optimizer::{FoundationAdamW, FoundationAdamWConfig, FoundationOptimizerStep};
+pub use reverse_causal::{
+    foundation_canonicalize_reverse_causal_token_row, foundation_reverse_causal_token_row,
+    load_reverse_causal_from_unified_checkpoint, validate_reverse_causal_namespace,
+    FoundationReverseCausalWarmStartReport, FOUNDATION_REVERSE_CAUSAL_DIRECTION_V01313,
+    FOUNDATION_REVERSE_CAUSAL_NAMESPACE_V01313,
+};
 pub use rt_harmonization::{
     apply_foundation_rt_harmonization, fit_foundation_rt_harmonization,
     FoundationRtCrossSourceConsistency, FoundationRtHarmonizationFitConfig,
