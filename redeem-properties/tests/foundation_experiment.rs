@@ -1,8 +1,8 @@
 use redeem_properties::foundation::{
-    build_foundation_benchmark_manifest, split_foundation_records, FoundationBenchmarkManifest,
-    FoundationModification, FoundationModificationSite, FoundationPartition, FoundationSplitConfig,
-    FoundationSplitMode, FoundationTrainingRecord, PeptidoformInput, RetentionTimeLabels,
-    TrainingContext,
+    build_foundation_benchmark_manifest, foundation_record_fingerprint, split_foundation_records,
+    FoundationBenchmarkManifest, FoundationModification, FoundationModificationSite,
+    FoundationPartition, FoundationSplitConfig, FoundationSplitMode, FoundationTrainingRecord,
+    ObservedSpectrumPeak, PeptidoformInput, RetentionTimeLabels, TrainingContext,
 };
 
 fn record(sequence: &str) -> FoundationTrainingRecord {
@@ -10,10 +10,12 @@ fn record(sequence: &str) -> FoundationTrainingRecord {
         peptidoform: PeptidoformInput::unmodified(sequence),
         retention_time: RetentionTimeLabels {
             normalized: Some(sequence.len() as f32),
+            harmonized: None,
             observed_seconds: None,
         },
         ccs: None,
         fragments: Vec::new(),
+        observed_spectrum_peaks: Vec::new(),
         context: TrainingContext {
             charge: Some(2),
             ..TrainingContext::default()
@@ -88,6 +90,25 @@ fn sequence_manifest_is_materialized_and_round_trips() {
     std::fs::remove_file(path).ok();
     assert_eq!(loaded, manifest);
     loaded.validate_against_records(&records).unwrap();
+}
+
+#[test]
+fn record_fingerprint_tracks_raw_observed_spectrum_without_changing_empty_records() {
+    let base = record("PEPTIDEK");
+    let base_fingerprint = foundation_record_fingerprint(&base);
+    let mut with_spectrum = base.clone();
+    with_spectrum.observed_spectrum_peaks = vec![ObservedSpectrumPeak {
+        mz: 250.2,
+        intensity: 100.0,
+    }];
+    let spectrum_fingerprint = foundation_record_fingerprint(&with_spectrum);
+    assert_ne!(base_fingerprint, spectrum_fingerprint);
+
+    with_spectrum.observed_spectrum_peaks[0].mz = 250.3;
+    assert_ne!(
+        spectrum_fingerprint,
+        foundation_record_fingerprint(&with_spectrum)
+    );
 }
 
 #[test]

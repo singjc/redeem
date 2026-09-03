@@ -2004,6 +2004,7 @@ mod tests {
             peptidoform: PeptidoformInput::unmodified(sequence),
             retention_time: RetentionTimeLabels {
                 normalized: Some(rt),
+                harmonized: None,
                 observed_seconds: None,
             },
             ccs: Some(ccs),
@@ -2013,6 +2014,7 @@ mod tests {
                 intensity: 1.0,
                 product_mz: None,
             }],
+            observed_spectrum_peaks: Vec::new(),
             context: TrainingContext {
                 charge: Some(charge),
                 nce: Some(27.0),

@@ -234,6 +234,9 @@ pub struct FoundationTableLoadStats {
     pub supported_fragment_rows: usize,
     /// Supported fragment rows carrying an explicitly observed/library product m/z.
     pub observed_fragment_mz_rows: usize,
+    /// Raw unannotated observed-spectrum peaks loaded from entry-oriented
+    /// spectral-library formats such as MSP.
+    pub raw_observed_peak_rows: usize,
     /// Number of grouped precursor-level records after aggregation.
     pub precursor_records: usize,
     /// Number of unique unmodified peptide sequences.
@@ -281,8 +284,20 @@ pub struct FoundationTableLoadStats {
     pub gradient_seconds_records: usize,
     /// Records carrying normalized RT/iRT.
     pub normalized_rt_records: usize,
+    /// Minimum finite normalized RT/iRT among grouped records.
+    pub min_normalized_rt: Option<f64>,
+    /// Mean finite normalized RT/iRT among grouped records.
+    pub mean_normalized_rt: Option<f64>,
+    /// Maximum finite normalized RT/iRT among grouped records.
+    pub max_normalized_rt: Option<f64>,
     /// Records carrying observed chromatographic RT.
     pub observed_rt_records: usize,
+    /// Minimum finite observed RT in seconds among grouped records.
+    pub min_observed_rt_seconds: Option<f64>,
+    /// Mean finite observed RT in seconds among grouped records.
+    pub mean_observed_rt_seconds: Option<f64>,
+    /// Maximum finite observed RT in seconds among grouped records.
+    pub max_observed_rt_seconds: Option<f64>,
     /// Records carrying CCS from either an explicit source column or derivation.
     pub ccs_records: usize,
     /// Records carrying CCS directly from an explicit source column.
@@ -478,6 +493,7 @@ impl FoundationDatasetLoader {
                     retention_time,
                     ccs,
                     fragments: Vec::new(),
+                    observed_spectrum_peaks: Vec::new(),
                     context,
                     run_id,
                 });
@@ -518,6 +534,11 @@ impl FoundationDatasetLoader {
             delimiter,
             stats,
         })
+    }
+
+    /// Allocate or retrieve an instrument id for non-tabular source adapters.
+    pub(crate) fn instrument_id_for(&mut self, name: Option<&str>) -> u32 {
+        self.instruments.id_for(name)
     }
 
     /// Return the currently accumulated instrument vocabulary.
@@ -593,6 +614,7 @@ impl FoundationDatasetLoader {
             peptidoform,
             retention_time: RetentionTimeLabels {
                 normalized: normalized_rt,
+                harmonized: None,
                 observed_seconds: observed_rt,
             },
             ccs,
@@ -729,7 +751,7 @@ impl TableSchema {
             sequence: require_header(headers, "ModifiedPeptideSequence")?,
             charge: exact_header(headers, "PrecursorCharge"),
             normalized_rt: exact_header(headers, "NormalizedRetentionTime"),
-            observed_rt: None,
+            observed_rt: exact_header(headers, "AverageExperimentalRetentionTime"),
             ccs: None,
             precursor_mz: exact_header(headers, "PrecursorMz"),
             ion_mobility: exact_header(headers, "PrecursorIonMobility"),
@@ -1066,7 +1088,10 @@ fn schema_collisions(
         .collect()
 }
 
-fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[FoundationTrainingRecord]) {
+pub(crate) fn finalize_load_stats(
+    stats: &mut FoundationTableLoadStats,
+    records: &[FoundationTrainingRecord],
+) {
     stats.precursor_records = records.len();
     let mut sequences = BTreeSet::<String>::new();
     let mut peptidoforms = BTreeSet::<String>::new();
@@ -1075,6 +1100,10 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
     let mut total_sequence_len = 0usize;
     let mut ccs_sum = 0.0f64;
     let mut finite_positive_ccs_count = 0usize;
+    let mut normalized_rt_sum = 0.0f64;
+    let mut finite_normalized_rt_count = 0usize;
+    let mut observed_rt_sum = 0.0f64;
+    let mut finite_observed_rt_count = 0usize;
 
     for record in records {
         let sequence_len = record.peptidoform.sequence.len();
@@ -1178,11 +1207,41 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
         if record.context.gradient_seconds.is_some() {
             stats.gradient_seconds_records += 1;
         }
-        if record.retention_time.normalized.is_some() {
+        if let Some(rt) = record.retention_time.normalized {
             stats.normalized_rt_records += 1;
+            if rt.is_finite() {
+                let rt = f64::from(rt);
+                finite_normalized_rt_count += 1;
+                normalized_rt_sum += rt;
+                stats.min_normalized_rt = Some(
+                    stats
+                        .min_normalized_rt
+                        .map_or(rt, |current| current.min(rt)),
+                );
+                stats.max_normalized_rt = Some(
+                    stats
+                        .max_normalized_rt
+                        .map_or(rt, |current| current.max(rt)),
+                );
+            }
         }
-        if record.retention_time.observed_seconds.is_some() {
+        if let Some(rt) = record.retention_time.observed_seconds {
             stats.observed_rt_records += 1;
+            if rt.is_finite() {
+                let rt = f64::from(rt);
+                finite_observed_rt_count += 1;
+                observed_rt_sum += rt;
+                stats.min_observed_rt_seconds = Some(
+                    stats
+                        .min_observed_rt_seconds
+                        .map_or(rt, |current| current.min(rt)),
+                );
+                stats.max_observed_rt_seconds = Some(
+                    stats
+                        .max_observed_rt_seconds
+                        .map_or(rt, |current| current.max(rt)),
+                );
+            }
         }
         if let Some(ccs) = record.ccs {
             stats.ccs_records += 1;
@@ -1194,15 +1253,16 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
                 stats.max_ccs = Some(stats.max_ccs.map_or(ccs, |current| current.max(ccs)));
             }
         }
-        if !record.fragments.is_empty() {
-            stats.ms2_records += 1;
-            if record
+        let has_annotated_observed_spectrum = !record.fragments.is_empty()
+            && record
                 .fragments
                 .iter()
-                .any(|fragment| fragment.product_mz.is_some())
-            {
-                stats.observed_spectrum_records += 1;
-            }
+                .any(|fragment| fragment.product_mz.is_some());
+        if !record.fragments.is_empty() {
+            stats.ms2_records += 1;
+        }
+        if has_annotated_observed_spectrum || !record.observed_spectrum_peaks.is_empty() {
+            stats.observed_spectrum_records += 1;
         }
         if let Some(run_id) = record
             .run_id
@@ -1231,6 +1291,10 @@ fn finalize_load_stats(stats: &mut FoundationTableLoadStats, records: &[Foundati
         (!records.is_empty()).then_some(total_sequence_len as f64 / records.len() as f64);
     stats.mean_ccs =
         (finite_positive_ccs_count > 0).then_some(ccs_sum / finite_positive_ccs_count as f64);
+    stats.mean_normalized_rt = (finite_normalized_rt_count > 0)
+        .then_some(normalized_rt_sum / finite_normalized_rt_count as f64);
+    stats.mean_observed_rt_seconds =
+        (finite_observed_rt_count > 0).then_some(observed_rt_sum / finite_observed_rt_count as f64);
 }
 
 pub(crate) fn canonical_peptidoform_label(peptidoform: &PeptidoformInput) -> String {

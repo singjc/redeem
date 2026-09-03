@@ -494,6 +494,12 @@ pub fn foundation_record_fingerprint(record: &FoundationTrainingRecord) -> u64 {
         hash.str(&format!("{:?}", modification.site));
     }
     hash.option_f32(record.retention_time.normalized);
+    // Preserve historical fingerprints for raw/source-native corpora. Harmonized RT is a new
+    // optional semantic layer and contributes only when a TRAIN-fit transform was applied.
+    if record.retention_time.harmonized.is_some() {
+        hash.str("harmonized-rt-v1");
+        hash.option_f32(record.retention_time.harmonized);
+    }
     hash.option_f32(record.retention_time.observed_seconds);
     hash.option_f32(record.ccs);
     hash.option_i32(record.context.charge);
@@ -526,6 +532,25 @@ pub fn foundation_record_fingerprint(record: &FoundationTrainingRecord) -> u64 {
         hash.usize(cleavage);
         hash.usize(channel);
         hash.u32(intensity);
+    }
+
+    // Raw unannotated spectra are a new record field and therefore do not
+    // affect historical table-only fingerprints when absent. When present,
+    // include them so MSP-backed benchmark manifests cannot silently validate
+    // against changed peak content.
+    if !record.observed_spectrum_peaks.is_empty() {
+        hash.str("raw-observed-spectrum-v1");
+        let mut peaks: Vec<(u32, u32)> = record
+            .observed_spectrum_peaks
+            .iter()
+            .map(|peak| (peak.mz.to_bits(), peak.intensity.to_bits()))
+            .collect();
+        peaks.sort_unstable();
+        hash.usize(peaks.len());
+        for (mz, intensity) in peaks {
+            hash.u32(mz);
+            hash.u32(intensity);
+        }
     }
     hash.finish()
 }

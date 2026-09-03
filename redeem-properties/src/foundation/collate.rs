@@ -358,6 +358,7 @@ impl FoundationCollator {
         for (batch_index, record) in records.iter().enumerate() {
             let rt = match self.config.retention_time_objective {
                 RetentionTimeObjective::Normalized => record.retention_time.normalized,
+                RetentionTimeObjective::Harmonized => record.retention_time.harmonized,
                 RetentionTimeObjective::Observed => record.retention_time.observed_seconds,
                 // The current foundation RT head is intrinsic.  In combined
                 // mode we therefore train it only on normalized RT and retain
@@ -484,6 +485,7 @@ mod tests {
                 peptidoform: PeptidoformInput::unmodified("PEPTIDEK"),
                 retention_time: RetentionTimeLabels {
                     normalized: Some(25.0),
+                    harmonized: None,
                     observed_seconds: None,
                 },
                 ccs: None,
@@ -493,6 +495,7 @@ mod tests {
                     intensity: 1.0,
                     product_mz: None,
                 }],
+                observed_spectrum_peaks: Vec::new(),
                 context: TrainingContext {
                     charge: Some(2),
                     nce: Some(27.0),
@@ -508,6 +511,7 @@ mod tests {
                 retention_time: RetentionTimeLabels::default(),
                 ccs: Some(430.0),
                 fragments: Vec::new(),
+                observed_spectrum_peaks: Vec::new(),
                 context: TrainingContext {
                     charge: Some(3),
                     ..TrainingContext::default()
@@ -532,6 +536,52 @@ mod tests {
         assert_eq!(
             batch.context.instrument_present.to_vec1::<f32>().unwrap(),
             vec![0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn harmonized_rt_objective_uses_train_calibrated_label_without_overwriting_raw_rt() {
+        let config = FoundationConfig {
+            max_sequence_len: 12,
+            transformer_layers: 1,
+            ..FoundationConfig::default()
+        };
+        let collator = FoundationCollator::new(
+            config,
+            FoundationCollatorConfig {
+                retention_time_objective: RetentionTimeObjective::Harmonized,
+                corruption: FoundationCorruptionConfig {
+                    residue_mask_probability: 0.0,
+                    chemistry_mask_probability: 0.0,
+                },
+            },
+        )
+        .unwrap();
+        let record = FoundationTrainingRecord {
+            peptidoform: PeptidoformInput::unmodified("PEPTIDEK"),
+            retention_time: RetentionTimeLabels {
+                normalized: Some(125.0),
+                harmonized: Some(52.5),
+                observed_seconds: None,
+            },
+            ccs: None,
+            fragments: Vec::new(),
+            observed_spectrum_peaks: Vec::new(),
+            context: TrainingContext::default(),
+            run_id: None,
+        };
+        let batch = collator.collate(&[record], &Device::Cpu, 1).unwrap();
+        assert_eq!(
+            batch
+                .targets
+                .rt
+                .as_ref()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![52.5]
         );
     }
 }

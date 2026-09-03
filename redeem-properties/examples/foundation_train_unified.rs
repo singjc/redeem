@@ -12,17 +12,20 @@ use redeem_properties::foundation::{
     contrastive_info_nce_loss, foundation_causal_next_token_loss, foundation_diffusion_length_loss,
     foundation_diffusion_x0_loss, foundation_spectrum_peptide_alignment_loss,
     load_foundation_corpus, load_unified_foundation_components, multi_task_loss,
-    read_foundation_training_run_config, FoundationAdamW, FoundationAdamWConfig,
+    read_foundation_training_run_config, sample_foundation_training_indices,
+    sample_foundation_validation_indices, FoundationAdamW, FoundationAdamWConfig,
     FoundationBenchmarkManifest, FoundationCausalCollator, FoundationCheckpointMetadata,
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
     FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
     FoundationLossWeights, FoundationPartition, FoundationRegressionNormalization,
+    FoundationRegressionNormalizationStrategy, FoundationSamplePlan, FoundationSamplingConfig,
     FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator,
     FoundationTargetNormalizationConfig, FoundationTrainingRecord, FoundationTrainingViews,
-    PeptideFoundationUnifiedModel, PeptidoformInput, PrecursorContextBatch,
+    PeptideFoundationUnifiedModel, PeptidoformInput, PrecursorContextBatch, RetentionTimeObjective,
     FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,7 +35,14 @@ struct InverseCheckpointMetadata {
     diffusion: FoundationDiffusionConfig,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Deserialize)]
+struct UnifiedParentMetadata {
+    forward_config: redeem_properties::foundation::FoundationConfig,
+    inverse_config: FoundationDiffusionConfig,
+    completed_steps: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UnifiedPilotMetadata {
     version: u32,
     objective: String,
@@ -42,6 +52,10 @@ struct UnifiedPilotMetadata {
     forward_checkpoint: String,
     diffusion_checkpoint: String,
     causal_checkpoint: String,
+    parent_unified_checkpoint: Option<String>,
+    rt_objective: RetentionTimeObjective,
+    rt_harmonization_calibration: Option<String>,
+    target_normalization: FoundationTargetNormalizationConfig,
     train_steps: usize,
     batch_size: usize,
     validation_batches: usize,
@@ -87,9 +101,9 @@ struct InverseMetrics {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 6 || args.len() > 16 {
+    if args.len() < 6 || args.len() > 17 {
         anyhow::bail!(
-            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25]"
+            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25] [parent_unified_checkpoint]"
         );
     }
 
@@ -108,6 +122,7 @@ fn main() -> Result<()> {
     let forward_objective_weight = parse_or(&args, 13, 0.5f64)?;
     let diffusion_objective_weight = parse_or(&args, 14, 0.25f64)?;
     let causal_objective_weight = parse_or(&args, 15, 0.25f64)?;
+    let parent_unified_checkpoint = args.get(16).map(PathBuf::from);
     let max_gradient_norm = 1.0f64;
     let diffusion_length_weight = 0.1f64;
 
@@ -205,48 +220,208 @@ fn main() -> Result<()> {
         );
     }
 
-    let validation_forward = deterministic_subset(
+    let mut forward_sampling = filtered_sampling_config(
+        &run.trainer.sampling,
+        &corpus.provenance,
+        &train_forward_indices,
         &validation_forward_indices,
-        validation_batches.saturating_mul(batch_size),
-        seed ^ 0x3d13_7f24_559c_81e7,
     );
-    let validation_inverse = deterministic_subset(
+    forward_sampling.train_steps_per_epoch = Some(train_steps);
+    forward_sampling.validation_steps = Some(validation_batches);
+    let mut inverse_sampling = filtered_sampling_config(
+        &run.trainer.sampling,
+        &corpus.provenance,
+        &train_inverse_indices,
         &validation_inverse_indices,
-        validation_batches.saturating_mul(batch_size),
-        seed ^ 0x72a4_c11d_0b95_e683,
     );
+    inverse_sampling.train_steps_per_epoch = Some(train_steps);
+    inverse_sampling.validation_steps = Some(validation_batches);
 
-    let varmap = VarMap::new();
+    let forward_a_plan = sample_foundation_training_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &train_forward_indices,
+        batch_size,
+        0,
+        seed ^ 0x18e7_64ad_a82f_1121,
+        true,
+        &forward_sampling,
+    )?;
+    let forward_b_plan = sample_foundation_training_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &train_forward_indices,
+        batch_size,
+        1,
+        seed ^ 0x62c9_e03a_733d_a1b5,
+        true,
+        &forward_sampling,
+    )?;
+    let diffusion_plan = sample_foundation_training_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &train_inverse_indices,
+        batch_size,
+        2,
+        seed ^ 0x9b43_7f21_c4a6_0d8b,
+        true,
+        &inverse_sampling,
+    )?;
+    let causal_plan = sample_foundation_training_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &train_inverse_indices,
+        batch_size,
+        3,
+        seed ^ 0xd532_6a91_089b_f417,
+        true,
+        &inverse_sampling,
+    )?;
+    for (label, plan) in [
+        ("forward_a_train", &forward_a_plan),
+        ("forward_b_train", &forward_b_plan),
+        ("diffusion_train", &diffusion_plan),
+        ("causal_train", &causal_plan),
+    ] {
+        require_plan_records(label, plan, train_steps.saturating_mul(batch_size))?;
+    }
+
+    let validation_forward_plan = sample_foundation_validation_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &validation_forward_indices,
+        batch_size,
+        seed ^ 0x3d13_7f24_559c_81e7,
+        &forward_sampling,
+    )?;
+    let validation_inverse_plan = sample_foundation_validation_indices(
+        &corpus.records,
+        &corpus.provenance,
+        &validation_inverse_indices,
+        batch_size,
+        seed ^ 0x72a4_c11d_0b95_e683,
+        &inverse_sampling,
+    )?;
+    require_plan_records(
+        "forward_validation",
+        &validation_forward_plan,
+        validation_batches.saturating_mul(batch_size),
+    )?;
+    require_plan_records(
+        "inverse_validation",
+        &validation_inverse_plan,
+        validation_batches.saturating_mul(batch_size),
+    )?;
+    let validation_forward = validation_forward_plan.indices.clone();
+    let validation_inverse = validation_inverse_plan.indices.clone();
+
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = PeptideFoundationUnifiedModel::new(
         forward_metadata.model_config.clone(),
         inverse_config.clone(),
         vb,
     )?;
-    let warm_start = load_unified_foundation_components(
-        &varmap,
-        &forward_model_path,
-        &diffusion_model_path,
-        &causal_model_path,
-        &device,
-    )?;
-    let alignment_initialization_seed = mix64(seed ^ 0xa17e_11a9_5eed_0132);
-    let alignment_initialization_fingerprint = initialize_alignment_projection_deterministically(
-        &varmap,
+
+    let (
+        warm_start_description,
+        alignment_initialization,
         alignment_initialization_seed,
-        &device,
-    )?;
-    let alignment_initialization = "seeded_kaiming_normal_weight_uniform_bias_v0132".to_string();
+        alignment_initialization_fingerprint,
+    ) = if let Some(parent) = &parent_unified_checkpoint {
+        let parent_metadata = read_unified_parent_metadata(parent)?;
+        if parent_metadata.forward_config != forward_metadata.model_config {
+            anyhow::bail!("parent unified checkpoint forward architecture does not match the supplied forward checkpoint");
+        }
+        if parent_metadata.inverse_config != inverse_config {
+            anyhow::bail!("parent unified checkpoint inverse architecture does not match the supplied inverse checkpoints");
+        }
+        let parent_model = resolve_model_safetensors(parent);
+        varmap
+            .load(&parent_model)
+            .with_context(|| format!("failed to load parent unified model {parent_model:?}"))?;
+        let fingerprint = alignment_projection_fingerprint(&varmap)?;
+        (
+            format!(
+                "unified_parent={}\tparent_completed_steps={}",
+                parent_model.display(),
+                parent_metadata.completed_steps
+            ),
+            "loaded_from_unified_parent_v0136".to_string(),
+            0u64,
+            fingerprint,
+        )
+    } else {
+        let warm_start = load_unified_foundation_components(
+            &varmap,
+            &forward_model_path,
+            &diffusion_model_path,
+            &causal_model_path,
+            &device,
+        )?;
+        let alignment_seed = mix64(seed ^ 0xa17e_11a9_5eed_0132);
+        let fingerprint =
+            initialize_alignment_projection_deterministically(&varmap, alignment_seed, &device)?;
+        (
+                format!(
+                    "forward_loaded={}\tdiffusion_loaded={}\tcausal_overlay_loaded={}\tfresh_alignment={}",
+                    warm_start.forward_loaded_variables,
+                    warm_start.diffusion_loaded_variables,
+                    warm_start.causal_overlay_loaded_variables,
+                    warm_start.fresh_alignment_variables
+                ),
+                "seeded_kaiming_normal_weight_uniform_bias_v0132".to_string(),
+                alignment_seed,
+                fingerprint,
+            )
+    };
 
     let forward_trainer = &forward_metadata.trainer_config;
+    let rt_objective = run.trainer.collator.retention_time_objective;
+    let rt_harmonization_calibration = rt_harmonization_calibration_id(&run)?;
+    if rt_objective == RetentionTimeObjective::Harmonized {
+        if rt_harmonization_calibration.is_none() {
+            anyhow::bail!("harmonized RT objective requires source RT harmonization transforms");
+        }
+        require_harmonized_rt_coverage(
+            &corpus.records,
+            &benchmark,
+            &[FoundationPartition::Train, FoundationPartition::Validation],
+        )?;
+    }
+
+    let mut target_normalization = forward_trainer.target_normalization;
+    let mut forward_collator_config = forward_trainer.collator.clone();
+    forward_collator_config.retention_time_objective = rt_objective;
+    if rt_objective == RetentionTimeObjective::Harmonized {
+        target_normalization.rt = run.trainer.target_normalization.rt;
+        target_normalization.rt.mean = None;
+        target_normalization.rt.standard_deviation = None;
+        target_normalization.rt.label_count = 0;
+        if target_normalization.rt.strategy
+            != FoundationRegressionNormalizationStrategy::TrainStandardize
+        {
+            anyhow::bail!("harmonized RT training requires trainer.target_normalization.rt.strategy=TrainStandardize");
+        }
+        let train_harmonized_rt = train_forward_indices
+            .iter()
+            .filter_map(|&index| corpus.records[index].retention_time.harmonized);
+        target_normalization
+            .rt
+            .resolve_from_values(train_harmonized_rt)?;
+        if !target_normalization.rt.is_active() {
+            anyhow::bail!("harmonized RT target normalization did not resolve from TRAIN labels");
+        }
+    }
+
     let forward_collator = FoundationCollator::new(
         forward_metadata.model_config.clone(),
-        forward_trainer.collator.clone(),
+        forward_collator_config,
     )?;
     let clean_collator = FoundationCollator::new(
         forward_metadata.model_config.clone(),
         FoundationCollatorConfig {
-            retention_time_objective: forward_trainer.collator.retention_time_objective,
+            retention_time_objective: rt_objective,
             corruption: FoundationCorruptionConfig {
                 residue_mask_probability: 0.0,
                 chemistry_mask_probability: 0.0,
@@ -314,18 +489,38 @@ fn main() -> Result<()> {
         0.5 * forward_objective_weight
     );
     println!("max_gradient_norm\t{max_gradient_norm}");
+    println!("warm_start\t{warm_start_description}");
+    println!("rt_objective\t{:?}", rt_objective);
     println!(
-        "warm_start\tforward_loaded={}\tdiffusion_loaded={}\tcausal_overlay_loaded={}\tfresh_alignment={}",
-        warm_start.forward_loaded_variables,
-        warm_start.diffusion_loaded_variables,
-        warm_start.causal_overlay_loaded_variables,
-        warm_start.fresh_alignment_variables,
+        "rt_harmonization_calibration\t{}",
+        rt_harmonization_calibration.as_deref().unwrap_or("none")
+    );
+    println!(
+        "rt_target_normalization\tstrategy={:?}\tmean={}\tstandard_deviation={}\tlabel_count={}",
+        target_normalization.rt.strategy,
+        target_normalization
+            .rt
+            .mean
+            .map(|value| format!("{value:.8}"))
+            .unwrap_or_else(|| "NA".into()),
+        target_normalization
+            .rt
+            .standard_deviation
+            .map(|value| format!("{value:.8}"))
+            .unwrap_or_else(|| "NA".into()),
+        target_normalization.rt.label_count,
     );
     println!("optimizer_variables\t{}", optimizer.variable_count());
+    print_sample_plan("forward_a_train", &forward_a_plan);
+    print_sample_plan("forward_b_train", &forward_b_plan);
+    print_sample_plan("diffusion_train", &diffusion_plan);
+    print_sample_plan("causal_train", &causal_plan);
+    print_sample_plan("forward_validation", &validation_forward_plan);
+    print_sample_plan("inverse_validation", &validation_inverse_plan);
 
     let metadata = |completed_steps| {
         UnifiedPilotMetadata {
-        version: 3,
+        version: 4,
         objective: "unified_forward_diffusion_causal_alignment_v2".into(),
         schedule: "one_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*causal".into(),
         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
@@ -336,6 +531,12 @@ fn main() -> Result<()> {
         forward_checkpoint: forward_model_path.display().to_string(),
         diffusion_checkpoint: diffusion_model_path.display().to_string(),
         causal_checkpoint: causal_model_path.display().to_string(),
+        parent_unified_checkpoint: parent_unified_checkpoint
+            .as_ref()
+            .map(|path| resolve_model_safetensors(path).display().to_string()),
+        rt_objective,
+        rt_harmonization_calibration: rt_harmonization_calibration.clone(),
+        target_normalization,
         train_steps,
         batch_size,
         validation_batches,
@@ -376,17 +577,13 @@ fn main() -> Result<()> {
             &diffusion_collator,
             &causal_collator,
             &spectrum_collator,
-            &forward_trainer.target_normalization,
+            &target_normalization,
             alignment_temperature,
             &device,
         )?,
     );
 
-    let probe_indices = deterministic_batch(
-        &train_inverse_indices,
-        batch_size,
-        seed ^ 0x5c7d_92a1_b460_31ef,
-    );
+    let probe_indices = causal_plan.indices[..batch_size].to_vec();
     let probe_records: Vec<&FoundationTrainingRecord> = probe_indices
         .iter()
         .map(|&index| &corpus.records[index])
@@ -404,16 +601,9 @@ fn main() -> Result<()> {
 
     let eval_every = train_steps.min(10).max(1);
     for step in 1..=train_steps {
-        let forward_a_indices = deterministic_batch(
-            &train_forward_indices,
-            batch_size,
-            seed ^ (step as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
-        );
-        let forward_b_indices = deterministic_batch(
-            &train_forward_indices,
-            batch_size,
-            seed ^ (step as u64).wrapping_mul(0x4cf5_ad43_2745_937f),
-        );
+        let offset = (step - 1).saturating_mul(batch_size);
+        let forward_a_indices = &forward_a_plan.indices[offset..offset + batch_size];
+        let forward_b_indices = &forward_b_plan.indices[offset..offset + batch_size];
         let forward_a_records: Vec<FoundationTrainingRecord> = forward_a_indices
             .iter()
             .map(|&index| corpus.records[index].clone())
@@ -430,7 +620,7 @@ fn main() -> Result<()> {
             forward_trainer.contrastive_temperature,
             forward_trainer.shared_gradient_scales.rt_encoder,
             forward_trainer.shared_gradient_scales.ccs_encoder,
-            &forward_trainer.target_normalization,
+            &target_normalization,
             seed ^ (step as u64).wrapping_mul(0xa24b_1c62_4073_f5d9),
             &device,
         )?;
@@ -442,16 +632,12 @@ fn main() -> Result<()> {
             forward_trainer.contrastive_temperature,
             forward_trainer.shared_gradient_scales.rt_encoder,
             forward_trainer.shared_gradient_scales.ccs_encoder,
-            &forward_trainer.target_normalization,
+            &target_normalization,
             seed ^ (step as u64).wrapping_mul(0xd6e8_feb8_6659_fd93),
             &device,
         )?;
 
-        let diffusion_indices = deterministic_batch(
-            &train_inverse_indices,
-            batch_size,
-            seed ^ (step as u64).wrapping_mul(0x8cb9_2baa_4f31_7e0d),
-        );
+        let diffusion_indices = &diffusion_plan.indices[offset..offset + batch_size];
         let diffusion_records: Vec<&FoundationTrainingRecord> = diffusion_indices
             .iter()
             .map(|&index| &corpus.records[index])
@@ -463,7 +649,7 @@ fn main() -> Result<()> {
             &clean_collator,
             &diffusion_collator,
             &spectrum_collator,
-            &forward_trainer.target_normalization,
+            &target_normalization,
             diffusion_length_weight,
             alignment_weight,
             alignment_temperature,
@@ -472,11 +658,7 @@ fn main() -> Result<()> {
             &device,
         )?;
 
-        let causal_indices = deterministic_batch(
-            &train_inverse_indices,
-            batch_size,
-            seed ^ (step as u64).wrapping_mul(0x94d0_49bb_1331_11eb),
-        );
+        let causal_indices = &causal_plan.indices[offset..offset + batch_size];
         let causal_records: Vec<&FoundationTrainingRecord> = causal_indices
             .iter()
             .map(|&index| &corpus.records[index])
@@ -487,7 +669,7 @@ fn main() -> Result<()> {
             &clean_collator,
             &causal_collator,
             &spectrum_collator,
-            &forward_trainer.target_normalization,
+            &target_normalization,
             alignment_weight,
             alignment_temperature,
             &device,
@@ -522,7 +704,7 @@ fn main() -> Result<()> {
                 &diffusion_collator,
                 &causal_collator,
                 &spectrum_collator,
-                &forward_trainer.target_normalization,
+                &target_normalization,
                 alignment_temperature,
                 &device,
             )?;
@@ -1293,6 +1475,72 @@ fn read_inverse_metadata(checkpoint: &Path) -> Result<InverseCheckpointMetadata>
     )?)
 }
 
+fn read_unified_parent_metadata(checkpoint: &Path) -> Result<UnifiedParentMetadata> {
+    let metadata_path = if checkpoint.is_dir() {
+        checkpoint.join("metadata.yaml")
+    } else {
+        checkpoint
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("metadata.yaml")
+    };
+    serde_yaml::from_str(
+        &fs::read_to_string(&metadata_path)
+            .with_context(|| format!("failed to read unified parent metadata {metadata_path:?}"))?,
+    )
+    .with_context(|| format!("failed to parse unified parent metadata {metadata_path:?}"))
+}
+
+fn rt_harmonization_calibration_id(
+    run: &redeem_properties::foundation::FoundationTrainingRunConfig,
+) -> Result<Option<String>> {
+    let ids: BTreeSet<String> = run
+        .corpus
+        .sources
+        .iter()
+        .filter_map(|source| source.rt_harmonization.as_ref())
+        .map(|transform| transform.calibration_id.clone())
+        .collect();
+    if ids.len() > 1 {
+        anyhow::bail!("unified run contains multiple RT harmonization calibration ids: {ids:?}");
+    }
+    Ok(ids.into_iter().next())
+}
+
+fn require_harmonized_rt_coverage(
+    records: &[FoundationTrainingRecord],
+    benchmark: &FoundationBenchmarkManifest,
+    partitions: &[FoundationPartition],
+) -> Result<()> {
+    let partitions: BTreeSet<FoundationPartition> = partitions.iter().copied().collect();
+    let mut source_native = 0usize;
+    let mut harmonized = 0usize;
+    let mut missing = Vec::new();
+    for entry in &benchmark.entries {
+        if !partitions.contains(&entry.partition) {
+            continue;
+        }
+        let record = &records[entry.record_index];
+        if record.retention_time.normalized.is_some_and(f32::is_finite) {
+            source_native += 1;
+            if record.retention_time.harmonized.is_some_and(f32::is_finite) {
+                harmonized += 1;
+            } else if missing.len() < 8 {
+                missing.push((entry.record_index, entry.peptidoform.clone()));
+            }
+        }
+    }
+    if source_native != harmonized {
+        anyhow::bail!(
+            "harmonized RT coverage is incomplete for TRAIN/VALIDATION: source-native labels={}, harmonized labels={}, examples={:?}",
+            source_native,
+            harmonized,
+            missing
+        );
+    }
+    Ok(())
+}
+
 fn resolve_forward_state(checkpoint: &Path) -> PathBuf {
     if checkpoint.is_dir() {
         checkpoint.join("state.yaml")
@@ -1364,31 +1612,55 @@ fn fmt_opt(value: Option<f64>) -> String {
         .unwrap_or_else(|| "NA".into())
 }
 
-fn deterministic_batch(indices: &[usize], batch_size: usize, seed: u64) -> Vec<usize> {
-    let mut result = Vec::with_capacity(batch_size);
-    let mut state = mix64(seed);
-    for _ in 0..batch_size {
-        state = mix64(state ^ 0x9e37_79b9_7f4a_7c15);
-        result.push(indices[(state as usize) % indices.len()]);
+fn filtered_sampling_config(
+    base: &FoundationSamplingConfig,
+    provenance: &[redeem_properties::foundation::FoundationRecordProvenance],
+    train_indices: &[usize],
+    validation_indices: &[usize],
+) -> FoundationSamplingConfig {
+    let train_sources: BTreeSet<String> = train_indices
+        .iter()
+        .filter_map(|&index| provenance.get(index))
+        .map(|item| item.source_id.clone())
+        .collect();
+    let validation_sources: BTreeSet<String> = validation_indices
+        .iter()
+        .filter_map(|&index| provenance.get(index))
+        .map(|item| item.source_id.clone())
+        .collect();
+    let mut config = base.clone();
+    if !config.source_weights.is_empty() {
+        config
+            .source_weights
+            .retain(|source, _| train_sources.contains(source));
     }
-    result
+    if !config.validation_source_weights.is_empty() {
+        config
+            .validation_source_weights
+            .retain(|source, _| validation_sources.contains(source));
+    }
+    config
 }
 
-fn deterministic_subset(indices: &[usize], count: usize, seed: u64) -> Vec<usize> {
-    if indices.is_empty() || count == 0 {
-        return Vec::new();
+fn require_plan_records(label: &str, plan: &FoundationSamplePlan, expected: usize) -> Result<()> {
+    if plan.indices.len() != expected {
+        anyhow::bail!(
+            "unified {label} sample plan has {} records but {expected} are required",
+            plan.indices.len()
+        );
     }
-    let mut keyed: Vec<(u64, usize)> = indices
-        .iter()
-        .copied()
-        .map(|index| (mix64(seed ^ index as u64), index))
-        .collect();
-    keyed.sort_by_key(|entry| entry.0);
-    keyed
-        .into_iter()
-        .take(count.min(indices.len()))
-        .map(|entry| entry.1)
-        .collect()
+    Ok(())
+}
+
+fn print_sample_plan(label: &str, plan: &FoundationSamplePlan) {
+    println!(
+        "sample_plan\tlane={label}\trecords={}\tunique_records={}",
+        plan.indices.len(),
+        plan.unique_records
+    );
+    for (source, count) in &plan.source_records {
+        println!("sample_plan_source\tlane={label}\tsource={source}\trecords={count}");
+    }
 }
 
 fn mix64(mut value: u64) -> u64 {

@@ -28,8 +28,10 @@ pub mod layers;
 pub mod loss;
 pub mod metadata;
 pub mod model;
+pub mod msp;
 pub mod normalization;
 pub mod optimizer;
+pub mod rt_harmonization;
 pub mod run;
 pub mod sampling;
 pub mod spectrum;
@@ -71,11 +73,12 @@ pub use config::{FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, F
 pub use control::{FoundationFitConfig, FoundationLearningRateSchedule};
 pub use corpus::{
     load_foundation_corpus, FoundationCorpus, FoundationCorpusConfig, FoundationCorpusDelimiter,
-    FoundationCorpusSourceSpec, FoundationCorpusSourceSummary, FoundationRecordProvenance,
+    FoundationCorpusSourceFormat, FoundationCorpusSourceSpec, FoundationCorpusSourceSummary,
+    FoundationRecordProvenance,
 };
 pub use data::{
-    FoundationTrainingRecord, FragmentTarget, RetentionTimeLabels, RetentionTimeObjective,
-    TrainingContext,
+    FoundationTrainingRecord, FragmentTarget, ObservedSpectrumPeak, RetentionTimeLabels,
+    RetentionTimeObjective, TrainingContext,
 };
 pub use dataset::{
     parse_modified_peptide, FoundationCcsDerivationMode, FoundationDataset,
@@ -119,11 +122,18 @@ pub use model::{
     FoundationMultiTaskOutput, FoundationOutput, PeptideFoundationEncoder,
     PeptideFoundationMultiTaskModel, PrecursorContextBatch,
 };
+pub use msp::{load_foundation_msp_reader, FoundationMspLoadReport};
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
     FoundationTargetNormalizationConfig,
 };
 pub use optimizer::{FoundationAdamW, FoundationAdamWConfig, FoundationOptimizerStep};
+pub use rt_harmonization::{
+    apply_foundation_rt_harmonization, fit_foundation_rt_harmonization,
+    FoundationRtCrossSourceConsistency, FoundationRtHarmonizationFitConfig,
+    FoundationRtHarmonizationFitResult, FoundationRtHarmonizationTransform,
+    FoundationRtSourceCalibrationSummary,
+};
 pub use run::{
     evaluate_foundation_checkpoint, read_foundation_training_run_config,
     run_foundation_pretraining, FoundationCheckpointEvaluationSummary, FoundationTrainingRunConfig,

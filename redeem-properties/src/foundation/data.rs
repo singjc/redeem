@@ -1,9 +1,10 @@
 //! Training-record types shared by transition-list and spectral-library loaders.
 //!
 //! This module deliberately separates intrinsic peptide labels from run-level
-//! experimental context.  In particular, normalized RT is treated as the
-//! portable intrinsic retention target, while observed RT can be retained as
-//! an auxiliary context-conditioned target when LC metadata are available.
+//! experimental context. Source-native normalized RT is retained for provenance;
+//! an optional TRAIN-fit harmonized RT coordinate is the portable intrinsic target
+//! across heterogeneous libraries. Observed RT can coexist as an auxiliary
+//! context-conditioned target when LC metadata are available.
 
 use super::featurize::PeptidoformInput;
 use serde::{Deserialize, Serialize};
@@ -11,13 +12,36 @@ use serde::{Deserialize, Serialize};
 /// Retention-time labels that may coexist for one peptide observation.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RetentionTimeLabels {
-    /// Experiment-normalized RT/iRT-like value used by the portable RT head.
+    /// Source-native normalized RT/iRT-like value exactly as provided by the library.
+    ///
+    /// Different public libraries may use incompatible numerical coordinate systems, so this
+    /// field is retained for provenance/audit and is not necessarily a globally portable target.
     pub normalized: Option<f32>,
+    /// Train-only cross-source harmonized intrinsic RT coordinate, when configured.
+    ///
+    /// This value is derived from `normalized` using source-specific affine transforms fit only
+    /// on the materialized TRAIN partition. The raw source-native value above is never overwritten.
+    pub harmonized: Option<f32>,
     /// Actual chromatographic retention time in seconds.
     pub observed_seconds: Option<f32>,
 }
 
-/// One fragment observation from a transition list or spectral library.
+/// One raw observed centroided spectrum peak.
+///
+/// This is deliberately separate from [`FragmentTarget`]. Raw spectral-library
+/// formats such as MSP may provide measured `(m/z, intensity)` pairs without
+/// assigning those peaks to a b/y cleavage channel. Keeping the raw spectrum in
+/// a separate field lets the inverse spectrum-to-peptide lane use the measured
+/// evidence without turning unannotated peaks into fabricated forward-MS2 labels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObservedSpectrumPeak {
+    /// Observed product-ion mass-to-charge ratio.
+    pub mz: f32,
+    /// Observed peak intensity in arbitrary units.
+    pub intensity: f32,
+}
+
+/// One annotated fragment observation from a transition list or spectral library.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FragmentTarget {
     /// Zero-based cleavage index (between residues `i` and `i + 1`).
@@ -68,8 +92,15 @@ pub struct FoundationTrainingRecord {
     pub retention_time: RetentionTimeLabels,
     /// Collision cross section, if present.
     pub ccs: Option<f32>,
-    /// Fragment targets, if present.
+    /// Annotated fragment targets, if present. These may supervise the forward
+    /// cleavage/channel MS2 head when their ion identity is known.
     pub fragments: Vec<FragmentTarget>,
+    /// Raw observed spectrum peaks when the source provides an MS/MS peak list
+    /// without trustworthy cleavage/channel annotations (for example MSP).
+    ///
+    /// The inverse spectrum-to-peptide lane consumes these peaks directly. The
+    /// forward MS2 head intentionally ignores them.
+    pub observed_spectrum_peaks: Vec<ObservedSpectrumPeak>,
     /// Acquisition and precursor context.
     pub context: TrainingContext,
     /// Optional run identifier used for grouped data splitting/calibration.
@@ -79,11 +110,13 @@ pub struct FoundationTrainingRecord {
 /// Which RT target a downstream training adapter should optimize.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetentionTimeObjective {
-    /// Train only against normalized RT/iRT.
+    /// Train only against the source-native normalized RT/iRT coordinate.
     Normalized,
+    /// Train against the train-only cross-source harmonized intrinsic RT coordinate.
+    Harmonized,
     /// Train only against actual observed chromatographic RT.
     Observed,
-    /// Use normalized RT as the intrinsic task and observed RT as an auxiliary
+    /// Use source-native normalized RT as the intrinsic task and observed RT as an auxiliary
     /// context-conditioned task when both are available.
     #[default]
     IntrinsicAndObserved,

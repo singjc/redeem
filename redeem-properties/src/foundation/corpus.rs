@@ -7,20 +7,25 @@
 //! sequence cannot leak across sources.
 
 use super::dataset::{
-    FoundationCcsDerivationMode, FoundationDatasetLoader, FoundationTableLoadReport,
-    FoundationTableLoadStats, FoundationTableLoaderConfig,
+    FoundationCcsDerivationMode, FoundationDatasetLoader, FoundationTableLoadStats,
+    FoundationTableLoaderConfig,
 };
 use super::experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,
     FoundationBenchmarkManifest,
 };
 use super::metadata::FoundationSourceMetadata;
+use super::msp::load_foundation_msp_reader;
+use super::rt_harmonization::{
+    apply_foundation_rt_harmonization, FoundationRtHarmonizationTransform,
+};
+use super::spectrum::foundation_diffusion_dataset_fingerprint;
 use super::split::FoundationSplitConfig;
 use super::FoundationTrainingRecord;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -28,7 +33,7 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FoundationCorpusDelimiter {
-    /// Infer from extension; `.tsv` and `.tsv.zst` use tab, otherwise comma.
+    /// Infer from extension; `.tsv`, `.tsv.zst`, and `.tsv.gz` use tab, otherwise comma.
     #[default]
     Auto,
     /// Tab-separated values.
@@ -44,7 +49,8 @@ impl FoundationCorpusDelimiter {
         match self {
             Self::Auto => {
                 let name = path.to_string_lossy().to_ascii_lowercase();
-                if name.ends_with(".tsv") || name.ends_with(".tsv.zst") {
+                if name.ends_with(".tsv") || name.ends_with(".tsv.zst") || name.ends_with(".tsv.gz")
+                {
                     b'\t'
                 } else {
                     b','
@@ -57,7 +63,35 @@ impl FoundationCorpusDelimiter {
     }
 }
 
-/// One source table in a multi-source foundation corpus.
+/// Physical source format for one foundation-corpus entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FoundationCorpusSourceFormat {
+    /// Infer MSP from `.msp`, `.msp.gz`, or `.msp.zst`; otherwise use the
+    /// long-form transition/spectral-library table loader.
+    #[default]
+    Auto,
+    /// Long-form CSV/TSV transition or spectral-library table.
+    Table,
+    /// Entry-oriented MSP spectral library with raw observed peak lists.
+    Msp,
+}
+
+impl FoundationCorpusSourceFormat {
+    fn resolve(self, path: &Path) -> Self {
+        if self != Self::Auto {
+            return self;
+        }
+        let name = path.to_string_lossy().to_ascii_lowercase();
+        if name.ends_with(".msp") || name.ends_with(".msp.gz") || name.ends_with(".msp.zst") {
+            Self::Msp
+        } else {
+            Self::Table
+        }
+    }
+}
+
+/// One source table or spectral library in a multi-source foundation corpus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FoundationCorpusSourceSpec {
@@ -67,9 +101,12 @@ pub struct FoundationCorpusSourceSpec {
     /// `name:` alias for compatibility with early foundation examples.
     #[serde(alias = "name")]
     pub id: String,
-    /// Source path. `.zst` files are streamed through the system `zstd -dc`.
+    /// Source path. `.zst` and `.gz` inputs are streamed through the system
+    /// `zstd -dc` / `gzip -dc` commands respectively.
     pub path: PathBuf,
-    /// Source delimiter.
+    /// Physical source format. `auto` recognizes MSP by extension.
+    pub format: FoundationCorpusSourceFormat,
+    /// Source delimiter for tabular inputs. Ignored for MSP.
     pub delimiter: FoundationCorpusDelimiter,
     /// Optional source-level acquisition metadata. Every field may be absent.
     pub metadata: FoundationSourceMetadata,
@@ -80,6 +117,9 @@ pub struct FoundationCorpusSourceSpec {
     /// This is useful for mixed corpora where only some sources contain
     /// Bruker/timsTOF inverse reduced mobility (`1/K0`).
     pub ccs_derivation: Option<FoundationCcsDerivationMode>,
+    /// Optional TRAIN-fit affine transform from this source's native normalized RT
+    /// coordinate into the common harmonized intrinsic RT coordinate.
+    pub rt_harmonization: Option<FoundationRtHarmonizationTransform>,
 }
 
 impl Default for FoundationCorpusSourceSpec {
@@ -87,10 +127,12 @@ impl Default for FoundationCorpusSourceSpec {
         Self {
             id: String::new(),
             path: PathBuf::new(),
+            format: FoundationCorpusSourceFormat::Auto,
             delimiter: FoundationCorpusDelimiter::Auto,
             metadata: FoundationSourceMetadata::default(),
             strict: None,
             ccs_derivation: None,
+            rt_harmonization: None,
         }
     }
 }
@@ -143,8 +185,18 @@ pub struct FoundationCorpusSourceSummary {
     pub record_count: usize,
     /// Content fingerprint over source records.
     pub dataset_fingerprint: u64,
-    /// Source table parse/coverage statistics.
+    /// Source table parse/coverage statistics in source-native coordinates.
     pub stats: FoundationTableLoadStats,
+    /// Records carrying the train-calibrated harmonized RT target.
+    pub harmonized_rt_records: usize,
+    /// Minimum harmonized RT among finite records.
+    pub min_harmonized_rt: Option<f64>,
+    /// Mean harmonized RT among finite records.
+    pub mean_harmonized_rt: Option<f64>,
+    /// Maximum harmonized RT among finite records.
+    pub max_harmonized_rt: Option<f64>,
+    /// Calibration id applied to this source, when present.
+    pub rt_harmonization_calibration_id: Option<String>,
 }
 
 /// Combined records plus source provenance and one shared instrument vocabulary.
@@ -223,6 +275,14 @@ pub fn load_foundation_corpus(config: &FoundationCorpusConfig) -> Result<Foundat
         if source.path.as_os_str().is_empty() {
             anyhow::bail!("foundation corpus source '{}' has an empty path", source.id);
         }
+        if let Some(transform) = &source.rt_harmonization {
+            transform.validate().with_context(|| {
+                format!(
+                    "invalid RT harmonization transform for source '{}'",
+                    source.id
+                )
+            })?;
+        }
     }
 
     let mut loader = FoundationDatasetLoader::new(config.instrument_vocab_size);
@@ -252,11 +312,36 @@ pub fn load_foundation_corpus(config: &FoundationCorpusConfig) -> Result<Foundat
             loader_config.default_gradient_seconds = Some(gradient_seconds);
         }
 
-        let report = load_source(&mut loader, source, &loader_config)?;
+        let mut report = load_source(&mut loader, source, &loader_config)?;
+        if let Some(transform) = &source.rt_harmonization {
+            for record in &mut report.records {
+                apply_foundation_rt_harmonization(record, transform)?;
+            }
+        }
+        let harmonized_values: Vec<f64> = report
+            .records
+            .iter()
+            .filter_map(|record| record.retention_time.harmonized)
+            .filter(|value| value.is_finite())
+            .map(f64::from)
+            .collect();
+        let harmonized_rt_records = harmonized_values.len();
+        let min_harmonized_rt = harmonized_values.iter().copied().reduce(f64::min);
+        let max_harmonized_rt = harmonized_values.iter().copied().reduce(f64::max);
+        let mean_harmonized_rt = (!harmonized_values.is_empty())
+            .then(|| harmonized_values.iter().sum::<f64>() / harmonized_values.len() as f64);
         let record_start = records.len();
         let record_count = report.records.len();
         let local_indices: Vec<usize> = (0..record_count).collect();
-        let source_fingerprint = foundation_dataset_fingerprint(&report.records, &local_indices)?;
+        let source_fingerprint = if report
+            .records
+            .iter()
+            .any(|record| !record.observed_spectrum_peaks.is_empty())
+        {
+            foundation_diffusion_dataset_fingerprint(&report.records, &local_indices)?
+        } else {
+            foundation_dataset_fingerprint(&report.records, &local_indices)?
+        };
         for source_record_index in 0..record_count {
             provenance.push(FoundationRecordProvenance {
                 source_index,
@@ -268,11 +353,19 @@ pub fn load_foundation_corpus(config: &FoundationCorpusConfig) -> Result<Foundat
         summaries.push(FoundationCorpusSourceSummary {
             id: source.id.clone(),
             path: source.path.clone(),
-            profile: report.schema.profile,
+            profile: report.profile,
             record_start,
             record_count,
             dataset_fingerprint: source_fingerprint,
             stats: report.stats,
+            harmonized_rt_records,
+            min_harmonized_rt,
+            mean_harmonized_rt,
+            max_harmonized_rt,
+            rt_harmonization_calibration_id: source
+                .rt_harmonization
+                .as_ref()
+                .map(|transform| transform.calibration_id.clone()),
         });
     }
 
@@ -287,49 +380,100 @@ pub fn load_foundation_corpus(config: &FoundationCorpusConfig) -> Result<Foundat
     })
 }
 
+struct FoundationSourceLoadReport {
+    records: Vec<FoundationTrainingRecord>,
+    profile: String,
+    stats: FoundationTableLoadStats,
+}
+
 fn load_source(
     loader: &mut FoundationDatasetLoader,
     source: &FoundationCorpusSourceSpec,
     config: &FoundationTableLoaderConfig,
-) -> Result<FoundationTableLoadReport> {
-    let path_text = source.path.to_string_lossy().to_ascii_lowercase();
-    if !path_text.ends_with(".zst") {
-        return loader
-            .load_path_with_report(&source.path, config)
-            .with_context(|| format!("failed to load corpus source '{}'", source.id));
+) -> Result<FoundationSourceLoadReport> {
+    match source.format.resolve(&source.path) {
+        FoundationCorpusSourceFormat::Auto => {
+            unreachable!("source format must resolve before load")
+        }
+        FoundationCorpusSourceFormat::Table => with_source_reader(source, |reader| {
+            let report = loader.load_reader_with_report(
+                reader,
+                source.delimiter.byte(&source.path),
+                config,
+            )?;
+            Ok(FoundationSourceLoadReport {
+                records: report.records,
+                profile: report.schema.profile,
+                stats: report.stats,
+            })
+        }),
+        FoundationCorpusSourceFormat::Msp => with_source_reader(source, |reader| {
+            let report = load_foundation_msp_reader(reader, loader, config)?;
+            Ok(FoundationSourceLoadReport {
+                records: report.records,
+                profile: "msp_spectral_library".to_string(),
+                stats: report.stats,
+            })
+        }),
     }
+    .with_context(|| format!("failed to load corpus source '{}'", source.id))
+}
 
-    let mut child = Command::new("zstd")
-        .arg("-dc")
+fn with_source_reader<T>(
+    source: &FoundationCorpusSourceSpec,
+    parse: impl FnOnce(Box<dyn BufRead>) -> Result<T>,
+) -> Result<T> {
+    let path_text = source.path.to_string_lossy().to_ascii_lowercase();
+    if path_text.ends_with(".zst") {
+        return with_decompressor(source, "zstd", &["-dc"], parse);
+    }
+    if path_text.ends_with(".gz") {
+        return with_decompressor(source, "gzip", &["-dc"], parse);
+    }
+    let file = File::open(&source.path).with_context(|| {
+        format!(
+            "failed to open corpus source '{}' ({:?})",
+            source.id, source.path
+        )
+    })?;
+    parse(Box::new(BufReader::new(file)))
+}
+
+fn with_decompressor<T>(
+    source: &FoundationCorpusSourceSpec,
+    command: &str,
+    args: &[&str],
+    parse: impl FnOnce(Box<dyn BufRead>) -> Result<T>,
+) -> Result<T> {
+    let mut child = Command::new(command)
+        .args(args)
         .arg(&source.path)
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| {
             format!(
-                "failed to start 'zstd -dc' for corpus source '{}' ({:?})",
-                source.id, source.path
+                "failed to start '{command} {}' for corpus source '{}' ({:?})",
+                args.join(" "),
+                source.id,
+                source.path
             )
         })?;
     let stdout = child.stdout.take().ok_or_else(|| {
         anyhow!(
-            "failed to capture zstd stdout for corpus source '{}'",
+            "failed to capture {command} stdout for corpus source '{}'",
             source.id
         )
     })?;
-    let report = loader.load_reader_with_report(
-        BufReader::new(stdout),
-        source.delimiter.byte(&source.path),
-        config,
-    );
+    let result = parse(Box::new(BufReader::new(stdout)));
     let status = child.wait()?;
     if !status.success() {
         anyhow::bail!(
-            "zstd decompression failed for corpus source '{}' with status {}",
+            "{command} decompression failed for corpus source '{}' with status {}",
             source.id,
             status
         );
     }
-    report.with_context(|| format!("failed to parse decompressed corpus source '{}'", source.id))
+    result
 }
 
 fn corpus_fingerprint(

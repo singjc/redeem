@@ -197,6 +197,7 @@ impl FoundationTargetNormalizationConfig {
             let rt = match rt_objective {
                 RetentionTimeObjective::Normalized
                 | RetentionTimeObjective::IntrinsicAndObserved => record.retention_time.normalized,
+                RetentionTimeObjective::Harmonized => record.retention_time.harmonized,
                 RetentionTimeObjective::Observed => record.retention_time.observed_seconds,
             };
             if let Some(value) = rt.filter(|value| value.is_finite()) {
