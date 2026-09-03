@@ -9,21 +9,23 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    contrastive_info_nce_loss, foundation_causal_next_token_loss, foundation_diffusion_length_loss,
+    contrastive_info_nce_loss, foundation_causal_conditioning_margin_loss,
+    foundation_causal_next_token_loss, foundation_diffusion_length_loss,
     foundation_diffusion_x0_loss, foundation_ms2_loss, foundation_spectrum_peptide_alignment_loss,
     load_foundation_corpus, load_unified_foundation_components, multi_task_loss_with_ms2_config,
     read_foundation_training_run_config, sample_foundation_training_indices,
     sample_foundation_validation_indices, FoundationAdamW, FoundationAdamWConfig,
-    FoundationBenchmarkManifest, FoundationCausalCollator, FoundationCheckpointMetadata,
-    FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
-    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationLossWeights, FoundationMs2LossConfig, FoundationMs2OutputActivation,
-    FoundationPartition, FoundationRegressionNormalization,
-    FoundationRegressionNormalizationStrategy, FoundationSamplePlan, FoundationSamplingConfig,
-    FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator,
-    FoundationTargetNormalizationConfig, FoundationTrainingRecord, FoundationTrainingViews,
-    PeptideFoundationUnifiedModel, PeptidoformInput, PrecursorContextBatch, RetentionTimeObjective,
-    FOUNDATION_DIFFUSION_VOCAB_SIZE, FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
+    FoundationBenchmarkManifest, FoundationCausalBatch, FoundationCausalCollator,
+    FoundationCausalOutput, FoundationCheckpointMetadata, FoundationCollator,
+    FoundationCollatorConfig, FoundationCorruptionConfig, FoundationDiffusionCollator,
+    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationLossWeights,
+    FoundationMs2LossConfig, FoundationMs2OutputActivation, FoundationPartition,
+    FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
+    FoundationSamplePlan, FoundationSamplingConfig, FoundationSpectrum, FoundationSpectrumBatch,
+    FoundationSpectrumCollator, FoundationTargetNormalizationConfig, FoundationTrainingRecord,
+    FoundationTrainingViews, PeptideFoundationUnifiedModel, PeptidoformInput,
+    PrecursorContextBatch, RetentionTimeObjective, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -72,11 +74,66 @@ struct UnifiedPilotMetadata {
     forward_objective_weight: f64,
     diffusion_objective_weight: f64,
     causal_objective_weight: f64,
+    causal_conditioning_margin_weight: f64,
+    causal_conditioning_margin_nats: f64,
+    causal_conditioning_negative: String,
     ms2_loss: FoundationMs2LossConfig,
     ms2_output_activation: FoundationMs2OutputActivation,
+    ms2_head_reset: String,
+    ms2_head_reset_channel: Option<usize>,
+    ms2_head_fingerprint_before_reset: Option<String>,
+    ms2_head_fingerprint_after_reset: Option<String>,
     completed_steps: usize,
     forward_config: redeem_properties::foundation::FoundationConfig,
     inverse_config: FoundationDiffusionConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ms2HeadResetMode {
+    None,
+    B2ZeroV0139,
+}
+
+impl Ms2HeadResetMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::B2ZeroV0139 => "b2-zero-v0139",
+        }
+    }
+}
+
+impl std::str::FromStr for Ms2HeadResetMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "b2-zero-v0139" | "b2-zero" => Ok(Self::B2ZeroV0139),
+            other => Err(format!(
+                "unsupported MS2 head reset {other:?}; expected none or b2-zero-v0139"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Ms2HeadResetReport {
+    mode: Ms2HeadResetMode,
+    channel: Option<usize>,
+    fingerprint_before: Option<String>,
+    fingerprint_after: Option<String>,
+}
+
+impl Ms2HeadResetReport {
+    fn none() -> Self {
+        Self {
+            mode: Ms2HeadResetMode::None,
+            channel: None,
+            fingerprint_before: None,
+            fingerprint_after: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -107,17 +164,32 @@ struct InverseMetrics {
     causal_loss: f64,
     causal_perplexity: f64,
     causal_token_accuracy: f64,
+    causal_shuffled_loss: f64,
+    causal_conditioning_gap: f64,
+    causal_conditioning_margin_loss: f64,
+    causal_conditioning_preference_fraction: f64,
+    causal_conditioning_margin_satisfied_fraction: f64,
     alignment_loss: f64,
     alignment_retrieval_top1: f64,
     shuffled_alignment_loss: f64,
     shuffled_alignment_retrieval_top1: f64,
 }
 
+#[derive(Debug)]
+struct CausalTrainObjective {
+    total: Tensor,
+    matched_ce: f64,
+    shuffled_ce: Option<f64>,
+    conditioning_gap: Option<f64>,
+    conditioning_margin_loss: f64,
+    alignment_loss: f64,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 6 || args.len() > 20 {
+    if args.len() < 6 || args.len() > 23 {
         anyhow::bail!(
-            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25] [parent_unified_checkpoint] [ms2_pointwise_weight=1.0] [ms2_cosine_weight=0.0] [ms2_output_activation=relu]"
+            "usage: foundation_train_unified FOUNDATION_TRAINING.yaml OUTPUT_DIR FORWARD_CHECKPOINT DIFFUSION_CHECKPOINT CAUSAL_CHECKPOINT [train_steps=30] [batch_size=8] [validation_batches=8] [seed=20260908] [learning_rate=2e-5] [alignment_weight=0.05] [alignment_temperature=0.07] [forward_objective_weight=0.5] [diffusion_objective_weight=0.25] [causal_objective_weight=0.25] [parent_unified_checkpoint] [ms2_pointwise_weight=1.0] [ms2_cosine_weight=0.0] [ms2_output_activation=relu] [ms2_head_reset=none] [causal_conditioning_margin_weight=0.0] [causal_conditioning_margin_nats=0.25]"
         );
     }
 
@@ -151,6 +223,22 @@ fn main() -> Result<()> {
         .transpose()
         .map_err(anyhow::Error::msg)?
         .unwrap_or_default();
+    let ms2_head_reset = args
+        .get(20)
+        .map(|value| value.parse::<Ms2HeadResetMode>())
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or(Ms2HeadResetMode::None);
+    let causal_conditioning_margin_weight = parse_or(&args, 21, 0.0f64)?;
+    let causal_conditioning_margin_nats = parse_or(&args, 22, 0.25f64)?;
+    if ms2_head_reset == Ms2HeadResetMode::B2ZeroV0139 {
+        if parent_unified_checkpoint.is_none() {
+            anyhow::bail!("b2-zero-v0139 requires a parent unified checkpoint");
+        }
+        if ms2_output_activation != FoundationMs2OutputActivation::SoftplusV0138 {
+            anyhow::bail!("b2-zero-v0139 requires softplus-v0138 MS2 output activation");
+        }
+    }
     let max_gradient_norm = 1.0f64;
     let diffusion_length_weight = 0.1f64;
 
@@ -165,6 +253,13 @@ fn main() -> Result<()> {
     }
     if !(alignment_temperature > 0.0 && alignment_temperature.is_finite()) {
         anyhow::bail!("alignment_temperature must be finite and positive");
+    }
+    if !(causal_conditioning_margin_weight >= 0.0 && causal_conditioning_margin_weight.is_finite())
+    {
+        anyhow::bail!("causal_conditioning_margin_weight must be finite and non-negative");
+    }
+    if !(causal_conditioning_margin_nats >= 0.0 && causal_conditioning_margin_nats.is_finite()) {
+        anyhow::bail!("causal_conditioning_margin_nats must be finite and non-negative");
     }
     for (name, value) in [
         ("forward_objective_weight", forward_objective_weight),
@@ -362,7 +457,7 @@ fn main() -> Result<()> {
             .forward_config
             .parameter_compatible_with(&forward_config)
         {
-            anyhow::bail!("parent unified checkpoint forward parameterization does not match the v0.13.8 candidate");
+            anyhow::bail!("parent unified checkpoint forward parameterization does not match the requested candidate");
         }
         if parent_metadata.inverse_config != inverse_config {
             anyhow::bail!("parent unified checkpoint inverse architecture does not match the supplied inverse checkpoints");
@@ -405,6 +500,11 @@ fn main() -> Result<()> {
                 alignment_seed,
                 fingerprint,
             )
+    };
+
+    let ms2_head_reset_report = match ms2_head_reset {
+        Ms2HeadResetMode::None => Ms2HeadResetReport::none(),
+        Ms2HeadResetMode::B2ZeroV0139 => reset_ms2_output_channel_to_zero(&varmap, 1, &device)?,
     };
 
     let forward_trainer = &forward_metadata.trainer_config;
@@ -473,9 +573,9 @@ fn main() -> Result<()> {
     )?;
 
     fs::create_dir_all(&output_root)?;
-    println!("objective\tunified_forward_diffusion_causal_alignment_v2");
+    println!("objective\tunified_forward_diffusion_causal_alignment_spectrum_margin_v3");
     println!(
-        "schedule\tone_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*causal"
+        "schedule\tone_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*(matched_causal_ce+conditioning_margin_weight*hinge+alignment_weight*alignment)"
     );
     println!("component_batches_per_optimizer_update\t4");
     println!(
@@ -507,6 +607,11 @@ fn main() -> Result<()> {
     println!("forward_objective_weight\t{forward_objective_weight}");
     println!("diffusion_objective_weight\t{diffusion_objective_weight}");
     println!("causal_objective_weight\t{causal_objective_weight}");
+    println!("causal_conditioning_margin_weight\t{causal_conditioning_margin_weight}");
+    println!("causal_conditioning_margin_nats\t{causal_conditioning_margin_nats}");
+    println!(
+        "causal_conditioning_negative\tdeterministic_rotate_left_1_spectrum_only_precursor_and_prefix_fixed"
+    );
     println!("ms2_pointwise_weight\t{}", ms2_loss.pointwise_weight);
     println!("ms2_cosine_weight\t{}", ms2_loss.cosine_weight);
     println!("ms2_output_activation\t{}", ms2_output_activation.as_str());
@@ -517,6 +622,22 @@ fn main() -> Result<()> {
         } else {
             "NA".to_string()
         }
+    );
+    println!(
+        "ms2_head_reset\talgorithm={}\tchannel={}\tfingerprint_before={}\tfingerprint_after={}",
+        ms2_head_reset_report.mode.as_str(),
+        ms2_head_reset_report
+            .channel
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "NA".into()),
+        ms2_head_reset_report
+            .fingerprint_before
+            .as_deref()
+            .unwrap_or("NA"),
+        ms2_head_reset_report
+            .fingerprint_after
+            .as_deref()
+            .unwrap_or("NA"),
     );
     println!(
         "forward_component_weight\t{}",
@@ -554,9 +675,9 @@ fn main() -> Result<()> {
 
     let metadata = |completed_steps| {
         UnifiedPilotMetadata {
-        version: 6,
-        objective: "unified_forward_diffusion_causal_alignment_v2".into(),
-        schedule: "one_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*causal".into(),
+        version: 8,
+        objective: "unified_forward_diffusion_causal_alignment_spectrum_margin_v3".into(),
+        schedule: "one_optimizer_update=0.5*forward_weight*forward_a+0.5*forward_weight*forward_b+diffusion_weight*diffusion+causal_weight*(matched_causal_ce+conditioning_margin_weight*hinge+alignment_weight*alignment)".into(),
         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
         benchmark_manifest_fingerprint: format!(
             "fnv1a64:{:016x}",
@@ -586,8 +707,16 @@ fn main() -> Result<()> {
         forward_objective_weight,
         diffusion_objective_weight,
         causal_objective_weight,
+        causal_conditioning_margin_weight,
+        causal_conditioning_margin_nats,
+        causal_conditioning_negative:
+            "deterministic_rotate_left_1_spectrum_only_precursor_and_prefix_fixed".into(),
         ms2_loss,
         ms2_output_activation,
+        ms2_head_reset: ms2_head_reset_report.mode.as_str().into(),
+        ms2_head_reset_channel: ms2_head_reset_report.channel,
+        ms2_head_fingerprint_before_reset: ms2_head_reset_report.fingerprint_before.clone(),
+        ms2_head_fingerprint_after_reset: ms2_head_reset_report.fingerprint_after.clone(),
         completed_steps,
         forward_config: forward_config.clone(),
         inverse_config: inverse_config.clone(),
@@ -616,6 +745,7 @@ fn main() -> Result<()> {
             &target_normalization,
             ms2_loss,
             alignment_temperature,
+            causal_conditioning_margin_nats,
             &device,
         )?,
     );
@@ -702,7 +832,7 @@ fn main() -> Result<()> {
             .iter()
             .map(|&index| &corpus.records[index])
             .collect();
-        let (causal, causal_alignment) = causal_loss(
+        let causal = causal_loss(
             &model,
             &causal_records,
             &clean_collator,
@@ -711,23 +841,30 @@ fn main() -> Result<()> {
             &target_normalization,
             alignment_weight,
             alignment_temperature,
+            causal_conditioning_margin_weight,
+            causal_conditioning_margin_nats,
             &device,
         )?;
 
         let forward_a_value = f64::from(forward_a.to_scalar::<f32>()?);
         let forward_b_value = f64::from(forward_b.to_scalar::<f32>()?);
         let diffusion_value = f64::from(diffusion.to_scalar::<f32>()?);
-        let causal_value = f64::from(causal.to_scalar::<f32>()?);
+        let causal_value = f64::from(causal.total.to_scalar::<f32>()?);
         let forward_a_weighted = forward_a.affine(0.5 * forward_objective_weight, 0.0)?;
         let forward_b_weighted = forward_b.affine(0.5 * forward_objective_weight, 0.0)?;
         let diffusion_weighted = diffusion.affine(diffusion_objective_weight, 0.0)?;
-        let causal_weighted = causal.affine(causal_objective_weight, 0.0)?;
+        let causal_weighted = causal.total.affine(causal_objective_weight, 0.0)?;
         let total =
             (((forward_a_weighted + forward_b_weighted)? + diffusion_weighted)? + causal_weighted)?;
         let total_value = f64::from(total.to_scalar::<f32>()?);
         let update = optimizer.backward_step(&total, Some(max_gradient_norm))?;
         println!(
-            "train\tstep={step}\tforward_a={forward_a_value:.6}\tforward_b={forward_b_value:.6}\tdiffusion={diffusion_value:.6}\tcausal={causal_value:.6}\tdiffusion_alignment={diffusion_alignment:.6}\tcausal_alignment={causal_alignment:.6}\tforward_weight={forward_objective_weight:.6}\tdiffusion_weight={diffusion_objective_weight:.6}\tcausal_weight={causal_objective_weight:.6}\ttotal={total_value:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+            "train\tstep={step}\tforward_a={forward_a_value:.6}\tforward_b={forward_b_value:.6}\tdiffusion={diffusion_value:.6}\tcausal={causal_value:.6}\tcausal_matched_ce={:.6}\tcausal_shuffled_ce={}\tcausal_conditioning_gap={}\tcausal_conditioning_margin_loss={:.6}\tdiffusion_alignment={diffusion_alignment:.6}\tcausal_alignment={:.6}\tforward_weight={forward_objective_weight:.6}\tdiffusion_weight={diffusion_objective_weight:.6}\tcausal_weight={causal_objective_weight:.6}\tconditioning_margin_weight={causal_conditioning_margin_weight:.6}\tconditioning_margin_nats={causal_conditioning_margin_nats:.6}\ttotal={total_value:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+            causal.matched_ce,
+            fmt_opt(causal.shuffled_ce),
+            fmt_opt(causal.conditioning_gap),
+            causal.conditioning_margin_loss,
+            causal.alignment_loss,
             update.gradient_norm,
             update.gradient_scale,
         );
@@ -746,6 +883,7 @@ fn main() -> Result<()> {
                 &target_normalization,
                 ms2_loss,
                 alignment_temperature,
+                causal_conditioning_margin_nats,
                 &device,
             )?;
             print_evaluation("validation", step, metrics);
@@ -861,8 +999,13 @@ fn causal_loss(
     _normalization: &FoundationTargetNormalizationConfig,
     alignment_weight: f64,
     alignment_temperature: f64,
+    conditioning_margin_weight: f64,
+    conditioning_margin_nats: f64,
     device: &Device,
-) -> Result<(Tensor, f64)> {
+) -> Result<CausalTrainObjective> {
+    if conditioning_margin_weight > 0.0 && records.len() < 2 {
+        anyhow::bail!("causal conditioning margin requires at least two records per batch");
+    }
     let peptides: Vec<PeptidoformInput> = records
         .iter()
         .map(|record| record.peptidoform.clone())
@@ -874,6 +1017,36 @@ fn causal_loss(
         .causal()
         .forward_t(&causal.input, &spectrum, &precursor, true)?;
     let causal_ce = foundation_causal_next_token_loss(&output, &causal)?;
+    let matched_ce = f64::from(causal_ce.to_scalar::<f32>()?);
+
+    // v0.13.12 conditioning intervention: only the spectrum is rotated. The
+    // teacher-forced peptide prefixes and precursor context remain matched to
+    // the target peptide, so the hinge cannot be solved by peptide-language or
+    // precursor-mass shortcuts alone.
+    let (conditioning_penalty, shuffled_ce, conditioning_gap) = if conditioning_margin_weight > 0.0
+    {
+        let shuffled_spectrum = collate_spectra(records, spectrum_collator, true, device)?;
+        let shuffled_output =
+            model
+                .causal()
+                .forward_t(&causal.input, &shuffled_spectrum, &precursor, true)?;
+        let shuffled_loss = foundation_causal_next_token_loss(&shuffled_output, &causal)?;
+        let shuffled_value = f64::from(shuffled_loss.to_scalar::<f32>()?);
+        let penalty = foundation_causal_conditioning_margin_loss(
+            &causal_ce,
+            &shuffled_loss,
+            conditioning_margin_nats,
+        )?;
+        (
+            penalty,
+            Some(shuffled_value),
+            Some(shuffled_value - matched_ce),
+        )
+    } else {
+        (Tensor::new(0.0f32, device)?, None, None)
+    };
+    let conditioning_margin_loss = f64::from(conditioning_penalty.to_scalar::<f32>()?);
+
     let peptide_projection =
         clean_peptide_projection(model, records, clean_collator, true, device)?;
     let spectrum_projection = model.project_spectrum_embedding(&output.spectrum_embedding)?;
@@ -882,9 +1055,17 @@ fn causal_loss(
         &peptide_projection,
         alignment_temperature,
     )?;
-    let alignment_value = f64::from(alignment.to_scalar::<f32>()?);
-    let total = (causal_ce + alignment.affine(alignment_weight, 0.0)?)?;
-    Ok((total, alignment_value))
+    let alignment_loss = f64::from(alignment.to_scalar::<f32>()?);
+    let total = ((causal_ce + conditioning_penalty.affine(conditioning_margin_weight, 0.0)?)?
+        + alignment.affine(alignment_weight, 0.0)?)?;
+    Ok(CausalTrainObjective {
+        total,
+        matched_ce,
+        shuffled_ce,
+        conditioning_gap,
+        conditioning_margin_loss,
+        alignment_loss,
+    })
 }
 
 fn normalize_targets(
@@ -966,6 +1147,113 @@ fn alignment_gradient_probe(
         gradient_norm_for_prefix(varmap, &gradients, "alignment.spectrum_projection.")?,
     );
     Ok(())
+}
+
+const MS2_HEAD_WEIGHT_NAME: &str = "heads.ms2.weight";
+const MS2_HEAD_BIAS_NAME: &str = "heads.ms2.bias";
+
+/// Controlled v0.13.9 intervention: reset exactly one output row of the final MS2
+/// linear head to zero while preserving every other row and every other variable.
+///
+/// With the accepted Softplus(beta=5) activation this yields a neutral initial
+/// output ln(2)/5 for that channel and a local derivative of 0.5, restoring a
+/// healthy optimization path without changing parameter names or shapes.
+fn reset_ms2_output_channel_to_zero(
+    varmap: &VarMap,
+    channel: usize,
+    device: &Device,
+) -> Result<Ms2HeadResetReport> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("unified VarMap lock poisoned"))?;
+    let weight = data
+        .get(MS2_HEAD_WEIGHT_NAME)
+        .ok_or_else(|| anyhow::anyhow!("missing {MS2_HEAD_WEIGHT_NAME}"))?;
+    let bias = data
+        .get(MS2_HEAD_BIAS_NAME)
+        .ok_or_else(|| anyhow::anyhow!("missing {MS2_HEAD_BIAS_NAME}"))?;
+
+    let (out_dim, in_dim) = weight.as_tensor().dims2()?;
+    if bias.as_tensor().dims1()? != out_dim {
+        anyhow::bail!(
+            "MS2 head bias shape {:?} is incompatible with weight shape {:?}",
+            bias.as_tensor().dims(),
+            weight.as_tensor().dims()
+        );
+    }
+    if channel >= out_dim {
+        anyhow::bail!(
+            "cannot reset MS2 channel {channel}; head has only {out_dim} output channels"
+        );
+    }
+
+    let mut weights = weight.as_tensor().to_vec2::<f32>()?;
+    let mut biases = bias.as_tensor().to_vec1::<f32>()?;
+    let fingerprint_before = ms2_head_values_fingerprint(&weights, &biases);
+
+    for value in &mut weights[channel] {
+        *value = 0.0;
+    }
+    biases[channel] = 0.0;
+
+    let fingerprint_after = ms2_head_values_fingerprint(&weights, &biases);
+    let flat_weights = weights.into_iter().flatten().collect::<Vec<_>>();
+    weight.set(&Tensor::from_vec(flat_weights, (out_dim, in_dim), device)?)?;
+    bias.set(&Tensor::from_vec(biases, out_dim, device)?)?;
+    drop(data);
+
+    let observed_after = ms2_head_fingerprint(varmap)?;
+    if observed_after != fingerprint_after {
+        anyhow::bail!(
+            "MS2 head reset verification failed: expected {fingerprint_after}, observed {observed_after}"
+        );
+    }
+
+    Ok(Ms2HeadResetReport {
+        mode: Ms2HeadResetMode::B2ZeroV0139,
+        channel: Some(channel),
+        fingerprint_before: Some(fingerprint_before),
+        fingerprint_after: Some(fingerprint_after),
+    })
+}
+
+fn ms2_head_fingerprint(varmap: &VarMap) -> Result<String> {
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("unified VarMap lock poisoned"))?;
+    let weight = data
+        .get(MS2_HEAD_WEIGHT_NAME)
+        .ok_or_else(|| anyhow::anyhow!("missing {MS2_HEAD_WEIGHT_NAME}"))?;
+    let bias = data
+        .get(MS2_HEAD_BIAS_NAME)
+        .ok_or_else(|| anyhow::anyhow!("missing {MS2_HEAD_BIAS_NAME}"))?;
+    Ok(ms2_head_values_fingerprint(
+        &weight.as_tensor().to_vec2::<f32>()?,
+        &bias.as_tensor().to_vec1::<f32>()?,
+    ))
+}
+
+fn ms2_head_values_fingerprint(weights: &[Vec<f32>], biases: &[f32]) -> String {
+    let mut hash = FNV1A64_OFFSET;
+    fnv1a64_bytes(&mut hash, MS2_HEAD_WEIGHT_NAME.as_bytes());
+    fnv1a64_bytes(&mut hash, &(weights.len() as u64).to_le_bytes());
+    fnv1a64_bytes(
+        &mut hash,
+        &(weights.first().map(Vec::len).unwrap_or(0) as u64).to_le_bytes(),
+    );
+    for row in weights {
+        for value in row {
+            fnv1a64_bytes(&mut hash, &value.to_bits().to_le_bytes());
+        }
+    }
+    fnv1a64_bytes(&mut hash, MS2_HEAD_BIAS_NAME.as_bytes());
+    fnv1a64_bytes(&mut hash, &(biases.len() as u64).to_le_bytes());
+    for value in biases {
+        fnv1a64_bytes(&mut hash, &value.to_bits().to_le_bytes());
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 const ALIGNMENT_WEIGHT_NAME: &str = "alignment.spectrum_projection.weight";
@@ -1284,6 +1572,7 @@ fn evaluate_all(
     normalization: &FoundationTargetNormalizationConfig,
     ms2_loss: FoundationMs2LossConfig,
     alignment_temperature: f64,
+    causal_conditioning_margin_nats: f64,
     device: &Device,
 ) -> Result<(PropertyMetrics, InverseMetrics)> {
     let properties = evaluate_properties(
@@ -1306,6 +1595,7 @@ fn evaluate_all(
         causal_collator,
         spectrum_collator,
         alignment_temperature,
+        causal_conditioning_margin_nats,
         device,
     )?;
     Ok((properties, inverse))
@@ -1402,12 +1692,17 @@ fn evaluate_inverse(
     causal_collator: &FoundationCausalCollator,
     spectrum_collator: &FoundationSpectrumCollator,
     alignment_temperature: f64,
+    causal_conditioning_margin_nats: f64,
     device: &Device,
 ) -> Result<InverseMetrics> {
     let mut metrics = InverseMetrics::default();
     let mut batches = 0usize;
+    let mut causal_sequence_records = 0usize;
     for chunk in indices.chunks(batch_size) {
         let selected: Vec<&FoundationTrainingRecord> = chunk.iter().map(|&i| &records[i]).collect();
+        if selected.len() < 2 {
+            anyhow::bail!("causal conditioning validation requires at least two records per batch");
+        }
         let peptides: Vec<PeptidoformInput> = selected
             .iter()
             .map(|record| record.peptidoform.clone())
@@ -1449,6 +1744,44 @@ fn evaluate_inverse(
             &causal.target_classes,
         )?;
 
+        let shuffled_causal_output =
+            model
+                .causal()
+                .forward_t(&causal.input, &shuffled_spectrum, &precursor, false)?;
+        let shuffled_causal_loss =
+            foundation_causal_next_token_loss(&shuffled_causal_output, &causal)?;
+        let shuffled_causal_loss_value = f64::from(shuffled_causal_loss.to_scalar::<f32>()?);
+        metrics.causal_shuffled_loss += shuffled_causal_loss_value;
+        metrics.causal_conditioning_gap += shuffled_causal_loss_value - causal_loss_value;
+        metrics.causal_conditioning_margin_loss += f64::from(
+            foundation_causal_conditioning_margin_loss(
+                &causal_loss,
+                &shuffled_causal_loss,
+                causal_conditioning_margin_nats,
+            )?
+            .to_scalar::<f32>()?,
+        );
+
+        let matched_sequence_nlls = causal_sequence_nlls(&causal_output, &causal)?;
+        let shuffled_sequence_nlls = causal_sequence_nlls(&shuffled_causal_output, &causal)?;
+        if matched_sequence_nlls.len() != shuffled_sequence_nlls.len() {
+            anyhow::bail!("matched/shuffled causal sequence diagnostics disagree on batch size");
+        }
+        for (matched, shuffled) in matched_sequence_nlls
+            .iter()
+            .zip(shuffled_sequence_nlls.iter())
+        {
+            let gap = shuffled - matched;
+            metrics.causal_conditioning_preference_fraction += if gap > 0.0 { 1.0 } else { 0.0 };
+            metrics.causal_conditioning_margin_satisfied_fraction +=
+                if gap >= causal_conditioning_margin_nats {
+                    1.0
+                } else {
+                    0.0
+                };
+        }
+        causal_sequence_records += matched_sequence_nlls.len();
+
         let peptide_projection =
             clean_peptide_projection(model, &selected, clean_collator, false, device)?;
         let matched_projection =
@@ -1488,6 +1821,15 @@ fn evaluate_inverse(
     metrics.causal_loss /= n;
     metrics.causal_perplexity /= n;
     metrics.causal_token_accuracy /= n;
+    metrics.causal_shuffled_loss /= n;
+    metrics.causal_conditioning_gap /= n;
+    metrics.causal_conditioning_margin_loss /= n;
+    if causal_sequence_records == 0 {
+        anyhow::bail!("causal conditioning validation produced zero sequence records");
+    }
+    let sequence_n = causal_sequence_records as f64;
+    metrics.causal_conditioning_preference_fraction /= sequence_n;
+    metrics.causal_conditioning_margin_satisfied_fraction /= sequence_n;
     metrics.alignment_loss /= n;
     metrics.alignment_retrieval_top1 /= n;
     metrics.shuffled_alignment_loss /= n;
@@ -1522,6 +1864,54 @@ fn accumulate_regression(
         *count += 1;
     }
     Ok(())
+}
+
+fn causal_sequence_nlls(
+    output: &FoundationCausalOutput,
+    batch: &FoundationCausalBatch,
+) -> Result<Vec<f64>> {
+    let logits = output.token_logits.to_vec3::<f32>()?;
+    let targets = batch.target_tokens.to_vec2::<u32>()?;
+    let masks = batch.input.token_mask.to_vec2::<f32>()?;
+    if logits.len() != targets.len() || logits.len() != masks.len() {
+        anyhow::bail!("causal sequence diagnostics disagree on batch dimension");
+    }
+    let mut losses = Vec::with_capacity(logits.len());
+    for batch_index in 0..logits.len() {
+        if logits[batch_index].len() != targets[batch_index].len()
+            || logits[batch_index].len() != masks[batch_index].len()
+        {
+            anyhow::bail!("causal sequence diagnostics disagree on token width");
+        }
+        let mut nll_sum = 0.0f64;
+        let mut active = 0usize;
+        for position in 0..logits[batch_index].len() {
+            if masks[batch_index][position] <= 0.0 {
+                continue;
+            }
+            let row = &logits[batch_index][position];
+            let target = targets[batch_index][position] as usize;
+            if target >= row.len() {
+                anyhow::bail!(
+                    "causal sequence target class {target} exceeds logits width {}",
+                    row.len()
+                );
+            }
+            let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let exp_sum = row
+                .iter()
+                .map(|&value| (f64::from(value) - max_logit).exp())
+                .sum::<f64>();
+            let logsumexp = max_logit + exp_sum.ln();
+            nll_sum += logsumexp - f64::from(row[target]);
+            active += 1;
+        }
+        if active == 0 {
+            anyhow::bail!("causal sequence diagnostics encountered an empty target row");
+        }
+        losses.push(nll_sum / active as f64);
+    }
+    Ok(losses)
 }
 
 fn token_accuracy(logits: &Tensor, active_indices: &Tensor, classes: &Tensor) -> Result<f64> {
@@ -1804,17 +2194,29 @@ fn print_evaluation(label: &str, step: usize, metrics: (PropertyMetrics, Inverse
         fmt_opt(p.ms2_mean_target_intensity),
     );
     println!(
-        "{label}_inverse\tstep={step}\tdiffusion_loss={:.6}\tdiffusion_length_loss={:.6}\tdiffusion_token_accuracy={:.6}\tcausal_loss={:.6}\tcausal_perplexity={:.4}\tcausal_token_accuracy={:.6}\talignment_loss={:.6}\talignment_retrieval_top1={:.6}\tshuffled_alignment_loss={:.6}\tshuffled_alignment_retrieval_top1={:.6}",
+        "{label}_inverse\tstep={step}\tdiffusion_loss={:.6}\tdiffusion_length_loss={:.6}\tdiffusion_token_accuracy={:.6}\tcausal_loss={:.6}\tcausal_perplexity={:.4}\tcausal_token_accuracy={:.6}\tcausal_shuffled_loss={:.6}\tcausal_conditioning_gap={:.6}\tcausal_conditioning_margin_loss={:.6}\tcausal_conditioning_preference_fraction={:.6}\tcausal_conditioning_margin_satisfied_fraction={:.6}\talignment_loss={:.6}\talignment_retrieval_top1={:.6}\tshuffled_alignment_loss={:.6}\tshuffled_alignment_retrieval_top1={:.6}",
         i.diffusion_loss,
         i.diffusion_length_loss,
         i.diffusion_token_accuracy,
         i.causal_loss,
         i.causal_perplexity,
         i.causal_token_accuracy,
+        i.causal_shuffled_loss,
+        i.causal_conditioning_gap,
+        i.causal_conditioning_margin_loss,
+        i.causal_conditioning_preference_fraction,
+        i.causal_conditioning_margin_satisfied_fraction,
         i.alignment_loss,
         i.alignment_retrieval_top1,
         i.shuffled_alignment_loss,
         i.shuffled_alignment_retrieval_top1,
+    );
+    println!(
+        "{label}_causal_conditioning_ablation\tstep={step}\tshuffled_minus_matched_nll={:.6}\tpreference_fraction={:.6}\tmargin_satisfied_fraction={:.6}\tmargin_hinge={:.6}",
+        i.causal_conditioning_gap,
+        i.causal_conditioning_preference_fraction,
+        i.causal_conditioning_margin_satisfied_fraction,
+        i.causal_conditioning_margin_loss,
     );
     println!(
         "{label}_alignment_ablation\tstep={step}\tloss_delta={:.6}\tretrieval_top1_delta={:.6}",

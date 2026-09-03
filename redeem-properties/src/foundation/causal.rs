@@ -630,6 +630,25 @@ pub fn foundation_causal_next_token_loss(
     loss::cross_entropy(&selected_logits, &batch.target_classes)
 }
 
+/// Hinge penalty that makes causal next-token likelihood spectrum-discriminative.
+///
+/// `matched_loss` and `shuffled_loss` are the same teacher-forced target loss
+/// evaluated with the correct spectrum and a deliberately mismatched spectrum,
+/// respectively. The penalty is
+/// `max(0, margin + matched_loss - shuffled_loss)`, so minimizing it requires
+/// the matched spectrum to beat the shuffled spectrum by at least `margin` nats.
+/// Prefix tokens and precursor context are intentionally held fixed by callers.
+pub fn foundation_causal_conditioning_margin_loss(
+    matched_loss: &Tensor,
+    shuffled_loss: &Tensor,
+    margin: f64,
+) -> Result<Tensor> {
+    if !(margin >= 0.0 && margin.is_finite()) {
+        candle_core::bail!("causal conditioning margin must be finite and non-negative");
+    }
+    (matched_loss - shuffled_loss)?.affine(1.0, margin)?.relu()
+}
+
 /// Warm-start report for loading an old diffusion checkpoint into the causal lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoundationCausalWarmStartReport {
@@ -700,4 +719,34 @@ pub fn load_causal_from_diffusion_checkpoint(
         causal_only_variables,
         ignored_checkpoint_variables,
     })
+}
+
+#[cfg(test)]
+mod conditioning_margin_tests {
+    use super::foundation_causal_conditioning_margin_loss;
+    use candle_core::{Device, Tensor};
+
+    #[test]
+    fn conditioning_margin_is_zero_after_required_gap() {
+        let device = Device::Cpu;
+        let matched = Tensor::new(&[1.0f32], &device).unwrap();
+        let shuffled = Tensor::new(&[1.5f32], &device).unwrap();
+        let loss = foundation_causal_conditioning_margin_loss(&matched, &shuffled, 0.25)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()[0];
+        assert!(loss.abs() < 1.0e-7);
+    }
+
+    #[test]
+    fn conditioning_margin_penalizes_insufficient_gap() {
+        let device = Device::Cpu;
+        let matched = Tensor::new(&[1.0f32], &device).unwrap();
+        let shuffled = Tensor::new(&[1.1f32], &device).unwrap();
+        let loss = foundation_causal_conditioning_margin_loss(&matched, &shuffled, 0.25)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()[0];
+        assert!((loss - 0.15).abs() < 1.0e-6);
+    }
 }

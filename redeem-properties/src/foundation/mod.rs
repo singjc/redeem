@@ -41,11 +41,12 @@ pub mod unified;
 pub mod wrapper;
 
 pub use causal::{
-    foundation_causal_next_token_loss, foundation_fragment_causal_rerank_score,
-    load_causal_from_diffusion_checkpoint, FoundationCausalBatch, FoundationCausalCollator,
-    FoundationCausalContext, FoundationCausalInputBatch, FoundationCausalOutput,
-    FoundationCausalWarmStartReport, PeptideSpectrumCausalModel,
-    FOUNDATION_CAUSAL_RERANK_POLICY_V0123, FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123,
+    foundation_causal_conditioning_margin_loss, foundation_causal_next_token_loss,
+    foundation_fragment_causal_rerank_score, load_causal_from_diffusion_checkpoint,
+    FoundationCausalBatch, FoundationCausalCollator, FoundationCausalContext,
+    FoundationCausalInputBatch, FoundationCausalOutput, FoundationCausalWarmStartReport,
+    PeptideSpectrumCausalModel, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
+    FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123,
 };
 pub use ccs_physics::{
     evaluate_foundation_ccs_physics_baseline, fit_foundation_ccs_physics_baseline,
