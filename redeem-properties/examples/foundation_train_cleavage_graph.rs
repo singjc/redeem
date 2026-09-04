@@ -1,25 +1,30 @@
-//! Train the isolated v0.13.16 spectrum-conditioned cleavage-mass graph edge scorer.
+//! Train the isolated v0.13.18 contextual globally structured cleavage-graph scorer.
 //!
 //! The accepted v0.13.10 unified model and v0.13.13 reverse-causal checkpoint
-//! are read only for provenance/compatibility checks. The optimizer owns only
-//! `cleavage_graph.*` variables.
+//! are read only for provenance/compatibility checks. The v0.13.17 anchor-bridge
+//! graph construction is frozen; only fresh `cleavage_graph_structured.*`
+//! parameters are optimized with exact source-to-sink structured path NLL.
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_build_cleavage_graph, foundation_cleavage_graph_outgoing_edge_loss,
-    foundation_cleavage_graph_training_batch, foundation_cleavage_graph_true_path_audit,
+    foundation_build_cleavage_graph, foundation_cleavage_graph_structured_decode,
+    foundation_cleavage_graph_structured_loss, foundation_cleavage_graph_true_path_audit,
     foundation_diffusion_dataset_fingerprint, load_foundation_corpus,
-    read_foundation_training_run_config, validate_cleavage_graph_namespace, FoundationAdamW,
-    FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationDiffusionConfig,
-    FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
-    FoundationTrainingRecord, PeptideSpectrumCleavageGraphScorer,
-    FOUNDATION_CLEAVAGE_GRAPH_HIDDEN_DIM_V01316, FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316,
+    read_foundation_training_run_config, validate_cleavage_graph_structured_namespace,
+    FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCleavageGraph,
+    FoundationCleavageGraphTruePathAudit, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
+    FoundationPartition, FoundationSpectrum, FoundationTrainingRecord,
+    PeptideSpectrumCleavageGraphStructuredScorer, FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316,
     FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_MAX_ANCHOR_BRIDGE_EDGES_V01317,
     FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316,
     FOUNDATION_CLEAVAGE_GRAPH_MAX_OUTGOING_EDGES_V01316,
-    FOUNDATION_CLEAVAGE_GRAPH_NAMESPACE_V01316, FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318,
+    FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318,
+    FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_NAMESPACE_V01318,
+    FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_OBJECTIVE_V01318,
     FOUNDATION_REVERSE_CAUSAL_DIRECTION_V01313, FOUNDATION_REVERSE_CAUSAL_NAMESPACE_V01313,
 };
 use serde::{Deserialize, Serialize};
@@ -76,6 +81,8 @@ struct CleavageGraphCheckpointMetadata {
     maximum_outgoing_edges: usize,
     k_best_graph_paths: usize,
     maximum_fragment_charge: usize,
+    maximum_anchor_bridge_edges: usize,
+    feature_dim: usize,
     hidden_dim: usize,
     parent_unified_checkpoint: String,
     parent_unified_completed_steps: usize,
@@ -88,14 +95,17 @@ struct CleavageGraphCheckpointMetadata {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct GraphMetrics {
-    mean_loss: f64,
-    outgoing_edge_accuracy: f64,
+    mean_nll: f64,
     structural_coverage: f64,
     true_node_coverage: f64,
     true_edge_coverage: f64,
     graph_records: usize,
     structural_records: usize,
-    classification_groups: usize,
+    structured_edges: usize,
+    true_path_top1: usize,
+    true_path_top8: usize,
+    true_path_top32: usize,
+    true_path_top64: usize,
 }
 
 fn main() -> Result<()> {
@@ -194,8 +204,8 @@ fn main() -> Result<()> {
     fs::create_dir_all(&output_root)?;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = PeptideSpectrumCleavageGraphScorer::new(vb)?;
-    validate_cleavage_graph_namespace(&varmap)?;
+    let model = PeptideSpectrumCleavageGraphStructuredScorer::new(vb)?;
+    validate_cleavage_graph_structured_namespace(&varmap)?;
     let mut optimizer = FoundationAdamW::new(
         &varmap,
         FoundationAdamWConfig {
@@ -204,9 +214,9 @@ fn main() -> Result<()> {
         },
     )?;
 
-    println!("objective\t{FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01316}");
-    println!("parameter_namespace\t{FOUNDATION_CLEAVAGE_GRAPH_NAMESPACE_V01316}");
-    println!("optimizer_scope\tcleavage_graph_only");
+    println!("objective\t{FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_OBJECTIVE_V01318}");
+    println!("parameter_namespace\t{FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_NAMESPACE_V01318}");
+    println!("optimizer_scope\tcleavage_graph_structured_only");
     println!("parent_unified_frozen\tYES");
     println!("diffusion_parameters_in_optimizer\tNO");
     println!("n_to_c_causal_parameters_in_optimizer\tNO");
@@ -242,7 +252,12 @@ fn main() -> Result<()> {
         "maximum_fragment_charge\t{}",
         FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316
     );
-    println!("edge_scorer_hidden_dim\t{FOUNDATION_CLEAVAGE_GRAPH_HIDDEN_DIM_V01316}");
+    println!(
+        "maximum_anchor_bridge_edges\t{}",
+        FOUNDATION_CLEAVAGE_GRAPH_MAX_ANCHOR_BRIDGE_EDGES_V01317
+    );
+    println!("structured_feature_dim\t{FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318}");
+    println!("structured_hidden_dim\t{FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318}");
     println!("parent_unified_checkpoint\t{}", parent_model_path.display());
     println!(
         "parent_unified_completed_steps\t{}",
@@ -252,8 +267,14 @@ fn main() -> Result<()> {
         "reverse_causal_checkpoint\t{}",
         resolve_model_safetensors(&reverse_checkpoint).display()
     );
-    println!("graph_construction\tobserved_b_like+precursor_complementary_y_like_v01316");
-    println!("training_target\tper_true_source_node_outgoing_edge_ce_v01316");
+    println!(
+        "graph_construction\tobserved_fragment_anchors+chemistry_bridges_up_to_3_edges_v01317"
+    );
+    println!("bridge_node_spectrum_support\tzero_direct_support");
+    println!("context_propagation\tforward+backward_dag_support_hops_path_multiplicity_v01318");
+    println!("training_target\texact_global_source_to_sink_path_nll_v01318");
+    println!("structured_partition\texact_dag_logsumexp");
+    println!("structured_gradient\texact_edge_marginal_minus_true_indicator");
 
     let (structurally_present, structural_records) =
         report_true_path_structural_presence(&corpus.records, &validation_selection)?;
@@ -270,10 +291,11 @@ fn main() -> Result<()> {
         &validation_selection,
         BATCH_SIZE,
         &device,
+        false,
     )?;
     println_metrics("initial_validation", 0, initial);
 
-    let mut best_validation_loss = initial.mean_loss;
+    let mut best_validation_loss = initial.mean_nll;
     let mut best_validation_structural_coverage = initial.structural_coverage;
     let initial_metadata = checkpoint_metadata(
         &parent_metadata,
@@ -309,18 +331,20 @@ fn main() -> Result<()> {
             .iter()
             .map(|(graph, audit)| (graph, audit))
             .collect::<Vec<_>>();
-        let Some(batch) = foundation_cleavage_graph_training_batch(&refs, &device)? else {
+        let Some((loss, structured_stats)) =
+            foundation_cleavage_graph_structured_loss(&model, &refs, &device)?
+        else {
             continue;
         };
-        let loss = foundation_cleavage_graph_outgoing_edge_loss(&model, &batch)?;
         let optimizer_step = optimizer.backward_step(&loss, Some(MAX_GRADIENT_NORM))?;
         global_step += 1;
 
         if global_step == 1 || global_step % 25 == 0 {
             println!(
-                "train_step\tstep={global_step}\tloss={:.6}\tgroups={}\tpre_clip_gradient_norm={:.6}\tgradient_scale={:.6}",
-                f64::from(loss.to_scalar::<f32>()?),
-                batch.groups,
+                "train_step\tstep={global_step}\tstructured_nll={:.6}\tgraphs={}\tedges={}\tpre_clip_gradient_norm={:.6}\tgradient_scale={:.6}",
+                structured_stats.mean_nll,
+                structured_stats.graphs,
+                structured_stats.edges,
                 optimizer_step.gradient_norm,
                 optimizer_step.gradient_scale
             );
@@ -333,10 +357,11 @@ fn main() -> Result<()> {
                 &validation_selection,
                 BATCH_SIZE,
                 &device,
+                false,
             )?;
             println_metrics("validation", global_step, validation);
-            if validation.mean_loss < best_validation_loss {
-                best_validation_loss = validation.mean_loss;
+            if validation.mean_nll < best_validation_loss {
+                best_validation_loss = validation.mean_nll;
                 best_validation_structural_coverage = validation.structural_coverage;
                 let metadata = checkpoint_metadata(
                     &parent_metadata,
@@ -363,6 +388,7 @@ fn main() -> Result<()> {
         &validation_selection,
         BATCH_SIZE,
         &device,
+        true,
     )?;
     let final_metadata = checkpoint_metadata(
         &parent_metadata,
@@ -470,8 +496,8 @@ fn build_examples(
     indices: &[usize],
 ) -> Result<
     Vec<(
-        redeem_properties::foundation::FoundationCleavageGraph,
-        redeem_properties::foundation::FoundationCleavageGraphTruePathAudit,
+        FoundationCleavageGraph,
+        FoundationCleavageGraphTruePathAudit,
     )>,
 > {
     let mut examples = Vec::new();
@@ -495,100 +521,123 @@ fn build_examples(
 }
 
 fn evaluate(
-    model: &PeptideSpectrumCleavageGraphScorer,
+    model: &PeptideSpectrumCleavageGraphStructuredScorer,
     records: &[FoundationTrainingRecord],
     indices: &[usize],
-    batch_size: usize,
+    _batch_size: usize,
     device: &Device,
+    emit_record_diagnostics: bool,
 ) -> Result<GraphMetrics> {
-    let mut loss_weighted_sum = 0.0f64;
-    let mut correct = 0usize;
-    let mut classification_groups = 0usize;
+    let mut nll_sum = 0.0f64;
     let mut graph_records = 0usize;
     let mut structural_records = 0usize;
     let mut present_nodes = 0usize;
     let mut total_nodes = 0usize;
     let mut present_edges = 0usize;
     let mut total_edges = 0usize;
+    let mut structured_edges = 0usize;
+    let mut true_path_top1 = 0usize;
+    let mut true_path_top8 = 0usize;
+    let mut true_path_top32 = 0usize;
+    let mut true_path_top64 = 0usize;
 
-    for chunk in indices.chunks(batch_size) {
-        let mut packed = Vec::new();
-        for &index in chunk {
-            let record = &records[index];
-            let true_edges = record.peptidoform.sequence.chars().count();
-            graph_records += 1;
-            total_edges += true_edges;
-            total_nodes += true_edges + 1;
+    for &index in indices {
+        let record = &records[index];
+        let true_edges = record.peptidoform.sequence.chars().count();
+        graph_records += 1;
+        total_edges += true_edges;
+        total_nodes += true_edges + 1;
 
-            let Some(spectrum) = FoundationSpectrum::from_training_record(record) else {
-                continue;
-            };
-            let Some(graph) =
-                foundation_build_cleavage_graph(record, &spectrum).map_err(anyhow::Error::msg)?
-            else {
-                continue;
-            };
-            let Ok(audit) = foundation_cleavage_graph_true_path_audit(&graph, &record.peptidoform)
-            else {
-                continue;
-            };
-            structural_records += usize::from(audit.structurally_present);
-            present_nodes += audit.present_nodes;
-            present_edges += audit.present_edges;
-            packed.push((graph, audit));
-        }
-
-        let refs = packed
-            .iter()
-            .map(|(graph, audit)| (graph, audit))
-            .collect::<Vec<_>>();
-        let Some(batch) = foundation_cleavage_graph_training_batch(&refs, device)? else {
+        let Some(spectrum) = FoundationSpectrum::from_training_record(record) else {
             continue;
         };
-        let loss = foundation_cleavage_graph_outgoing_edge_loss(model, &batch)?;
-        loss_weighted_sum += f64::from(loss.to_scalar::<f32>()?) * batch.groups as f64;
-        let logits = model.forward_batch(&batch)?.to_vec2::<f32>()?;
-        let targets = batch.target_indices.to_vec1::<u32>()?;
-        for (row, target) in logits.iter().zip(targets) {
-            let predicted = row
-                .iter()
-                .enumerate()
-                .max_by(|left, right| left.1.total_cmp(right.1))
-                .map(|(index, _)| index)
-                .unwrap_or(0);
-            correct += usize::from(predicted == target as usize);
+        let Some(graph) =
+            foundation_build_cleavage_graph(record, &spectrum).map_err(anyhow::Error::msg)?
+        else {
+            continue;
+        };
+        let Ok(audit) = foundation_cleavage_graph_true_path_audit(&graph, &record.peptidoform)
+        else {
+            continue;
+        };
+        present_nodes += audit.present_nodes;
+        present_edges += audit.present_edges;
+        if !audit.structurally_present {
+            continue;
         }
-        classification_groups += batch.groups;
+        structural_records += 1;
+        structured_edges += graph.edge_count();
+
+        let decode =
+            foundation_cleavage_graph_structured_decode(model, &graph, Some(&audit), device)?;
+        let true_score = decode
+            .true_path_score
+            .ok_or_else(|| anyhow::anyhow!("structured validation lost true-path score"))?;
+        nll_sum += (decode.log_partition - true_score).max(0.0);
+        let rank = decode
+            .candidates
+            .iter()
+            .position(|candidate| candidate.peptide == record.peptidoform)
+            .map(|position| position + 1);
+        true_path_top1 += usize::from(rank.is_some_and(|value| value <= 1));
+        true_path_top8 += usize::from(rank.is_some_and(|value| value <= 8));
+        true_path_top32 += usize::from(rank.is_some_and(|value| value <= 32));
+        true_path_top64 += usize::from(rank.is_some_and(|value| value <= 64));
+
+        if emit_record_diagnostics {
+            println!(
+                "cleavage_graph_structured_rank\trecord_index={index}\ttrue_path_score={true_score:.6}\tbest_decoded_path_score={}\tlog_partition={:.6}\ttrue_path_rank={}\ttop1={}\ttop8={}\ttop32={}\ttop64={}\tgraph_nodes={}\tgraph_edges={}",
+                decode
+                    .candidates
+                    .first()
+                    .map(|candidate| format!("{:.6}", candidate.path_log_probability))
+                    .unwrap_or_else(|| "NA".into()),
+                decode.log_partition,
+                rank.map(|value| value.to_string()).unwrap_or_else(|| ">64".into()),
+                if rank.is_some_and(|value| value <= 1) { "YES" } else { "NO" },
+                if rank.is_some_and(|value| value <= 8) { "YES" } else { "NO" },
+                if rank.is_some_and(|value| value <= 32) { "YES" } else { "NO" },
+                if rank.is_some_and(|value| value <= 64) { "YES" } else { "NO" },
+                graph.nodes.len(),
+                graph.edge_count()
+            );
+        }
     }
 
-    if graph_records == 0 || classification_groups == 0 {
+    if graph_records == 0 || structural_records == 0 {
         anyhow::bail!(
-            "cleavage-graph validation produced no requested records/classification groups"
+            "structured cleavage-graph validation produced no structurally present graphs"
         );
     }
     Ok(GraphMetrics {
-        mean_loss: loss_weighted_sum / classification_groups as f64,
-        outgoing_edge_accuracy: correct as f64 / classification_groups as f64,
+        mean_nll: nll_sum / structural_records as f64,
         structural_coverage: structural_records as f64 / graph_records as f64,
         true_node_coverage: present_nodes as f64 / total_nodes.max(1) as f64,
         true_edge_coverage: present_edges as f64 / total_edges.max(1) as f64,
         graph_records,
         structural_records,
-        classification_groups,
+        structured_edges,
+        true_path_top1,
+        true_path_top8,
+        true_path_top32,
+        true_path_top64,
     })
 }
 
 fn println_metrics(label: &str, step: usize, metrics: GraphMetrics) {
     println!(
-        "{label}\tstep={step}\tloss={:.6}\toutgoing_edge_accuracy={:.6}\ttrue_path_structural_coverage={:.6}\ttrue_node_coverage={:.6}\ttrue_edge_coverage={:.6}\tgraph_records={}\tstructural_records={}\tclassification_groups={}",
-        metrics.mean_loss,
-        metrics.outgoing_edge_accuracy,
+        "{label}\tstep={step}\tstructured_nll={:.6}\ttrue_path_structural_coverage={:.6}\ttrue_node_coverage={:.6}\ttrue_edge_coverage={:.6}\tgraph_records={}\tstructural_records={}\tstructured_edges={}\ttrue_path_top1={}\ttrue_path_top8={}\ttrue_path_top32={}\ttrue_path_top64={}",
+        metrics.mean_nll,
         metrics.structural_coverage,
         metrics.true_node_coverage,
         metrics.true_edge_coverage,
         metrics.graph_records,
         metrics.structural_records,
-        metrics.classification_groups
+        metrics.structured_edges,
+        metrics.true_path_top1,
+        metrics.true_path_top8,
+        metrics.true_path_top32,
+        metrics.true_path_top64
     );
 }
 
@@ -608,9 +657,9 @@ fn checkpoint_metadata(
     best_validation_structural_coverage: f64,
 ) -> CleavageGraphCheckpointMetadata {
     CleavageGraphCheckpointMetadata {
-        version: 1,
-        objective: FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01316.into(),
-        parameter_namespace: FOUNDATION_CLEAVAGE_GRAPH_NAMESPACE_V01316.into(),
+        version: 3,
+        objective: FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_OBJECTIVE_V01318.into(),
+        parameter_namespace: FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_NAMESPACE_V01318.into(),
         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
         benchmark_manifest_fingerprint: format!(
             "fnv1a64:{:016x}",
@@ -630,7 +679,9 @@ fn checkpoint_metadata(
         maximum_outgoing_edges: FOUNDATION_CLEAVAGE_GRAPH_MAX_OUTGOING_EDGES_V01316,
         k_best_graph_paths: FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316,
         maximum_fragment_charge: FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316,
-        hidden_dim: FOUNDATION_CLEAVAGE_GRAPH_HIDDEN_DIM_V01316,
+        maximum_anchor_bridge_edges: FOUNDATION_CLEAVAGE_GRAPH_MAX_ANCHOR_BRIDGE_EDGES_V01317,
+        feature_dim: FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318,
+        hidden_dim: FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318,
         parent_unified_checkpoint: parent_model_path.display().to_string(),
         parent_unified_completed_steps: parent_metadata.completed_steps,
         reverse_causal_checkpoint: resolve_model_safetensors(reverse_checkpoint)

@@ -1,10 +1,11 @@
 //! Isolated spectrum-conditioned cleavage-mass graph proposal branch.
 //!
-//! v0.13.16 deliberately avoids peptide-seed initialization and left-to-right
-//! prefix commitment. The graph is constructed directly from observed fragment
-//! evidence plus the measured precursor mass, connected by chemically valid
-//! residue/PTM units, scored by a small isolated MLP, and decoded with a
-//! deterministic precursor-mass-constrained k-best DAG search.
+//! v0.13.18 retains the v0.13.17 anchor-and-bridge graph construction but
+//! replaces independent local outgoing-edge classification with a contextual,
+//! globally normalized source-to-sink path model. Exact DAG forward/backward
+//! dynamic programming computes the path partition and edge marginals; training
+//! uses the exact structured-NLL gradient while deterministic k-best decoding
+//! ranks paths by unnormalized contextual edge energies.
 
 use super::chemistry::common_unimod_definition;
 use super::data::FoundationTrainingRecord;
@@ -20,11 +21,24 @@ use super::spectrum::FoundationSpectrum;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{self as nn, loss, Linear, VarBuilder, VarMap};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// Isolated parameter namespace for v0.13.16.
 pub const FOUNDATION_CLEAVAGE_GRAPH_NAMESPACE_V01316: &str = "cleavage_graph";
 /// Fixed training objective identifier.
 pub const FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01316: &str = "outgoing_edge_cross_entropy_v01316";
+/// Fixed v0.13.17 objective identifier for the anchor-and-bridge redesign.
+pub const FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01317: &str =
+    "outgoing_edge_cross_entropy_anchor_bridge_v01317";
+/// Fresh isolated namespace for the v0.13.18 structured scorer.
+pub const FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_NAMESPACE_V01318: &str = "cleavage_graph_structured";
+/// Fixed globally normalized path objective for v0.13.18.
+pub const FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_OBJECTIVE_V01318: &str =
+    "global_path_nll_contextual_v01318";
+/// Context-augmented edge feature width used by v0.13.18.
+pub const FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318: usize = 58;
+/// Hidden width of the first contextual structured scorer.
+pub const FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318: usize = 64;
 /// Fixed node/edge mass compatibility tolerance for the first pilot.
 pub const FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316: f64 = 0.05;
 /// Fixed outgoing-edge cap for every graph node.
@@ -37,6 +51,11 @@ pub const FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316: usize = 2;
 pub const FOUNDATION_CLEAVAGE_GRAPH_HIDDEN_DIM_V01316: usize = 64;
 /// Fixed edge-feature width.
 pub const FOUNDATION_CLEAVAGE_GRAPH_FEATURE_DIM_V01316: usize = 42;
+/// Longest anchor-to-anchor chemical bridge admitted by the structural redesign.
+///
+/// Three edges can restore up to two consecutive unobserved cleavage nodes while
+/// keeping every inferred node bracketed by observed/source/sink anchors.
+pub const FOUNDATION_CLEAVAGE_GRAPH_MAX_ANCHOR_BRIDGE_EDGES_V01317: usize = 3;
 
 const PROTON_MASS_DA: f64 = 1.007_276_466_77;
 const RESIDUES: [char; 20] = [
@@ -186,7 +205,7 @@ pub struct FoundationCleavageGraphBatch {
 pub struct FoundationCleavageGraphCandidate {
     /// Canonical chemistry-aware peptide.
     pub peptide: PeptidoformInput,
-    /// Sum of local outgoing-edge log probabilities along the source-to-sink path.
+    /// Decoder path score (local log probability for v0.13.16/17; raw structured energy for v0.13.18).
     pub path_log_probability: f64,
     /// Number of residue edges in the path.
     pub edge_count: usize,
@@ -258,7 +277,699 @@ pub fn validate_cleavage_graph_namespace(varmap: &VarMap) -> Result<()> {
     Ok(())
 }
 
-/// Build the deterministic v0.13.16 graph from observed spectrum + precursor only.
+/// Aggregate metrics from one exact structured-path loss evaluation.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FoundationCleavageGraphStructuredLossStats {
+    /// Mean exact `log Z - score(true path)` over structurally present graphs.
+    pub mean_nll: f64,
+    /// Number of structurally present graphs contributing to the loss.
+    pub graphs: usize,
+    /// Number of directed edges scored across those graphs.
+    pub edges: usize,
+}
+
+/// One structured decode plus exact partition diagnostics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundationCleavageGraphStructuredDecode {
+    /// Deterministic source-to-sink candidates ranked by raw structured path score.
+    pub candidates: Vec<FoundationCleavageGraphCandidate>,
+    /// Exact log partition over all valid source-to-sink graph paths.
+    pub log_partition: f64,
+    /// Raw score of the known true path when a complete structural audit is supplied.
+    pub true_path_score: Option<f64>,
+}
+
+/// v0.13.18 contextual edge-energy model in a fresh isolated namespace.
+pub struct PeptideSpectrumCleavageGraphStructuredScorer {
+    input: Linear,
+    hidden: Linear,
+    output: Linear,
+}
+
+impl PeptideSpectrumCleavageGraphStructuredScorer {
+    /// Construct the structured scorer under `cleavage_graph_structured.*`.
+    pub fn new(vb: VarBuilder<'_>) -> Result<Self> {
+        let vb = vb.pp(FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_NAMESPACE_V01318);
+        let input = nn::linear(
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318,
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318,
+            vb.pp("contextual_mlp.input"),
+        )?;
+        let hidden = nn::linear(
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318,
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318,
+            vb.pp("contextual_mlp.hidden"),
+        )?;
+        let output = nn::linear(
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_HIDDEN_DIM_V01318,
+            1,
+            vb.pp("contextual_mlp.output"),
+        )?;
+        Ok(Self {
+            input,
+            hidden,
+            output,
+        })
+    }
+
+    /// Score a flat `[edge, contextual_feature]` tensor and return raw edge energies.
+    pub fn forward(&self, features: &Tensor) -> Result<Tensor> {
+        let (_, feature_dim) = features.dims2()?;
+        if feature_dim != FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318 {
+            candle_core::bail!(
+                "structured cleavage-graph feature width {feature_dim} does not match fixed {}",
+                FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318
+            );
+        }
+        let hidden = self.input.forward(features)?.relu()?;
+        let hidden = self.hidden.forward(&hidden)?.relu()?;
+        self.output.forward(&hidden)?.squeeze(1)
+    }
+}
+
+/// Validate that v0.13.18 variables are isolated to `cleavage_graph_structured.*`.
+pub fn validate_cleavage_graph_structured_namespace(varmap: &VarMap) -> Result<()> {
+    let data = varmap.data().lock().map_err(|_| {
+        candle_core::Error::Msg("structured cleavage-graph VarMap lock poisoned".into())
+    })?;
+    if data.is_empty() {
+        candle_core::bail!("structured cleavage-graph VarMap contains no variables");
+    }
+    let prefix = format!("{FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_NAMESPACE_V01318}.");
+    if let Some(name) = data.keys().find(|name| !name.starts_with(&prefix)) {
+        candle_core::bail!(
+            "structured cleavage-graph variable '{name}' is outside expected namespace '{prefix}'"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct FoundationCleavageGraphStructuredContext {
+    incoming_degree: Vec<usize>,
+    min_hops_from_source: Vec<usize>,
+    min_hops_to_sink: Vec<usize>,
+    forward_support_context: Vec<f64>,
+    backward_support_context: Vec<f64>,
+    forward_log_path_count: Vec<f64>,
+    backward_log_path_count: Vec<f64>,
+}
+
+fn foundation_cleavage_graph_structured_context(
+    graph: &FoundationCleavageGraph,
+) -> FoundationCleavageGraphStructuredContext {
+    let n = graph.nodes.len();
+    let mut incoming_degree = vec![0usize; n];
+    for outgoing in &graph.outgoing {
+        for edge in outgoing {
+            incoming_degree[edge.target_node] += 1;
+        }
+    }
+
+    let unreachable = usize::MAX / 4;
+    let mut min_hops_from_source = vec![unreachable; n];
+    if n > 0 {
+        min_hops_from_source[0] = 0;
+    }
+    for source in 0..n {
+        if min_hops_from_source[source] == unreachable {
+            continue;
+        }
+        let next_hops = min_hops_from_source[source].saturating_add(1);
+        for edge in &graph.outgoing[source] {
+            min_hops_from_source[edge.target_node] =
+                min_hops_from_source[edge.target_node].min(next_hops);
+        }
+    }
+
+    let mut min_hops_to_sink = vec![unreachable; n];
+    if n > 0 {
+        min_hops_to_sink[graph.sink_index()] = 0;
+    }
+    for source in (0..n.saturating_sub(1)).rev() {
+        let mut best = unreachable;
+        for edge in &graph.outgoing[source] {
+            if min_hops_to_sink[edge.target_node] != unreachable {
+                best = best.min(min_hops_to_sink[edge.target_node].saturating_add(1));
+            }
+        }
+        min_hops_to_sink[source] = best;
+    }
+
+    let mut forward_support_context = vec![f64::NEG_INFINITY; n];
+    let mut forward_log_path_count = vec![f64::NEG_INFINITY; n];
+    if n > 0 {
+        forward_support_context[0] = 0.0;
+        forward_log_path_count[0] = 0.0;
+    }
+    for source in 0..n {
+        if !forward_support_context[source].is_finite() {
+            continue;
+        }
+        for edge in &graph.outgoing[source] {
+            let support = graph.nodes[edge.target_node].total_support() as f64;
+            let candidate = 0.65 * forward_support_context[source] + 0.35 * support;
+            forward_support_context[edge.target_node] =
+                forward_support_context[edge.target_node].max(candidate);
+            forward_log_path_count[edge.target_node] = logaddexp(
+                forward_log_path_count[edge.target_node],
+                forward_log_path_count[source],
+            );
+        }
+    }
+
+    let mut backward_support_context = vec![f64::NEG_INFINITY; n];
+    let mut backward_log_path_count = vec![f64::NEG_INFINITY; n];
+    if n > 0 {
+        backward_support_context[graph.sink_index()] = 0.0;
+        backward_log_path_count[graph.sink_index()] = 0.0;
+    }
+    for source in (0..n.saturating_sub(1)).rev() {
+        for edge in &graph.outgoing[source] {
+            if backward_support_context[edge.target_node].is_finite() {
+                let support = graph.nodes[source].total_support() as f64;
+                let candidate = 0.65 * backward_support_context[edge.target_node] + 0.35 * support;
+                backward_support_context[source] = backward_support_context[source].max(candidate);
+                backward_log_path_count[source] = logaddexp(
+                    backward_log_path_count[source],
+                    backward_log_path_count[edge.target_node],
+                );
+            }
+        }
+    }
+
+    for values in [&mut forward_support_context, &mut backward_support_context] {
+        for value in values.iter_mut() {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+    }
+
+    FoundationCleavageGraphStructuredContext {
+        incoming_degree,
+        min_hops_from_source,
+        min_hops_to_sink,
+        forward_support_context,
+        backward_support_context,
+        forward_log_path_count,
+        backward_log_path_count,
+    }
+}
+
+/// Context-augmented v0.13.18 edge feature vector.
+pub fn foundation_cleavage_graph_structured_edge_features(
+    graph: &FoundationCleavageGraph,
+    edge: &FoundationCleavageGraphEdge,
+) -> [f32; FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318] {
+    let context = foundation_cleavage_graph_structured_context(graph);
+    foundation_cleavage_graph_structured_edge_features_with_context(graph, &context, edge)
+}
+
+fn foundation_cleavage_graph_structured_edge_features_with_context(
+    graph: &FoundationCleavageGraph,
+    context: &FoundationCleavageGraphStructuredContext,
+    edge: &FoundationCleavageGraphEdge,
+) -> [f32; FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318] {
+    let base = foundation_cleavage_graph_edge_features(graph, edge);
+    let mut features = [0.0f32; FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318];
+    features[..FOUNDATION_CLEAVAGE_GRAPH_FEATURE_DIM_V01316].copy_from_slice(&base);
+    let source = edge.source_node;
+    let target = edge.target_node;
+    let source_out = graph.outgoing[source].len();
+    let target_out = graph.outgoing[target].len();
+    let hop = |value: usize| -> f32 {
+        if value >= usize::MAX / 8 {
+            1.0
+        } else {
+            (value as f32 / 64.0).min(1.0)
+        }
+    };
+    let path_count = |value: f64| -> f32 {
+        if value.is_finite() {
+            (value / 20.0).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        }
+    };
+    features[42] = (context.incoming_degree[source] as f32 / 64.0).min(1.0);
+    features[43] = (source_out as f32 / 64.0).min(1.0);
+    features[44] = (context.incoming_degree[target] as f32 / 64.0).min(1.0);
+    features[45] = (target_out as f32 / 64.0).min(1.0);
+    features[46] = hop(context.min_hops_from_source[source]);
+    features[47] = hop(context.min_hops_from_source[target]);
+    features[48] = hop(context.min_hops_to_sink[source]);
+    features[49] = hop(context.min_hops_to_sink[target]);
+    features[50] = context.forward_support_context[source].clamp(0.0, 1.0) as f32;
+    features[51] = context.forward_support_context[target].clamp(0.0, 1.0) as f32;
+    features[52] = context.backward_support_context[source].clamp(0.0, 1.0) as f32;
+    features[53] = context.backward_support_context[target].clamp(0.0, 1.0) as f32;
+    features[54] = path_count(context.forward_log_path_count[source]);
+    features[55] = path_count(context.backward_log_path_count[target]);
+    features[56] = ((graph.residue_mass_total - graph.nodes[target].mass_da)
+        / graph.residue_mass_total.max(f64::EPSILON))
+    .clamp(0.0, 1.0) as f32;
+    features[57] = if graph.nodes[source].total_support() == 0.0
+        && graph.nodes[target].total_support() == 0.0
+    {
+        1.0
+    } else {
+        0.0
+    };
+    features
+}
+
+/// Exact globally normalized structured-path NLL gradient for one graph batch.
+///
+/// Forward/backward path dynamic programming is performed in stable `f64` on
+/// detached edge scores. For a log-linear DAG path model the exact derivative
+/// with respect to each edge energy is `p(edge|graph) - 1[edge in true path]`.
+/// Multiplying those detached coefficients by the original Candle logits gives
+/// a compact surrogate scalar whose autograd gradient is exactly the structured
+/// NLL gradient while avoiding thousands of tiny differentiable DP operations.
+pub fn foundation_cleavage_graph_structured_loss(
+    model: &PeptideSpectrumCleavageGraphStructuredScorer,
+    examples: &[(
+        &FoundationCleavageGraph,
+        &FoundationCleavageGraphTruePathAudit,
+    )],
+    device: &Device,
+) -> Result<Option<(Tensor, FoundationCleavageGraphStructuredLossStats)>> {
+    let examples = examples
+        .iter()
+        .copied()
+        .filter(|(_, audit)| audit.structurally_present)
+        .collect::<Vec<_>>();
+    if examples.is_empty() {
+        return Ok(None);
+    }
+
+    let total_edges = examples
+        .iter()
+        .map(|(graph, _)| graph.edge_count())
+        .sum::<usize>();
+    if total_edges == 0 {
+        return Ok(None);
+    }
+    let mut features = Vec::<f32>::with_capacity(
+        total_edges * FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318,
+    );
+    let mut graph_ranges = Vec::<(usize, usize)>::with_capacity(examples.len());
+    for (graph, _) in &examples {
+        let start = features.len() / FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318;
+        let context = foundation_cleavage_graph_structured_context(graph);
+        for outgoing in &graph.outgoing {
+            for edge in outgoing {
+                features.extend_from_slice(
+                    &foundation_cleavage_graph_structured_edge_features_with_context(
+                        graph, &context, edge,
+                    ),
+                );
+            }
+        }
+        let end = features.len() / FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318;
+        graph_ranges.push((start, end));
+    }
+
+    let feature_tensor = Tensor::from_vec(
+        features,
+        (
+            total_edges,
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318,
+        ),
+        device,
+    )?;
+    let logits = model.forward(&feature_tensor)?;
+    let detached_scores = logits.to_vec1::<f32>()?;
+    let mut coefficients = vec![0.0f32; total_edges];
+    let mut nll_sum = 0.0f64;
+
+    for (example_index, &(graph, audit)) in examples.iter().enumerate() {
+        let (start, end) = graph_ranges[example_index];
+        let nested = reshape_flat_edge_scores(graph, &detached_scores[start..end])?;
+        let stats = structured_path_statistics(graph, audit, &nested)?;
+        nll_sum += stats.nll;
+        let mut cursor = start;
+        for row in stats.gradient_coefficients {
+            for coefficient in row {
+                coefficients[cursor] = coefficient as f32;
+                cursor += 1;
+            }
+        }
+        if cursor != end {
+            candle_core::bail!("structured cleavage-graph coefficient arity mismatch");
+        }
+    }
+
+    let coefficient_tensor = Tensor::from_vec(coefficients, total_edges, device)?;
+    let surrogate = (&logits * &coefficient_tensor)?
+        .sum_all()?
+        .affine(1.0 / examples.len() as f64, 0.0)?;
+    let mean_nll = nll_sum / examples.len() as f64;
+    // Shift only the scalar value, not the derivative, so logging sees the exact
+    // structured NLL while autograd follows the exact analytic NLL gradient.
+    let surrogate_value = f64::from(surrogate.to_scalar::<f32>()?);
+    let loss = surrogate.affine(1.0, mean_nll - surrogate_value)?;
+    Ok(Some((
+        loss,
+        FoundationCleavageGraphStructuredLossStats {
+            mean_nll,
+            graphs: examples.len(),
+            edges: total_edges,
+        },
+    )))
+}
+
+/// Decode v0.13.18 paths and return exact partition/true-path diagnostics.
+pub fn foundation_cleavage_graph_structured_decode(
+    model: &PeptideSpectrumCleavageGraphStructuredScorer,
+    graph: &FoundationCleavageGraph,
+    audit: Option<&FoundationCleavageGraphTruePathAudit>,
+    device: &Device,
+) -> Result<FoundationCleavageGraphStructuredDecode> {
+    let edge_scores = foundation_cleavage_graph_structured_edge_scores(model, graph, device)?;
+    let log_partition =
+        structured_log_partition(graph, &edge_scores).map_err(candle_core::Error::Msg)?;
+    let true_path_score = match audit {
+        Some(audit) if audit.structurally_present => Some(
+            structured_true_path_score(graph, audit, &edge_scores)
+                .map_err(candle_core::Error::Msg)?,
+        ),
+        _ => None,
+    };
+    let candidates =
+        foundation_cleavage_graph_structured_k_best_from_edge_scores(graph, &edge_scores)
+            .map_err(candle_core::Error::Msg)?;
+    Ok(FoundationCleavageGraphStructuredDecode {
+        candidates,
+        log_partition,
+        true_path_score,
+    })
+}
+
+/// Decode deterministic v0.13.18 k-best paths by sums of raw contextual energies.
+pub fn foundation_cleavage_graph_structured_k_best_candidates(
+    model: &PeptideSpectrumCleavageGraphStructuredScorer,
+    graph: &FoundationCleavageGraph,
+    device: &Device,
+) -> Result<Vec<FoundationCleavageGraphCandidate>> {
+    Ok(foundation_cleavage_graph_structured_decode(model, graph, None, device)?.candidates)
+}
+
+/// Deterministic raw-energy k-best decoder used by v0.13.18 and unit tests.
+pub fn foundation_cleavage_graph_structured_k_best_from_edge_scores(
+    graph: &FoundationCleavageGraph,
+    edge_scores: &[Vec<f64>],
+) -> std::result::Result<Vec<FoundationCleavageGraphCandidate>, String> {
+    if edge_scores.len() != graph.outgoing.len() {
+        return Err("structured cleavage-graph edge-score/source-node arity mismatch".into());
+    }
+    for (scores, outgoing) in edge_scores.iter().zip(&graph.outgoing) {
+        if scores.len() != outgoing.len() {
+            return Err("structured cleavage-graph edge-score/outgoing arity mismatch".into());
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct PathState {
+        score: f64,
+        units: Vec<FoundationCleavageGraphUnit>,
+    }
+
+    let mut paths = vec![Vec::<PathState>::new(); graph.nodes.len()];
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    paths[0].push(PathState {
+        score: 0.0,
+        units: Vec::new(),
+    });
+
+    for source_node in 0..graph.nodes.len().saturating_sub(1) {
+        if paths[source_node].is_empty() {
+            continue;
+        }
+        let source_paths = paths[source_node].clone();
+        for state in source_paths {
+            for (edge_index, edge) in graph.outgoing[source_node].iter().enumerate() {
+                let mut units = state.units.clone();
+                units.push(edge.unit);
+                paths[edge.target_node].push(PathState {
+                    score: state.score + edge_scores[source_node][edge_index],
+                    units,
+                });
+                paths[edge.target_node].sort_by(|left, right| {
+                    right
+                        .score
+                        .total_cmp(&left.score)
+                        .then_with(|| left.units.cmp(&right.units))
+                });
+                paths[edge.target_node].truncate(FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316);
+            }
+        }
+    }
+
+    let mut candidates = Vec::<FoundationCleavageGraphCandidate>::new();
+    let mut seen = HashSet::<String>::new();
+    let mut sink_paths = paths[graph.sink_index()].clone();
+    sink_paths.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.units.cmp(&right.units))
+    });
+    for path in sink_paths {
+        let theoretical_residue_mass = path
+            .units
+            .iter()
+            .copied()
+            .map(FoundationCleavageGraphUnit::mass_da)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum::<f64>();
+        if (theoretical_residue_mass - graph.residue_mass_total).abs()
+            > FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316
+        {
+            continue;
+        }
+        let peptide = peptide_from_units(&path.units)?;
+        let key = canonical_candidate_key(&peptide);
+        if seen.insert(key) {
+            candidates.push(FoundationCleavageGraphCandidate {
+                peptide,
+                path_log_probability: path.score,
+                edge_count: path.units.len(),
+            });
+        }
+        if candidates.len() >= FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316 {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
+fn foundation_cleavage_graph_structured_edge_scores(
+    model: &PeptideSpectrumCleavageGraphStructuredScorer,
+    graph: &FoundationCleavageGraph,
+    device: &Device,
+) -> Result<Vec<Vec<f64>>> {
+    let edge_count = graph.edge_count();
+    if edge_count == 0 {
+        return Ok(vec![Vec::new(); graph.nodes.len()]);
+    }
+    let context = foundation_cleavage_graph_structured_context(graph);
+    let mut features = Vec::<f32>::with_capacity(
+        edge_count * FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318,
+    );
+    let mut lengths = Vec::<usize>::with_capacity(graph.outgoing.len());
+    for outgoing in &graph.outgoing {
+        lengths.push(outgoing.len());
+        for edge in outgoing {
+            features.extend_from_slice(
+                &foundation_cleavage_graph_structured_edge_features_with_context(
+                    graph, &context, edge,
+                ),
+            );
+        }
+    }
+    let tensor = Tensor::from_vec(
+        features,
+        (
+            edge_count,
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318,
+        ),
+        device,
+    )?;
+    let flat_scores = model.forward(&tensor)?.to_vec1::<f32>()?;
+    reshape_flat_edge_scores(graph, &flat_scores)
+}
+
+fn reshape_flat_edge_scores<T: Copy + Into<f64>>(
+    graph: &FoundationCleavageGraph,
+    flat_scores: &[T],
+) -> Result<Vec<Vec<f64>>> {
+    if flat_scores.len() != graph.edge_count() {
+        candle_core::bail!("structured cleavage-graph flat edge-score arity mismatch");
+    }
+    let mut cursor = 0usize;
+    let mut scores = Vec::<Vec<f64>>::with_capacity(graph.outgoing.len());
+    for outgoing in &graph.outgoing {
+        let length = outgoing.len();
+        scores.push(
+            flat_scores[cursor..cursor + length]
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+        );
+        cursor += length;
+    }
+    Ok(scores)
+}
+
+#[derive(Debug, Clone)]
+struct FoundationCleavageGraphStructuredPathStats {
+    nll: f64,
+    gradient_coefficients: Vec<Vec<f64>>,
+}
+
+fn structured_path_statistics(
+    graph: &FoundationCleavageGraph,
+    audit: &FoundationCleavageGraphTruePathAudit,
+    edge_scores: &[Vec<f64>],
+) -> Result<FoundationCleavageGraphStructuredPathStats> {
+    if !audit.structurally_present {
+        candle_core::bail!("structured path statistics require a complete true path");
+    }
+    let (alpha, beta, log_partition) =
+        structured_forward_backward(graph, edge_scores).map_err(candle_core::Error::Msg)?;
+    let true_score =
+        structured_true_path_score(graph, audit, edge_scores).map_err(candle_core::Error::Msg)?;
+    let true_edges = audit
+        .training_groups
+        .iter()
+        .map(|group| (group.source_node, group.target_outgoing_index))
+        .collect::<HashSet<_>>();
+    let mut gradient_coefficients = Vec::<Vec<f64>>::with_capacity(graph.outgoing.len());
+    for (source, outgoing) in graph.outgoing.iter().enumerate() {
+        let mut row = Vec::with_capacity(outgoing.len());
+        for (edge_index, edge) in outgoing.iter().enumerate() {
+            let log_marginal =
+                alpha[source] + edge_scores[source][edge_index] + beta[edge.target_node]
+                    - log_partition;
+            let marginal = if log_marginal.is_finite() {
+                log_marginal.exp().clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            row.push(
+                marginal
+                    - if true_edges.contains(&(source, edge_index)) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+            );
+        }
+        gradient_coefficients.push(row);
+    }
+    Ok(FoundationCleavageGraphStructuredPathStats {
+        nll: (log_partition - true_score).max(0.0),
+        gradient_coefficients,
+    })
+}
+
+fn structured_true_path_score(
+    graph: &FoundationCleavageGraph,
+    audit: &FoundationCleavageGraphTruePathAudit,
+    edge_scores: &[Vec<f64>],
+) -> std::result::Result<f64, String> {
+    if !audit.structurally_present {
+        return Err("true-path score requested for structurally incomplete graph".into());
+    }
+    let mut score = 0.0f64;
+    for group in &audit.training_groups {
+        let outgoing = graph
+            .outgoing
+            .get(group.source_node)
+            .ok_or_else(|| "true-path source node out of range".to_string())?;
+        if group.target_outgoing_index >= outgoing.len()
+            || group.target_outgoing_index >= edge_scores[group.source_node].len()
+        {
+            return Err("true-path outgoing edge index out of range".into());
+        }
+        score += edge_scores[group.source_node][group.target_outgoing_index];
+    }
+    Ok(score)
+}
+
+fn structured_log_partition(
+    graph: &FoundationCleavageGraph,
+    edge_scores: &[Vec<f64>],
+) -> std::result::Result<f64, String> {
+    let (_, _, log_partition) = structured_forward_backward(graph, edge_scores)?;
+    Ok(log_partition)
+}
+
+fn structured_forward_backward(
+    graph: &FoundationCleavageGraph,
+    edge_scores: &[Vec<f64>],
+) -> std::result::Result<(Vec<f64>, Vec<f64>, f64), String> {
+    if edge_scores.len() != graph.outgoing.len() {
+        return Err("structured cleavage-graph edge-score/source-node arity mismatch".into());
+    }
+    let n = graph.nodes.len();
+    if n == 0 {
+        return Err("structured cleavage graph has no nodes".into());
+    }
+    let mut alpha = vec![f64::NEG_INFINITY; n];
+    alpha[0] = 0.0;
+    for source in 0..n {
+        if edge_scores[source].len() != graph.outgoing[source].len() {
+            return Err("structured cleavage-graph edge-score/outgoing arity mismatch".into());
+        }
+        if !alpha[source].is_finite() {
+            continue;
+        }
+        for (edge_index, edge) in graph.outgoing[source].iter().enumerate() {
+            let candidate = alpha[source] + edge_scores[source][edge_index];
+            alpha[edge.target_node] = logaddexp(alpha[edge.target_node], candidate);
+        }
+    }
+    let log_partition = alpha[graph.sink_index()];
+    if !log_partition.is_finite() {
+        return Err("structured cleavage graph has no finite source-to-sink path".into());
+    }
+
+    let mut beta = vec![f64::NEG_INFINITY; n];
+    beta[graph.sink_index()] = 0.0;
+    for source in (0..n.saturating_sub(1)).rev() {
+        let mut value = f64::NEG_INFINITY;
+        for (edge_index, edge) in graph.outgoing[source].iter().enumerate() {
+            if beta[edge.target_node].is_finite() {
+                value = logaddexp(
+                    value,
+                    edge_scores[source][edge_index] + beta[edge.target_node],
+                );
+            }
+        }
+        beta[source] = value;
+    }
+    Ok((alpha, beta, log_partition))
+}
+
+fn logaddexp(left: f64, right: f64) -> f64 {
+    if !left.is_finite() {
+        return right;
+    }
+    if !right.is_finite() {
+        return left;
+    }
+    let maximum = left.max(right);
+    maximum + ((left - maximum).exp() + (right - maximum).exp()).ln()
+}
+
+/// Build the deterministic v0.13.17 anchor-and-bridge graph from spectrum + precursor only.
 pub fn foundation_build_cleavage_graph(
     record: &FoundationTrainingRecord,
     spectrum: &FoundationSpectrum,
@@ -385,22 +1096,80 @@ pub fn foundation_build_cleavage_graph(
     });
     clustered.sort_by(|left, right| left.mass_da.total_cmp(&right.mass_da));
 
-    let mut nodes = Vec::with_capacity(clustered.len() + 2);
-    nodes.push(FoundationCleavageGraphNode {
+    let source = FoundationCleavageGraphNode {
         mass_da: 0.0,
         n_terminal_support: 1.0,
         c_terminal_support: 0.0,
         is_source: true,
         is_sink: false,
-    });
-    nodes.extend(clustered);
-    nodes.push(FoundationCleavageGraphNode {
+    };
+    let sink = FoundationCleavageGraphNode {
         mass_da: residue_mass_total,
         n_terminal_support: 0.0,
         c_terminal_support: 1.0,
         is_source: false,
         is_sink: true,
-    });
+    };
+
+    // v0.13.16 required direct observed-fragment support at every cleavage, which
+    // produced only 40/128 complete true paths even though 75.8% of true nodes
+    // were individually present. v0.13.17 keeps those observed nodes as immutable
+    // anchors and fills only chemically exact short gaps bracketed by anchor pairs.
+    // The inferred nodes carry zero direct spectrum support, so the edge scorer can
+    // distinguish them naturally from observed evidence without target identity.
+    let mut anchors = Vec::with_capacity(clustered.len() + 2);
+    anchors.push(source);
+    anchors.extend(clustered.iter().copied());
+    anchors.push(sink);
+    let normal_bridge_patterns = cleavage_graph_bridge_patterns(false)?;
+    let source_bridge_patterns = cleavage_graph_bridge_patterns(true)?;
+    let mut bridge_nodes = Vec::<FoundationCleavageGraphNode>::new();
+    for (left_index, left) in anchors.iter().copied().enumerate().take(anchors.len() - 1) {
+        let patterns = if left.is_source {
+            source_bridge_patterns
+        } else {
+            normal_bridge_patterns
+        };
+        for right in anchors.iter().copied().skip(left_index + 1) {
+            let gap = right.mass_da - left.mass_da;
+            if gap <= 0.0 {
+                continue;
+            }
+            let low = gap - FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316;
+            let high = gap + FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316;
+            let first = lower_bound_bridge_pattern(patterns, low);
+            for pattern in patterns.iter().skip(first) {
+                if pattern.total_mass > high {
+                    break;
+                }
+                for &relative_mass in
+                    pattern.intermediate_masses[..pattern.intermediate_count].iter()
+                {
+                    let mass_da = left.mass_da + relative_mass;
+                    if mass_da > FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316
+                        && mass_da
+                            < residue_mass_total
+                                - FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316
+                    {
+                        bridge_nodes.push(FoundationCleavageGraphNode {
+                            mass_da,
+                            n_terminal_support: 0.0,
+                            c_terminal_support: 0.0,
+                            is_source: false,
+                            is_sink: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    clustered.extend(bridge_nodes);
+    clustered = merge_cleavage_graph_nodes(clustered);
+
+    let mut nodes = Vec::with_capacity(clustered.len() + 2);
+    nodes.push(source);
+    nodes.extend(clustered);
+    nodes.push(sink);
 
     let mut outgoing = vec![Vec::<FoundationCleavageGraphEdge>::new(); nodes.len()];
     for source_node in 0..nodes.len().saturating_sub(1) {
@@ -768,6 +1537,117 @@ fn foundation_cleavage_graph_edge_scores(
     Ok(scores)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FoundationCleavageGraphBridgePattern {
+    total_mass: f64,
+    intermediate_masses: [f64; 2],
+    intermediate_count: usize,
+}
+
+fn cleavage_graph_bridge_patterns(
+    include_n_terminal_acetyl: bool,
+) -> std::result::Result<&'static [FoundationCleavageGraphBridgePattern], String> {
+    static NORMAL: OnceLock<
+        std::result::Result<Vec<FoundationCleavageGraphBridgePattern>, String>,
+    > = OnceLock::new();
+    static SOURCE: OnceLock<
+        std::result::Result<Vec<FoundationCleavageGraphBridgePattern>, String>,
+    > = OnceLock::new();
+    let cached = if include_n_terminal_acetyl {
+        SOURCE.get_or_init(|| build_cleavage_graph_bridge_patterns(true))
+    } else {
+        NORMAL.get_or_init(|| build_cleavage_graph_bridge_patterns(false))
+    };
+    match cached {
+        Ok(patterns) => Ok(patterns.as_slice()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn build_cleavage_graph_bridge_patterns(
+    include_n_terminal_acetyl: bool,
+) -> std::result::Result<Vec<FoundationCleavageGraphBridgePattern>, String> {
+    let first_units = allowed_units(include_n_terminal_acetyl)?;
+    let following_units = allowed_units(false)?;
+    let mut patterns = Vec::<FoundationCleavageGraphBridgePattern>::new();
+
+    for first in first_units {
+        let first_mass = first.mass_da()?;
+        for second in following_units.iter().copied() {
+            let second_mass = second.mass_da()?;
+            patterns.push(FoundationCleavageGraphBridgePattern {
+                total_mass: first_mass + second_mass,
+                intermediate_masses: [first_mass, 0.0],
+                intermediate_count: 1,
+            });
+            if FOUNDATION_CLEAVAGE_GRAPH_MAX_ANCHOR_BRIDGE_EDGES_V01317 >= 3 {
+                for third in following_units.iter().copied() {
+                    let third_mass = third.mass_da()?;
+                    patterns.push(FoundationCleavageGraphBridgePattern {
+                        total_mass: first_mass + second_mass + third_mass,
+                        intermediate_masses: [first_mass, first_mass + second_mass],
+                        intermediate_count: 2,
+                    });
+                }
+            }
+        }
+    }
+    patterns.sort_by(|left, right| {
+        left.total_mass
+            .total_cmp(&right.total_mass)
+            .then_with(|| left.intermediate_count.cmp(&right.intermediate_count))
+            .then_with(|| left.intermediate_masses[0].total_cmp(&right.intermediate_masses[0]))
+            .then_with(|| left.intermediate_masses[1].total_cmp(&right.intermediate_masses[1]))
+    });
+    patterns.dedup_by(|left, right| {
+        left.total_mass.to_bits() == right.total_mass.to_bits()
+            && left.intermediate_count == right.intermediate_count
+            && left.intermediate_masses[0].to_bits() == right.intermediate_masses[0].to_bits()
+            && left.intermediate_masses[1].to_bits() == right.intermediate_masses[1].to_bits()
+    });
+    Ok(patterns)
+}
+
+fn lower_bound_bridge_pattern(
+    patterns: &[FoundationCleavageGraphBridgePattern],
+    total_mass: f64,
+) -> usize {
+    let mut low = 0usize;
+    let mut high = patterns.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if patterns[middle].total_mass < total_mass {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+fn merge_cleavage_graph_nodes(
+    mut nodes: Vec<FoundationCleavageGraphNode>,
+) -> Vec<FoundationCleavageGraphNode> {
+    nodes.sort_by(|left, right| left.mass_da.total_cmp(&right.mass_da));
+    let mut merged = Vec::<FoundationCleavageGraphNode>::with_capacity(nodes.len());
+    for node in nodes {
+        if let Some(last) = merged.last_mut() {
+            if (node.mass_da - last.mass_da).abs()
+                <= FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316
+            {
+                if node.total_support() > last.total_support() {
+                    last.mass_da = node.mass_da;
+                }
+                last.n_terminal_support = last.n_terminal_support.max(node.n_terminal_support);
+                last.c_terminal_support = last.c_terminal_support.max(node.c_terminal_support);
+                continue;
+            }
+        }
+        merged.push(node);
+    }
+    merged
+}
+
 fn allowed_units(
     include_n_terminal_acetyl: bool,
 ) -> std::result::Result<Vec<FoundationCleavageGraphUnit>, String> {
@@ -1121,6 +2001,33 @@ mod tests {
     }
 
     #[test]
+    fn anchor_bridge_restores_two_consecutive_missing_cleavages() {
+        let peptide = PeptidoformInput {
+            sequence: "PEPTIDEK".into(),
+            modifications: Vec::new(),
+        };
+        let mut record = synthetic_record(peptide.clone(), 2);
+        // synthetic_record emits [b_i, y_i] for each internal cleavage. Remove
+        // both orientations for two consecutive true cleavages. The graph builder
+        // must recover the missing cumulative masses only from chemistry between
+        // the neighboring observed anchors; peptide identity is not an input.
+        record.observed_spectrum_peaks = record
+            .observed_spectrum_peaks
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, peak)| (!matches!(index, 4 | 5 | 6 | 7)).then_some(peak))
+            .collect();
+        let spectrum = FoundationSpectrum::from_training_record(&record).unwrap();
+        let graph = foundation_build_cleavage_graph(&record, &spectrum)
+            .unwrap()
+            .unwrap();
+        let audit = foundation_cleavage_graph_true_path_audit(&graph, &peptide).unwrap();
+        assert!(audit.structurally_present);
+        assert_eq!(audit.present_nodes, audit.total_nodes);
+        assert_eq!(audit.present_edges, audit.total_edges);
+    }
+
+    #[test]
     fn deterministic_k_best_reconstructs_high_scoring_true_path() {
         let peptide = PeptidoformInput {
             sequence: "PEPTIDEK".into(),
@@ -1159,5 +2066,73 @@ mod tests {
         let candidates =
             foundation_cleavage_graph_k_best_from_edge_scores(&graph, &scores).unwrap();
         assert_eq!(candidates.first().unwrap().peptide, peptide);
+    }
+
+    #[test]
+    fn structured_raw_energy_k_best_reconstructs_high_scoring_true_path() {
+        let peptide = PeptidoformInput {
+            sequence: "PEPTIDEK".into(),
+            modifications: Vec::new(),
+        };
+        let record = synthetic_record(peptide.clone(), 2);
+        let spectrum = FoundationSpectrum::from_training_record(&record).unwrap();
+        let graph = foundation_build_cleavage_graph(&record, &spectrum)
+            .unwrap()
+            .unwrap();
+        let audit = foundation_cleavage_graph_true_path_audit(&graph, &peptide).unwrap();
+        assert!(audit.structurally_present);
+        let true_edges = audit
+            .training_groups
+            .iter()
+            .map(|group| (group.source_node, group.target_outgoing_index))
+            .collect::<HashSet<_>>();
+        let scores = graph
+            .outgoing
+            .iter()
+            .enumerate()
+            .map(|(source_node, outgoing)| {
+                outgoing
+                    .iter()
+                    .enumerate()
+                    .map(|(edge_index, _)| {
+                        if true_edges.contains(&(source_node, edge_index)) {
+                            4.0
+                        } else {
+                            -4.0
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let candidates =
+            foundation_cleavage_graph_structured_k_best_from_edge_scores(&graph, &scores).unwrap();
+        assert_eq!(candidates.first().unwrap().peptide, peptide);
+        let stats = structured_path_statistics(&graph, &audit, &scores).unwrap();
+        assert!(stats.nll.is_finite());
+        assert!(stats.nll >= 0.0);
+    }
+
+    #[test]
+    fn structured_context_features_are_finite_and_fixed_width() {
+        let peptide = PeptidoformInput {
+            sequence: "PEPTIDEK".into(),
+            modifications: Vec::new(),
+        };
+        let record = synthetic_record(peptide, 2);
+        let spectrum = FoundationSpectrum::from_training_record(&record).unwrap();
+        let graph = foundation_build_cleavage_graph(&record, &spectrum)
+            .unwrap()
+            .unwrap();
+        let edge = graph
+            .outgoing
+            .iter()
+            .find_map(|outgoing| outgoing.first())
+            .unwrap();
+        let features = foundation_cleavage_graph_structured_edge_features(&graph, edge);
+        assert_eq!(
+            features.len(),
+            FOUNDATION_CLEAVAGE_GRAPH_STRUCTURED_FEATURE_DIM_V01318
+        );
+        assert!(features.iter().all(|value| value.is_finite()));
     }
 }
