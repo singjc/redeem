@@ -15,25 +15,37 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_canonicalize_reverse_causal_token_row, foundation_diffusion_residue_ptm_valid,
-    foundation_diffusion_reverse_probabilities, foundation_diffusion_token_mass_da,
-    foundation_diffusion_token_residue, foundation_fragment_causal_rerank_score,
-    foundation_precursor_mass_error_da, foundation_precursor_neutral_mass,
-    foundation_reverse_causal_token_row, load_foundation_corpus,
+    foundation_build_cleavage_graph, foundation_canonicalize_reverse_causal_token_row,
+    foundation_cleavage_graph_k_best_candidates, foundation_cleavage_graph_true_path_audit,
+    foundation_diffusion_residue_ptm_valid, foundation_diffusion_reverse_probabilities,
+    foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
+    foundation_fragment_causal_rerank_score, foundation_precursor_mass_error_da,
+    foundation_precursor_neutral_mass, foundation_reverse_causal_token_row, load_foundation_corpus,
     read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationCausalCollator,
     FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
     FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
-    PeptideSpectrumCausalModel, PeptideSpectrumDiffusionModel, PeptidoformInput,
-    PrecursorContextBatch, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
-    FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK,
-    FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_PAD,
-    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
-    FOUNDATION_PEPTIDE_WATER_MASS_DA, FOUNDATION_REVERSE_CAUSAL_DIRECTION_V01313,
-    FOUNDATION_REVERSE_CAUSAL_NAMESPACE_V01313,
+    PeptideSpectrumCausalModel, PeptideSpectrumCleavageGraphScorer, PeptideSpectrumDiffusionModel,
+    PeptidoformInput, PrecursorContextBatch, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
+    FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123, FOUNDATION_CLEAVAGE_GRAPH_HIDDEN_DIM_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_MAX_OUTGOING_EDGES_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_NAMESPACE_V01316, FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01316,
+    FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
+    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FOUNDATION_ITERATIVE_REFINEMENT_MASK_FRACTION_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_NAMESPACE_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_OBJECTIVE_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_BEAM_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_TOPK_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_ROUNDS_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315, FOUNDATION_PEPTIDE_WATER_MASS_DA,
+    FOUNDATION_REVERSE_CAUSAL_DIRECTION_V01313, FOUNDATION_REVERSE_CAUSAL_NAMESPACE_V01313,
 };
 use serde::Deserialize;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -52,6 +64,37 @@ struct ReverseCausalCheckpointMetadata {
     corpus_fingerprint: String,
     benchmark_manifest_fingerprint: String,
     parent_unified_checkpoint: String,
+    inverse_config: FoundationDiffusionConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct IterativeRefinementCheckpointMetadata {
+    objective: String,
+    parameter_namespace: String,
+    corpus_fingerprint: String,
+    benchmark_manifest_fingerprint: String,
+    parent_unified_checkpoint: String,
+    mask_fraction: f64,
+    refinement_rounds: usize,
+    seed_hypotheses: usize,
+    replacement_topk: usize,
+    replacement_beam_width: usize,
+    inverse_config: FoundationDiffusionConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct CleavageGraphCheckpointMetadata {
+    objective: String,
+    parameter_namespace: String,
+    corpus_fingerprint: String,
+    benchmark_manifest_fingerprint: String,
+    parent_unified_checkpoint: String,
+    reverse_causal_checkpoint: String,
+    graph_mass_tolerance_da: f64,
+    maximum_outgoing_edges: usize,
+    k_best_graph_paths: usize,
+    maximum_fragment_charge: usize,
+    hidden_dim: usize,
     inverse_config: FoundationDiffusionConfig,
 }
 
@@ -79,6 +122,8 @@ struct GeneratedCandidate {
     from_diffusion: bool,
     from_causal_beam: bool,
     from_reverse_causal_beam: bool,
+    from_iterative_refinement: bool,
+    from_cleavage_graph: bool,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +169,28 @@ struct GenerationMetrics {
     reverse_causal_beam_pool_mass_valid_il_sequence_exact: usize,
     reverse_causal_beam_final_candidates: usize,
     reverse_causal_beam_records_with_candidate: usize,
+    iterative_refinement_pool_mass_valid_peptidoform_exact: usize,
+    iterative_refinement_pool_mass_valid_sequence_exact: usize,
+    iterative_refinement_pool_mass_valid_il_sequence_exact: usize,
+    iterative_refinement_final_candidates: usize,
+    iterative_refinement_records_with_candidate: usize,
+    cleavage_graph_pool_mass_valid_peptidoform_exact: usize,
+    cleavage_graph_pool_mass_valid_sequence_exact: usize,
+    cleavage_graph_pool_mass_valid_il_sequence_exact: usize,
+    cleavage_graph_final_candidates: usize,
+    cleavage_graph_records_with_candidate: usize,
+    cleavage_graph_true_path_structural_present: usize,
+    cleavage_graph_structural_records: usize,
+    cleavage_graph_true_nodes_present: usize,
+    cleavage_graph_true_nodes_total: usize,
+    cleavage_graph_true_edges_present: usize,
+    cleavage_graph_true_edges_total: usize,
+    frozen_v01313_pool_mass_valid_peptidoform_exact: usize,
+    frozen_v01313_pool_mass_valid_sequence_exact: usize,
+    frozen_v01313_pool_mass_valid_il_sequence_exact: usize,
+    frozen_v01313_forward_ranking_peptidoform_exact: usize,
+    frozen_v01313_forward_ranking_sequence_exact: usize,
+    frozen_v01313_forward_ranking_il_sequence_exact: usize,
     neural_top1_peptidoform_exact: usize,
     neural_top1_sequence_exact: usize,
     neural_top1_il_sequence_exact: usize,
@@ -201,11 +268,29 @@ struct CausalReranker {
     collator: FoundationCausalCollator,
 }
 
+struct IterativeRefiner {
+    _varmap: VarMap,
+    model: PeptideSpectrumDiffusionModel,
+    collator: FoundationDiffusionCollator,
+}
+
+struct CleavageGraphProposer {
+    _varmap: VarMap,
+    model: PeptideSpectrumCleavageGraphScorer,
+}
+
+#[derive(Debug, Clone)]
+struct RefinementFillState {
+    tokens: Vec<u32>,
+    assigned_mass_da: f64,
+    log_probability: f64,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 || args.len() > 20 {
+    if args.len() < 4 || args.len() > 22 {
         anyhow::bail!(
-            "usage: foundation_generate_unified FOUNDATION_TRAINING.yaml UNIFIED_CHECKPOINT OUTPUT.tsv [validation_records=128] [samples_per_record=16] [seed=20260912] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=16] [neural_rerank_weight=1.0] [causal_rerank_weight=0.1] [causal_generation_beam_width=32] [causal_generation_final_candidates=16] [reverse_causal_checkpoint=none] [reverse_causal_generation_beam_width=32] [reverse_causal_generation_final_candidates=16]"
+            "usage: foundation_generate_unified FOUNDATION_TRAINING.yaml UNIFIED_CHECKPOINT OUTPUT.tsv [validation_records=128] [samples_per_record=16] [seed=20260912] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=16] [neural_rerank_weight=1.0] [causal_rerank_weight=0.1] [causal_generation_beam_width=32] [causal_generation_final_candidates=16] [reverse_causal_checkpoint=none] [reverse_causal_generation_beam_width=32] [reverse_causal_generation_final_candidates=16] [iterative_refinement_checkpoint=none] [cleavage_graph_checkpoint=none]"
         );
     }
 
@@ -232,6 +317,16 @@ fn main() -> Result<()> {
     });
     let reverse_causal_generation_beam_width = parse_or(&args, 18, 32usize)?;
     let reverse_causal_generation_final_candidates = parse_or(&args, 19, 16usize)?;
+    let iterative_refinement_checkpoint = args.get(20).and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none"))
+            .then(|| PathBuf::from(trimmed))
+    });
+    let cleavage_graph_checkpoint = args.get(21).and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none"))
+            .then(|| PathBuf::from(trimmed))
+    });
     if validation_records == 0
         || samples_per_record == 0
         || mass_beam_width == 0
@@ -271,6 +366,43 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "reverse_causal_generation_final_candidates must be positive when reverse causal generation is enabled"
         );
+    }
+    if iterative_refinement_checkpoint.is_some() && reverse_causal_checkpoint.is_none() {
+        anyhow::bail!(
+            "v0.13.15 iterative refinement requires the accepted v0.13.13 reverse-causal checkpoint so frozen three-way parity can be verified"
+        );
+    }
+    if cleavage_graph_checkpoint.is_some() && reverse_causal_checkpoint.is_none() {
+        anyhow::bail!(
+            "v0.13.16 cleavage graph requires the accepted v0.13.13 reverse-causal checkpoint so frozen three-way parity can be verified"
+        );
+    }
+    if cleavage_graph_checkpoint.is_some() && iterative_refinement_checkpoint.is_some() {
+        anyhow::bail!(
+            "v0.13.16 cleavage graph cannot be combined with the rejected v0.13.15 iterative-refinement branch"
+        );
+    }
+    if cleavage_graph_checkpoint.is_some() {
+        let fixed_policy = validation_records == 128
+            && samples_per_record == 16
+            && seed == 20_260_912
+            && (mass_tolerance_da - 0.05).abs() <= 1.0e-12
+            && (temperature - 1.0).abs() <= 1.0e-12
+            && mass_beam_width == 512
+            && final_candidates_per_chain == 4
+            && (fragment_tolerance_ppm - 20.0).abs() <= 1.0e-12
+            && (spectral_beam_weight - 16.0).abs() <= 1.0e-12
+            && (neural_rerank_weight - 1.0).abs() <= 1.0e-12
+            && (causal_rerank_weight - FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123).abs() <= 1.0e-12
+            && causal_generation_beam_width == 32
+            && causal_generation_final_candidates == 16
+            && reverse_causal_generation_beam_width == 32
+            && reverse_causal_generation_final_candidates == 16;
+        if !fixed_policy {
+            anyhow::bail!(
+                "v0.13.16 cleavage-graph evaluation is a fixed val128 decision run; do not sweep legacy proposal/ranking/search parameters"
+            );
+        }
     }
 
     let device = Device::Cpu;
@@ -398,6 +530,185 @@ fn main() -> Result<()> {
         None
     };
 
+    let iterative_refiner = if let Some(refinement_checkpoint) =
+        iterative_refinement_checkpoint.as_ref()
+    {
+        let refinement_metadata_path = if refinement_checkpoint.is_dir() {
+            refinement_checkpoint.join("metadata.yaml")
+        } else {
+            refinement_checkpoint
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("metadata.yaml")
+        };
+        let refinement_metadata: IterativeRefinementCheckpointMetadata = serde_yaml::from_str(
+            &fs::read_to_string(&refinement_metadata_path)
+                .with_context(|| format!("failed to read {refinement_metadata_path:?}"))?,
+        )?;
+        if refinement_metadata.objective != FOUNDATION_ITERATIVE_REFINEMENT_OBJECTIVE_V01315
+            || refinement_metadata.parameter_namespace
+                != FOUNDATION_ITERATIVE_REFINEMENT_NAMESPACE_V01315
+        {
+            anyhow::bail!(
+                "iterative-refinement checkpoint has incompatible objective/namespace: objective={:?} namespace={:?}",
+                refinement_metadata.objective,
+                refinement_metadata.parameter_namespace
+            );
+        }
+        if refinement_metadata.inverse_config != config {
+            anyhow::bail!(
+                "iterative-refinement checkpoint inverse config does not match unified checkpoint"
+            );
+        }
+        if (refinement_metadata.mask_fraction
+            - FOUNDATION_ITERATIVE_REFINEMENT_MASK_FRACTION_V01315)
+            .abs()
+            > f64::EPSILON
+            || refinement_metadata.refinement_rounds
+                != FOUNDATION_ITERATIVE_REFINEMENT_ROUNDS_V01315
+            || refinement_metadata.seed_hypotheses
+                != FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315
+            || refinement_metadata.replacement_topk
+                != FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_TOPK_V01315
+            || refinement_metadata.replacement_beam_width
+                != FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_BEAM_V01315
+        {
+            anyhow::bail!(
+                "iterative-refinement checkpoint policy does not match fixed v0.13.15 constants"
+            );
+        }
+        let corpus_fingerprint = format!("fnv1a64:{:016x}", corpus.corpus_fingerprint);
+        let benchmark_fingerprint = format!("fnv1a64:{:016x}", benchmark.manifest_fingerprint());
+        if refinement_metadata.corpus_fingerprint != corpus_fingerprint
+            || refinement_metadata.benchmark_manifest_fingerprint != benchmark_fingerprint
+        {
+            anyhow::bail!("iterative-refinement checkpoint corpus/benchmark fingerprint mismatch");
+        }
+        let expected_parent = checkpoint_dir.join("model.safetensors");
+        if PathBuf::from(&refinement_metadata.parent_unified_checkpoint) != expected_parent {
+            anyhow::bail!(
+                "iterative-refinement checkpoint parent {:?} does not match evaluated unified parent {:?}",
+                refinement_metadata.parent_unified_checkpoint,
+                expected_parent
+            );
+        }
+        let refinement_model_path = if refinement_checkpoint.is_dir() {
+            refinement_checkpoint.join("model.safetensors")
+        } else {
+            refinement_checkpoint.clone()
+        };
+        let refinement_varmap = VarMap::new();
+        let refinement_vb = VarBuilder::from_varmap(&refinement_varmap, DType::F32, &device)
+            .pp(FOUNDATION_ITERATIVE_REFINEMENT_NAMESPACE_V01315);
+        let refinement_model = PeptideSpectrumDiffusionModel::new(config.clone(), refinement_vb)?;
+        load_matching_variables(&refinement_varmap, &refinement_model_path, &device).with_context(
+            || format!("failed to load iterative-refinement variables {refinement_model_path:?}"),
+        )?;
+        Some(IterativeRefiner {
+            _varmap: refinement_varmap,
+            model: refinement_model,
+            collator: FoundationDiffusionCollator::new(config.clone())?,
+        })
+    } else {
+        None
+    };
+
+    let cleavage_graph_proposer = if let Some(graph_checkpoint) = cleavage_graph_checkpoint.as_ref()
+    {
+        let graph_metadata_path = if graph_checkpoint.is_dir() {
+            graph_checkpoint.join("metadata.yaml")
+        } else {
+            graph_checkpoint
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("metadata.yaml")
+        };
+        let graph_metadata: CleavageGraphCheckpointMetadata = serde_yaml::from_str(
+            &fs::read_to_string(&graph_metadata_path)
+                .with_context(|| format!("failed to read {graph_metadata_path:?}"))?,
+        )?;
+        if graph_metadata.objective != FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01316
+            || graph_metadata.parameter_namespace != FOUNDATION_CLEAVAGE_GRAPH_NAMESPACE_V01316
+        {
+            anyhow::bail!(
+                "cleavage-graph checkpoint has incompatible objective/namespace: objective={:?} namespace={:?}",
+                graph_metadata.objective,
+                graph_metadata.parameter_namespace
+            );
+        }
+        if graph_metadata.inverse_config != config {
+            anyhow::bail!(
+                "cleavage-graph checkpoint inverse config does not match unified checkpoint"
+            );
+        }
+        if (graph_metadata.graph_mass_tolerance_da
+            - FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316)
+            .abs()
+            > f64::EPSILON
+            || graph_metadata.maximum_outgoing_edges
+                != FOUNDATION_CLEAVAGE_GRAPH_MAX_OUTGOING_EDGES_V01316
+            || graph_metadata.k_best_graph_paths != FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316
+            || graph_metadata.maximum_fragment_charge
+                != FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316
+            || graph_metadata.hidden_dim != FOUNDATION_CLEAVAGE_GRAPH_HIDDEN_DIM_V01316
+        {
+            anyhow::bail!(
+                "cleavage-graph checkpoint policy does not match fixed v0.13.16 constants"
+            );
+        }
+        let corpus_fingerprint = format!("fnv1a64:{:016x}", corpus.corpus_fingerprint);
+        let benchmark_fingerprint = format!("fnv1a64:{:016x}", benchmark.manifest_fingerprint());
+        if graph_metadata.corpus_fingerprint != corpus_fingerprint
+            || graph_metadata.benchmark_manifest_fingerprint != benchmark_fingerprint
+        {
+            anyhow::bail!("cleavage-graph checkpoint corpus/benchmark fingerprint mismatch");
+        }
+        let expected_parent = checkpoint_dir.join("model.safetensors");
+        if PathBuf::from(&graph_metadata.parent_unified_checkpoint) != expected_parent {
+            anyhow::bail!(
+                "cleavage-graph checkpoint parent {:?} does not match evaluated unified parent {:?}",
+                graph_metadata.parent_unified_checkpoint,
+                expected_parent
+            );
+        }
+        let expected_reverse = reverse_causal_checkpoint
+            .as_ref()
+            .map(|path| {
+                if path.is_dir() {
+                    path.join("model.safetensors")
+                } else {
+                    path.clone()
+                }
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("cleavage-graph evaluation requires reverse checkpoint")
+            })?;
+        if PathBuf::from(&graph_metadata.reverse_causal_checkpoint) != expected_reverse {
+            anyhow::bail!(
+                "cleavage-graph checkpoint reverse parent {:?} does not match evaluated reverse {:?}",
+                graph_metadata.reverse_causal_checkpoint,
+                expected_reverse
+            );
+        }
+        let graph_model_path = if graph_checkpoint.is_dir() {
+            graph_checkpoint.join("model.safetensors")
+        } else {
+            graph_checkpoint.clone()
+        };
+        let graph_varmap = VarMap::new();
+        let graph_vb = VarBuilder::from_varmap(&graph_varmap, DType::F32, &device);
+        let graph_model = PeptideSpectrumCleavageGraphScorer::new(graph_vb)?;
+        load_matching_variables(&graph_varmap, &graph_model_path, &device).with_context(|| {
+            format!("failed to load cleavage-graph variables {graph_model_path:?}")
+        })?;
+        Some(CleavageGraphProposer {
+            _varmap: graph_varmap,
+            model: graph_model,
+        })
+    } else {
+        None
+    };
+
     println!(
         "corpus_fingerprint\tfnv1a64:{:016x}",
         corpus.corpus_fingerprint
@@ -408,6 +719,7 @@ fn main() -> Result<()> {
     );
     println!("checkpoint\t{}", checkpoint_dir.display());
     println!("validation_records\t{}", selected.len());
+    println!("test_partition_consumed\tNO");
     println!("samples_per_record\t{samples_per_record}");
     println!("diffusion_steps\t{}", config.diffusion_steps);
     println!("mass_tolerance_da\t{mass_tolerance_da}");
@@ -427,7 +739,10 @@ fn main() -> Result<()> {
             "custom_fragment_plus_weighted_ar_total"
         };
     println!("causal_rerank_policy\t{causal_rerank_policy}");
-    if reverse_causal_reranker.is_some() {
+    if reverse_causal_reranker.is_some()
+        && iterative_refiner.is_none()
+        && cleavage_graph_proposer.is_none()
+    {
         println!("bidirectional_causal_rerank_policy\tfragment_plus_0.05_n_to_c_ar_total_plus_0.05_c_to_n_ar_total_v01314");
         println!(
             "bidirectional_causal_rerank_direction_weight\t{}",
@@ -450,6 +765,80 @@ fn main() -> Result<()> {
     println!(
         "reverse_causal_generation_final_candidates\t{reverse_causal_generation_final_candidates}"
     );
+    println!(
+        "iterative_refinement_checkpoint\t{}",
+        iterative_refinement_checkpoint
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "disabled".into())
+    );
+    println!(
+        "iterative_refinement_policy\t{}",
+        if iterative_refiner.is_some() {
+            "four_round_quarter_residue_joint_mass_refill_v01315"
+        } else {
+            "disabled"
+        }
+    );
+    if iterative_refiner.is_some() {
+        println!(
+            "iterative_refinement_rounds\t{}",
+            FOUNDATION_ITERATIVE_REFINEMENT_ROUNDS_V01315
+        );
+        println!(
+            "iterative_refinement_mask_fraction\t{}",
+            FOUNDATION_ITERATIVE_REFINEMENT_MASK_FRACTION_V01315
+        );
+        println!(
+            "iterative_refinement_seed_hypotheses\t{}",
+            FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315
+        );
+        println!(
+            "iterative_refinement_replacement_topk\t{}",
+            FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_TOPK_V01315
+        );
+        println!(
+            "iterative_refinement_replacement_beam_width\t{}",
+            FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_BEAM_V01315
+        );
+    }
+    println!(
+        "cleavage_graph_checkpoint\t{}",
+        cleavage_graph_checkpoint
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "disabled".into())
+    );
+    println!(
+        "cleavage_graph_policy\t{}",
+        if cleavage_graph_proposer.is_some() {
+            "observed_fragment_cleavage_mass_dag_edge_mlp_kbest_v01316"
+        } else {
+            "disabled"
+        }
+    );
+    if cleavage_graph_proposer.is_some() {
+        println!(
+            "cleavage_graph_mass_tolerance_da\t{}",
+            FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316
+        );
+        println!(
+            "cleavage_graph_maximum_outgoing_edges\t{}",
+            FOUNDATION_CLEAVAGE_GRAPH_MAX_OUTGOING_EDGES_V01316
+        );
+        println!(
+            "cleavage_graph_k_best_paths\t{}",
+            FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316
+        );
+        println!(
+            "cleavage_graph_maximum_fragment_charge\t{}",
+            FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316
+        );
+        println!("cleavage_graph_true_path_diagnostic\tpre_neural_scoring_per_record");
+        println!(
+            "cleavage_graph_ranking_policy\tfragment_score+0.1*n_to_c_ar_total_log_probability"
+        );
+    }
     println!(
         "reverse_causal_generation_policy\t{}",
         if reverse_causal_reranker.is_some() && reverse_causal_generation_beam_width > 0 {
@@ -482,11 +871,28 @@ fn main() -> Result<()> {
             "disabled"
         }
     );
-    println!("primary_candidate_ranking\tfragment_mass");
+    println!(
+        "primary_candidate_ranking\t{}",
+        if cleavage_graph_proposer.is_some() {
+            "fragment_score+0.1*n_to_c_ar_total_log_probability_v01316"
+        } else {
+            "fragment_mass"
+        }
+    );
     println!("parallel_candidate_rankings\tneural_all_mask_mass,hybrid_fragment_neural_mass,causal_ar_mass,hybrid_fragment_causal_mass,hybrid_fragment_bidirectional_causal_mass");
     println!(
         "candidate_pool_sources\t{}",
-        if reverse_causal_reranker.is_some() && reverse_causal_generation_beam_width > 0 {
+        if cleavage_graph_proposer.is_some()
+            && reverse_causal_reranker.is_some()
+            && reverse_causal_generation_beam_width > 0
+        {
+            "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+cleavage_mass_graph_v01316"
+        } else if iterative_refiner.is_some()
+            && reverse_causal_reranker.is_some()
+            && reverse_causal_generation_beam_width > 0
+        {
+            "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+iterative_masked_refinement_v01315"
+        } else if reverse_causal_reranker.is_some() && reverse_causal_generation_beam_width > 0 {
             "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313"
         } else if causal_generation_beam_width > 0 {
             "diffusion_reverse_v0115+causal_prefix_mass_beam_v0124"
@@ -495,6 +901,7 @@ fn main() -> Result<()> {
         }
     );
     println!("candidate_reranker\tall_mask_x0_v1+causal_next_token_v1");
+    println!("accepted_candidate_ranking\tfragment_score+0.1*n_to_c_ar_total_log_probability");
     println!("neural_candidate_input\tspectrum+precursor+length_all_masked");
     println!("causal_candidate_input\tspectrum+precursor+START+shifted_candidate_prefix");
     println!("seed\t{seed}");
@@ -508,7 +915,7 @@ fn main() -> Result<()> {
     let mut output = BufWriter::new(file);
     writeln!(
         output,
-        "record_index\tsource_id\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tneural_mass_rank\thybrid_mass_rank\tcausal_mass_rank\tfragment_causal_mass_rank\tfragment_bidirectional_causal_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tneural_all_mask_log_probability\tneural_all_mask_perplexity\tneural_length_log_probability\thybrid_score\tar_total_log_probability\tar_mean_log_probability\tar_perplexity\tfragment_causal_score\treverse_ar_total_log_probability\treverse_ar_mean_log_probability\treverse_ar_perplexity\tbidirectional_ar_total_log_probability\tfragment_bidirectional_causal_score\tmass_error_da\tmass_valid\tfrom_diffusion\tfrom_causal_beam\tfrom_reverse_causal_beam\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
+        "record_index\tsource_id\ttarget_sequence\ttarget_active_tokens\tpredicted_active_tokens\tfragment_mass_rank\tneural_mass_rank\thybrid_mass_rank\tcausal_mass_rank\tfragment_causal_mass_rank\tfragment_bidirectional_causal_mass_rank\tmass_rank\treverse_rank\tcandidate_sequence\tcandidate_modifications\treverse_log_probability\tfragment_score\tmatched_cleavages\tneural_all_mask_log_probability\tneural_all_mask_perplexity\tneural_length_log_probability\thybrid_score\tar_total_log_probability\tar_mean_log_probability\tar_perplexity\tfragment_causal_score\treverse_ar_total_log_probability\treverse_ar_mean_log_probability\treverse_ar_perplexity\tbidirectional_ar_total_log_probability\tfragment_bidirectional_causal_score\tmass_error_da\tmass_valid\tfrom_diffusion\tfrom_causal_beam\tfrom_reverse_causal_beam\tfrom_iterative_refinement\tfrom_cleavage_graph\tpeptidoform_exact\tsequence_exact\til_sequence_exact"
     )?;
 
     let spectra_path = companion_spectra_path(&output_tsv);
@@ -667,6 +1074,8 @@ fn main() -> Result<()> {
                 from_diffusion: true,
                 from_causal_beam: false,
                 from_reverse_causal_beam: false,
+                from_iterative_refinement: false,
+                from_cleavage_graph: false,
             };
             unique
                 .entry(tokens)
@@ -674,8 +1083,14 @@ fn main() -> Result<()> {
                     existing.from_diffusion = true;
                     if candidate.reverse_log_probability > existing.reverse_log_probability {
                         let from_causal_beam = existing.from_causal_beam;
+                        let from_reverse_causal_beam = existing.from_reverse_causal_beam;
+                        let from_iterative_refinement = existing.from_iterative_refinement;
+                        let from_cleavage_graph = existing.from_cleavage_graph;
                         *existing = candidate.clone();
                         existing.from_causal_beam = from_causal_beam;
+                        existing.from_reverse_causal_beam = from_reverse_causal_beam;
+                        existing.from_iterative_refinement = from_iterative_refinement;
+                        existing.from_cleavage_graph = from_cleavage_graph;
                     }
                 })
                 .or_insert(candidate);
@@ -738,6 +1153,8 @@ fn main() -> Result<()> {
                         from_diffusion: false,
                         from_causal_beam: true,
                         from_reverse_causal_beam: false,
+                        from_iterative_refinement: false,
+                        from_cleavage_graph: false,
                     };
                     unique
                         .entry(generated.tokens)
@@ -806,6 +1223,8 @@ fn main() -> Result<()> {
                         from_diffusion: false,
                         from_causal_beam: false,
                         from_reverse_causal_beam: true,
+                        from_iterative_refinement: false,
+                        from_cleavage_graph: false,
                     };
                     unique
                         .entry(generated.tokens)
@@ -813,6 +1232,265 @@ fn main() -> Result<()> {
                             existing.from_reverse_causal_beam = true;
                         })
                         .or_insert(candidate);
+                }
+            }
+        }
+
+        let mut frozen_extension_candidates = None;
+        if iterative_refiner.is_some() || cleavage_graph_proposer.is_some() {
+            // Snapshot and independently rescore the accepted v0.13.13 three-way pool
+            // before any extension candidate is inserted. This is the parity boundary
+            // for both rejected v0.13.15 and new v0.13.16 branches.
+            let mut frozen_candidates = unique.values().cloned().collect::<Vec<_>>();
+            if let Some(causal) = causal_reranker.as_ref() {
+                let frozen_scores = score_causal_candidates(
+                    &causal.model,
+                    &causal.collator,
+                    &spectrum_collator,
+                    record,
+                    &spectrum,
+                    &frozen_candidates,
+                    &device,
+                )?;
+                for (candidate, score) in frozen_candidates.iter_mut().zip(frozen_scores) {
+                    candidate.ar_total_log_probability = score.total_log_probability;
+                    candidate.ar_mean_log_probability = score.mean_log_probability;
+                    candidate.ar_perplexity = score.perplexity;
+                    candidate.fragment_causal_score = foundation_fragment_causal_rerank_score(
+                        candidate.fragment_score,
+                        candidate.ar_total_log_probability,
+                        causal_rerank_weight,
+                    );
+                }
+            }
+
+            let frozen_target_il = normalize_il(&record.peptidoform.sequence);
+            let frozen_mass_valid = frozen_candidates
+                .iter()
+                .filter(|candidate| candidate.mass_valid)
+                .collect::<Vec<_>>();
+            metrics.frozen_v01313_pool_mass_valid_peptidoform_exact += usize::from(
+                frozen_mass_valid
+                    .iter()
+                    .any(|candidate| candidate.peptide == record.peptidoform),
+            );
+            metrics.frozen_v01313_pool_mass_valid_sequence_exact +=
+                usize::from(frozen_mass_valid.iter().any(|candidate| {
+                    candidate.peptide.sequence.as_str() == record.peptidoform.sequence.as_str()
+                }));
+            metrics.frozen_v01313_pool_mass_valid_il_sequence_exact +=
+                usize::from(frozen_mass_valid.iter().any(|candidate| {
+                    normalize_il(&candidate.peptide.sequence) == frozen_target_il
+                }));
+
+            let mut frozen_ranked = frozen_candidates.clone();
+            frozen_ranked.sort_by(fragment_causal_mass_candidate_order);
+            if let Some(top1) = frozen_ranked.first() {
+                let exact = ranking_exact_flags(top1, record, &frozen_target_il);
+                metrics.frozen_v01313_forward_ranking_peptidoform_exact += exact.0;
+                metrics.frozen_v01313_forward_ranking_sequence_exact += exact.1;
+                metrics.frozen_v01313_forward_ranking_il_sequence_exact += exact.2;
+            }
+            frozen_extension_candidates = Some(frozen_candidates);
+        }
+
+        if let Some(refiner) = iterative_refiner.as_ref() {
+            let frozen_candidates = frozen_extension_candidates
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing frozen v0.13.13 refinement snapshot"))?;
+            let seeds = select_iterative_refinement_seeds(frozen_candidates);
+            let refined_rows = iterative_refine_candidates(
+                refiner,
+                &spectrum_collator,
+                &config,
+                record,
+                &spectrum,
+                &seeds,
+                target_neutral_mass,
+                mass_tolerance_da,
+                &device,
+            )?;
+            metrics.iterative_refinement_final_candidates += refined_rows.len();
+            if !refined_rows.is_empty() {
+                metrics.iterative_refinement_records_with_candidate += 1;
+            }
+            for tokens in refined_rows {
+                let peptide = match vocabulary.decode(&tokens) {
+                    Ok(peptide) => peptide,
+                    Err(_) => continue,
+                };
+                let mass_error_da = precursor_mass_error(record, &peptide)?;
+                let mass_valid = mass_error_da
+                    .map(|error| error.abs() <= mass_tolerance_da)
+                    .unwrap_or(false);
+                if !mass_valid {
+                    continue;
+                }
+                let evidence = peptidoform_fragment_evidence(
+                    &peptide,
+                    target_neutral_mass,
+                    &observed_peaks,
+                    fragment_charge,
+                    fragment_tolerance_ppm,
+                );
+                let candidate = GeneratedCandidate {
+                    tokens: tokens.clone(),
+                    peptide,
+                    reverse_log_probability: f64::NEG_INFINITY,
+                    fragment_score: evidence.score,
+                    matched_cleavages: evidence.matched_cleavages,
+                    neural_all_mask_log_probability: f64::NEG_INFINITY,
+                    neural_length_log_probability: f64::NEG_INFINITY,
+                    hybrid_score: f64::NEG_INFINITY,
+                    ar_total_log_probability: f64::NEG_INFINITY,
+                    ar_mean_log_probability: f64::NEG_INFINITY,
+                    ar_perplexity: f64::INFINITY,
+                    fragment_causal_score: f64::NEG_INFINITY,
+                    reverse_ar_total_log_probability: f64::NEG_INFINITY,
+                    reverse_ar_mean_log_probability: f64::NEG_INFINITY,
+                    reverse_ar_perplexity: f64::INFINITY,
+                    bidirectional_ar_total_log_probability: f64::NEG_INFINITY,
+                    fragment_bidirectional_causal_score: f64::NEG_INFINITY,
+                    mass_error_da,
+                    mass_valid,
+                    from_diffusion: false,
+                    from_causal_beam: false,
+                    from_reverse_causal_beam: false,
+                    from_iterative_refinement: true,
+                    from_cleavage_graph: false,
+                };
+                unique
+                    .entry(tokens)
+                    .and_modify(|existing| {
+                        existing.from_iterative_refinement = true;
+                    })
+                    .or_insert(candidate);
+            }
+        }
+
+        if let Some(graph_proposer) = cleavage_graph_proposer.as_ref() {
+            // The structural diagnostic is deliberately evaluated before the first
+            // neural edge-score call and counts every requested validation peptide.
+            metrics.cleavage_graph_structural_records += 1;
+            let expected_edges = record.peptidoform.sequence.chars().count();
+            metrics.cleavage_graph_true_nodes_total += expected_edges + 1;
+            metrics.cleavage_graph_true_edges_total += expected_edges;
+
+            let graph = match foundation_build_cleavage_graph(record, &spectrum) {
+                Ok(Some(graph)) => Some(graph),
+                Ok(None) => {
+                    println!(
+                        "cleavage_graph_structural\trecord_index={record_index}\ttrue_path_structurally_present=NO\tpresent_nodes=0\ttotal_nodes={}\tpresent_edges=0\ttotal_edges={}\treason=graph_unavailable",
+                        expected_edges + 1,
+                        expected_edges
+                    );
+                    None
+                }
+                Err(error) => {
+                    println!(
+                        "cleavage_graph_structural\trecord_index={record_index}\ttrue_path_structurally_present=NO\tpresent_nodes=0\ttotal_nodes={}\tpresent_edges=0\ttotal_edges={}\treason=graph_construction_error:{}",
+                        expected_edges + 1,
+                        expected_edges,
+                        sanitize_diagnostic_text(&error)
+                    );
+                    None
+                }
+            };
+
+            if let Some(graph) = graph {
+                match foundation_cleavage_graph_true_path_audit(&graph, &record.peptidoform) {
+                    Ok(audit) => {
+                        metrics.cleavage_graph_true_path_structural_present +=
+                            usize::from(audit.structurally_present);
+                        metrics.cleavage_graph_true_nodes_present += audit.present_nodes;
+                        metrics.cleavage_graph_true_edges_present += audit.present_edges;
+                        println!(
+                            "cleavage_graph_structural\trecord_index={record_index}\ttrue_path_structurally_present={}\tpresent_nodes={}\ttotal_nodes={}\tpresent_edges={}\ttotal_edges={}\tgraph_nodes={}\tgraph_edges={}",
+                            if audit.structurally_present { "YES" } else { "NO" },
+                            audit.present_nodes,
+                            audit.total_nodes,
+                            audit.present_edges,
+                            audit.total_edges,
+                            graph.nodes.len(),
+                            graph.edge_count()
+                        );
+                    }
+                    Err(error) => {
+                        println!(
+                            "cleavage_graph_structural\trecord_index={record_index}\ttrue_path_structurally_present=NO\tpresent_nodes=0\ttotal_nodes={}\tpresent_edges=0\ttotal_edges={}\tgraph_nodes={}\tgraph_edges={}\treason=true_path_audit_error:{}",
+                            expected_edges + 1,
+                            expected_edges,
+                            graph.nodes.len(),
+                            graph.edge_count(),
+                            sanitize_diagnostic_text(&error)
+                        );
+                    }
+                }
+
+                // Neural scoring starts only after the structural line above is emitted.
+                let graph_candidates = foundation_cleavage_graph_k_best_candidates(
+                    &graph_proposer.model,
+                    &graph,
+                    &device,
+                )?;
+                metrics.cleavage_graph_final_candidates += graph_candidates.len();
+                let mut inserted = 0usize;
+                for graph_candidate in graph_candidates {
+                    let tokens =
+                        match vocabulary.encode(&graph_candidate.peptide, config.max_tokens) {
+                            Ok(tokens) => tokens,
+                            Err(_) => continue,
+                        };
+                    let mass_error_da = precursor_mass_error(record, &graph_candidate.peptide)?;
+                    let mass_valid = mass_error_da
+                        .map(|error| error.abs() <= mass_tolerance_da)
+                        .unwrap_or(false);
+                    if !mass_valid {
+                        continue;
+                    }
+                    let evidence = peptidoform_fragment_evidence(
+                        &graph_candidate.peptide,
+                        target_neutral_mass,
+                        &observed_peaks,
+                        fragment_charge,
+                        fragment_tolerance_ppm,
+                    );
+                    let candidate = GeneratedCandidate {
+                        tokens: tokens.clone(),
+                        peptide: graph_candidate.peptide,
+                        reverse_log_probability: f64::NEG_INFINITY,
+                        fragment_score: evidence.score,
+                        matched_cleavages: evidence.matched_cleavages,
+                        neural_all_mask_log_probability: f64::NEG_INFINITY,
+                        neural_length_log_probability: f64::NEG_INFINITY,
+                        hybrid_score: f64::NEG_INFINITY,
+                        ar_total_log_probability: f64::NEG_INFINITY,
+                        ar_mean_log_probability: f64::NEG_INFINITY,
+                        ar_perplexity: f64::INFINITY,
+                        fragment_causal_score: f64::NEG_INFINITY,
+                        reverse_ar_total_log_probability: f64::NEG_INFINITY,
+                        reverse_ar_mean_log_probability: f64::NEG_INFINITY,
+                        reverse_ar_perplexity: f64::INFINITY,
+                        bidirectional_ar_total_log_probability: f64::NEG_INFINITY,
+                        fragment_bidirectional_causal_score: f64::NEG_INFINITY,
+                        mass_error_da,
+                        mass_valid,
+                        from_diffusion: false,
+                        from_causal_beam: false,
+                        from_reverse_causal_beam: false,
+                        from_iterative_refinement: false,
+                        from_cleavage_graph: true,
+                    };
+                    unique
+                        .entry(tokens)
+                        .and_modify(|existing| {
+                            existing.from_cleavage_graph = true;
+                        })
+                        .or_insert(candidate);
+                    inserted += 1;
+                }
+                if inserted > 0 {
+                    metrics.cleavage_graph_records_with_candidate += 1;
                 }
             }
         }
@@ -900,29 +1578,31 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Some(reverse_causal) = reverse_causal_reranker.as_ref() {
-            let reverse_causal_scores = score_reverse_causal_candidates(
-                &reverse_causal.model,
-                &reverse_causal.collator,
-                &spectrum_collator,
-                record,
-                &spectrum,
-                &candidates,
-                &device,
-            )?;
-            for (candidate, score) in candidates.iter_mut().zip(reverse_causal_scores) {
-                candidate.reverse_ar_total_log_probability = score.total_log_probability;
-                candidate.reverse_ar_mean_log_probability = score.mean_log_probability;
-                candidate.reverse_ar_perplexity = score.perplexity;
-                candidate.bidirectional_ar_total_log_probability = 0.5
-                    * (candidate.ar_total_log_probability
-                        + candidate.reverse_ar_total_log_probability);
-                candidate.fragment_bidirectional_causal_score =
-                    foundation_fragment_causal_rerank_score(
-                        candidate.fragment_score,
-                        candidate.bidirectional_ar_total_log_probability,
-                        causal_rerank_weight,
-                    );
+        if iterative_refiner.is_none() && cleavage_graph_proposer.is_none() {
+            if let Some(reverse_causal) = reverse_causal_reranker.as_ref() {
+                let reverse_causal_scores = score_reverse_causal_candidates(
+                    &reverse_causal.model,
+                    &reverse_causal.collator,
+                    &spectrum_collator,
+                    record,
+                    &spectrum,
+                    &candidates,
+                    &device,
+                )?;
+                for (candidate, score) in candidates.iter_mut().zip(reverse_causal_scores) {
+                    candidate.reverse_ar_total_log_probability = score.total_log_probability;
+                    candidate.reverse_ar_mean_log_probability = score.mean_log_probability;
+                    candidate.reverse_ar_perplexity = score.perplexity;
+                    candidate.bidirectional_ar_total_log_probability = 0.5
+                        * (candidate.ar_total_log_probability
+                            + candidate.reverse_ar_total_log_probability);
+                    candidate.fragment_bidirectional_causal_score =
+                        foundation_fragment_causal_rerank_score(
+                            candidate.fragment_score,
+                            candidate.bidirectional_ar_total_log_probability,
+                            causal_rerank_weight,
+                        );
+                }
             }
         }
 
@@ -952,11 +1632,16 @@ fn main() -> Result<()> {
             ranked.sort_by(fragment_causal_mass_candidate_order);
             ranked
         });
-        let fragment_bidirectional_causal_ranked = reverse_causal_reranker.as_ref().map(|_| {
-            let mut ranked = candidates.clone();
-            ranked.sort_by(fragment_bidirectional_causal_mass_candidate_order);
-            ranked
-        });
+        let fragment_bidirectional_causal_ranked =
+            if iterative_refiner.is_none() && cleavage_graph_proposer.is_none() {
+                reverse_causal_reranker.as_ref().map(|_| {
+                    let mut ranked = candidates.clone();
+                    ranked.sort_by(fragment_bidirectional_causal_mass_candidate_order);
+                    ranked
+                })
+            } else {
+                None
+            };
         candidates.sort_by(fragment_mass_candidate_order);
         if candidates.iter().any(|candidate| candidate.mass_valid) {
             metrics.records_with_mass_valid_candidate += 1;
@@ -1027,6 +1712,16 @@ fn main() -> Result<()> {
             .iter()
             .copied()
             .filter(|candidate| candidate.from_reverse_causal_beam)
+            .collect();
+        let iterative_refinement_mass_valid_pool: Vec<&GeneratedCandidate> = mass_valid_pool
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.from_iterative_refinement)
+            .collect();
+        let cleavage_graph_mass_valid_pool: Vec<&GeneratedCandidate> = mass_valid_pool
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.from_cleavage_graph)
             .collect();
         if mass_valid_pool
             .iter()
@@ -1117,6 +1812,42 @@ fn main() -> Result<()> {
             .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il)
         {
             metrics.reverse_causal_beam_pool_mass_valid_il_sequence_exact += 1;
+        }
+        if iterative_refinement_mass_valid_pool
+            .iter()
+            .any(|candidate| candidate.peptide == record.peptidoform)
+        {
+            metrics.iterative_refinement_pool_mass_valid_peptidoform_exact += 1;
+        }
+        if iterative_refinement_mass_valid_pool
+            .iter()
+            .any(|candidate| candidate.peptide.sequence.as_str() == target_sequence.as_str())
+        {
+            metrics.iterative_refinement_pool_mass_valid_sequence_exact += 1;
+        }
+        if iterative_refinement_mass_valid_pool
+            .iter()
+            .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il)
+        {
+            metrics.iterative_refinement_pool_mass_valid_il_sequence_exact += 1;
+        }
+        if cleavage_graph_mass_valid_pool
+            .iter()
+            .any(|candidate| candidate.peptide == record.peptidoform)
+        {
+            metrics.cleavage_graph_pool_mass_valid_peptidoform_exact += 1;
+        }
+        if cleavage_graph_mass_valid_pool
+            .iter()
+            .any(|candidate| candidate.peptide.sequence.as_str() == target_sequence.as_str())
+        {
+            metrics.cleavage_graph_pool_mass_valid_sequence_exact += 1;
+        }
+        if cleavage_graph_mass_valid_pool
+            .iter()
+            .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il)
+        {
+            metrics.cleavage_graph_pool_mass_valid_il_sequence_exact += 1;
         }
         if mass_ranked[0].peptide == record.peptidoform {
             metrics.mass_top1_peptidoform_exact += 1;
@@ -1314,6 +2045,8 @@ fn main() -> Result<()> {
                 candidate.from_diffusion.to_string(),
                 candidate.from_causal_beam.to_string(),
                 candidate.from_reverse_causal_beam.to_string(),
+                candidate.from_iterative_refinement.to_string(),
+                candidate.from_cleavage_graph.to_string(),
                 (candidate.peptide == record.peptidoform).to_string(),
                 (candidate.peptide.sequence.as_str() == record.peptidoform.sequence.as_str())
                     .to_string(),
@@ -1395,6 +2128,60 @@ fn main() -> Result<()> {
                 top1.ar_total_log_probability,
                 top1.reverse_ar_total_log_probability,
                 top1.bidirectional_ar_total_log_probability,
+            );
+        }
+        if iterative_refiner.is_some() {
+            let iterative_top1 = fragment_causal_ranked.as_ref().and_then(|ranked| {
+                ranked
+                    .iter()
+                    .find(|candidate| candidate.from_iterative_refinement)
+            });
+            println!(
+                "generation_iterative_refinement\trecord_index={record_index}\tcandidates={}\tmass_valid_candidates={}\ttop1={}\ttop1_score={}\ttopk_exact={}\ttopk_il_exact={}",
+                candidates
+                    .iter()
+                    .filter(|candidate| candidate.from_iterative_refinement)
+                    .count(),
+                iterative_refinement_mass_valid_pool.len(),
+                iterative_top1
+                    .map(|candidate| candidate.peptide.sequence.as_str())
+                    .unwrap_or("NA"),
+                iterative_top1
+                    .map(|candidate| format!("{:.4}", candidate.fragment_causal_score))
+                    .unwrap_or_else(|| "NA".into()),
+                iterative_refinement_mass_valid_pool
+                    .iter()
+                    .any(|candidate| candidate.peptide == record.peptidoform),
+                iterative_refinement_mass_valid_pool
+                    .iter()
+                    .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il),
+            );
+        }
+        if cleavage_graph_proposer.is_some() {
+            let graph_top1 = fragment_causal_ranked.as_ref().and_then(|ranked| {
+                ranked
+                    .iter()
+                    .find(|candidate| candidate.from_cleavage_graph)
+            });
+            println!(
+                "generation_cleavage_graph\trecord_index={record_index}\tcandidates={}\tmass_valid_candidates={}\ttop1={}\ttop1_score={}\ttopk_exact={}\ttopk_il_exact={}",
+                candidates
+                    .iter()
+                    .filter(|candidate| candidate.from_cleavage_graph)
+                    .count(),
+                cleavage_graph_mass_valid_pool.len(),
+                graph_top1
+                    .map(|candidate| candidate.peptide.sequence.as_str())
+                    .unwrap_or("NA"),
+                graph_top1
+                    .map(|candidate| format!("{:.4}", candidate.fragment_causal_score))
+                    .unwrap_or_else(|| "NA".into()),
+                cleavage_graph_mass_valid_pool
+                    .iter()
+                    .any(|candidate| candidate.peptide == record.peptidoform),
+                cleavage_graph_mass_valid_pool
+                    .iter()
+                    .any(|candidate| normalize_il(&candidate.peptide.sequence) == target_il),
             );
         }
     }
@@ -1498,16 +2285,26 @@ fn main() -> Result<()> {
             "generation_summary\tfrozen_parent_pool_mass_valid_il_sequence_exact\t{:.6}",
             metrics.frozen_parent_pool_mass_valid_il_sequence_exact as f64 / records
         );
+        let has_post_v01313_extension =
+            iterative_refiner.is_some() || cleavage_graph_proposer.is_some();
+        let accepted_threeway_literal = if has_post_v01313_extension {
+            metrics.frozen_v01313_pool_mass_valid_peptidoform_exact
+        } else {
+            metrics.candidate_pool_mass_valid_peptidoform_exact
+        };
+        let accepted_threeway_il = if has_post_v01313_extension {
+            metrics.frozen_v01313_pool_mass_valid_il_sequence_exact
+        } else {
+            metrics.candidate_pool_mass_valid_il_sequence_exact
+        };
         println!(
             "generation_summary\treverse_causal_incremental_literal_records\t{}",
-            metrics
-                .candidate_pool_mass_valid_peptidoform_exact
+            accepted_threeway_literal
                 .saturating_sub(metrics.frozen_parent_pool_mass_valid_peptidoform_exact)
         );
         println!(
             "generation_summary\treverse_causal_incremental_il_records\t{}",
-            metrics
-                .candidate_pool_mass_valid_il_sequence_exact
+            accepted_threeway_il
                 .saturating_sub(metrics.frozen_parent_pool_mass_valid_il_sequence_exact)
         );
         println!(
@@ -1538,50 +2335,145 @@ fn main() -> Result<()> {
         );
         let reverse_gate = parent_parity
             && branch_parity
-            && metrics.candidate_pool_mass_valid_peptidoform_exact >= 25
-            && metrics.candidate_pool_mass_valid_il_sequence_exact >= 45;
+            && accepted_threeway_literal >= 25
+            && accepted_threeway_il >= 45;
         println!(
             "reverse_causal_acceptance_gate\trequired_literal=25\trequired_il=45\tobserved_literal={}\tobserved_il={}\tparent_parity={}\tbranch_parity={}\tgate={}",
-            metrics.candidate_pool_mass_valid_peptidoform_exact,
-            metrics.candidate_pool_mass_valid_il_sequence_exact,
+            accepted_threeway_literal,
+            accepted_threeway_il,
             if parent_parity { "YES" } else { "NO" },
             if branch_parity { "YES" } else { "NO" },
             if reverse_gate { "PASS" } else { "FAIL" }
         );
-        let candidate_pool_parity = metrics.candidate_pool_mass_valid_peptidoform_exact == 28
-            && metrics.candidate_pool_mass_valid_il_sequence_exact == 46;
-        let forward_ranking_parity = metrics.fragment_causal_top1_peptidoform_exact == 23
-            && metrics.fragment_causal_top1_il_sequence_exact == 37;
+
+        let candidate_pool_parity = accepted_threeway_literal == 28 && accepted_threeway_il == 46;
+        let accepted_forward_literal = if has_post_v01313_extension {
+            metrics.frozen_v01313_forward_ranking_peptidoform_exact
+        } else {
+            metrics.fragment_causal_top1_peptidoform_exact
+        };
+        let accepted_forward_il = if has_post_v01313_extension {
+            metrics.frozen_v01313_forward_ranking_il_sequence_exact
+        } else {
+            metrics.fragment_causal_top1_il_sequence_exact
+        };
+        let forward_ranking_parity = accepted_forward_literal == 23 && accepted_forward_il == 37;
         println!(
             "frozen_v01313_candidate_pool_parity\texpected_literal=28\texpected_il=46\tobserved_literal={}\tobserved_il={}\tparity={}",
-            metrics.candidate_pool_mass_valid_peptidoform_exact,
-            metrics.candidate_pool_mass_valid_il_sequence_exact,
+            accepted_threeway_literal,
+            accepted_threeway_il,
             if candidate_pool_parity { "YES" } else { "NO" }
         );
         println!(
             "frozen_v01313_forward_ranking_parity\texpected_literal=23\texpected_il=37\tobserved_literal={}\tobserved_il={}\tparity={}",
-            metrics.fragment_causal_top1_peptidoform_exact,
-            metrics.fragment_causal_top1_il_sequence_exact,
+            accepted_forward_literal,
+            accepted_forward_il,
             if forward_ranking_parity { "YES" } else { "NO" }
         );
-        let bidirectional_gate = parent_parity
-            && branch_parity
-            && candidate_pool_parity
-            && forward_ranking_parity
-            && metrics.fragment_bidirectional_causal_top1_peptidoform_exact >= 25
-            && metrics.fragment_bidirectional_causal_top1_il_sequence_exact >= 40;
-        println!(
-            "bidirectional_causal_acceptance_gate\trequired_literal=25\trequired_il=40\tobserved_literal={}\tobserved_il={}\tcandidate_pool_literal={}\tcandidate_pool_il={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
-            metrics.fragment_bidirectional_causal_top1_peptidoform_exact,
-            metrics.fragment_bidirectional_causal_top1_il_sequence_exact,
-            metrics.candidate_pool_mass_valid_peptidoform_exact,
-            metrics.candidate_pool_mass_valid_il_sequence_exact,
-            if candidate_pool_parity { "YES" } else { "NO" },
-            if forward_ranking_parity { "YES" } else { "NO" },
-            if parent_parity { "YES" } else { "NO" },
-            if branch_parity { "YES" } else { "NO" },
-            if bidirectional_gate { "PASS" } else { "FAIL" }
-        );
+
+        if !has_post_v01313_extension {
+            let bidirectional_gate = parent_parity
+                && branch_parity
+                && candidate_pool_parity
+                && forward_ranking_parity
+                && metrics.fragment_bidirectional_causal_top1_peptidoform_exact >= 25
+                && metrics.fragment_bidirectional_causal_top1_il_sequence_exact >= 40;
+            println!(
+                "bidirectional_causal_acceptance_gate\trequired_literal=25\trequired_il=40\tobserved_literal={}\tobserved_il={}\tcandidate_pool_literal={}\tcandidate_pool_il={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
+                metrics.fragment_bidirectional_causal_top1_peptidoform_exact,
+                metrics.fragment_bidirectional_causal_top1_il_sequence_exact,
+                accepted_threeway_literal,
+                accepted_threeway_il,
+                if candidate_pool_parity { "YES" } else { "NO" },
+                if forward_ranking_parity { "YES" } else { "NO" },
+                if parent_parity { "YES" } else { "NO" },
+                if branch_parity { "YES" } else { "NO" },
+                if bidirectional_gate { "PASS" } else { "FAIL" }
+            );
+        }
+
+        if iterative_refiner.is_some() {
+            println!(
+                "generation_summary\tfrozen_v01313_pool_mass_valid_peptidoform_exact\t{:.6}",
+                metrics.frozen_v01313_pool_mass_valid_peptidoform_exact as f64 / records
+            );
+            println!(
+                "generation_summary\tfrozen_v01313_pool_mass_valid_il_sequence_exact\t{:.6}",
+                metrics.frozen_v01313_pool_mass_valid_il_sequence_exact as f64 / records
+            );
+            println!(
+                "generation_summary\titerative_refinement_incremental_literal_records\t{}",
+                metrics
+                    .candidate_pool_mass_valid_peptidoform_exact
+                    .saturating_sub(metrics.frozen_v01313_pool_mass_valid_peptidoform_exact)
+            );
+            println!(
+                "generation_summary\titerative_refinement_incremental_il_records\t{}",
+                metrics
+                    .candidate_pool_mass_valid_il_sequence_exact
+                    .saturating_sub(metrics.frozen_v01313_pool_mass_valid_il_sequence_exact)
+            );
+            let refinement_gate = parent_parity
+                && branch_parity
+                && candidate_pool_parity
+                && forward_ranking_parity
+                && metrics.candidate_pool_mass_valid_peptidoform_exact >= 32
+                && metrics.candidate_pool_mass_valid_il_sequence_exact >= 52;
+            println!(
+                "iterative_refinement_acceptance_gate\trequired_literal=32\trequired_il=52\tobserved_literal={}\tobserved_il={}\tfrozen_pool_literal={}\tfrozen_pool_il={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
+                metrics.candidate_pool_mass_valid_peptidoform_exact,
+                metrics.candidate_pool_mass_valid_il_sequence_exact,
+                accepted_threeway_literal,
+                accepted_threeway_il,
+                if candidate_pool_parity { "YES" } else { "NO" },
+                if forward_ranking_parity { "YES" } else { "NO" },
+                if parent_parity { "YES" } else { "NO" },
+                if branch_parity { "YES" } else { "NO" },
+                if refinement_gate { "PASS" } else { "FAIL" }
+            );
+        }
+        if cleavage_graph_proposer.is_some() {
+            println!(
+                "generation_summary\tfrozen_v01313_pool_mass_valid_peptidoform_exact\t{:.6}",
+                metrics.frozen_v01313_pool_mass_valid_peptidoform_exact as f64 / records
+            );
+            println!(
+                "generation_summary\tfrozen_v01313_pool_mass_valid_il_sequence_exact\t{:.6}",
+                metrics.frozen_v01313_pool_mass_valid_il_sequence_exact as f64 / records
+            );
+            println!(
+                "generation_summary\tcleavage_graph_incremental_literal_records\t{}",
+                metrics
+                    .candidate_pool_mass_valid_peptidoform_exact
+                    .saturating_sub(metrics.frozen_v01313_pool_mass_valid_peptidoform_exact)
+            );
+            println!(
+                "generation_summary\tcleavage_graph_incremental_il_records\t{}",
+                metrics
+                    .candidate_pool_mass_valid_il_sequence_exact
+                    .saturating_sub(metrics.frozen_v01313_pool_mass_valid_il_sequence_exact)
+            );
+            let graph_gate = parent_parity
+                && branch_parity
+                && candidate_pool_parity
+                && forward_ranking_parity
+                && metrics.candidate_pool_mass_valid_peptidoform_exact >= 33
+                && metrics.candidate_pool_mass_valid_il_sequence_exact >= 54;
+            println!(
+                "cleavage_graph_acceptance_gate\trequired_literal=33\trequired_il=54\tobserved_literal={}\tobserved_il={}\taccepted_top1_literal={}\taccepted_top1_il={}\tfrozen_pool_literal={}\tfrozen_pool_il={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
+                metrics.candidate_pool_mass_valid_peptidoform_exact,
+                metrics.candidate_pool_mass_valid_il_sequence_exact,
+                metrics.fragment_causal_top1_peptidoform_exact,
+                metrics.fragment_causal_top1_il_sequence_exact,
+                accepted_threeway_literal,
+                accepted_threeway_il,
+                if candidate_pool_parity { "YES" } else { "NO" },
+                if forward_ranking_parity { "YES" } else { "NO" },
+                if parent_parity { "YES" } else { "NO" },
+                if branch_parity { "YES" } else { "NO" },
+                if graph_gate { "PASS" } else { "FAIL" }
+            );
+        }
     }
     println!(
         "generation_summary\tdiffusion_pool_mass_valid_peptidoform_exact\t{:.6}",
@@ -1637,6 +2529,73 @@ fn main() -> Result<()> {
             metrics.reverse_causal_beam_records_with_candidate as f64 / records
         );
     }
+    if iterative_refiner.is_some() {
+        println!(
+            "generation_summary\titerative_refinement_pool_mass_valid_peptidoform_exact\t{:.6}",
+            metrics.iterative_refinement_pool_mass_valid_peptidoform_exact as f64 / records
+        );
+        println!(
+            "generation_summary\titerative_refinement_pool_mass_valid_sequence_exact\t{:.6}",
+            metrics.iterative_refinement_pool_mass_valid_sequence_exact as f64 / records
+        );
+        println!(
+            "generation_summary\titerative_refinement_pool_mass_valid_il_sequence_exact\t{:.6}",
+            metrics.iterative_refinement_pool_mass_valid_il_sequence_exact as f64 / records
+        );
+        println!(
+            "generation_summary\titerative_refinement_final_candidates\t{}",
+            metrics.iterative_refinement_final_candidates
+        );
+        println!(
+            "generation_summary\titerative_refinement_records_with_candidate_rate\t{:.6}",
+            metrics.iterative_refinement_records_with_candidate as f64 / records
+        );
+    }
+    if cleavage_graph_proposer.is_some() {
+        println!(
+            "generation_summary\tcleavage_graph_pool_mass_valid_peptidoform_exact\t{:.6}",
+            metrics.cleavage_graph_pool_mass_valid_peptidoform_exact as f64 / records
+        );
+        println!(
+            "generation_summary\tcleavage_graph_pool_mass_valid_sequence_exact\t{:.6}",
+            metrics.cleavage_graph_pool_mass_valid_sequence_exact as f64 / records
+        );
+        println!(
+            "generation_summary\tcleavage_graph_pool_mass_valid_il_sequence_exact\t{:.6}",
+            metrics.cleavage_graph_pool_mass_valid_il_sequence_exact as f64 / records
+        );
+        println!(
+            "generation_summary\tcleavage_graph_final_candidates\t{}",
+            metrics.cleavage_graph_final_candidates
+        );
+        println!(
+            "generation_summary\tcleavage_graph_records_with_candidate_rate\t{:.6}",
+            metrics.cleavage_graph_records_with_candidate as f64 / records
+        );
+        println!(
+            "generation_summary\ttrue_path_structural_coverage\t{:.6}",
+            metrics.cleavage_graph_true_path_structural_present as f64
+                / metrics.cleavage_graph_structural_records.max(1) as f64
+        );
+        println!(
+            "generation_summary\ttrue_path_structural_present_records\t{}",
+            metrics.cleavage_graph_true_path_structural_present
+        );
+        println!(
+            "generation_summary\ttrue_path_structural_records\t{}",
+            metrics.cleavage_graph_structural_records
+        );
+        println!(
+            "generation_summary\ttrue_path_node_coverage\t{:.6}",
+            metrics.cleavage_graph_true_nodes_present as f64
+                / metrics.cleavage_graph_true_nodes_total.max(1) as f64
+        );
+        println!(
+            "generation_summary\ttrue_path_edge_coverage\t{:.6}",
+            metrics.cleavage_graph_true_edges_present as f64
+                / metrics.cleavage_graph_true_edges_total.max(1) as f64
+        );
+    }
     println!(
         "generation_summary\tneural_top1_peptidoform_exact\t{:.6}",
         metrics.neural_top1_peptidoform_exact as f64 / records
@@ -1687,7 +2646,10 @@ fn main() -> Result<()> {
             "generation_summary\tfragment_causal_top1_il_sequence_exact\t{:.6}",
             metrics.fragment_causal_top1_il_sequence_exact as f64 / causal_records
         );
-        if reverse_causal_reranker.is_some() {
+        if reverse_causal_reranker.is_some()
+            && iterative_refiner.is_none()
+            && cleavage_graph_proposer.is_none()
+        {
             println!(
                 "generation_summary\tfragment_bidirectional_causal_top1_peptidoform_exact\t{:.6}",
                 metrics.fragment_bidirectional_causal_top1_peptidoform_exact as f64
@@ -3496,6 +4458,19 @@ fn deterministic_subset(indices: &[usize], requested: usize, seed: u64) -> Vec<u
         .collect()
 }
 
+fn sanitize_diagnostic_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch == '\t' || ch == '\n' || ch == '\r' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 fn format_finite(value: f64) -> String {
     value
         .is_finite()
@@ -3548,6 +4523,379 @@ impl GenerationRng {
         let value = self.next_u64() >> 11;
         value as f64 / ((1u64 << 53) - 1) as f64
     }
+}
+
+fn select_iterative_refinement_seeds(candidates: &[GeneratedCandidate]) -> Vec<GeneratedCandidate> {
+    let mut selected = Vec::<GeneratedCandidate>::new();
+    let mut seen = HashSet::<Vec<u32>>::new();
+    let per_branch = FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315 / 3;
+
+    for source in 0..3 {
+        let mut branch = candidates
+            .iter()
+            .filter(|candidate| candidate.mass_valid)
+            .filter(|candidate| match source {
+                0 => candidate.from_diffusion,
+                1 => candidate.from_causal_beam,
+                _ => candidate.from_reverse_causal_beam,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        branch.sort_by(fragment_causal_mass_candidate_order);
+        let mut branch_added = 0usize;
+        for candidate in branch {
+            if seen.insert(candidate.tokens.clone()) {
+                selected.push(candidate);
+                branch_added += 1;
+                if selected.len() >= FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315
+                    || branch_added >= per_branch
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    if selected.len() < FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315 {
+        let mut global = candidates
+            .iter()
+            .filter(|candidate| candidate.mass_valid)
+            .cloned()
+            .collect::<Vec<_>>();
+        global.sort_by(fragment_causal_mass_candidate_order);
+        for candidate in global {
+            if seen.insert(candidate.tokens.clone()) {
+                selected.push(candidate);
+                if selected.len() >= FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315 {
+                    break;
+                }
+            }
+        }
+    }
+    selected.truncate(FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315);
+    selected
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iterative_refine_candidates(
+    refiner: &IterativeRefiner,
+    spectrum_collator: &FoundationSpectrumCollator,
+    config: &FoundationDiffusionConfig,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    seeds: &[GeneratedCandidate],
+    target_neutral_mass: Option<f64>,
+    mass_tolerance_da: f64,
+    device: &Device,
+) -> Result<Vec<Vec<u32>>> {
+    let Some(target_neutral_mass) = target_neutral_mass.filter(|value| value.is_finite()) else {
+        return Ok(Vec::new());
+    };
+    let mut emitted = Vec::<Vec<u32>>::new();
+    let mut emitted_seen = HashSet::<Vec<u32>>::new();
+
+    for (seed_index, seed) in seeds.iter().enumerate() {
+        let mut current = seed.tokens.clone();
+        let mut trajectory_seen = HashSet::<Vec<u32>>::new();
+        trajectory_seen.insert(current.clone());
+        for round in 0..FOUNDATION_ITERATIVE_REFINEMENT_ROUNDS_V01315 {
+            let Some(next) = iterative_refinement_round(
+                refiner,
+                spectrum_collator,
+                config,
+                record,
+                spectrum,
+                &current,
+                target_neutral_mass,
+                mass_tolerance_da,
+                mix64((seed_index as u64) ^ (round as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                &trajectory_seen,
+                device,
+            )?
+            else {
+                break;
+            };
+            trajectory_seen.insert(next.clone());
+            if emitted_seen.insert(next.clone()) {
+                emitted.push(next.clone());
+            }
+            current = next;
+        }
+    }
+    Ok(emitted)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iterative_refinement_round(
+    refiner: &IterativeRefiner,
+    spectrum_collator: &FoundationSpectrumCollator,
+    config: &FoundationDiffusionConfig,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    current: &[u32],
+    target_neutral_mass: f64,
+    mass_tolerance_da: f64,
+    seed: u64,
+    forbidden: &HashSet<Vec<u32>>,
+    device: &Device,
+) -> Result<Option<Vec<u32>>> {
+    let active_length = active_token_length(current, config.max_tokens)?;
+    let residue_positions = current[..active_length]
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &token)| {
+            foundation_diffusion_token_residue(token).map(|_| position)
+        })
+        .collect::<Vec<_>>();
+    if residue_positions.is_empty() {
+        return Ok(None);
+    }
+
+    let confidence_groups = 4usize;
+    let mut confidence_rows = Vec::<Vec<u32>>::with_capacity(confidence_groups);
+    for group in 0..confidence_groups {
+        let mut row = current.to_vec();
+        for (residue_index, &position) in residue_positions.iter().enumerate() {
+            if residue_index % confidence_groups == group {
+                row[position] = FOUNDATION_DIFFUSION_MASK;
+            }
+        }
+        confidence_rows.push(row);
+    }
+    let confidence_lengths = vec![active_length; confidence_groups];
+    let confidence_logits = iterative_refinement_logits(
+        refiner,
+        spectrum_collator,
+        record,
+        spectrum,
+        &confidence_rows,
+        &confidence_lengths,
+        device,
+    )?;
+    let mut confidence = Vec::<(f64, u64, usize)>::with_capacity(residue_positions.len());
+    for (residue_index, &position) in residue_positions.iter().enumerate() {
+        let group = residue_index % confidence_groups;
+        let token = current[position] as usize;
+        confidence.push((
+            selected_log_softmax(&confidence_logits[group][position], token)?,
+            mix64(seed ^ position as u64),
+            position,
+        ));
+    }
+    confidence.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let refine_count = ((residue_positions.len() as f64
+        * FOUNDATION_ITERATIVE_REFINEMENT_MASK_FRACTION_V01315)
+        .ceil() as usize)
+        .clamp(1, residue_positions.len());
+    let mut selected_positions = confidence
+        .into_iter()
+        .take(refine_count)
+        .map(|(_, _, position)| position)
+        .collect::<Vec<_>>();
+    selected_positions.sort_unstable();
+
+    let mut masked = current.to_vec();
+    for &position in &selected_positions {
+        masked[position] = FOUNDATION_DIFFUSION_MASK;
+    }
+    let refill_logits = iterative_refinement_logits(
+        refiner,
+        spectrum_collator,
+        record,
+        spectrum,
+        &[masked],
+        &[active_length],
+        device,
+    )?;
+
+    let mut options = Vec::<Vec<(u32, f64, f64)>>::with_capacity(selected_positions.len());
+    for &position in &selected_positions {
+        let mut position_options = Vec::<(u32, f64, f64)>::new();
+        for token in 0..FOUNDATION_DIFFUSION_VOCAB_SIZE as u32 {
+            if foundation_diffusion_token_residue(token).is_none() {
+                continue;
+            }
+            if !replacement_residue_ptm_compatible(current, position, active_length, token) {
+                continue;
+            }
+            let Some(mass) = foundation_diffusion_token_mass_da(token) else {
+                continue;
+            };
+            let log_probability =
+                selected_log_softmax(&refill_logits[0][position], token as usize)?;
+            position_options.push((token, log_probability, mass));
+        }
+        position_options.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let original = current[position];
+        let original_option = position_options
+            .iter()
+            .find(|(token, _, _)| *token == original)
+            .copied();
+        position_options.truncate(FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_TOPK_V01315);
+        if let Some(original_option) = original_option {
+            if !position_options
+                .iter()
+                .any(|(token, _, _)| *token == original)
+            {
+                position_options.push(original_option);
+            }
+        }
+        if position_options.is_empty() {
+            return Ok(None);
+        }
+        options.push(position_options);
+    }
+
+    let selected_set = selected_positions.iter().copied().collect::<HashSet<_>>();
+    let fixed_mass = FOUNDATION_PEPTIDE_WATER_MASS_DA
+        + current[..active_length]
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !selected_set.contains(position))
+            .filter_map(|(_, &token)| foundation_diffusion_token_mass_da(token))
+            .sum::<f64>();
+    let mut future_min = vec![0.0f64; options.len() + 1];
+    let mut future_max = vec![0.0f64; options.len() + 1];
+    for index in (0..options.len()).rev() {
+        let min_mass = options[index]
+            .iter()
+            .map(|(_, _, mass)| *mass)
+            .fold(f64::INFINITY, f64::min);
+        let max_mass = options[index]
+            .iter()
+            .map(|(_, _, mass)| *mass)
+            .fold(f64::NEG_INFINITY, f64::max);
+        future_min[index] = future_min[index + 1] + min_mass;
+        future_max[index] = future_max[index + 1] + max_mass;
+    }
+
+    let mut beam = vec![RefinementFillState {
+        tokens: current.to_vec(),
+        assigned_mass_da: fixed_mass,
+        log_probability: 0.0,
+    }];
+    for (option_index, &position) in selected_positions.iter().enumerate() {
+        let mut expanded = Vec::<RefinementFillState>::new();
+        for state in &beam {
+            for &(token, log_probability, mass) in &options[option_index] {
+                let assigned_mass_da = state.assigned_mass_da + mass;
+                let min_final = assigned_mass_da + future_min[option_index + 1];
+                let max_final = assigned_mass_da + future_max[option_index + 1];
+                if target_neutral_mass < min_final - mass_tolerance_da
+                    || target_neutral_mass > max_final + mass_tolerance_da
+                {
+                    continue;
+                }
+                let mut tokens = state.tokens.clone();
+                tokens[position] = token;
+                expanded.push(RefinementFillState {
+                    tokens,
+                    assigned_mass_da,
+                    log_probability: state.log_probability + log_probability,
+                });
+            }
+        }
+        expanded.sort_by(|left, right| {
+            right
+                .log_probability
+                .total_cmp(&left.log_probability)
+                .then_with(|| {
+                    (left.assigned_mass_da - target_neutral_mass)
+                        .abs()
+                        .total_cmp(&(right.assigned_mass_da - target_neutral_mass).abs())
+                })
+                .then_with(|| left.tokens.cmp(&right.tokens))
+        });
+        expanded.truncate(FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_BEAM_V01315);
+        if expanded.is_empty() {
+            return Ok(None);
+        }
+        beam = expanded;
+    }
+
+    beam.sort_by(|left, right| {
+        right
+            .log_probability
+            .total_cmp(&left.log_probability)
+            .then_with(|| {
+                (left.assigned_mass_da - target_neutral_mass)
+                    .abs()
+                    .total_cmp(&(right.assigned_mass_da - target_neutral_mass).abs())
+            })
+            .then_with(|| left.tokens.cmp(&right.tokens))
+    });
+    Ok(beam
+        .into_iter()
+        .find(|state| {
+            (state.assigned_mass_da - target_neutral_mass).abs() <= mass_tolerance_da
+                && state.tokens != current
+                && !forbidden.contains(&state.tokens)
+        })
+        .map(|state| state.tokens))
+}
+
+fn replacement_residue_ptm_compatible(
+    tokens: &[u32],
+    position: usize,
+    active_length: usize,
+    residue_token: u32,
+) -> bool {
+    let Some(residue) = foundation_diffusion_token_residue(residue_token) else {
+        return false;
+    };
+    let mut cursor = position + 1;
+    while cursor < active_length {
+        let token = tokens[cursor];
+        if token == FOUNDATION_DIFFUSION_EOS || foundation_diffusion_token_residue(token).is_some()
+        {
+            break;
+        }
+        if token == FOUNDATION_DIFFUSION_NTERM_ACETYL
+            || token == FOUNDATION_DIFFUSION_MASK
+            || token == FOUNDATION_DIFFUSION_PAD
+            || !foundation_diffusion_residue_ptm_valid(token, residue)
+        {
+            return false;
+        }
+        cursor += 1;
+    }
+    true
+}
+
+fn iterative_refinement_logits(
+    refiner: &IterativeRefiner,
+    spectrum_collator: &FoundationSpectrumCollator,
+    record: &FoundationTrainingRecord,
+    spectrum: &FoundationSpectrum,
+    rows: &[Vec<u32>],
+    active_lengths: &[usize],
+    device: &Device,
+) -> Result<Vec<Vec<Vec<f32>>>> {
+    let diffusion = refiner.collator.collate_inference_tokens(
+        rows,
+        active_lengths,
+        refiner.model.config().diffusion_steps,
+        device,
+    )?;
+    let spectra = vec![spectrum.clone(); rows.len()];
+    let spectrum_batch = spectrum_collator.collate(&spectra, device)?;
+    let records = vec![record; rows.len()];
+    let precursor = precursor_context(&records, device)?;
+    Ok(refiner
+        .model
+        .forward_t(&diffusion, &spectrum_batch, &precursor, false)?
+        .token_logits
+        .to_vec3::<f32>()?)
 }
 
 #[cfg(test)]

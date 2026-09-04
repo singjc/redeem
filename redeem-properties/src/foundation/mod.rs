@@ -15,6 +15,7 @@ pub mod causal;
 pub mod ccs_physics;
 pub mod checkpoint;
 pub mod chemistry;
+pub mod cleavage_graph;
 pub mod collate;
 pub mod config;
 pub mod control;
@@ -24,6 +25,7 @@ pub mod dataset;
 pub mod diffusion;
 pub mod experiment;
 pub mod featurize;
+pub mod iterative_refinement;
 pub mod layers;
 pub mod loss;
 pub mod metadata;
@@ -66,6 +68,21 @@ pub use checkpoint::{
 pub use chemistry::{
     common_unimod_definition, exact_graph_modification, ElementalComposition,
     ExactGraphModification, FoundationModificationDefinition, ModificationAttachmentSite,
+};
+pub use cleavage_graph::{
+    foundation_build_cleavage_graph, foundation_cleavage_graph_edge_features,
+    foundation_cleavage_graph_k_best_candidates, foundation_cleavage_graph_k_best_from_edge_scores,
+    foundation_cleavage_graph_outgoing_edge_loss, foundation_cleavage_graph_training_batch,
+    foundation_cleavage_graph_true_path_audit, validate_cleavage_graph_namespace,
+    FoundationCleavageGraph, FoundationCleavageGraphBatch, FoundationCleavageGraphCandidate,
+    FoundationCleavageGraphEdge, FoundationCleavageGraphNode, FoundationCleavageGraphTrainingGroup,
+    FoundationCleavageGraphTruePathAudit, FoundationCleavageGraphUnit,
+    PeptideSpectrumCleavageGraphScorer, FOUNDATION_CLEAVAGE_GRAPH_FEATURE_DIM_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_HIDDEN_DIM_V01316, FOUNDATION_CLEAVAGE_GRAPH_K_BEST_PATHS_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_MASS_TOLERANCE_DA_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_MAX_FRAGMENT_CHARGE_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_MAX_OUTGOING_EDGES_V01316,
+    FOUNDATION_CLEAVAGE_GRAPH_NAMESPACE_V01316, FOUNDATION_CLEAVAGE_GRAPH_OBJECTIVE_V01316,
 };
 pub use collate::{
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
@@ -114,6 +131,18 @@ pub use experiment::{
 pub use featurize::{
     exact_graph_modification_for, FoundationBatch, FoundationModification,
     FoundationModificationSite, PeptideGraphFeaturizer, PeptidoformInput,
+};
+pub use iterative_refinement::{
+    foundation_iterative_refinement_collate, foundation_iterative_refinement_mask_positions,
+    load_iterative_refinement_from_unified_checkpoint, validate_iterative_refinement_namespace,
+    FoundationIterativeRefinementWarmStartReport,
+    FOUNDATION_ITERATIVE_REFINEMENT_MASK_FRACTION_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_NAMESPACE_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_OBJECTIVE_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_BEAM_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_REPLACEMENT_TOPK_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_ROUNDS_V01315,
+    FOUNDATION_ITERATIVE_REFINEMENT_SEED_HYPOTHESES_V01315,
 };
 pub use loss::{
     contrastive_info_nce_loss, foundation_ms2_loss, multi_task_loss,
