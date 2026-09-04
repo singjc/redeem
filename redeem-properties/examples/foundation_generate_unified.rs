@@ -181,6 +181,11 @@ struct GenerationMetrics {
     mitm_records_with_mass_join: usize,
     mitm_unique_mass_joins_before_cap: usize,
     mitm_joined_candidates: usize,
+    mitm_selector_scored_candidates: usize,
+    mitm_selector_displaced_legacy_candidates: usize,
+    mitm_legacy_pool_mass_valid_peptidoform_exact: usize,
+    mitm_legacy_pool_mass_valid_sequence_exact: usize,
+    mitm_legacy_pool_mass_valid_il_sequence_exact: usize,
     mitm_pool_mass_valid_peptidoform_exact: usize,
     mitm_pool_mass_valid_sequence_exact: usize,
     mitm_pool_mass_valid_il_sequence_exact: usize,
@@ -282,6 +287,8 @@ struct CausalBeamCandidate {
 }
 
 const FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01319: &str = "midpoint_residue_mass_join_v01319";
+const FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01320: &str =
+    "evidence_aware_fixed_budget_midpoint_join_v01320";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MitmDirection {
@@ -304,6 +311,9 @@ struct MitmPartialState {
 struct MitmJoinedCandidate {
     tokens: Vec<u32>,
     proposal_score: f64,
+    selector_score: f64,
+    selector_fragment_score: f64,
+    selector_matched_cleavages: usize,
     join_mass_error_da: f64,
 }
 
@@ -335,7 +345,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 23 {
         anyhow::bail!(
-            "usage: foundation_generate_unified FOUNDATION_TRAINING.yaml UNIFIED_CHECKPOINT OUTPUT.tsv [validation_records=128] [samples_per_record=16] [seed=20260912] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=16] [neural_rerank_weight=1.0] [causal_rerank_weight=0.1] [causal_generation_beam_width=32] [causal_generation_final_candidates=16] [reverse_causal_checkpoint=none] [reverse_causal_generation_beam_width=32] [reverse_causal_generation_final_candidates=16] [iterative_refinement_checkpoint=none] [cleavage_graph_checkpoint=none] [bidirectional_mitm=none]"
+            "usage: foundation_generate_unified FOUNDATION_TRAINING.yaml UNIFIED_CHECKPOINT OUTPUT.tsv [validation_records=128] [samples_per_record=16] [seed=20260912] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=16] [neural_rerank_weight=1.0] [causal_rerank_weight=0.1] [causal_generation_beam_width=32] [causal_generation_final_candidates=16] [reverse_causal_checkpoint=none] [reverse_causal_generation_beam_width=32] [reverse_causal_generation_final_candidates=16] [iterative_refinement_checkpoint=none] [cleavage_graph_checkpoint=none] [bidirectional_mitm=none|v01319|v01320]"
         );
     }
 
@@ -372,19 +382,26 @@ fn main() -> Result<()> {
         (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none"))
             .then(|| PathBuf::from(trimmed))
     });
-    let bidirectional_mitm = match args.get(22).map(|value| value.trim()) {
-        None | Some("") => false,
-        Some(value) if value.eq_ignore_ascii_case("none") => false,
-        Some(value)
-            if value.eq_ignore_ascii_case("v01319")
-                || value.eq_ignore_ascii_case(FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01319) =>
-        {
-            true
-        }
-        Some(value) => anyhow::bail!(
-            "unsupported bidirectional_mitm policy '{value}'; expected 'none' or 'v01319'"
-        ),
-    };
+    let (bidirectional_mitm, bidirectional_mitm_evidence_aware) =
+        match args.get(22).map(|value| value.trim()) {
+            None | Some("") => (false, false),
+            Some(value) if value.eq_ignore_ascii_case("none") => (false, false),
+            Some(value)
+                if value.eq_ignore_ascii_case("v01319")
+                    || value.eq_ignore_ascii_case(FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01319) =>
+            {
+                (true, false)
+            }
+            Some(value)
+                if value.eq_ignore_ascii_case("v01320")
+                    || value.eq_ignore_ascii_case(FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01320) =>
+            {
+                (true, true)
+            }
+            Some(value) => anyhow::bail!(
+                "unsupported bidirectional_mitm policy '{value}'; expected 'none', 'v01319', or 'v01320'"
+            ),
+        };
     if validation_records == 0
         || samples_per_record == 0
         || mass_beam_width == 0
@@ -442,14 +459,14 @@ fn main() -> Result<()> {
     }
     if bidirectional_mitm && reverse_causal_checkpoint.is_none() {
         anyhow::bail!(
-            "v0.13.19 bidirectional MITM requires the accepted v0.13.13 reverse-causal checkpoint"
+            "v0.13.19/v0.13.20 bidirectional MITM requires the accepted v0.13.13 reverse-causal checkpoint"
         );
     }
     if bidirectional_mitm
         && (iterative_refinement_checkpoint.is_some() || cleavage_graph_checkpoint.is_some())
     {
         anyhow::bail!(
-            "v0.13.19 bidirectional MITM must be evaluated as an isolated post-v0.13.13 proposal extension"
+            "v0.13.19/v0.13.20 bidirectional MITM must be evaluated as an isolated post-v0.13.13 proposal extension"
         );
     }
     if bidirectional_mitm {
@@ -470,7 +487,7 @@ fn main() -> Result<()> {
             && reverse_causal_generation_final_candidates == 16;
         if !fixed_policy {
             anyhow::bail!(
-                "v0.13.19 bidirectional MITM evaluation is a fixed val128 decision run; do not sweep proposal/ranking/search parameters"
+                "v0.13.19/v0.13.20 bidirectional MITM evaluation is a fixed val128 decision run; do not sweep proposal/ranking/search parameters"
             );
         }
     }
@@ -864,7 +881,9 @@ fn main() -> Result<()> {
     );
     println!(
         "bidirectional_mitm_policy\t{}",
-        if bidirectional_mitm {
+        if bidirectional_mitm_evidence_aware {
+            FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01320
+        } else if bidirectional_mitm {
             FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01319
         } else {
             "disabled"
@@ -881,6 +900,24 @@ fn main() -> Result<()> {
                 .saturating_mul(reverse_causal_generation_final_candidates)
         );
         println!("bidirectional_mitm_reverse_ar_usage\tproposal_only");
+        println!(
+            "bidirectional_mitm_join_selector\t{}",
+            if bidirectional_mitm_evidence_aware {
+                "full_peptide_fragment+0.1*mean_bidirectional_partial_ar_v01320"
+            } else {
+                "sum_partial_fragment_plus_0.1*directional_ar_total_v01319"
+            }
+        );
+        if bidirectional_mitm_evidence_aware {
+            println!("bidirectional_mitm_selector_full_fragment_evidence\texact_partial_plus_join_seam_assembly");
+            println!("bidirectional_mitm_selector_ar_normalization\tmean_log_probability_per_emitted_partial_token");
+            println!(
+                "bidirectional_mitm_selector_candidate_budget\t{}",
+                causal_generation_final_candidates
+                    .saturating_mul(reverse_causal_generation_final_candidates)
+            );
+            println!("bidirectional_mitm_selector_legacy_shadow\tv01319_top256_same_join_pool");
+        }
         println!(
             "bidirectional_mitm_final_ranking\tfragment_score+0.1*n_to_c_ar_total_log_probability"
         );
@@ -1012,7 +1049,11 @@ fn main() -> Result<()> {
     println!(
         "primary_candidate_ranking\t{}",
         if bidirectional_mitm {
-            "fragment_score+0.1*n_to_c_ar_total_log_probability_v01319"
+            if bidirectional_mitm_evidence_aware {
+                "fragment_score+0.1*n_to_c_ar_total_log_probability_v01320"
+            } else {
+                "fragment_score+0.1*n_to_c_ar_total_log_probability_v01319"
+            }
         } else if cleavage_graph_proposer.is_some() {
             "fragment_score+0.1*n_to_c_ar_total_log_probability_v01318"
         } else {
@@ -1033,7 +1074,11 @@ fn main() -> Result<()> {
             && reverse_causal_reranker.is_some()
             && reverse_causal_generation_beam_width > 0
         {
-            "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+bidirectional_midpoint_mitm_v01319"
+            if bidirectional_mitm_evidence_aware {
+                "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+evidence_aware_bidirectional_mitm_v01320"
+            } else {
+                "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+bidirectional_midpoint_mitm_v01319"
+            }
         } else if cleavage_graph_proposer.is_some()
             && reverse_causal_reranker.is_some()
             && reverse_causal_generation_beam_width > 0
@@ -1397,7 +1442,7 @@ fn main() -> Result<()> {
         if bidirectional_mitm || iterative_refiner.is_some() || cleavage_graph_proposer.is_some() {
             // Snapshot and independently rescore the accepted v0.13.13 three-way pool
             // before any extension candidate is inserted. This is the parity boundary
-            // for rejected v0.13.15/v0.13.18 branches and the v0.13.19 MITM extension.
+            // for rejected v0.13.15/v0.13.18 branches and the v0.13.19/v0.13.20 MITM extensions.
             let mut frozen_candidates = unique.values().cloned().collect::<Vec<_>>();
             if let Some(causal) = causal_reranker.as_ref() {
                 let frozen_scores = score_causal_candidates(
@@ -1495,7 +1540,7 @@ fn main() -> Result<()> {
 
             let max_joined_candidates = causal_generation_final_candidates
                 .saturating_mul(reverse_causal_generation_final_candidates);
-            let (unique_mass_joins_before_cap, joined) = bidirectional_mitm_join(
+            let (unique_mass_joins_before_cap, joined, legacy_shadow) = bidirectional_mitm_join(
                 &prefix_states,
                 &suffix_states,
                 target_neutral_mass,
@@ -1503,16 +1548,60 @@ fn main() -> Result<()> {
                 config.max_tokens,
                 vocabulary,
                 max_joined_candidates,
+                &observed_peaks,
+                fragment_charge,
+                fragment_tolerance_ppm,
+                causal_rerank_weight,
+                bidirectional_mitm_evidence_aware,
             )?;
             metrics.mitm_unique_mass_joins_before_cap += unique_mass_joins_before_cap;
             metrics.mitm_records_with_mass_join += usize::from(unique_mass_joins_before_cap > 0);
             metrics.mitm_joined_candidates += joined.len();
+            if bidirectional_mitm_evidence_aware {
+                metrics.mitm_selector_scored_candidates += unique_mass_joins_before_cap;
+                let selected_tokens: HashSet<Vec<u32>> = joined
+                    .iter()
+                    .map(|candidate| candidate.tokens.clone())
+                    .collect();
+                let legacy_tokens: HashSet<Vec<u32>> = legacy_shadow
+                    .iter()
+                    .map(|candidate| candidate.tokens.clone())
+                    .collect();
+                metrics.mitm_selector_displaced_legacy_candidates +=
+                    selected_tokens.difference(&legacy_tokens).count();
+
+                let target_il = normalize_il(&record.peptidoform.sequence);
+                let legacy_peptides: Vec<PeptidoformInput> = legacy_shadow
+                    .iter()
+                    .filter_map(|candidate| vocabulary.decode(&candidate.tokens).ok())
+                    .collect();
+                metrics.mitm_legacy_pool_mass_valid_peptidoform_exact += usize::from(
+                    legacy_peptides
+                        .iter()
+                        .any(|peptide| peptide == &record.peptidoform),
+                );
+                metrics.mitm_legacy_pool_mass_valid_sequence_exact +=
+                    usize::from(legacy_peptides.iter().any(|peptide| {
+                        peptide.sequence.as_str() == record.peptidoform.sequence.as_str()
+                    }));
+                metrics.mitm_legacy_pool_mass_valid_il_sequence_exact += usize::from(
+                    legacy_peptides
+                        .iter()
+                        .any(|peptide| normalize_il(&peptide.sequence) == target_il),
+                );
+            }
             println!(
-                "generation_bidirectional_mitm_search\trecord_index={record_index}\tprefix_states={}\tsuffix_states={}\tunique_mass_joins_before_cap={}\tretained_joined_candidates={}\tmidpoint_fraction=0.5",
+                "generation_bidirectional_mitm_search\trecord_index={record_index}\tprefix_states={}\tsuffix_states={}\tunique_mass_joins_before_cap={}\tretained_joined_candidates={}\tselector={}\tlegacy_shadow_candidates={}\tmidpoint_fraction=0.5",
                 prefix_states.len(),
                 suffix_states.len(),
                 unique_mass_joins_before_cap,
                 joined.len(),
+                if bidirectional_mitm_evidence_aware {
+                    "full_fragment_plus_bidirectional_partial_ar_mean_v01320"
+                } else {
+                    "legacy_partial_priority_v01319"
+                },
+                legacy_shadow.len(),
             );
 
             for generated in joined {
@@ -2788,20 +2877,47 @@ fn main() -> Result<()> {
                     .candidate_pool_mass_valid_il_sequence_exact
                     .saturating_sub(metrics.frozen_v01313_pool_mass_valid_il_sequence_exact)
             );
+            let legacy_join_pool_parity = !bidirectional_mitm_evidence_aware
+                || (metrics.mitm_records_with_mass_join == 123
+                    && metrics.mitm_unique_mass_joins_before_cap == 1_162_210
+                    && metrics.mitm_joined_candidates == 31_361);
+            let legacy_selector_parity = !bidirectional_mitm_evidence_aware
+                || (metrics.mitm_legacy_pool_mass_valid_peptidoform_exact == 42
+                    && metrics.mitm_legacy_pool_mass_valid_il_sequence_exact == 51);
+            if bidirectional_mitm_evidence_aware {
+                println!(
+                    "v01319_join_pool_parity\texpected_records_with_join=123\texpected_unique_joins=1162210\texpected_retained=31361\tobserved_records_with_join={}\tobserved_unique_joins={}\tobserved_retained={}\tparity={}",
+                    metrics.mitm_records_with_mass_join,
+                    metrics.mitm_unique_mass_joins_before_cap,
+                    metrics.mitm_joined_candidates,
+                    if legacy_join_pool_parity { "YES" } else { "NO" }
+                );
+                println!(
+                    "v01319_selector_shadow_parity\texpected_literal=42\texpected_il=51\tobserved_literal={}\tobserved_il={}\tparity={}",
+                    metrics.mitm_legacy_pool_mass_valid_peptidoform_exact,
+                    metrics.mitm_legacy_pool_mass_valid_il_sequence_exact,
+                    if legacy_selector_parity { "YES" } else { "NO" }
+                );
+            }
             let mitm_gate = parent_parity
                 && branch_parity
                 && candidate_pool_parity
                 && forward_ranking_parity
+                && legacy_join_pool_parity
+                && legacy_selector_parity
                 && metrics.candidate_pool_mass_valid_peptidoform_exact >= 33
                 && metrics.candidate_pool_mass_valid_il_sequence_exact >= 54;
             println!(
-                "bidirectional_mitm_acceptance_gate\trequired_literal=33\trequired_il=54\tobserved_literal={}\tobserved_il={}\taccepted_top1_literal={}\taccepted_top1_il={}\tfrozen_pool_literal={}\tfrozen_pool_il={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
+                "bidirectional_mitm_acceptance_gate\tpolicy={}\trequired_literal=33\trequired_il=54\tobserved_literal={}\tobserved_il={}\taccepted_top1_literal={}\taccepted_top1_il={}\tfrozen_pool_literal={}\tfrozen_pool_il={}\tlegacy_join_pool_parity={}\tlegacy_selector_parity={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
+                if bidirectional_mitm_evidence_aware { "v01320" } else { "v01319" },
                 metrics.candidate_pool_mass_valid_peptidoform_exact,
                 metrics.candidate_pool_mass_valid_il_sequence_exact,
                 metrics.fragment_causal_top1_peptidoform_exact,
                 metrics.fragment_causal_top1_il_sequence_exact,
                 accepted_threeway_literal,
                 accepted_threeway_il,
+                if legacy_join_pool_parity { "YES" } else { "NO" },
+                if legacy_selector_parity { "YES" } else { "NO" },
                 if candidate_pool_parity { "YES" } else { "NO" },
                 if forward_ranking_parity { "YES" } else { "NO" },
                 if parent_parity { "YES" } else { "NO" },
@@ -2968,6 +3084,28 @@ fn main() -> Result<()> {
             "generation_summary\tmitm_joined_candidates\t{}",
             metrics.mitm_joined_candidates
         );
+        if bidirectional_mitm_evidence_aware {
+            println!(
+                "generation_summary\tmitm_selector_scored_candidates\t{}",
+                metrics.mitm_selector_scored_candidates
+            );
+            println!(
+                "generation_summary\tmitm_selector_displaced_legacy_candidates\t{}",
+                metrics.mitm_selector_displaced_legacy_candidates
+            );
+            println!(
+                "generation_summary\tmitm_legacy_selector_literal_oracle\t{}",
+                metrics.mitm_legacy_pool_mass_valid_peptidoform_exact
+            );
+            println!(
+                "generation_summary\tmitm_legacy_selector_sequence_oracle\t{}",
+                metrics.mitm_legacy_pool_mass_valid_sequence_exact
+            );
+            println!(
+                "generation_summary\tmitm_legacy_selector_il_oracle\t{}",
+                metrics.mitm_legacy_pool_mass_valid_il_sequence_exact
+            );
+        }
         println!(
             "generation_summary\tmitm_standalone_literal_oracle\t{}",
             metrics.mitm_pool_mass_valid_peptidoform_exact
@@ -4031,6 +4169,62 @@ fn mitm_reverse_partial_to_canonical_suffix(
     Ok((has_nterm_acetyl, body))
 }
 
+fn mitm_legacy_join_order(left: &MitmJoinedCandidate, right: &MitmJoinedCandidate) -> Ordering {
+    right
+        .proposal_score
+        .total_cmp(&left.proposal_score)
+        .then_with(|| {
+            left.join_mass_error_da
+                .abs()
+                .total_cmp(&right.join_mass_error_da.abs())
+        })
+        .then_with(|| left.tokens.cmp(&right.tokens))
+}
+
+fn mitm_evidence_join_order(left: &MitmJoinedCandidate, right: &MitmJoinedCandidate) -> Ordering {
+    right
+        .selector_score
+        .total_cmp(&left.selector_score)
+        .then_with(|| {
+            right
+                .selector_matched_cleavages
+                .cmp(&left.selector_matched_cleavages)
+        })
+        .then_with(|| {
+            right
+                .selector_fragment_score
+                .total_cmp(&left.selector_fragment_score)
+        })
+        .then_with(|| {
+            left.join_mass_error_da
+                .abs()
+                .total_cmp(&right.join_mass_error_da.abs())
+        })
+        .then_with(|| right.proposal_score.total_cmp(&left.proposal_score))
+        .then_with(|| left.tokens.cmp(&right.tokens))
+}
+
+fn mitm_retain_top_candidates(
+    mut candidates: Vec<MitmJoinedCandidate>,
+    max_candidates: usize,
+    evidence_aware: bool,
+) -> Vec<MitmJoinedCandidate> {
+    let order: fn(&MitmJoinedCandidate, &MitmJoinedCandidate) -> Ordering = if evidence_aware {
+        mitm_evidence_join_order
+    } else {
+        mitm_legacy_join_order
+    };
+    if candidates.len() <= max_candidates {
+        candidates.sort_by(order);
+        return candidates;
+    }
+    candidates.select_nth_unstable_by(max_candidates, order);
+    candidates.truncate(max_candidates);
+    candidates.sort_by(order);
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bidirectional_mitm_join(
     prefix_states: &[MitmPartialState],
     suffix_states: &[MitmPartialState],
@@ -4039,12 +4233,17 @@ fn bidirectional_mitm_join(
     max_tokens: usize,
     vocabulary: FoundationDiffusionVocabulary,
     max_joined_candidates: usize,
-) -> Result<(usize, Vec<MitmJoinedCandidate>)> {
+    observed_peaks: &[(f64, f64)],
+    max_fragment_charge: usize,
+    fragment_tolerance_ppm: f64,
+    causal_weight: f64,
+    evidence_aware: bool,
+) -> Result<(usize, Vec<MitmJoinedCandidate>, Vec<MitmJoinedCandidate>)> {
     let Some(target_neutral_mass) = target_neutral_mass.filter(|value| value.is_finite()) else {
-        return Ok((0, Vec::new()));
+        return Ok((0, Vec::new(), Vec::new()));
     };
     if target_neutral_mass <= FOUNDATION_PEPTIDE_WATER_MASS_DA || max_joined_candidates == 0 {
-        return Ok((0, Vec::new()));
+        return Ok((0, Vec::new(), Vec::new()));
     }
     let target_residue_mass = target_neutral_mass - FOUNDATION_PEPTIDE_WATER_MASS_DA;
     let nterm_acetyl_mass =
@@ -4155,43 +4354,98 @@ fn bidirectional_mitm_join(
                     }
 
                     let proposal_score = prefix.priority + suffix.state.priority;
-                    let candidate = MitmJoinedCandidate {
-                        tokens: row.clone(),
-                        proposal_score,
-                        join_mass_error_da: exact_join_error,
-                    };
+                    let (selector_fragment_score, selector_matched_cleavages, selector_score) =
+                        if evidence_aware {
+                            // The two partial searches have already scored every cleavage
+                            // internal to their respective halves.  Add only the join-seam
+                            // cleavage to reconstruct complete-peptide fragment evidence
+                            // exactly, avoiding an O(peptide_length) rescan for every join.
+                            let seam_prefix_mass = prefix.assigned_mass_da
+                                + if !prefix_has_nterm && suffix_has_nterm {
+                                    nterm_acetyl_mass
+                                } else {
+                                    0.0
+                                };
+                            let seam = cleavage_fragment_evidence(
+                                seam_prefix_mass,
+                                target_neutral_mass,
+                                observed_peaks,
+                                max_fragment_charge,
+                                fragment_tolerance_ppm,
+                            );
+                            let complete_fragment_score =
+                                prefix.fragment_score + suffix.state.fragment_score + seam.score;
+                            let complete_matched_cleavages = prefix
+                                .matched_cleavages
+                                .saturating_add(suffix.state.matched_cleavages)
+                                .saturating_add(usize::from(seam.matched));
+                            let prefix_mean =
+                                prefix.ar_total_log_probability / prefix.tokens.len().max(1) as f64;
+                            let suffix_mean = suffix.state.ar_total_log_probability
+                                / suffix.state.tokens.len().max(1) as f64;
+                            let bidirectional_partial_mean = 0.5 * (prefix_mean + suffix_mean);
+                            (
+                                complete_fragment_score,
+                                complete_matched_cleavages,
+                                complete_fragment_score
+                                    + causal_weight * bidirectional_partial_mean,
+                            )
+                        } else {
+                            (0.0, 0, proposal_score)
+                        };
+
                     joined
-                        .entry(row)
+                        .entry(row.clone())
                         .and_modify(|existing| {
-                            if candidate.proposal_score > existing.proposal_score
-                                || (candidate.proposal_score == existing.proposal_score
-                                    && candidate.join_mass_error_da.abs()
-                                        < existing.join_mass_error_da.abs())
-                            {
-                                *existing = candidate.clone();
+                            if proposal_score > existing.proposal_score {
+                                existing.proposal_score = proposal_score;
+                            }
+                            if selector_score > existing.selector_score {
+                                existing.selector_score = selector_score;
+                                existing.selector_fragment_score = selector_fragment_score;
+                                existing.selector_matched_cleavages = selector_matched_cleavages;
+                            }
+                            if exact_join_error.abs() < existing.join_mass_error_da.abs() {
+                                existing.join_mass_error_da = exact_join_error;
                             }
                         })
-                        .or_insert(candidate);
+                        .or_insert(MitmJoinedCandidate {
+                            tokens: row,
+                            proposal_score,
+                            selector_score,
+                            selector_fragment_score,
+                            selector_matched_cleavages,
+                            join_mass_error_da: exact_join_error,
+                        });
                 }
             }
         }
     }
 
     let unique_before_cap = joined.len();
-    let mut joined: Vec<MitmJoinedCandidate> = joined.into_values().collect();
-    joined.sort_by(|left, right| {
-        right
-            .proposal_score
-            .total_cmp(&left.proposal_score)
-            .then_with(|| {
-                left.join_mass_error_da
-                    .abs()
-                    .total_cmp(&right.join_mass_error_da.abs())
-            })
-            .then_with(|| left.tokens.cmp(&right.tokens))
-    });
-    joined.truncate(max_joined_candidates);
-    Ok((unique_before_cap, joined))
+    let all: Vec<MitmJoinedCandidate> = joined.into_values().collect();
+    if !evidence_aware {
+        let selected = mitm_retain_top_candidates(all, max_joined_candidates, false);
+        return Ok((unique_before_cap, selected, Vec::new()));
+    }
+
+    // Shadow the frozen v0.13.19 selector on the exact same join pool.  Only the
+    // ordering changes in v0.13.20; beams, midpoint, chemistry and budget remain fixed.
+    let mut legacy_indices: Vec<usize> = (0..all.len()).collect();
+    if legacy_indices.len() > max_joined_candidates {
+        legacy_indices.select_nth_unstable_by(max_joined_candidates, |&left, &right| {
+            mitm_legacy_join_order(&all[left], &all[right])
+        });
+        legacy_indices.truncate(max_joined_candidates);
+    }
+    legacy_indices.sort_by(|&left, &right| mitm_legacy_join_order(&all[left], &all[right]));
+    let legacy_shadow: Vec<MitmJoinedCandidate> = legacy_indices
+        .into_iter()
+        .map(|index| all[index].clone())
+        .collect();
+
+    let selected = mitm_retain_top_candidates(all, max_joined_candidates, true);
+    Ok((unique_before_cap, selected, legacy_shadow))
 }
 
 #[derive(Debug, Clone)]
@@ -5943,6 +6197,51 @@ mod fragment_evidence_tests {
     }
 
     #[test]
+    fn mitm_complete_fragment_decomposition_matches_full_ladder() {
+        let peptide = PeptidoformInput {
+            sequence: "PEPTIDEK".into(),
+            modifications: Vec::new(),
+        };
+        let target_mass =
+            redeem_properties::foundation::foundation_peptidoform_neutral_mass(&peptide).unwrap();
+        let vocabulary = FoundationDiffusionVocabulary;
+        let tokens = vocabulary.encode(&peptide, 32).unwrap();
+        let eos = tokens
+            .iter()
+            .position(|&token| token == FOUNDATION_DIFFUSION_EOS)
+            .unwrap();
+        let active = &tokens[..eos];
+        let mut prefix_masses = Vec::new();
+        let mut mass = 0.0;
+        for &token in active {
+            mass += foundation_diffusion_token_mass_da(token).unwrap();
+            if foundation_diffusion_token_residue(token).is_some() {
+                prefix_masses.push(mass);
+            }
+        }
+        let mut peaks = Vec::new();
+        for &prefix_mass in prefix_masses.iter().take(prefix_masses.len() - 1) {
+            peaks.push(FoundationSpectrumPeak {
+                mz: (prefix_mass + 1.007_276_466_77) as f32,
+                intensity: 1.0,
+            });
+        }
+        let observed = normalized_observed_peaks(&FoundationSpectrum { peaks });
+        let split = 3usize;
+        let score_at = |residues: usize| {
+            cleavage_fragment_evidence(prefix_masses[residues - 1], target_mass, &observed, 1, 20.0)
+                .score
+        };
+        let prefix_internal: f64 = (1..split).map(|residues| score_at(residues)).sum();
+        let seam = score_at(split);
+        let suffix_internal: f64 = ((split + 1)..prefix_masses.len())
+            .map(|residues| score_at(residues))
+            .sum();
+        let full = peptidoform_fragment_evidence(&peptide, Some(target_mass), &observed, 1, 20.0);
+        assert!((prefix_internal + seam + suffix_internal - full.score).abs() < 1e-12);
+    }
+
+    #[test]
     fn mitm_reverse_partial_canonicalizes_suffix_units() {
         let vocabulary = FoundationDiffusionVocabulary;
         let suffix = vocabulary
@@ -6024,7 +6323,7 @@ mod fragment_evidence_tests {
         };
         let target_neutral_mass =
             redeem_properties::foundation::foundation_peptidoform_neutral_mass(&peptide).unwrap();
-        let (before_cap, joined) = bidirectional_mitm_join(
+        let (before_cap, joined, legacy_shadow) = bidirectional_mitm_join(
             &[prefix_state],
             &[suffix_state],
             Some(target_neutral_mass),
@@ -6032,11 +6331,47 @@ mod fragment_evidence_tests {
             32,
             vocabulary,
             16,
+            &[],
+            1,
+            20.0,
+            FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123,
+            false,
         )
         .unwrap();
         assert_eq!(before_cap, 1);
         assert_eq!(joined.len(), 1);
+        assert!(legacy_shadow.is_empty());
         assert_eq!(joined[0].tokens, canonical);
         assert!(joined[0].join_mass_error_da.abs() <= 0.05);
+    }
+
+    #[test]
+    fn mitm_v01320_selector_can_displace_legacy_partial_priority() {
+        let legacy_favored = MitmJoinedCandidate {
+            tokens: vec![1, 2, 3],
+            proposal_score: 10.0,
+            selector_score: 2.0,
+            selector_fragment_score: 2.2,
+            selector_matched_cleavages: 2,
+            join_mass_error_da: 0.001,
+        };
+        let evidence_favored = MitmJoinedCandidate {
+            tokens: vec![4, 5, 6],
+            proposal_score: 9.0,
+            selector_score: 5.0,
+            selector_fragment_score: 5.2,
+            selector_matched_cleavages: 5,
+            join_mass_error_da: 0.002,
+        };
+
+        let legacy = mitm_retain_top_candidates(
+            vec![legacy_favored.clone(), evidence_favored.clone()],
+            1,
+            false,
+        );
+        let evidence =
+            mitm_retain_top_candidates(vec![legacy_favored, evidence_favored.clone()], 1, true);
+        assert_eq!(legacy[0].tokens, vec![1, 2, 3]);
+        assert_eq!(evidence[0].tokens, evidence_favored.tokens);
     }
 }
