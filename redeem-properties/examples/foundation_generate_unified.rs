@@ -222,6 +222,14 @@ struct GenerationMetrics {
     mitm_precap_evidence_literal_rank_cutoffs: MitmRankCutoffMetrics,
     mitm_precap_evidence_sequence_rank_cutoffs: MitmRankCutoffMetrics,
     mitm_precap_evidence_il_rank_cutoffs: MitmRankCutoffMetrics,
+    mitm_component_audit_incremental_deep_literal_records: usize,
+    mitm_component_audit_incremental_deep_il_records: usize,
+    mitm_component_audit_deep_literal_top256_any_component: usize,
+    mitm_component_audit_deep_il_top256_any_component: usize,
+    mitm_component_audit_deep_literal_pareto_le256: usize,
+    mitm_component_audit_deep_il_pareto_le256: usize,
+    mitm_component_audit_deep_literal_actionable_records: usize,
+    mitm_component_audit_deep_il_actionable_records: usize,
     mitm_pool_mass_valid_peptidoform_exact: usize,
     mitm_pool_mass_valid_sequence_exact: usize,
     mitm_pool_mass_valid_il_sequence_exact: usize,
@@ -327,6 +335,8 @@ const FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01320: &str =
     "evidence_aware_fixed_budget_midpoint_join_v01320";
 const FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01321: &str =
     "diagnostic_precap_join_oracle_audit_v01321";
+const FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01322: &str =
+    "terminal_deep_candidate_component_rank_audit_v01322";
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MitmOracleRanks {
@@ -343,6 +353,47 @@ struct MitmPrecapOracleAudit {
     il_sequence_present: bool,
     legacy_ranks: MitmOracleRanks,
     evidence_ranks: MitmOracleRanks,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MitmComponentRanks {
+    fragment: MitmOracleRanks,
+    prefix_ar_mean: MitmOracleRanks,
+    suffix_ar_mean: MitmOracleRanks,
+    prefix_ar_total: MitmOracleRanks,
+    suffix_ar_total: MitmOracleRanks,
+    mass_error: MitmOracleRanks,
+    seam_fragment: MitmOracleRanks,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MitmTargetProvenance {
+    found: bool,
+    prefix_partial_rank: usize,
+    suffix_partial_rank: usize,
+    best_prefix_partial_rank: usize,
+    best_suffix_partial_rank: usize,
+    prefix_token_count: usize,
+    suffix_token_count: usize,
+    prefix_residue_count: usize,
+    suffix_residue_count: usize,
+    join_seam_fragment_score: f64,
+    fragment_score: f64,
+    prefix_ar_mean: f64,
+    suffix_ar_mean: f64,
+    prefix_ar_total: f64,
+    suffix_ar_total: f64,
+    abs_mass_error_da: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MitmComponentAudit {
+    ranks: MitmComponentRanks,
+    pareto_frontier_size: usize,
+    pareto_peptidoform_present: bool,
+    pareto_sequence_present: bool,
+    pareto_il_present: bool,
+    il_provenance: MitmTargetProvenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,7 +413,7 @@ struct MitmPartialState {
     priority: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct MitmJoinedCandidate {
     tokens: Vec<u32>,
     proposal_score: f64,
@@ -370,6 +421,25 @@ struct MitmJoinedCandidate {
     selector_fragment_score: f64,
     selector_matched_cleavages: usize,
     join_mass_error_da: f64,
+    component_fragment_score: f64,
+    component_prefix_ar_mean: f64,
+    component_suffix_ar_mean: f64,
+    component_prefix_ar_total: f64,
+    component_suffix_ar_total: f64,
+    component_join_seam_fragment_score: f64,
+    best_prefix_partial_rank: usize,
+    best_suffix_partial_rank: usize,
+    selector_prefix_partial_rank: usize,
+    selector_suffix_partial_rank: usize,
+    selector_prefix_token_count: usize,
+    selector_suffix_token_count: usize,
+    selector_prefix_residue_count: usize,
+    selector_suffix_residue_count: usize,
+    selector_join_seam_fragment_score: f64,
+    selector_prefix_ar_mean: f64,
+    selector_suffix_ar_mean: f64,
+    selector_prefix_ar_total: f64,
+    selector_suffix_ar_total: f64,
 }
 
 struct CausalReranker {
@@ -400,7 +470,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 23 {
         anyhow::bail!(
-            "usage: foundation_generate_unified FOUNDATION_TRAINING.yaml UNIFIED_CHECKPOINT OUTPUT.tsv [validation_records=128] [samples_per_record=16] [seed=20260912] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=16] [neural_rerank_weight=1.0] [causal_rerank_weight=0.1] [causal_generation_beam_width=32] [causal_generation_final_candidates=16] [reverse_causal_checkpoint=none] [reverse_causal_generation_beam_width=32] [reverse_causal_generation_final_candidates=16] [iterative_refinement_checkpoint=none] [cleavage_graph_checkpoint=none] [bidirectional_mitm=none|v01319|v01320|v01321]"
+            "usage: foundation_generate_unified FOUNDATION_TRAINING.yaml UNIFIED_CHECKPOINT OUTPUT.tsv [validation_records=128] [samples_per_record=16] [seed=20260912] [mass_tolerance_da=0.05] [temperature=1.0] [mass_beam_width=512] [final_candidates_per_chain=4] [fragment_tolerance_ppm=20] [spectral_beam_weight=16] [neural_rerank_weight=1.0] [causal_rerank_weight=0.1] [causal_generation_beam_width=32] [causal_generation_final_candidates=16] [reverse_causal_checkpoint=none] [reverse_causal_generation_beam_width=32] [reverse_causal_generation_final_candidates=16] [iterative_refinement_checkpoint=none] [cleavage_graph_checkpoint=none] [bidirectional_mitm=none|v01319|v01320|v01321|v01322]"
         );
     }
 
@@ -437,30 +507,40 @@ fn main() -> Result<()> {
         (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none"))
             .then(|| PathBuf::from(trimmed))
     });
-    let (bidirectional_mitm, bidirectional_mitm_evidence_aware, bidirectional_mitm_precap_audit) =
-        match args.get(22).map(|value| value.trim()) {
-            None | Some("") => (false, false, false),
-            Some(value) if value.eq_ignore_ascii_case("none") => (false, false, false),
+    let (
+        bidirectional_mitm,
+        bidirectional_mitm_evidence_aware,
+        bidirectional_mitm_precap_audit,
+        bidirectional_mitm_component_audit,
+    ) = match args.get(22).map(|value| value.trim()) {
+            None | Some("") => (false, false, false, false),
+            Some(value) if value.eq_ignore_ascii_case("none") => (false, false, false, false),
             Some(value)
                 if value.eq_ignore_ascii_case("v01319")
                     || value.eq_ignore_ascii_case(FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01319) =>
             {
-                (true, false, false)
+                (true, false, false, false)
             }
             Some(value)
                 if value.eq_ignore_ascii_case("v01320")
                     || value.eq_ignore_ascii_case(FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01320) =>
             {
-                (true, true, false)
+                (true, true, false, false)
             }
             Some(value)
                 if value.eq_ignore_ascii_case("v01321")
                     || value.eq_ignore_ascii_case(FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01321) =>
             {
-                (true, true, true)
+                (true, true, true, false)
+            }
+            Some(value)
+                if value.eq_ignore_ascii_case("v01322")
+                    || value.eq_ignore_ascii_case(FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01322) =>
+            {
+                (true, true, true, true)
             }
             Some(value) => anyhow::bail!(
-                "unsupported bidirectional_mitm policy '{value}'; expected 'none', 'v01319', 'v01320', or 'v01321'"
+                "unsupported bidirectional_mitm policy '{value}'; expected 'none', 'v01319', 'v01320', 'v01321', or 'v01322'"
             ),
         };
     if validation_records == 0
@@ -942,7 +1022,9 @@ fn main() -> Result<()> {
     );
     println!(
         "bidirectional_mitm_policy\t{}",
-        if bidirectional_mitm_precap_audit {
+        if bidirectional_mitm_component_audit {
+            FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01322
+        } else if bidirectional_mitm_precap_audit {
             FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01321
         } else if bidirectional_mitm_evidence_aware {
             FOUNDATION_BIDIRECTIONAL_MITM_POLICY_V01320
@@ -984,6 +1066,15 @@ fn main() -> Result<()> {
                 println!("bidirectional_mitm_precap_audit\tfull_mass_compatible_join_pool_target_evaluation_only_v01321");
                 println!("bidirectional_mitm_precap_audit_candidate_effect\tNONE");
                 println!("bidirectional_mitm_precap_audit_target_identity_usage\tpost_generation_metrics_only");
+                if bidirectional_mitm_component_audit {
+                    println!("bidirectional_mitm_component_audit\tterminal_existing_signal_rank_and_pareto_audit_v01322");
+                    println!("bidirectional_mitm_component_audit_candidate_effect\tNONE");
+                    println!("bidirectional_mitm_component_audit_pareto_axes\tfragment,prefix_ar_mean,suffix_ar_mean,abs_mass_error");
+                    println!("bidirectional_mitm_component_audit_component_reduction\tbest_observed_value_per_complete_canonical_candidate");
+                    println!("bidirectional_mitm_component_audit_provenance\tv01320_selector_representative_join_plus_best_directional_partial_ranks");
+                    println!("bidirectional_mitm_component_audit_partial_rank_definition\tdirectional_priority_rank_within_midpoint_frontier");
+                    println!("bidirectional_mitm_component_audit_stop_rule\tallow_at_most_one_v01323_if_every_incremental_deep_il_target_is_component_top256_or_on_pareto_frontier_le256_else_close_lane");
+                }
             }
         }
         println!(
@@ -1118,7 +1209,11 @@ fn main() -> Result<()> {
         "primary_candidate_ranking\t{}",
         if bidirectional_mitm {
             if bidirectional_mitm_precap_audit {
-                "fragment_score+0.1*n_to_c_ar_total_log_probability_v01321_diagnostic_same_as_v01320"
+                if bidirectional_mitm_component_audit {
+                    "fragment_score+0.1*n_to_c_ar_total_log_probability_v01322_terminal_diagnostic_same_as_v01320"
+                } else {
+                    "fragment_score+0.1*n_to_c_ar_total_log_probability_v01321_diagnostic_same_as_v01320"
+                }
             } else if bidirectional_mitm_evidence_aware {
                 "fragment_score+0.1*n_to_c_ar_total_log_probability_v01320"
             } else {
@@ -1145,7 +1240,11 @@ fn main() -> Result<()> {
             && reverse_causal_generation_beam_width > 0
         {
             if bidirectional_mitm_precap_audit {
-                "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+evidence_aware_bidirectional_mitm_v01320+diagnostic_precap_audit_v01321"
+                if bidirectional_mitm_component_audit {
+                    "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+evidence_aware_bidirectional_mitm_v01320+terminal_component_audit_v01322"
+                } else {
+                    "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+evidence_aware_bidirectional_mitm_v01320+diagnostic_precap_audit_v01321"
+                }
             } else if bidirectional_mitm_evidence_aware {
                 "diffusion_reverse_v0115+n_to_c_causal_v0124+c_to_n_reverse_causal_v01313+evidence_aware_bidirectional_mitm_v01320"
             } else {
@@ -1733,6 +1832,115 @@ fn main() -> Result<()> {
                     format_mitm_rank(audit.evidence_ranks.sequence),
                     format_mitm_rank(audit.evidence_ranks.il_sequence),
                 );
+                if bidirectional_mitm_component_audit {
+                    let deep_literal = !frozen_literal_present
+                        && audit.peptidoform_present
+                        && audit
+                            .legacy_ranks
+                            .peptidoform
+                            .map(|rank| rank > 256)
+                            .unwrap_or(false)
+                        && audit
+                            .evidence_ranks
+                            .peptidoform
+                            .map(|rank| rank > 256)
+                            .unwrap_or(false);
+                    let deep_il = !frozen_il_present
+                        && audit.il_sequence_present
+                        && audit
+                            .legacy_ranks
+                            .il_sequence
+                            .map(|rank| rank > 256)
+                            .unwrap_or(false)
+                        && audit
+                            .evidence_ranks
+                            .il_sequence
+                            .map(|rank| rank > 256)
+                            .unwrap_or(false);
+                    let component = mitm_component_rank_audit(
+                        &precap_audit_pool,
+                        &record.peptidoform,
+                        config.max_tokens,
+                        vocabulary,
+                        deep_literal || deep_il,
+                    )?;
+                    let literal_top256_any =
+                        mitm_component_rank_any_top256(&component.ranks, false);
+                    let il_top256_any = mitm_component_rank_any_top256(&component.ranks, true);
+                    let literal_pareto_le256 = component.pareto_frontier_size <= 256
+                        && component.pareto_peptidoform_present;
+                    let il_pareto_le256 =
+                        component.pareto_frontier_size <= 256 && component.pareto_il_present;
+                    if deep_literal {
+                        metrics.mitm_component_audit_incremental_deep_literal_records += 1;
+                        metrics.mitm_component_audit_deep_literal_top256_any_component +=
+                            usize::from(literal_top256_any);
+                        metrics.mitm_component_audit_deep_literal_pareto_le256 +=
+                            usize::from(literal_pareto_le256);
+                        metrics.mitm_component_audit_deep_literal_actionable_records +=
+                            usize::from(literal_top256_any || literal_pareto_le256);
+                    }
+                    if deep_il {
+                        metrics.mitm_component_audit_incremental_deep_il_records += 1;
+                        metrics.mitm_component_audit_deep_il_top256_any_component +=
+                            usize::from(il_top256_any);
+                        metrics.mitm_component_audit_deep_il_pareto_le256 +=
+                            usize::from(il_pareto_le256);
+                        metrics.mitm_component_audit_deep_il_actionable_records +=
+                            usize::from(il_top256_any || il_pareto_le256);
+                    }
+                    let provenance = component.il_provenance;
+                    println!(
+                        "generation_bidirectional_mitm_component_audit\trecord_index={record_index}\tdeep_incremental_literal={}\tdeep_incremental_il={}\tfragment_literal_rank={}\tfragment_sequence_rank={}\tfragment_il_rank={}\tprefix_mean_literal_rank={}\tprefix_mean_sequence_rank={}\tprefix_mean_il_rank={}\tsuffix_mean_literal_rank={}\tsuffix_mean_sequence_rank={}\tsuffix_mean_il_rank={}\tprefix_total_literal_rank={}\tprefix_total_sequence_rank={}\tprefix_total_il_rank={}\tsuffix_total_literal_rank={}\tsuffix_total_sequence_rank={}\tsuffix_total_il_rank={}\tmass_error_literal_rank={}\tmass_error_sequence_rank={}\tmass_error_il_rank={}\tseam_fragment_literal_rank={}\tseam_fragment_sequence_rank={}\tseam_fragment_il_rank={}\tliteral_top256_any_component={}\til_top256_any_component={}\tpareto_frontier_size={}\tpareto_literal_present={}\tpareto_sequence_present={}\tpareto_il_present={}\tliteral_pareto_le256={}\til_pareto_le256={}\til_provenance_found={}\til_prefix_partial_rank={}\til_suffix_partial_rank={}\til_best_prefix_partial_rank={}\til_best_suffix_partial_rank={}\til_prefix_token_count={}\til_suffix_token_count={}\til_prefix_residue_count={}\til_suffix_residue_count={}\til_join_seam_fragment_score={:.6}\til_fragment_score={:.6}\til_prefix_ar_mean={:.6}\til_suffix_ar_mean={:.6}\til_prefix_ar_total={:.6}\til_suffix_ar_total={:.6}\til_abs_mass_error_da={:.6}",
+                        yes_no(deep_literal),
+                        yes_no(deep_il),
+                        format_mitm_rank(component.ranks.fragment.peptidoform),
+                        format_mitm_rank(component.ranks.fragment.sequence),
+                        format_mitm_rank(component.ranks.fragment.il_sequence),
+                        format_mitm_rank(component.ranks.prefix_ar_mean.peptidoform),
+                        format_mitm_rank(component.ranks.prefix_ar_mean.sequence),
+                        format_mitm_rank(component.ranks.prefix_ar_mean.il_sequence),
+                        format_mitm_rank(component.ranks.suffix_ar_mean.peptidoform),
+                        format_mitm_rank(component.ranks.suffix_ar_mean.sequence),
+                        format_mitm_rank(component.ranks.suffix_ar_mean.il_sequence),
+                        format_mitm_rank(component.ranks.prefix_ar_total.peptidoform),
+                        format_mitm_rank(component.ranks.prefix_ar_total.sequence),
+                        format_mitm_rank(component.ranks.prefix_ar_total.il_sequence),
+                        format_mitm_rank(component.ranks.suffix_ar_total.peptidoform),
+                        format_mitm_rank(component.ranks.suffix_ar_total.sequence),
+                        format_mitm_rank(component.ranks.suffix_ar_total.il_sequence),
+                        format_mitm_rank(component.ranks.mass_error.peptidoform),
+                        format_mitm_rank(component.ranks.mass_error.sequence),
+                        format_mitm_rank(component.ranks.mass_error.il_sequence),
+                        format_mitm_rank(component.ranks.seam_fragment.peptidoform),
+                        format_mitm_rank(component.ranks.seam_fragment.sequence),
+                        format_mitm_rank(component.ranks.seam_fragment.il_sequence),
+                        yes_no(literal_top256_any),
+                        yes_no(il_top256_any),
+                        component.pareto_frontier_size,
+                        yes_no(component.pareto_peptidoform_present),
+                        yes_no(component.pareto_sequence_present),
+                        yes_no(component.pareto_il_present),
+                        yes_no(literal_pareto_le256),
+                        yes_no(il_pareto_le256),
+                        yes_no(provenance.found),
+                        provenance.prefix_partial_rank,
+                        provenance.suffix_partial_rank,
+                        provenance.best_prefix_partial_rank,
+                        provenance.best_suffix_partial_rank,
+                        provenance.prefix_token_count,
+                        provenance.suffix_token_count,
+                        provenance.prefix_residue_count,
+                        provenance.suffix_residue_count,
+                        provenance.join_seam_fragment_score,
+                        provenance.fragment_score,
+                        provenance.prefix_ar_mean,
+                        provenance.suffix_ar_mean,
+                        provenance.prefix_ar_total,
+                        provenance.suffix_ar_total,
+                        provenance.abs_mass_error_da,
+                    );
+                }
             }
 
             println!(
@@ -3054,7 +3262,9 @@ fn main() -> Result<()> {
                 && metrics.candidate_pool_mass_valid_il_sequence_exact >= 54;
             println!(
                 "bidirectional_mitm_acceptance_gate\tpolicy={}\trequired_literal=33\trequired_il=54\tobserved_literal={}\tobserved_il={}\taccepted_top1_literal={}\taccepted_top1_il={}\tfrozen_pool_literal={}\tfrozen_pool_il={}\tlegacy_join_pool_parity={}\tlegacy_selector_parity={}\tcandidate_pool_parity={}\tforward_ranking_parity={}\tparent_parity={}\tbranch_parity={}\tgate={}",
-                if bidirectional_mitm_precap_audit {
+                if bidirectional_mitm_component_audit {
+                    "v01322_terminal_diagnostic_same_candidates_as_v01320"
+                } else if bidirectional_mitm_precap_audit {
                     "v01321_diagnostic_same_candidates_as_v01320"
                 } else if bidirectional_mitm_evidence_aware {
                     "v01320"
@@ -3114,6 +3324,45 @@ fn main() -> Result<()> {
                     yes_no(v01320_union_parity),
                     diagnosis,
                 );
+                if bidirectional_mitm_component_audit {
+                    let v01321_precap_parity = metrics.mitm_precap_pool_peptidoform_exact == 43
+                        && metrics.mitm_precap_pool_sequence_exact == 43
+                        && metrics.mitm_precap_pool_il_sequence_exact == 52
+                        && metrics.mitm_precap_union_peptidoform_exact == 44
+                        && metrics.mitm_precap_union_sequence_exact == 44
+                        && metrics.mitm_precap_union_il_sequence_exact == 54;
+                    let deep_il = metrics.mitm_component_audit_incremental_deep_il_records;
+                    let actionable_il = metrics.mitm_component_audit_deep_il_actionable_records;
+                    let terminal_decision =
+                        if v01321_precap_parity && deep_il > 0 && actionable_il == deep_il {
+                            "ALLOW_ONE_FINAL_FIXED_SELECTOR_V01323_THEN_CLOSE_LANE"
+                        } else {
+                            "CLOSE_MITM_SELECTOR_LANE_AND_MOVE_ON"
+                        };
+                    println!(
+                        "v01321_precap_parity\texpected_precap_literal=43\texpected_precap_sequence=43\texpected_precap_il=52\texpected_union_literal=44\texpected_union_sequence=44\texpected_union_il=54\tobserved_precap_literal={}\tobserved_precap_sequence={}\tobserved_precap_il={}\tobserved_union_literal={}\tobserved_union_sequence={}\tobserved_union_il={}\tparity={}",
+                        metrics.mitm_precap_pool_peptidoform_exact,
+                        metrics.mitm_precap_pool_sequence_exact,
+                        metrics.mitm_precap_pool_il_sequence_exact,
+                        metrics.mitm_precap_union_peptidoform_exact,
+                        metrics.mitm_precap_union_sequence_exact,
+                        metrics.mitm_precap_union_il_sequence_exact,
+                        yes_no(v01321_precap_parity),
+                    );
+                    println!(
+                        "v01322_terminal_component_rank_audit\tincremental_deep_literal_records={}\tincremental_deep_il_records={}\tdeep_literal_top256_any_component={}\tdeep_il_top256_any_component={}\tdeep_literal_pareto_le256={}\tdeep_il_pareto_le256={}\tdeep_literal_actionable={}\tdeep_il_actionable={}\tv01321_precap_parity={}\tdecision={}",
+                        metrics.mitm_component_audit_incremental_deep_literal_records,
+                        metrics.mitm_component_audit_incremental_deep_il_records,
+                        metrics.mitm_component_audit_deep_literal_top256_any_component,
+                        metrics.mitm_component_audit_deep_il_top256_any_component,
+                        metrics.mitm_component_audit_deep_literal_pareto_le256,
+                        metrics.mitm_component_audit_deep_il_pareto_le256,
+                        metrics.mitm_component_audit_deep_literal_actionable_records,
+                        metrics.mitm_component_audit_deep_il_actionable_records,
+                        yes_no(v01321_precap_parity),
+                        terminal_decision,
+                    );
+                }
             }
         }
 
@@ -4457,6 +4706,21 @@ fn mitm_evidence_join_order(left: &MitmJoinedCandidate, right: &MitmJoinedCandid
         .then_with(|| left.tokens.cmp(&right.tokens))
 }
 
+fn mitm_partial_priority_ranks(states: &[MitmPartialState]) -> HashMap<Vec<u32>, usize> {
+    let mut indices: Vec<usize> = (0..states.len()).collect();
+    indices.sort_by(|&left, &right| {
+        states[right]
+            .priority
+            .total_cmp(&states[left].priority)
+            .then_with(|| states[left].tokens.cmp(&states[right].tokens))
+    });
+    let mut ranks = HashMap::with_capacity(indices.len());
+    for (zero_based_rank, index) in indices.into_iter().enumerate() {
+        ranks.insert(states[index].tokens.clone(), zero_based_rank + 1);
+    }
+    ranks
+}
+
 fn mitm_retain_top_candidates(
     mut candidates: Vec<MitmJoinedCandidate>,
     max_candidates: usize,
@@ -4508,6 +4772,8 @@ fn bidirectional_mitm_join(
     let nterm_acetyl_mass =
         foundation_diffusion_token_mass_da(FOUNDATION_DIFFUSION_NTERM_ACETYL).unwrap_or(0.0);
     let bin_width = mass_tolerance_da.max(0.05);
+    let prefix_priority_ranks = mitm_partial_priority_ranks(prefix_states);
+    let suffix_priority_ranks = mitm_partial_priority_ranks(suffix_states);
 
     #[derive(Debug, Clone)]
     struct SuffixEntry {
@@ -4613,45 +4879,56 @@ fn bidirectional_mitm_join(
                     }
 
                     let proposal_score = prefix.priority + suffix.state.priority;
-                    let (selector_fragment_score, selector_matched_cleavages, selector_score) =
-                        if evidence_aware {
-                            // The two partial searches have already scored every cleavage
-                            // internal to their respective halves.  Add only the join-seam
-                            // cleavage to reconstruct complete-peptide fragment evidence
-                            // exactly, avoiding an O(peptide_length) rescan for every join.
-                            let seam_prefix_mass = prefix.assigned_mass_da
-                                + if !prefix_has_nterm && suffix_has_nterm {
-                                    nterm_acetyl_mass
-                                } else {
-                                    0.0
-                                };
-                            let seam = cleavage_fragment_evidence(
-                                seam_prefix_mass,
-                                target_neutral_mass,
-                                observed_peaks,
-                                max_fragment_charge,
-                                fragment_tolerance_ppm,
-                            );
-                            let complete_fragment_score =
-                                prefix.fragment_score + suffix.state.fragment_score + seam.score;
-                            let complete_matched_cleavages = prefix
-                                .matched_cleavages
-                                .saturating_add(suffix.state.matched_cleavages)
-                                .saturating_add(usize::from(seam.matched));
-                            let prefix_mean =
-                                prefix.ar_total_log_probability / prefix.tokens.len().max(1) as f64;
-                            let suffix_mean = suffix.state.ar_total_log_probability
-                                / suffix.state.tokens.len().max(1) as f64;
-                            let bidirectional_partial_mean = 0.5 * (prefix_mean + suffix_mean);
-                            (
-                                complete_fragment_score,
-                                complete_matched_cleavages,
-                                complete_fragment_score
-                                    + causal_weight * bidirectional_partial_mean,
-                            )
-                        } else {
-                            (0.0, 0, proposal_score)
-                        };
+                    let prefix_ar_mean =
+                        prefix.ar_total_log_probability / prefix.tokens.len().max(1) as f64;
+                    let suffix_ar_mean = suffix.state.ar_total_log_probability
+                        / suffix.state.tokens.len().max(1) as f64;
+                    let prefix_partial_rank = prefix_priority_ranks
+                        .get(&prefix.tokens)
+                        .copied()
+                        .unwrap_or(usize::MAX);
+                    let suffix_partial_rank = suffix_priority_ranks
+                        .get(&suffix.state.tokens)
+                        .copied()
+                        .unwrap_or(usize::MAX);
+                    let (
+                        selector_fragment_score,
+                        selector_matched_cleavages,
+                        selector_score,
+                        join_seam_fragment_score,
+                    ) = if evidence_aware {
+                        // The two partial searches have already scored every cleavage
+                        // internal to their respective halves. Add only the join-seam
+                        // cleavage to reconstruct complete-peptide fragment evidence exactly.
+                        let seam_prefix_mass = prefix.assigned_mass_da
+                            + if !prefix_has_nterm && suffix_has_nterm {
+                                nterm_acetyl_mass
+                            } else {
+                                0.0
+                            };
+                        let seam = cleavage_fragment_evidence(
+                            seam_prefix_mass,
+                            target_neutral_mass,
+                            observed_peaks,
+                            max_fragment_charge,
+                            fragment_tolerance_ppm,
+                        );
+                        let complete_fragment_score =
+                            prefix.fragment_score + suffix.state.fragment_score + seam.score;
+                        let complete_matched_cleavages = prefix
+                            .matched_cleavages
+                            .saturating_add(suffix.state.matched_cleavages)
+                            .saturating_add(usize::from(seam.matched));
+                        let bidirectional_partial_mean = 0.5 * (prefix_ar_mean + suffix_ar_mean);
+                        (
+                            complete_fragment_score,
+                            complete_matched_cleavages,
+                            complete_fragment_score + causal_weight * bidirectional_partial_mean,
+                            seam.score,
+                        )
+                    } else {
+                        (0.0, 0, proposal_score, 0.0)
+                    };
 
                     joined
                         .entry(row.clone())
@@ -4663,7 +4940,40 @@ fn bidirectional_mitm_join(
                                 existing.selector_score = selector_score;
                                 existing.selector_fragment_score = selector_fragment_score;
                                 existing.selector_matched_cleavages = selector_matched_cleavages;
+                                existing.selector_prefix_partial_rank = prefix_partial_rank;
+                                existing.selector_suffix_partial_rank = suffix_partial_rank;
+                                existing.selector_prefix_token_count = prefix.tokens.len();
+                                existing.selector_suffix_token_count = suffix.state.tokens.len();
+                                existing.selector_prefix_residue_count = prefix.residue_count;
+                                existing.selector_suffix_residue_count = suffix.state.residue_count;
+                                existing.selector_join_seam_fragment_score =
+                                    join_seam_fragment_score;
+                                existing.selector_prefix_ar_mean = prefix_ar_mean;
+                                existing.selector_suffix_ar_mean = suffix_ar_mean;
+                                existing.selector_prefix_ar_total = prefix.ar_total_log_probability;
+                                existing.selector_suffix_ar_total =
+                                    suffix.state.ar_total_log_probability;
                             }
+                            existing.component_fragment_score = existing
+                                .component_fragment_score
+                                .max(selector_fragment_score);
+                            existing.component_prefix_ar_mean =
+                                existing.component_prefix_ar_mean.max(prefix_ar_mean);
+                            existing.component_suffix_ar_mean =
+                                existing.component_suffix_ar_mean.max(suffix_ar_mean);
+                            existing.component_prefix_ar_total = existing
+                                .component_prefix_ar_total
+                                .max(prefix.ar_total_log_probability);
+                            existing.component_suffix_ar_total = existing
+                                .component_suffix_ar_total
+                                .max(suffix.state.ar_total_log_probability);
+                            existing.component_join_seam_fragment_score = existing
+                                .component_join_seam_fragment_score
+                                .max(join_seam_fragment_score);
+                            existing.best_prefix_partial_rank =
+                                existing.best_prefix_partial_rank.min(prefix_partial_rank);
+                            existing.best_suffix_partial_rank =
+                                existing.best_suffix_partial_rank.min(suffix_partial_rank);
                             if exact_join_error.abs() < existing.join_mass_error_da.abs() {
                                 existing.join_mass_error_da = exact_join_error;
                             }
@@ -4675,6 +4985,25 @@ fn bidirectional_mitm_join(
                             selector_fragment_score,
                             selector_matched_cleavages,
                             join_mass_error_da: exact_join_error,
+                            component_fragment_score: selector_fragment_score,
+                            component_prefix_ar_mean: prefix_ar_mean,
+                            component_suffix_ar_mean: suffix_ar_mean,
+                            component_prefix_ar_total: prefix.ar_total_log_probability,
+                            component_suffix_ar_total: suffix.state.ar_total_log_probability,
+                            component_join_seam_fragment_score: join_seam_fragment_score,
+                            best_prefix_partial_rank: prefix_partial_rank,
+                            best_suffix_partial_rank: suffix_partial_rank,
+                            selector_prefix_partial_rank: prefix_partial_rank,
+                            selector_suffix_partial_rank: suffix_partial_rank,
+                            selector_prefix_token_count: prefix.tokens.len(),
+                            selector_suffix_token_count: suffix.state.tokens.len(),
+                            selector_prefix_residue_count: prefix.residue_count,
+                            selector_suffix_residue_count: suffix.state.residue_count,
+                            selector_join_seam_fragment_score: join_seam_fragment_score,
+                            selector_prefix_ar_mean: prefix_ar_mean,
+                            selector_suffix_ar_mean: suffix_ar_mean,
+                            selector_prefix_ar_total: prefix.ar_total_log_probability,
+                            selector_suffix_ar_total: suffix.state.ar_total_log_probability,
                         });
                 }
             }
@@ -4778,6 +5107,257 @@ fn mitm_oracle_ranks_with_order(
         }
     }
     ranks
+}
+
+fn mitm_component_fragment_order(
+    left: &MitmJoinedCandidate,
+    right: &MitmJoinedCandidate,
+) -> Ordering {
+    right
+        .component_fragment_score
+        .total_cmp(&left.component_fragment_score)
+        .then_with(|| mitm_evidence_join_order(left, right))
+}
+
+fn mitm_component_prefix_ar_mean_order(
+    left: &MitmJoinedCandidate,
+    right: &MitmJoinedCandidate,
+) -> Ordering {
+    right
+        .component_prefix_ar_mean
+        .total_cmp(&left.component_prefix_ar_mean)
+        .then_with(|| mitm_evidence_join_order(left, right))
+}
+
+fn mitm_component_suffix_ar_mean_order(
+    left: &MitmJoinedCandidate,
+    right: &MitmJoinedCandidate,
+) -> Ordering {
+    right
+        .component_suffix_ar_mean
+        .total_cmp(&left.component_suffix_ar_mean)
+        .then_with(|| mitm_evidence_join_order(left, right))
+}
+
+fn mitm_component_prefix_ar_total_order(
+    left: &MitmJoinedCandidate,
+    right: &MitmJoinedCandidate,
+) -> Ordering {
+    right
+        .component_prefix_ar_total
+        .total_cmp(&left.component_prefix_ar_total)
+        .then_with(|| mitm_evidence_join_order(left, right))
+}
+
+fn mitm_component_suffix_ar_total_order(
+    left: &MitmJoinedCandidate,
+    right: &MitmJoinedCandidate,
+) -> Ordering {
+    right
+        .component_suffix_ar_total
+        .total_cmp(&left.component_suffix_ar_total)
+        .then_with(|| mitm_evidence_join_order(left, right))
+}
+
+fn mitm_component_mass_error_order(
+    left: &MitmJoinedCandidate,
+    right: &MitmJoinedCandidate,
+) -> Ordering {
+    left.join_mass_error_da
+        .abs()
+        .total_cmp(&right.join_mass_error_da.abs())
+        .then_with(|| mitm_evidence_join_order(left, right))
+}
+
+fn mitm_component_seam_fragment_order(
+    left: &MitmJoinedCandidate,
+    right: &MitmJoinedCandidate,
+) -> Ordering {
+    right
+        .component_join_seam_fragment_score
+        .total_cmp(&left.component_join_seam_fragment_score)
+        .then_with(|| mitm_evidence_join_order(left, right))
+}
+
+fn mitm_component_dominates(left: &MitmJoinedCandidate, right: &MitmJoinedCandidate) -> bool {
+    let left_mass = left.join_mass_error_da.abs();
+    let right_mass = right.join_mass_error_da.abs();
+    let no_worse = left.component_fragment_score >= right.component_fragment_score
+        && left.component_prefix_ar_mean >= right.component_prefix_ar_mean
+        && left.component_suffix_ar_mean >= right.component_suffix_ar_mean
+        && left_mass <= right_mass;
+    let strictly_better = left.component_fragment_score > right.component_fragment_score
+        || left.component_prefix_ar_mean > right.component_prefix_ar_mean
+        || left.component_suffix_ar_mean > right.component_suffix_ar_mean
+        || left_mass < right_mass;
+    no_worse && strictly_better
+}
+
+fn mitm_component_pareto_frontier(candidates: &[MitmJoinedCandidate]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&left, &right| {
+        mitm_component_fragment_order(&candidates[left], &candidates[right])
+    });
+    let mut frontier = Vec::<usize>::new();
+    for index in order {
+        if frontier
+            .iter()
+            .any(|&existing| mitm_component_dominates(&candidates[existing], &candidates[index]))
+        {
+            continue;
+        }
+        frontier.retain(|&existing| {
+            !mitm_component_dominates(&candidates[index], &candidates[existing])
+        });
+        frontier.push(index);
+    }
+    frontier
+        .sort_by(|&left, &right| mitm_evidence_join_order(&candidates[left], &candidates[right]));
+    frontier
+}
+
+fn mitm_component_ranks(
+    candidates: &[MitmJoinedCandidate],
+    target_tokens: &[u32],
+    target_sequence: &str,
+) -> MitmComponentRanks {
+    MitmComponentRanks {
+        fragment: mitm_oracle_ranks_with_order(
+            candidates,
+            mitm_component_fragment_order,
+            target_tokens,
+            target_sequence,
+        ),
+        prefix_ar_mean: mitm_oracle_ranks_with_order(
+            candidates,
+            mitm_component_prefix_ar_mean_order,
+            target_tokens,
+            target_sequence,
+        ),
+        suffix_ar_mean: mitm_oracle_ranks_with_order(
+            candidates,
+            mitm_component_suffix_ar_mean_order,
+            target_tokens,
+            target_sequence,
+        ),
+        prefix_ar_total: mitm_oracle_ranks_with_order(
+            candidates,
+            mitm_component_prefix_ar_total_order,
+            target_tokens,
+            target_sequence,
+        ),
+        suffix_ar_total: mitm_oracle_ranks_with_order(
+            candidates,
+            mitm_component_suffix_ar_total_order,
+            target_tokens,
+            target_sequence,
+        ),
+        mass_error: mitm_oracle_ranks_with_order(
+            candidates,
+            mitm_component_mass_error_order,
+            target_tokens,
+            target_sequence,
+        ),
+        seam_fragment: mitm_oracle_ranks_with_order(
+            candidates,
+            mitm_component_seam_fragment_order,
+            target_tokens,
+            target_sequence,
+        ),
+    }
+}
+
+fn mitm_component_rank_any_top256(ranks: &MitmComponentRanks, il: bool) -> bool {
+    let select = |ranks: MitmOracleRanks| {
+        if il {
+            ranks.il_sequence
+        } else {
+            ranks.peptidoform
+        }
+    };
+    [
+        select(ranks.fragment),
+        select(ranks.prefix_ar_mean),
+        select(ranks.suffix_ar_mean),
+        select(ranks.prefix_ar_total),
+        select(ranks.suffix_ar_total),
+        select(ranks.mass_error),
+        select(ranks.seam_fragment),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|rank| rank <= 256)
+}
+
+fn mitm_target_il_provenance(
+    candidates: &[MitmJoinedCandidate],
+    target_sequence: &str,
+) -> MitmTargetProvenance {
+    let mut indices: Vec<usize> = (0..candidates.len()).collect();
+    indices
+        .sort_by(|&left, &right| mitm_evidence_join_order(&candidates[left], &candidates[right]));
+    let Some(index) = indices.into_iter().find(|&index| {
+        mitm_token_sequence_matches(&candidates[index].tokens, target_sequence, true)
+    }) else {
+        return MitmTargetProvenance::default();
+    };
+    let candidate = &candidates[index];
+    MitmTargetProvenance {
+        found: true,
+        prefix_partial_rank: candidate.selector_prefix_partial_rank,
+        suffix_partial_rank: candidate.selector_suffix_partial_rank,
+        best_prefix_partial_rank: candidate.best_prefix_partial_rank,
+        best_suffix_partial_rank: candidate.best_suffix_partial_rank,
+        prefix_token_count: candidate.selector_prefix_token_count,
+        suffix_token_count: candidate.selector_suffix_token_count,
+        prefix_residue_count: candidate.selector_prefix_residue_count,
+        suffix_residue_count: candidate.selector_suffix_residue_count,
+        join_seam_fragment_score: candidate.selector_join_seam_fragment_score,
+        fragment_score: candidate.selector_fragment_score,
+        prefix_ar_mean: candidate.selector_prefix_ar_mean,
+        suffix_ar_mean: candidate.selector_suffix_ar_mean,
+        prefix_ar_total: candidate.selector_prefix_ar_total,
+        suffix_ar_total: candidate.selector_suffix_ar_total,
+        abs_mass_error_da: candidate.join_mass_error_da.abs(),
+    }
+}
+
+fn mitm_component_rank_audit(
+    candidates: &[MitmJoinedCandidate],
+    target: &PeptidoformInput,
+    max_tokens: usize,
+    vocabulary: FoundationDiffusionVocabulary,
+    compute_pareto: bool,
+) -> Result<MitmComponentAudit> {
+    // Evaluation-only terminal diagnostic. Target identity is never available to join
+    // construction, selector scoring, candidate retention, or the accepted final reranker.
+    let target_tokens = vocabulary.encode(target, max_tokens).map_err(|error| {
+        anyhow::anyhow!("encode v0.13.22 target for component-rank audit: {error}")
+    })?;
+    let ranks = mitm_component_ranks(candidates, &target_tokens, &target.sequence);
+    let frontier = if compute_pareto {
+        mitm_component_pareto_frontier(candidates)
+    } else {
+        Vec::new()
+    };
+    let mut pareto_peptidoform_present = false;
+    let mut pareto_sequence_present = false;
+    let mut pareto_il_present = false;
+    for index in frontier.iter().copied() {
+        let candidate = &candidates[index];
+        pareto_peptidoform_present |= candidate.tokens.as_slice() == target_tokens.as_slice();
+        pareto_sequence_present |=
+            mitm_token_sequence_matches(&candidate.tokens, &target.sequence, false);
+        pareto_il_present |= mitm_token_sequence_matches(&candidate.tokens, &target.sequence, true);
+    }
+    Ok(MitmComponentAudit {
+        ranks,
+        pareto_frontier_size: frontier.len(),
+        pareto_peptidoform_present,
+        pareto_sequence_present,
+        pareto_il_present,
+        il_provenance: mitm_target_il_provenance(candidates, &target.sequence),
+    })
 }
 
 fn mitm_precap_oracle_audit(
@@ -6741,6 +7321,7 @@ mod fragment_evidence_tests {
             selector_fragment_score: 2.2,
             selector_matched_cleavages: 2,
             join_mass_error_da: 0.001,
+            ..Default::default()
         };
         let evidence_favored = MitmJoinedCandidate {
             tokens: vec![4, 5, 6],
@@ -6749,6 +7330,7 @@ mod fragment_evidence_tests {
             selector_fragment_score: 5.2,
             selector_matched_cleavages: 5,
             join_mass_error_da: 0.002,
+            ..Default::default()
         };
 
         let legacy = mitm_retain_top_candidates(
@@ -6783,6 +7365,7 @@ mod fragment_evidence_tests {
                 selector_fragment_score: 1.0,
                 selector_matched_cleavages: 1,
                 join_mass_error_da: 0.001,
+                ..Default::default()
             },
             MitmJoinedCandidate {
                 tokens: target_tokens,
@@ -6791,6 +7374,7 @@ mod fragment_evidence_tests {
                 selector_fragment_score: 5.0,
                 selector_matched_cleavages: 5,
                 join_mass_error_da: 0.002,
+                ..Default::default()
             },
         ];
         let audit = mitm_precap_oracle_audit(&candidates, &target, 32, vocabulary).unwrap();
@@ -6804,5 +7388,61 @@ mod fragment_evidence_tests {
         assert_eq!(audit.evidence_ranks.peptidoform, Some(1));
         assert_eq!(audit.evidence_ranks.sequence, Some(1));
         assert_eq!(audit.evidence_ranks.il_sequence, Some(1));
+    }
+
+    #[test]
+    fn mitm_v01322_component_audit_exposes_actionable_individual_signal() {
+        let vocabulary = FoundationDiffusionVocabulary;
+        let target = PeptidoformInput {
+            sequence: "PEPTIDEK".into(),
+            modifications: Vec::new(),
+        };
+        let distractor = PeptidoformInput {
+            sequence: "AAAAAAAK".into(),
+            modifications: Vec::new(),
+        };
+        let target_tokens = vocabulary.encode(&target, 32).unwrap();
+        let distractor_tokens = vocabulary.encode(&distractor, 32).unwrap();
+        let candidates = vec![
+            MitmJoinedCandidate {
+                tokens: distractor_tokens,
+                selector_score: 5.0,
+                selector_fragment_score: 1.0,
+                component_fragment_score: 1.0,
+                component_prefix_ar_mean: -1.0,
+                component_suffix_ar_mean: -1.0,
+                component_prefix_ar_total: -5.0,
+                component_suffix_ar_total: -5.0,
+                component_join_seam_fragment_score: 0.5,
+                join_mass_error_da: 0.001,
+                ..Default::default()
+            },
+            MitmJoinedCandidate {
+                tokens: target_tokens,
+                selector_score: 1.0,
+                selector_fragment_score: 10.0,
+                component_fragment_score: 10.0,
+                component_prefix_ar_mean: -2.0,
+                component_suffix_ar_mean: -2.0,
+                component_prefix_ar_total: -10.0,
+                component_suffix_ar_total: -10.0,
+                component_join_seam_fragment_score: 2.0,
+                join_mass_error_da: 0.002,
+                selector_prefix_partial_rank: 400,
+                selector_suffix_partial_rank: 500,
+                selector_prefix_token_count: 4,
+                selector_suffix_token_count: 4,
+                selector_prefix_residue_count: 4,
+                selector_suffix_residue_count: 4,
+                selector_join_seam_fragment_score: 2.0,
+                ..Default::default()
+            },
+        ];
+        let audit = mitm_component_rank_audit(&candidates, &target, 32, vocabulary, true).unwrap();
+        assert_eq!(audit.ranks.fragment.peptidoform, Some(1));
+        assert!(mitm_component_rank_any_top256(&audit.ranks, false));
+        assert!(audit.pareto_peptidoform_present);
+        assert!(audit.pareto_frontier_size <= 256);
+        assert!(audit.il_provenance.found);
     }
 }
