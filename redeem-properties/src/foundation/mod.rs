@@ -25,6 +25,7 @@ pub mod dataset;
 pub mod diffusion;
 pub mod experiment;
 pub mod featurize;
+pub mod interaction;
 pub mod iterative_refinement;
 pub mod layers;
 pub mod loss;
@@ -145,6 +146,7 @@ pub use featurize::{
     exact_graph_modification_for, FoundationBatch, FoundationModification,
     FoundationModificationSite, PeptideGraphFeaturizer, PeptidoformInput,
 };
+pub use interaction::FoundationSpectrumCandidateInteractionAdapter;
 pub use iterative_refinement::{
     foundation_iterative_refinement_collate, foundation_iterative_refinement_mask_positions,
     load_iterative_refinement_from_unified_checkpoint, validate_iterative_refinement_namespace,

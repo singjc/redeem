@@ -307,6 +307,8 @@ pub struct FoundationCausalOutput {
     pub decoder_hidden: Tensor,
     /// Cross-attention memory, including the prepended precursor token.
     pub spectrum_memory: Tensor,
+    /// Key-validity mask for `spectrum_memory` `[batch, memory_len]`.
+    pub spectrum_memory_mask: Tensor,
     /// Mask-aware pooled observed-spectrum embedding.
     pub spectrum_embedding: Tensor,
 }
@@ -574,6 +576,7 @@ impl PeptideSpectrumCausalModel {
             token_logits,
             decoder_hidden: hidden,
             spectrum_memory,
+            spectrum_memory_mask,
             spectrum_embedding,
         })
     }
