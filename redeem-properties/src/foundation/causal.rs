@@ -298,6 +298,13 @@ impl FoundationCausalCollator {
 pub struct FoundationCausalOutput {
     /// Next-token logits `[batch, max_tokens, vocabulary]`.
     pub token_logits: Tensor,
+    /// Final spectrum-conditioned decoder hidden states `[batch, max_tokens, model_dim]`.
+    ///
+    /// This representation is exposed for frozen-backbone downstream interaction
+    /// heads. It contains only model-visible shifted candidate prefixes plus
+    /// spectrum/precursor cross-attention; clean next-token targets remain outside
+    /// the model input contract.
+    pub decoder_hidden: Tensor,
     /// Cross-attention memory, including the prepended precursor token.
     pub spectrum_memory: Tensor,
     /// Mask-aware pooled observed-spectrum embedding.
@@ -565,6 +572,7 @@ impl PeptideSpectrumCausalModel {
         let token_logits = self.token_head.forward(&hidden)?;
         Ok(FoundationCausalOutput {
             token_logits,
+            decoder_hidden: hidden,
             spectrum_memory,
             spectrum_embedding,
         })
