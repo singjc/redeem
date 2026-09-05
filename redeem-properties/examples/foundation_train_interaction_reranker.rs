@@ -28,7 +28,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const VERSION: &str = "v0.15.0";
-const EXPECTED_MODEL_DIM: usize = 192;
+const EXPECTED_MODEL_DIM: usize = 96;
 const INTERACTION_DIM: usize = EXPECTED_MODEL_DIM * 2;
 const HIDDEN: usize = 8;
 const TRAIN_HARD_WINDOW: usize = 32;
@@ -380,7 +380,7 @@ fn main() -> Result<()> {
 
     println!("interaction_reranker_version\t{VERSION}");
     println!("objective\thierarchical_il_then_exact_listwise_unit_weight_fixed_hard_negatives");
-    println!("architecture\tfrozen_causal_cross_attention_hidden_plus_bilinear_product_residual_mlp_384x8x1");
+    println!("architecture\tfrozen_causal_cross_attention_hidden_plus_bilinear_product_residual_mlp_192x8x1");
     println!("proposal_policy\tv01323_final_two_view_fixed_budget_frozen");
     println!("base_score\tfragment_score+0.1*n_to_c_ar_total_log_probability_frozen");
     println!("representation\tmean_pooled_frozen_causal_decoder_hidden+elementwise_product_with_frozen_spectrum_embedding");
@@ -579,7 +579,7 @@ fn main() -> Result<()> {
         version: VERSION.to_string(),
         objective: "hierarchical_il_then_exact_listwise_unit_weight_fixed_hard_negatives".into(),
         architecture:
-            "frozen_causal_cross_attention_hidden_plus_bilinear_product_residual_mlp_384x8x1"
+            "frozen_causal_cross_attention_hidden_plus_bilinear_product_residual_mlp_192x8x1"
                 .into(),
         proposal_policy: "v01323_final_two_view_fixed_budget_frozen".into(),
         base_score: "fragment_score+0.1*n_to_c_ar_total_log_probability_frozen".into(),
