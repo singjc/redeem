@@ -7,6 +7,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
 
 ARG RUST_TOOLCHAIN=stable
 ARG CUDA_COMPUTE_CAP=80
+ARG CARGO_BUILD_JOBS=2
+ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 
 RUN apt-get -o Acquire::Retries=5 update && \
     apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
@@ -33,10 +35,12 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
+ENV CARGO_INCREMENTAL=0
 
 WORKDIR /app
 
-# Keep workspace dependency resolution reproducible.
 COPY Cargo.toml Cargo.lock ./
 COPY redeem-openms-ffi ./redeem-openms-ffi
 COPY redeem-classifiers ./redeem-classifiers
@@ -45,10 +49,12 @@ COPY redeem-properties ./redeem-properties
 COPY redeem-properties-py ./redeem-properties-py
 COPY scripts ./scripts
 
-# Build the main CLI plus the foundation-model executables needed for training,
-# inference, validation and the current v0.16.0 experiment.  They remain example
-# binaries in Rust for now, but are first-class commands inside the container.
+# Build the production CLI and the current foundation research binaries.  Keep
+# Cargo parallelism deliberately conservative for workstation image builds;
+# this controls peak host RAM and linker pressure without changing the emitted
+# model architecture or runtime numerics.
 RUN set -eux; \
+    echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"; \
     cargo build --release --locked --bin redeem --features cuda; \
     FOUNDATION_EXAMPLES="\
 foundation_initialize_model \
@@ -78,13 +84,11 @@ foundation_export_alphapeptdeep_comparison"; \
     done
 
 # -----------------------------------------------------------------------------
-# Runtime: CUDA + Rust binaries + reproducible Python comparison environment
+# Runtime base. Apt may run while the Rust builder is active, but the expensive
+# Python/AlphaPeptDeep installation is deliberately placed in the final stage
+# *after* COPY --from=builder, forcing BuildKit to wait for Rust compilation.
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
-
-ARG PEPTDEEP_VERSION=1.5.1
-ARG INSTALL_ALPHAPEPTDEEP=1
-ARG PRELOAD_ALPHAPEPTDEEP_MODELS=1
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime-base
 
 RUN apt-get -o Acquire::Retries=5 update && \
     apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
@@ -109,6 +113,31 @@ ENV MPLCONFIGDIR=/tmp/redeem-matplotlib
 ENV NUMBA_CACHE_DIR=/tmp/redeem-numba
 ENV XDG_CACHE_HOME=/tmp/redeem-cache
 
+FROM runtime-base AS runtime
+
+ARG PEPTDEEP_VERSION=1.5.1
+ARG INSTALL_ALPHAPEPTDEEP=1
+ARG PRELOAD_ALPHAPEPTDEEP_MODELS=1
+ARG PYTHON_BUILD_THREADS=2
+
+# IMPORTANT: this dependency edge serializes the two high-pressure phases.
+# Python / torch / AlphaPeptDeep installation cannot begin until the complete
+# CUDA/Rust builder has finished and its binaries have been copied.
+COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
+
+WORKDIR /work
+
+COPY scripts/compare_foundation_alphapeptdeep.py /opt/redeem/scripts/compare_foundation_alphapeptdeep.py
+COPY redeem-properties/nbs/redeem_foundation_validation_report.ipynb /opt/redeem/notebooks/redeem_foundation_validation_report.ipynb
+COPY scripts/redeem-foundation /usr/local/bin/redeem-foundation
+COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
+
+ENV MAX_JOBS=${PYTHON_BUILD_THREADS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${PYTHON_BUILD_THREADS}
+ENV OMP_NUM_THREADS=${PYTHON_BUILD_THREADS}
+ENV OPENBLAS_NUM_THREADS=${PYTHON_BUILD_THREADS}
+ENV MKL_NUM_THREADS=${PYTHON_BUILD_THREADS}
+
 RUN python3 -m venv "${VIRTUAL_ENV}" && \
     "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 --upgrade pip setuptools wheel && \
     if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
@@ -131,21 +160,10 @@ RUN python3 -m venv "${VIRTUAL_ENV}" && \
         fi; \
     fi
 
-WORKDIR /work
-
-COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
-COPY scripts/compare_foundation_alphapeptdeep.py /opt/redeem/scripts/compare_foundation_alphapeptdeep.py
-COPY redeem-properties/nbs/redeem_foundation_validation_report.ipynb /opt/redeem/notebooks/redeem_foundation_validation_report.ipynb
-COPY scripts/redeem-foundation /usr/local/bin/redeem-foundation
-COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
-
 RUN chmod 0755 \
         /usr/local/bin/redeem-foundation \
         /usr/local/bin/redeem-container-info \
         /opt/redeem/scripts/compare_foundation_alphapeptdeep.py && \
     /usr/local/bin/redeem-container-info --build-check
 
-# No ENTRYPOINT: Docker and Singularity/Apptainer can execute either the main
-# `redeem` CLI or any foundation executable directly.  `docker run IMAGE` still
-# yields a useful default command.
 CMD ["redeem-foundation", "help"]
