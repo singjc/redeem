@@ -559,6 +559,17 @@ fn main() -> Result<()> {
                 "unsupported bidirectional_mitm policy '{value}'; expected 'none', 'v01319', 'v01320', 'v01321', 'v01322', or 'v01323'"
             ),
         };
+    let generation_partition_train = match env::var("REDEEM_GENERATION_PARTITION") {
+        Ok(value) if value.eq_ignore_ascii_case("train") => true,
+        Ok(value) if value.eq_ignore_ascii_case("validation") || value.trim().is_empty() => false,
+        Ok(value) => anyhow::bail!(
+            "unsupported REDEEM_GENERATION_PARTITION='{value}'; only 'train' or 'validation' are allowed, and TEST is intentionally unavailable"
+        ),
+        Err(_) => false,
+    };
+    if generation_partition_train && !bidirectional_mitm_final_two_view {
+        anyhow::bail!("TRAIN candidate export requires frozen v0.13.23 two-view MITM");
+    }
     if validation_records == 0
         || samples_per_record == 0
         || mass_beam_width == 0
@@ -627,7 +638,7 @@ fn main() -> Result<()> {
         );
     }
     if bidirectional_mitm {
-        let fixed_policy = validation_records == 128
+        let fixed_policy = (generation_partition_train || validation_records == 128)
             && samples_per_record == 16
             && seed == 20_260_912
             && (mass_tolerance_da - 0.05).abs() <= 1.0e-12
@@ -644,7 +655,7 @@ fn main() -> Result<()> {
             && reverse_causal_generation_final_candidates == 16;
         if !fixed_policy {
             anyhow::bail!(
-                "v0.13.19-v0.13.23 bidirectional MITM evaluation is a fixed val128 decision run; do not sweep proposal/ranking/search parameters"
+                "v0.13.19-v0.13.23 MITM uses frozen proposal/ranking/search parameters; TRAIN export may change record count only"
             );
         }
     }
@@ -687,16 +698,24 @@ fn main() -> Result<()> {
     config.validate().map_err(anyhow::Error::msg)?;
 
     let vocabulary = FoundationDiffusionVocabulary;
-    let usable_validation = usable_indices(
+    let generation_partition = if generation_partition_train {
+        FoundationPartition::Train
+    } else {
+        FoundationPartition::Validation
+    };
+    let usable_generation = usable_indices(
         &corpus.records,
         &benchmark,
-        FoundationPartition::Validation,
+        generation_partition,
         &config,
         vocabulary,
     );
-    let selected = deterministic_subset(&usable_validation, validation_records, seed);
+    let selected = deterministic_subset(&usable_generation, validation_records, seed);
     if selected.is_empty() {
-        anyhow::bail!("no usable validation diffusion pairs were selected");
+        anyhow::bail!(
+            "no usable {:?} diffusion pairs were selected",
+            generation_partition
+        );
     }
 
     let varmap = VarMap::new();
@@ -988,8 +1007,21 @@ fn main() -> Result<()> {
         benchmark.manifest_fingerprint()
     );
     println!("checkpoint\t{}", checkpoint_dir.display());
+    println!(
+        "generation_partition\t{}",
+        if generation_partition_train {
+            "TRAIN"
+        } else {
+            "VALIDATION"
+        }
+    );
     println!("validation_records\t{}", selected.len());
     println!("test_partition_consumed\tNO");
+    if generation_partition_train {
+        println!("v0140_candidate_export_role\tTRAIN_supervision_candidates");
+        println!("v0140_candidate_export_target_usage\tpost_generation_labels_only");
+        println!("v0140_candidate_export_backbone\tfrozen_v01323");
+    }
     println!("samples_per_record\t{samples_per_record}");
     println!("diffusion_steps\t{}", config.diffusion_steps);
     println!("mass_tolerance_da\t{mass_tolerance_da}");
@@ -3302,7 +3334,7 @@ fn main() -> Result<()> {
             );
         }
 
-        if bidirectional_mitm {
+        if bidirectional_mitm && !generation_partition_train {
             println!(
                 "generation_summary\tfrozen_v01313_pool_mass_valid_peptidoform_exact\t{:.6}",
                 metrics.frozen_v01313_pool_mass_valid_peptidoform_exact as f64 / records
@@ -3589,6 +3621,17 @@ fn main() -> Result<()> {
             );
         }
     }
+    if generation_partition_train {
+        println!(
+            "v0140_train_candidate_export\trecords={}\tpool_literal={}\tpool_sequence={}\tpool_il={}\tretained_mitm_candidates={}\tpolicy=frozen_v01323_two_view\ttest_partition_consumed=NO",
+            metrics.records,
+            metrics.candidate_pool_mass_valid_peptidoform_exact,
+            metrics.candidate_pool_mass_valid_sequence_exact,
+            metrics.candidate_pool_mass_valid_il_sequence_exact,
+            metrics.mitm_joined_candidates,
+        );
+    }
+
     println!(
         "generation_summary\tdiffusion_pool_mass_valid_peptidoform_exact\t{:.6}",
         metrics.diffusion_pool_mass_valid_peptidoform_exact as f64 / records
