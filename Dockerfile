@@ -126,6 +126,8 @@ ENV XDG_CACHE_HOME=/tmp/redeem-cache
 FROM runtime-base AS runtime
 
 ARG PEPTDEEP_VERSION=1.5.1
+ARG PEPTDEEP_TORCH_VERSION=2.5.1
+ARG PEPTDEEP_TORCH_VARIANT=cpu
 ARG INSTALL_ALPHAPEPTDEEP=1
 ARG PRELOAD_ALPHAPEPTDEEP_MODELS=1
 ARG PYTHON_BUILD_THREADS=1
@@ -148,26 +150,43 @@ ENV OMP_NUM_THREADS=${PYTHON_BUILD_THREADS}
 ENV OPENBLAS_NUM_THREADS=${PYTHON_BUILD_THREADS}
 ENV MKL_NUM_THREADS=${PYTHON_BUILD_THREADS}
 
+# AlphaPeptDeep comparison is intentionally CPU-only. ReDeeM/Candle remains CUDA-enabled.
+# Installing the official CPU torch wheel first prevents pip from pulling a second
+# CUDA runtime (currently cu124 for torch 2.5.1), which conflicts with the image's
+# CUDA 12.2 runtime and is unnecessary for the small held-out comparison.
+# Keep each expensive Python step in its own Docker layer so successful downloads
+# remain cached even if a later model-preload step fails.
 RUN python3 -m venv "${VIRTUAL_ENV}" && \
-    "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 --upgrade pip setuptools wheel && \
-    if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
+    "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 --upgrade pip setuptools wheel
+
+RUN if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
+        test "${PEPTDEEP_TORCH_VARIANT}" = "cpu"; \
+        "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 \
+            --index-url https://download.pytorch.org/whl/cpu \
+            "torch==${PEPTDEEP_TORCH_VERSION}"; \
+    fi
+
+RUN if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
         "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 \
             "peptdeep[stable]==${PEPTDEEP_VERSION}" \
             "nbconvert>=7,<8" \
             "matplotlib>=3.7"; \
-        if [ "${PRELOAD_ALPHAPEPTDEEP_MODELS}" = "1" ]; then \
-            mkdir -p /opt/redeem; \
-            success=0; \
-            for attempt in 1 2 3 4 5; do \
-                if HOME=/opt/redeem "${VIRTUAL_ENV}/bin/peptdeep" install-models --overwrite True; then \
-                    success=1; \
-                    break; \
-                fi; \
-                echo "AlphaPeptDeep model download attempt ${attempt} failed; retrying..." >&2; \
-                sleep $((attempt * 10)); \
-            done; \
-            test "${success}" = "1"; \
-        fi; \
+        "${VIRTUAL_ENV}/bin/python" -m pip check; \
+        "${VIRTUAL_ENV}/bin/python" -c 'import torch; print("AlphaPeptDeep torch:", torch.__version__, "cuda_available=", torch.cuda.is_available()); assert "+cpu" in torch.__version__; assert not torch.cuda.is_available()'; \
+    fi
+
+RUN if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ] && [ "${PRELOAD_ALPHAPEPTDEEP_MODELS}" = "1" ]; then \
+        mkdir -p /opt/redeem; \
+        success=0; \
+        for attempt in 1 2 3 4 5; do \
+            if HOME=/opt/redeem "${VIRTUAL_ENV}/bin/peptdeep" install-models --overwrite True; then \
+                success=1; \
+                break; \
+            fi; \
+            echo "AlphaPeptDeep model download attempt ${attempt} failed; retrying..." >&2; \
+            sleep $((attempt * 10)); \
+        done; \
+        test "${success}" = "1"; \
     fi
 
 RUN chmod 0755 \
