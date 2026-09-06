@@ -189,6 +189,18 @@ RUN if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ] && [ "${PRELOAD_ALPHAPEPTDEEP_MODELS
         test "${success}" = "1"; \
     fi
 
+# Foundation corpus ingestion deliberately streams compressed inputs through
+# system decompressors (zstd -dc / gzip -dc). Install these in a late runtime
+# layer so adding them does not invalidate the expensive Rust/CUDA or Python/APD
+# build layers that are already cached.
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        gzip \
+        zstd && \
+    command -v gzip && \
+    command -v zstd && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN chmod 0755 \
         /usr/local/bin/redeem-foundation \
         /usr/local/bin/redeem-container-info \
