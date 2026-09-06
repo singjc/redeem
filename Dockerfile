@@ -7,7 +7,10 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
 
 ARG RUST_TOOLCHAIN=stable
 ARG CUDA_COMPUTE_CAP=80
-ARG CARGO_BUILD_JOBS=2
+ARG CARGO_BUILD_JOBS=1
+ARG CARGO_RELEASE_LTO=off
+ARG CARGO_RELEASE_CODEGEN_UNITS=8
+ARG CARGO_RELEASE_DEBUG=0
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 
 RUN apt-get -o Acquire::Retries=5 update && \
@@ -38,6 +41,13 @@ ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
 ENV CARGO_INCREMENTAL=0
+# Override only the container's Cargo release profile. The workspace normally
+# uses fat LTO + one codegen unit + full debug info, which causes very high
+# peak LLVM/linker RAM usage. Cargo officially supports these profile settings
+# through CARGO_PROFILE_<name>_* environment variables.
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_RELEASE_LTO}
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_RELEASE_CODEGEN_UNITS}
+ENV CARGO_PROFILE_RELEASE_DEBUG=${CARGO_RELEASE_DEBUG}
 
 WORKDIR /app
 
@@ -118,7 +128,7 @@ FROM runtime-base AS runtime
 ARG PEPTDEEP_VERSION=1.5.1
 ARG INSTALL_ALPHAPEPTDEEP=1
 ARG PRELOAD_ALPHAPEPTDEEP_MODELS=1
-ARG PYTHON_BUILD_THREADS=2
+ARG PYTHON_BUILD_THREADS=1
 
 # IMPORTANT: this dependency edge serializes the two high-pressure phases.
 # Python / torch / AlphaPeptDeep installation cannot begin until the complete
