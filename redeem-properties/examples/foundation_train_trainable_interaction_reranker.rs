@@ -202,7 +202,10 @@ fn main() -> Result<()> {
         );
     }
 
-    let device = Device::Cpu;
+    // The deployment image is built with Candle CUDA support. Use CUDA when that
+    // feature is present (the Slurm path supplies the GPU through Singularity --nv),
+    // while retaining CPU behavior for ordinary non-CUDA local builds.
+    let device = Device::cuda_if_available(0)?;
     let causal_varmap = VarMap::new();
     let causal_vb = VarBuilder::from_varmap(&causal_varmap, DType::F32, &device);
     let causal_model = PeptideSpectrumCausalModel::new(config.clone(), causal_vb)?;
@@ -215,6 +218,10 @@ fn main() -> Result<()> {
     let spectrum_collator = FoundationSpectrumCollator::new(config.spectrum.clone())?;
 
     println!("interaction_reranker_version\t{VERSION}");
+    println!(
+        "compute_device\t{}",
+        if device.is_cuda() { "cuda:0" } else { "cpu" }
+    );
     println!("objective\thierarchical_il_then_exact_listwise_unit_weight_fixed_hard_negatives");
     println!("architecture\tfrozen_causal_states_plus_trainable_cross_attention_adapter_96x48x96_zero_residual");
     println!("proposal_policy\tv01323_final_two_view_fixed_budget_frozen");
@@ -814,13 +821,17 @@ fn precursor_context(
     device: &Device,
 ) -> Result<PrecursorContextBatch> {
     let charge = record.context.charge.unwrap_or(0) as f32;
-    let charge_present = if record.context.charge.is_some() {
+    // Keep every continuous precursor-context tensor in F32. Without an explicit
+    // type here, Rust defaults these standalone floating literals to f64, which
+    // produces F64 presence masks and fails inside the frozen causal context path
+    // when they are multiplied by the F32 precursor features.
+    let charge_present: f32 = if record.context.charge.is_some() {
         1.0
     } else {
         0.0
     };
-    let precursor_mz = record.context.precursor_mz.unwrap_or(0.0);
-    let precursor_mz_present = if record.context.precursor_mz.is_some() {
+    let precursor_mz: f32 = record.context.precursor_mz.unwrap_or(0.0);
+    let precursor_mz_present: f32 = if record.context.precursor_mz.is_some() {
         1.0
     } else {
         0.0
