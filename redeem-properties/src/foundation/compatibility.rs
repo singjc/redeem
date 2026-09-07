@@ -438,9 +438,13 @@ impl FoundationSpectrumPeptideCompatibilityModel {
             .residue_mask
             .narrow(1, 0, sequence_len - 1)?
             .broadcast_mul(&peptide.residue_mask.narrow(1, 1, sequence_len - 1)?)?;
-        let mut cleavage = self
-            .cleavage_projection
-            .forward(&Tensor::cat(&[&left, &right], 2)?)?;
+        // `left` and `right` are narrow views into the residue tensor. On CUDA,
+        // Candle may preserve a strided layout through concatenation along the
+        // feature axis, while `Linear`/matmul requires contiguous storage for
+        // this 3-D batched projection. Materialize the exact same concatenated
+        // cleavage features before the 2*model_dim -> model_dim projection.
+        let cleavage_input = Tensor::cat(&[&left, &right], 2)?.contiguous()?;
+        let mut cleavage = self.cleavage_projection.forward(&cleavage_input)?;
         cleavage = cleavage.broadcast_mul(&cleavage_mask.unsqueeze(2)?.broadcast_as((
             pair_batch,
             sequence_len - 1,
