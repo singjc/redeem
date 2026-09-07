@@ -57,6 +57,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 struct UnifiedCheckpointMetadata {
+    corpus_fingerprint: String,
+    benchmark_manifest_fingerprint: String,
+    completed_steps: usize,
     inverse_config: FoundationDiffusionConfig,
 }
 
@@ -68,6 +71,7 @@ struct ReverseCausalCheckpointMetadata {
     corpus_fingerprint: String,
     benchmark_manifest_fingerprint: String,
     parent_unified_checkpoint: String,
+    parent_unified_completed_steps: usize,
     inverse_config: FoundationDiffusionConfig,
 }
 
@@ -786,12 +790,29 @@ fn main() -> Result<()> {
         {
             anyhow::bail!("reverse causal checkpoint corpus/benchmark fingerprint mismatch");
         }
-        let expected_parent = checkpoint_dir.join("model.safetensors");
-        if PathBuf::from(&reverse_metadata.parent_unified_checkpoint) != expected_parent {
+        if reverse_metadata.corpus_fingerprint != checkpoint_metadata.corpus_fingerprint
+            || reverse_metadata.benchmark_manifest_fingerprint
+                != checkpoint_metadata.benchmark_manifest_fingerprint
+            || reverse_metadata.parent_unified_completed_steps
+                != checkpoint_metadata.completed_steps
+        {
             anyhow::bail!(
-                "reverse causal checkpoint parent {:?} does not match evaluated unified parent {:?}",
-                reverse_metadata.parent_unified_checkpoint,
-                expected_parent
+                "reverse causal checkpoint parent lineage does not match evaluated unified parent: reverse corpus={} benchmark={} parent_completed_steps={}, unified corpus={} benchmark={} completed_steps={}",
+                reverse_metadata.corpus_fingerprint,
+                reverse_metadata.benchmark_manifest_fingerprint,
+                reverse_metadata.parent_unified_completed_steps,
+                checkpoint_metadata.corpus_fingerprint,
+                checkpoint_metadata.benchmark_manifest_fingerprint,
+                checkpoint_metadata.completed_steps
+            );
+        }
+        let expected_parent = checkpoint_dir.join("model.safetensors");
+        let recorded_parent = PathBuf::from(&reverse_metadata.parent_unified_checkpoint);
+        if recorded_parent != expected_parent {
+            println!(
+                "reverse_causal_parent_relocation\trecorded={}\tevaluated={}\tlineage=accepted_by_metadata_identity",
+                recorded_parent.display(),
+                expected_parent.display()
             );
         }
         let reverse_model_path = if reverse_checkpoint.is_dir() {
