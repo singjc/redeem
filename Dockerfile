@@ -82,6 +82,7 @@ foundation_benchmark_unified_forward \
 foundation_train_trainable_interaction_reranker \
 foundation_train_compatibility_pretraining \
 foundation_train_compatibility_pretraining_v0171 \
+foundation_train_compatibility_pretraining_v0180 \
 foundation_export_alphapeptdeep_comparison"; \
     EXAMPLE_ARGS=""; \
     for example_name in ${FOUNDATION_EXAMPLES}; do \
