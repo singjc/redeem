@@ -235,10 +235,12 @@ fn main() -> Result<()> {
 
     let run = read_foundation_training_run_config(&training_yaml)
         .with_context(|| format!("read foundation run config {training_yaml:?}"))?;
-    let corpus = load_foundation_corpus(&run.corpus).context("load foundation corpus")?;
+    let mut corpus = load_foundation_corpus(&run.corpus).context("load foundation corpus")?;
+    log_host_memory("after_corpus_load");
     let benchmark = FoundationBenchmarkManifest::read_tsv(&run.benchmark_manifest)
         .with_context(|| format!("read benchmark manifest {:?}", run.benchmark_manifest))?;
     benchmark.validate_against_records(&corpus.records)?;
+    log_host_memory("after_benchmark_validation");
 
     let validation_groups = read_candidate_groups(&validation_path)
         .with_context(|| format!("read validation candidate TSV {validation_path:?}"))?;
@@ -294,12 +296,14 @@ fn main() -> Result<()> {
     )?;
     initialize_fresh_compatibility_variables(&varmap, SEED, &device)?;
     let initialization_fingerprint = compatibility_model_fingerprint(&varmap)?;
+    log_host_memory("after_model_initialization");
 
     let featurizer = PeptideGraphFeaturizer::new(metadata.forward_config.clone())?;
     let spectrum_collator =
         FoundationSpectrumCollator::new(metadata.inverse_config.spectrum.clone())?;
 
     let train_indices = benchmark.partition_indices(FoundationPartition::Train);
+    drop(benchmark);
     let (hard_groups, mining_stats) = build_hard_negative_groups(
         &corpus.records,
         &train_indices,
@@ -318,6 +322,15 @@ fn main() -> Result<()> {
             hard_groups.len()
         );
     }
+
+    log_host_memory("after_hard_negative_mining");
+    let retention = prune_unused_spectrum_payloads(
+        &mut corpus.records,
+        &hard_groups,
+        &validation_groups,
+        mode,
+    )?;
+    log_host_memory("after_spectrum_payload_prune");
 
     println!("compatibility_pretraining_version\t{VERSION}");
     println!("run_mode\t{}", mode.as_str());
@@ -371,6 +384,18 @@ fn main() -> Result<()> {
     println!(
         "hard_negative_abs_mass_error_max_da\t{:.6}",
         mining_stats.max_absolute_mass_error_da
+    );
+    println!(
+        "retained_training_spectrum_records\t{}",
+        retention.training_records
+    );
+    println!(
+        "retained_validation_spectrum_records\t{}",
+        retention.validation_records
+    );
+    println!(
+        "pruned_spectrum_payload_records\t{}",
+        retention.pruned_records
     );
     println!(
         "warm_start_peptide_encoder_variables\t{}",
@@ -429,6 +454,11 @@ fn main() -> Result<()> {
         gradient_norm_for_prefix(&varmap, &probe_gradients, "compatibility.output.")?,
     );
     require_nonzero_end_to_end_gradients(&varmap, &probe_gradients)?;
+    drop(probe_gradients);
+    drop(probe_loss);
+    drop(probe_output);
+    drop(probe_batch);
+    log_host_memory("after_gradient_probe");
 
     let mut optimizer = FoundationAdamW::new(
         &varmap,
@@ -688,10 +718,19 @@ fn build_hard_negative_groups(
     max_sequence_len: usize,
 ) -> Result<(Vec<HardNegativeGroup>, HardNegativeMiningStats)> {
     let mut buckets = BTreeMap::<i32, Vec<MassCandidate>>::new();
-    let mut il_keys = HashMap::<usize, String>::new();
+    let mut il_keys = vec![None::<String>; records.len()];
     let mut spectrum_anchors = Vec::<usize>::new();
 
-    for &record_index in train_indices {
+    for (position, &record_index) in train_indices.iter().enumerate() {
+        if position > 0 && position % 50_000 == 0 {
+            println!(
+                "hard_negative_index_progress\trecords_done={}\trecords_total={}\tspectrum_anchors={}",
+                position,
+                train_indices.len(),
+                spectrum_anchors.len(),
+            );
+            log_host_memory("hard_negative_index_progress");
+        }
         let record = records
             .get(record_index)
             .with_context(|| format!("TRAIN record index {record_index} exceeds corpus"))?;
@@ -705,7 +744,7 @@ fn build_hard_negative_groups(
             Ok(value) if value.is_finite() && value > 0.0 => value,
             _ => continue,
         };
-        il_keys.insert(record_index, il_sequence_key(&record.peptidoform.sequence));
+        il_keys[record_index] = Some(il_sequence_key(&record.peptidoform.sequence));
         buckets
             .entry(charge)
             .or_default()
@@ -718,7 +757,7 @@ fn build_hard_negative_groups(
         else {
             continue;
         };
-        if FoundationSpectrum::from_training_record(record).is_none() {
+        if !training_record_has_usable_spectrum(record) {
             continue;
         }
         let observed_mass = match foundation_precursor_neutral_mass(f64::from(precursor_mz), charge)
@@ -731,6 +770,13 @@ fn build_hard_negative_groups(
         }
         spectrum_anchors.push(record_index);
     }
+    println!(
+        "hard_negative_index_progress\trecords_done={}\trecords_total={}\tspectrum_anchors={}",
+        train_indices.len(),
+        train_indices.len(),
+        spectrum_anchors.len(),
+    );
+    log_host_memory("hard_negative_index_complete");
 
     for bucket in buckets.values_mut() {
         bucket.sort_by(|left, right| {
@@ -749,7 +795,17 @@ fn build_hard_negative_groups(
     let mut mass_error_count = 0usize;
     let mut mass_error_max = 0.0f64;
 
-    for anchor_index in spectrum_anchors.iter().copied() {
+    for (anchor_position, anchor_index) in spectrum_anchors.iter().copied().enumerate() {
+        let done = anchor_position + 1;
+        if done % 50_000 == 0 || done == spectrum_anchors.len() {
+            println!(
+                "hard_negative_group_progress\tanchors_done={}\tanchors_total={}\tgroups_built={}",
+                done,
+                spectrum_anchors.len(),
+                groups.len(),
+            );
+            log_host_memory("hard_negative_group_progress");
+        }
         let record = &records[anchor_index];
         let charge = record.context.charge.context("anchor charge disappeared")?;
         let precursor_mz = record
@@ -759,7 +815,8 @@ fn build_hard_negative_groups(
         let observed_mass = foundation_precursor_neutral_mass(f64::from(precursor_mz), charge)
             .map_err(anyhow::Error::msg)?;
         let anchor_il = il_keys
-            .get(&anchor_index)
+            .get(anchor_index)
+            .and_then(Option::as_ref)
             .context("missing anchor I/L key")?;
         let bucket = buckets
             .get(&charge)
@@ -774,7 +831,8 @@ fn build_hard_negative_groups(
             if candidate.record_index == anchor_index {
                 continue;
             }
-            let Some(candidate_il) = il_keys.get(&candidate.record_index) else {
+            let Some(candidate_il) = il_keys.get(candidate.record_index).and_then(Option::as_ref)
+            else {
                 continue;
             };
             if candidate_il == anchor_il {
@@ -828,6 +886,93 @@ fn build_hard_negative_groups(
             max_absolute_mass_error_da: mass_error_max,
         },
     ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpectrumPayloadRetentionStats {
+    training_records: usize,
+    validation_records: usize,
+    pruned_records: usize,
+}
+
+fn training_record_has_usable_spectrum(record: &FoundationTrainingRecord) -> bool {
+    record.observed_spectrum_peaks.iter().any(|peak| {
+        peak.mz.is_finite() && peak.mz > 0.0 && peak.intensity.is_finite() && peak.intensity > 0.0
+    }) || record.fragments.iter().any(|fragment| {
+        fragment
+            .product_mz
+            .is_some_and(|mz| mz.is_finite() && mz > 0.0)
+            && fragment.intensity.is_finite()
+            && fragment.intensity > 0.0
+    })
+}
+
+fn prune_unused_spectrum_payloads(
+    records: &mut [FoundationTrainingRecord],
+    groups: &[HardNegativeGroup],
+    validation_groups: &[CandidateGroup],
+    mode: RunMode,
+) -> Result<SpectrumPayloadRetentionStats> {
+    let mut planned_sampler = AnchorSampler::new(groups.len(), SEED);
+    let mut training_records = HashSet::<usize>::new();
+    for _ in 0..mode.train_steps() {
+        for group_index in planned_sampler.next_batch(mode.anchor_batch()) {
+            let group = groups.get(group_index).with_context(|| {
+                format!("planned hard-negative group {group_index} exceeds groups")
+            })?;
+            training_records.insert(group.anchor_index);
+        }
+    }
+
+    let validation_limit = mode
+        .validation_limit()
+        .unwrap_or(validation_groups.len())
+        .min(validation_groups.len());
+    let validation_records = validation_groups
+        .iter()
+        .take(validation_limit)
+        .map(|group| group.record_index)
+        .collect::<HashSet<_>>();
+
+    let mut keep = training_records.clone();
+    keep.extend(validation_records.iter().copied());
+    let mut pruned_records = 0usize;
+    for (record_index, record) in records.iter_mut().enumerate() {
+        if keep.contains(&record_index) {
+            continue;
+        }
+        if !record.observed_spectrum_peaks.is_empty() || !record.fragments.is_empty() {
+            record.observed_spectrum_peaks = Vec::new();
+            record.fragments = Vec::new();
+            pruned_records += 1;
+        }
+    }
+
+    Ok(SpectrumPayloadRetentionStats {
+        training_records: training_records.len(),
+        validation_records: validation_records.len(),
+        pruned_records,
+    })
+}
+
+fn proc_status_value<'a>(status: &'a str, key: &str) -> Option<&'a str> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .map(str::trim)
+}
+
+fn log_host_memory(stage: &str) {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return;
+    };
+    println!(
+        "host_memory\tstage={}\trss={}\tpeak={}\tdata={}",
+        stage,
+        proc_status_value(&status, "VmRSS:").unwrap_or("NA"),
+        proc_status_value(&status, "VmHWM:").unwrap_or("NA"),
+        proc_status_value(&status, "VmData:").unwrap_or("NA"),
+    );
 }
 
 fn peptide_supported(peptide: &PeptidoformInput, max_sequence_len: usize) -> bool {
