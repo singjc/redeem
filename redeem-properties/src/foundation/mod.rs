@@ -17,6 +17,7 @@ pub mod checkpoint;
 pub mod chemistry;
 pub mod cleavage_graph;
 pub mod collate;
+pub mod compatibility;
 pub mod config;
 pub mod control;
 pub mod corpus;
@@ -101,6 +102,12 @@ pub use cleavage_graph::{
 pub use collate::{
     FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
     FoundationTrainingBatch, FoundationTrainingViews,
+};
+pub use compatibility::{
+    foundation_compatibility_listwise_loss, load_compatibility_from_unified_checkpoint,
+    FoundationCompatibilityOutput, FoundationCompatibilitySpectrumContext,
+    FoundationCompatibilityWarmStartReport, FoundationSpectrumPeptideCompatibilityModel,
+    FOUNDATION_COMPATIBILITY_NAMESPACE_V0170,
 };
 pub use config::{
     FoundationCcsContextMode, FoundationCcsPhysicsBaselineConfig, FoundationConfig,
