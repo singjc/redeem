@@ -712,6 +712,33 @@ struct MassCandidate {
     mass: f64,
 }
 
+fn hard_negative_candidate_order(
+    left: &HardNegativeCandidate,
+    right: &HardNegativeCandidate,
+) -> std::cmp::Ordering {
+    left.absolute_mass_error_da
+        .total_cmp(&right.absolute_mass_error_da)
+        .then_with(|| left.record_index.cmp(&right.record_index))
+}
+
+fn retain_bounded_hard_negative_candidate(
+    candidates: &mut Vec<HardNegativeCandidate>,
+    candidate: HardNegativeCandidate,
+) {
+    let insert_at = candidates.partition_point(|existing| {
+        hard_negative_candidate_order(existing, &candidate) != std::cmp::Ordering::Greater
+    });
+
+    if candidates.len() < HARD_NEGATIVE_POOL {
+        candidates.insert(insert_at, candidate);
+    } else if insert_at < HARD_NEGATIVE_POOL {
+        // Drop the current worst candidate before inserting so the Vec never
+        // grows beyond its fixed HARD_NEGATIVE_POOL allocation.
+        candidates.pop();
+        candidates.insert(insert_at, candidate);
+    }
+}
+
 fn build_hard_negative_groups(
     records: &[FoundationTrainingRecord],
     train_indices: &[usize],
@@ -826,7 +853,15 @@ fn build_hard_negative_groups(
         let start = bucket.partition_point(|candidate| candidate.mass < lower);
         let end = bucket.partition_point(|candidate| candidate.mass <= upper);
 
-        let mut candidates = Vec::<HardNegativeCandidate>::new();
+        // Keep only the scientifically used top-K candidates while scanning the
+        // mass window.  The previous implementation collected the entire window
+        // and then called Vec::truncate(HARD_NEGATIVE_POOL).  truncate() preserves
+        // the Vec capacity, so millions of groups retained allocations sized for
+        // hundreds or thousands of candidates even though only 24 entries were
+        // ever used.  Maintaining this sorted bounded buffer is exactly
+        // equivalent to sorting the full eligible window by the same key and
+        // taking the first HARD_NEGATIVE_POOL entries.
+        let mut candidates = Vec::<HardNegativeCandidate>::with_capacity(HARD_NEGATIVE_POOL);
         for candidate in &bucket[start..end] {
             if candidate.record_index == anchor_index {
                 continue;
@@ -838,17 +873,15 @@ fn build_hard_negative_groups(
             if candidate_il == anchor_il {
                 continue;
             }
-            candidates.push(HardNegativeCandidate {
-                record_index: candidate.record_index,
-                absolute_mass_error_da: (candidate.mass - observed_mass).abs(),
-            });
+
+            retain_bounded_hard_negative_candidate(
+                &mut candidates,
+                HardNegativeCandidate {
+                    record_index: candidate.record_index,
+                    absolute_mass_error_da: (candidate.mass - observed_mass).abs(),
+                },
+            );
         }
-        candidates.sort_by(|left, right| {
-            left.absolute_mass_error_da
-                .total_cmp(&right.absolute_mass_error_da)
-                .then_with(|| left.record_index.cmp(&right.record_index))
-        });
-        candidates.truncate(HARD_NEGATIVE_POOL);
         if candidates.len() < HARD_NEGATIVES_PER_ANCHOR {
             continue;
         }
@@ -1789,6 +1822,36 @@ mod tests {
         let mut second = AnchorSampler::new(20, 123);
         assert_eq!(first.next_batch(12), second.next_batch(12));
         assert_eq!(first.next_batch(12), second.next_batch(12));
+    }
+
+    #[test]
+    fn bounded_hard_negative_pool_matches_full_sort_and_never_grows_capacity() {
+        let source = (0..257usize)
+            .map(|record_index| HardNegativeCandidate {
+                record_index,
+                absolute_mass_error_da: (((record_index * 73) % 251) as f64) / 10_000.0,
+            })
+            .collect::<Vec<_>>();
+
+        let mut expected = source.clone();
+        expected.sort_by(hard_negative_candidate_order);
+        expected.truncate(HARD_NEGATIVE_POOL);
+
+        let mut bounded = Vec::with_capacity(HARD_NEGATIVE_POOL);
+        for candidate in source {
+            retain_bounded_hard_negative_candidate(&mut bounded, candidate);
+            assert!(bounded.len() <= HARD_NEGATIVE_POOL);
+            assert_eq!(bounded.capacity(), HARD_NEGATIVE_POOL);
+        }
+
+        assert_eq!(bounded.len(), expected.len());
+        for (observed, expected) in bounded.iter().zip(expected.iter()) {
+            assert_eq!(observed.record_index, expected.record_index);
+            assert_eq!(
+                observed.absolute_mass_error_da.to_bits(),
+                expected.absolute_mass_error_da.to_bits()
+            );
+        }
     }
 
     #[test]
