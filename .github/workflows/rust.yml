@@ -32,6 +32,7 @@ jobs:
       with:
         toolchain: "nightly"
         override: true
+        components: rustfmt
 
     - name: Verify Rust version
       run: rustc --version
@@ -80,6 +81,7 @@ jobs:
       with:
         toolchain: "nightly"
         override: true
+        components: rustfmt
 
     - name: Install Python test dependencies
       run: |
