@@ -1,16 +1,13 @@
 use crate::{
     building_blocks::featurize::{
-        self, aa_indices_tensor, aa_indices_tensor_from_arc, get_mod_features_from_parsed,
+        aa_indices_tensor_from_arc,
         get_mod_features_from_parsed_arc,
     },
     models::{ccs_model::CCSModelWrapper, ms2_model::MS2ModelWrapper, rt_model::RTModelWrapper},
     utils::{
         data_handling::{PeptideBatchData, PeptideData, TargetNormalization},
         logging::Progress,
-        peptdeep_utils::{
-            get_modification_indices, get_modification_string, parse_instrument_index,
-            remove_mass_shift,
-        },
+        peptdeep_utils::parse_instrument_index,
         stats::{compute_loss_stats, Metrics, TrainingPhase, TrainingStepMetrics},
         utils::{get_tensor_stats, CosineWithWarmup, LRScheduler},
     },
@@ -21,11 +18,9 @@ use candle_nn::{Optimizer, VarMap};
 use log::info;
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, path::PathBuf};
 use std::{
-    ops::{Deref, Index},
-    process::Output,
+    ops::Index,
     sync::Arc,
 };
 
@@ -512,10 +507,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                 let predictions: Vec<Vec<Vec<f32>>> = out.to_vec3()?;
                 Ok(PredictionResult::MS2Result(predictions))
             }
-            _ => Err(anyhow::anyhow!(
-                "Unsupported property type: {:?}",
-                self.get_property_type()
-            )),
         }
     }
 
@@ -825,7 +816,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
         let compute_loss = |predicted: &Tensor, target: &Tensor| -> Result<Tensor> {
             // Ensure target matches the predicted shape before any math.
             let adjusted_target = {
-                let mut t = target.clone();
+                let t = target.clone();
                 let t_elems = t.elem_count();
                 let p_elems = predicted.elem_count();
 
@@ -924,11 +915,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                             pred_flat.shape(),
                             tgt_flat.shape()
                         );
-                        tgt_flat = Tensor::zeros(
-                            pred_flat.shape(),
-                            pred_flat.dtype(),
-                            pred_flat.device(),
-                        )?;
                         return Err(anyhow::anyhow!(
                             "Empty target tensor after flatten in train loop"
                         ));
@@ -1024,7 +1010,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
             let (avg_loss, std_loss) = compute_loss_stats(&batch_losses);
 
             if let Some(val_data) = validation_data {
-                let val_batches =
+                let _val_batches =
                     (val_data.len() + validation_batch_size - 1) / validation_batch_size;
 
                 // Ensure the model is in evaluation mode during validation so
@@ -1055,11 +1041,6 @@ pub trait ModelInterface: Send + Sync + ModelClone {
                                 pred_flat.shape(),
                                 tgt_flat.shape()
                             );
-                            tgt_flat = Tensor::zeros(
-                                pred_flat.shape(),
-                                pred_flat.dtype(),
-                                pred_flat.device(),
-                            )?;
                             return Err(anyhow::anyhow!(
                                 "Empty target tensor after flatten in val loop"
                             ));
@@ -1239,7 +1220,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
         &self,
         inference_data: &Vec<PeptideData>,
         batch_size: usize,
-        modifications: HashMap<
+        _modifications: HashMap<
             (String, Option<char>),
             crate::utils::peptdeep_utils::ModificationMap,
         >,
@@ -1568,7 +1549,7 @@ pub trait ModelInterface: Send + Sync + ModelClone {
     // TODO: Maybe move to ms2_bert_model, since it's specific to that model
     fn process_predictions(&self, predicts: &Tensor, min_inten: f32) -> Result<Tensor> {
         // Reshape and get max
-        let (batch_size, seq_len, feature_size) = predicts.shape().dims3()?;
+        let (batch_size, _seq_len, _feature_size) = predicts.shape().dims3()?;
         let reshaped = predicts.reshape((batch_size, ()))?;
         let apex_intens = reshaped.max(1)?;
 

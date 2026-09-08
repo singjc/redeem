@@ -1,6 +1,6 @@
 use candle_core::{Result, Tensor};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::thread;
 use sysinfo::System;
 use tqdm::pbar;

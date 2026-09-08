@@ -10,7 +10,7 @@ use redeem_properties::models::ms2_bert_model::MS2BertModel;
 use redeem_properties::models::rt_cnn_lstm_model::RTCNNLSTMModel;
 use redeem_properties::models::rt_cnn_transformer_model::RTCNNTFModel;
 use redeem_properties::utils::data_handling::{PeptideData, TargetNormalization};
-use redeem_properties::utils::peptdeep_utils::{MODIFICATION_MAP, load_modifications};
+use redeem_properties::utils::peptdeep_utils::load_modifications;
 use redeem_properties::utils::stats::Metrics;
 use redeem_properties::utils::utils::get_device;
 use report_builder::{Report, ReportSection, plots::plot_scatter};
@@ -18,7 +18,7 @@ use report_builder::{Report, ReportSection, plots::plot_scatter};
 use crate::properties::inference::input::PropertyInferenceConfig;
 use crate::properties::inference::output::write_peptide_data;
 use crate::properties::load_data::load_peptide_data;
-use crate::properties::train::{sample_indices, sample_peptides};
+use crate::properties::train::sample_indices;
 use crate::properties::util::write_bytes_to_file;
 
 pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
@@ -180,7 +180,7 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
             let mut list_lines: Vec<String> = Vec::new();
             for (name, tensor) in tensors.iter() {
                 // Keep special "scale" dump as a separate artifact to aid debugging
-                let lname = name.to_lowercase();
+                let _lname = name.to_lowercase();
                 // (suppressed) Per-tensor scale dumps are disabled to avoid producing
                 // analysis artifacts during normal CLI inference runs.
 
@@ -203,7 +203,7 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
 
             // Also write a deterministic small sample for load-time parity checks.
             // Prefer a known decoder tensor name; fall back to first decoder-like tensor.
-            let sample_out = "analysis/model_load_sample_inference.txt";
+            let _sample_out = "analysis/model_load_sample_inference.txt";
             let mut sample_lines: Vec<String> = Vec::new();
             sample_lines.push(format!("model_path={}", &config.model_path));
             if let Some((name, tensor)) = tensors

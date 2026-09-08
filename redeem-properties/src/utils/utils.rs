@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use candle_core::utils::{cuda_is_available, metal_is_available};
 use candle_core::{Device, Tensor};
-use std::f64::consts::PI;
 
 // Learning rate scheduler trait
 /// Trait representing a learning rate scheduler that can be updated each step

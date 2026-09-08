@@ -45,7 +45,7 @@ impl CCSCNNTFModel {
         head_type: &str,
         head_learnable_scaler: bool,
     ) -> Result<Self> {
-        let mut varmap = VarMap::new();
+        let varmap = VarMap::new();
         let varbuilder = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
         log::trace!("[CCSCNNTFModel] Initializing ccs_encoder");

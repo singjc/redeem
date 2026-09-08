@@ -10,7 +10,6 @@ use std::fs;
 #[cfg(feature = "pretrained-download")]
 use std::fs::File;
 use std::io;
-use std::ops::Index;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -304,7 +303,7 @@ pub fn extract_masses_and_indices(peptide: &str) -> Vec<(f64, usize)> {
 pub fn get_modification_indices(peptide: &str) -> String {
     let re = Regex::new(r"(\[.*?\]|\(UniMod:\d+\)|\([a-zA-Z]+\))").unwrap();
     let mut indices = Vec::new();
-    let mut offset = 0;
+    let _offset = 0;
     let mut aa_index = 0;
     let mut i = 0;
 
@@ -374,7 +373,7 @@ pub fn extract_mass_annotations(peptide: &str) -> Vec<(String, usize)> {
 pub fn extract_unimod_annotations(peptide: &str) -> Vec<(String, usize)> {
     let re_unimod = Regex::new(r"\(UniMod:(\d+)\)").unwrap();
     let mut results = Vec::new();
-    let mut offset = 0;
+    let mut _offset = 0;
     let mut aa_index = 0;
     let mut idx = 0;
 
@@ -385,7 +384,7 @@ pub fn extract_unimod_annotations(peptide: &str) -> Vec<(String, usize)> {
                 let cap = re_unimod.captures(&peptide[idx..mat.end()]).unwrap();
                 let unimod_str = format!("UniMod:{}", &cap[1]);
                 results.push((unimod_str, aa_index));
-                offset += mat.end() - mat.start();
+                _offset += mat.end() - mat.start();
                 idx = mat.end();
                 continue;
             }

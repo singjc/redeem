@@ -1,4 +1,4 @@
-use plotly::common::{Fill, Mode, Title};
+use plotly::common::{Fill, Mode};
 use plotly::{Histogram, Layout, Plot, Scatter};
 use redeem_properties::utils::stats::{TrainingPhase, TrainingStepMetrics};
 
@@ -51,8 +51,8 @@ pub fn plot_losses(epoch_losses: &[(usize, f32, Option<f32>, f32, Option<f32>)])
     // Training loss band
     let mut train_band_y = train_upper.clone();
     let mut train_band_x = epochs.clone();
-    let mut lower_reversed: Vec<_> = train_lower.iter().cloned().rev().collect();
-    let mut x_reversed: Vec<_> = epochs.iter().cloned().rev().collect();
+    let lower_reversed: Vec<_> = train_lower.iter().cloned().rev().collect();
+    let x_reversed: Vec<_> = epochs.iter().cloned().rev().collect();
     train_band_y.extend(lower_reversed);
     train_band_x.extend(x_reversed);
 
@@ -76,8 +76,8 @@ pub fn plot_losses(epoch_losses: &[(usize, f32, Option<f32>, f32, Option<f32>)])
     // Validation loss band
     let mut val_band_y = val_upper.clone();
     let mut val_band_x = epochs.clone();
-    let mut val_lower_rev: Vec<_> = val_lower.iter().cloned().rev().collect();
-    let mut val_x_rev: Vec<_> = epochs.iter().cloned().rev().collect();
+    let val_lower_rev: Vec<_> = val_lower.iter().cloned().rev().collect();
+    let val_x_rev: Vec<_> = epochs.iter().cloned().rev().collect();
     val_band_y.extend(val_lower_rev);
     val_band_x.extend(val_x_rev);
 
