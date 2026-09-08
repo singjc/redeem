@@ -571,6 +571,30 @@ fn main() -> Result<()> {
         ),
         Err(_) => false,
     };
+    let generation_shard_count = match env::var("REDEEM_GENERATION_SHARD_COUNT") {
+        Ok(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("invalid REDEEM_GENERATION_SHARD_COUNT='{value}'"))?,
+        Err(_) => 1,
+    };
+    let generation_shard_index = match env::var("REDEEM_GENERATION_SHARD_INDEX") {
+        Ok(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("invalid REDEEM_GENERATION_SHARD_INDEX='{value}'"))?,
+        Err(_) => 0,
+    };
+    if generation_shard_count == 0 || generation_shard_index >= generation_shard_count {
+        anyhow::bail!(
+            "invalid generation shard specification: index={} count={}; require count>0 and index<count",
+            generation_shard_index,
+            generation_shard_count
+        );
+    }
+    if !generation_partition_train && generation_shard_count != 1 {
+        anyhow::bail!(
+            "generation sharding is TRAIN-only; validation must use one unsharded frozen candidate run"
+        );
+    }
     if generation_partition_train && !bidirectional_mitm_final_two_view {
         anyhow::bail!("TRAIN candidate export requires frozen v0.13.23 two-view MITM");
     }
@@ -714,13 +738,32 @@ fn main() -> Result<()> {
         &config,
         vocabulary,
     );
-    let selected = deterministic_subset(&usable_generation, validation_records, seed);
-    if selected.is_empty() {
+    let selected_all = deterministic_subset(&usable_generation, validation_records, seed);
+    if selected_all.is_empty() {
         anyhow::bail!(
             "no usable {:?} diffusion pairs were selected",
             generation_partition
         );
     }
+    let (generation_shard_start, generation_shard_end) = contiguous_shard_bounds(
+        selected_all.len(),
+        generation_shard_count,
+        generation_shard_index,
+    );
+    if generation_shard_start == generation_shard_end {
+        anyhow::bail!(
+            "generation shard {} of {} is empty for {} selected records",
+            generation_shard_index,
+            generation_shard_count,
+            selected_all.len()
+        );
+    }
+    let selected: Vec<(usize, usize)> = selected_all[generation_shard_start..generation_shard_end]
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(local_index, record_index)| (generation_shard_start + local_index, record_index))
+        .collect();
 
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -1037,6 +1080,13 @@ fn main() -> Result<()> {
         }
     );
     println!("validation_records\t{}", selected.len());
+    println!("generation_total_selected_records\t{}", selected_all.len());
+    println!("generation_shard_count\t{generation_shard_count}");
+    println!("generation_shard_index\t{generation_shard_index}");
+    println!("generation_shard_start\t{generation_shard_start}");
+    println!("generation_shard_end_exclusive\t{generation_shard_end}");
+    println!("generation_shard_records\t{}", selected.len());
+    println!("generation_shard_rng_policy\tglobal_selection_index_preserved");
     println!("test_partition_consumed\tNO");
     if generation_partition_train {
         println!("v0140_candidate_export_role\tTRAIN_supervision_candidates");
@@ -1379,7 +1429,7 @@ fn main() -> Result<()> {
     )?;
 
     let mut metrics = GenerationMetrics::default();
-    for (selection_index, &record_index) in selected.iter().enumerate() {
+    for &(selection_index, record_index) in &selected {
         let record = &corpus.records[record_index];
         let target_tokens = vocabulary
             .encode(&record.peptidoform, config.max_tokens)
@@ -6841,6 +6891,16 @@ fn usable_indices(
         .collect()
 }
 
+fn contiguous_shard_bounds(total: usize, shard_count: usize, shard_index: usize) -> (usize, usize) {
+    debug_assert!(shard_count > 0);
+    debug_assert!(shard_index < shard_count);
+    let base = total / shard_count;
+    let remainder = total % shard_count;
+    let start = shard_index * base + shard_index.min(remainder);
+    let len = base + usize::from(shard_index < remainder);
+    (start, start + len)
+}
+
 fn deterministic_subset(indices: &[usize], requested: usize, seed: u64) -> Vec<usize> {
     let mut ranked: Vec<(u64, usize)> = indices
         .iter()
@@ -7299,6 +7359,43 @@ fn iterative_refinement_logits(
 mod fragment_evidence_tests {
     use super::*;
     use redeem_properties::foundation::FoundationSpectrumPeak;
+
+    #[test]
+    fn generation_shards_partition_selected_records_without_overlap_or_loss() {
+        let total = 32_771usize;
+        let shard_count = 8usize;
+        let mut cursor = 0usize;
+        let mut sizes = Vec::new();
+        for shard_index in 0..shard_count {
+            let (start, end) = contiguous_shard_bounds(total, shard_count, shard_index);
+            assert_eq!(start, cursor);
+            assert!(end > start);
+            sizes.push(end - start);
+            cursor = end;
+        }
+        assert_eq!(cursor, total);
+        assert_eq!(sizes.iter().sum::<usize>(), total);
+        assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+    }
+
+    #[test]
+    fn generation_shard_global_indices_reconstruct_unsharded_rng_indices() {
+        let selected: Vec<usize> = (0..17).map(|index| 10_000 + index).collect();
+        let shard_count = 4usize;
+        let mut reconstructed = Vec::new();
+        for shard_index in 0..shard_count {
+            let (start, end) = contiguous_shard_bounds(selected.len(), shard_count, shard_index);
+            reconstructed.extend(
+                selected[start..end]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(local_index, record_index)| (start + local_index, record_index)),
+            );
+        }
+        let expected: Vec<(usize, usize)> = selected.into_iter().enumerate().collect();
+        assert_eq!(reconstructed, expected);
+    }
 
     #[test]
     fn all_mask_reranker_input_depends_on_length_not_candidate_identity() {
