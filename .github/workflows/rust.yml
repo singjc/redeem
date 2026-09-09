@@ -43,6 +43,9 @@ jobs:
     - name: Build
       run: cargo build --verbose
 
+    - name: Ensure xgboost output directory exists
+      run: mkdir -p target/debug/deps
+
     - name: Build with xgboost features
       run: cargo build --verbose --features xgboost
 
