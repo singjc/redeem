@@ -9,12 +9,16 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_causal_next_token_loss, foundation_diffusion_dataset_fingerprint,
-    load_causal_from_diffusion_checkpoint, load_foundation_corpus,
-    read_foundation_training_run_config, FoundationAdamW, FoundationAdamWConfig,
-    FoundationBenchmarkManifest, FoundationCausalCollator, FoundationDiffusionConfig,
-    FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
-    FoundationSpectrumCollator, FoundationTrainingRecord, PeptideSpectrumCausalModel,
-    PeptidoformInput, PrecursorContextBatch, FOUNDATION_DIFFUSION_EOS,
+    foundation_direct_beam_search, foundation_direct_conditioning_loss,
+    foundation_direct_shuffled_order, foundation_precursor_neutral_mass,
+    load_causal_from_diffusion_checkpoint, load_direct_decoder_from_unified_checkpoint,
+    load_foundation_corpus, read_foundation_training_run_config, DirectDecoderBeamConfig,
+    FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCausalCollator,
+    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
+    FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
+    PeptideSpectrumCausalModel, PeptidoformInput, PrecursorContextBatch, FOUNDATION_DIFFUSION_EOS,
+    FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190, FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
+    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -317,6 +321,539 @@ fn main() -> Result<()> {
     println!("best_step\t{best_step}");
     println!("best_validation_causal_loss\t{best_validation_loss:.8}");
     println!("best_checkpoint\t{}", output_root.join("best").display());
+    Ok(())
+}
+
+/// v0.19 entry point reused by `foundation_train_direct_decoder_v0190`.
+///
+/// It lives here so the established, audited corpus/partition/collation helpers
+/// remain the single implementation used by both causal generations.  Unlike
+/// the historical executable, v0.19 trains on CUDA, adds the spectrum-use
+/// objective, evaluates the entire frozen VALIDATION partition, and finishes
+/// with direct mass-constrained beam decoding.
+pub(crate) fn v0190_main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 4 || args.len() > 5 {
+        anyhow::bail!(
+            "usage: foundation_train_direct_decoder_v0190 RUN.yaml UNIFIED_CHECKPOINT OUTPUT_DIR [full|smoke]"
+        );
+    }
+    let training_yaml = PathBuf::from(&args[1]);
+    let parent = PathBuf::from(&args[2]);
+    let output_root = PathBuf::from(&args[3]);
+    let mode = args.get(4).map(String::as_str).unwrap_or("full");
+    let (train_steps, batch_size, validation_limit, beam_width) = match mode {
+        "full" => (4_000usize, 32usize, None, 128usize),
+        "smoke" => (2usize, 2usize, Some(4usize), 8usize),
+        other => anyhow::bail!("unsupported v0.19 mode {other:?}; expected full or smoke"),
+    };
+    reject_test_path_v0190(&training_yaml)?;
+    reject_test_path_v0190(&parent)?;
+    reject_test_path_v0190(&output_root)?;
+
+    let run = read_foundation_training_run_config(&training_yaml)?;
+    let corpus = load_foundation_corpus(&run.corpus)?;
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&run.benchmark_manifest)?;
+    benchmark.validate_against_records(&corpus.records)?;
+    let metadata_path = parent.join("metadata.yaml");
+    let metadata: UnifiedV0190Metadata = serde_yaml::from_str(
+        &fs::read_to_string(&metadata_path)
+            .with_context(|| format!("read accepted unified metadata {metadata_path:?}"))?,
+    )?;
+    metadata
+        .inverse_config
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    if metadata.inverse_config.model_dim != 96 {
+        anyhow::bail!(
+            "v0.19 is anchored to the accepted 96-d unified checkpoint, found {}",
+            metadata.inverse_config.model_dim
+        );
+    }
+    let vocabulary = FoundationDiffusionVocabulary;
+    let train_indices = usable_indices(
+        &corpus.records,
+        &benchmark,
+        FoundationPartition::Train,
+        &metadata.inverse_config,
+        vocabulary,
+    );
+    let mut validation_indices = usable_indices(
+        &corpus.records,
+        &benchmark,
+        FoundationPartition::Validation,
+        &metadata.inverse_config,
+        vocabulary,
+    );
+    if let Some(limit) = validation_limit {
+        validation_indices.truncate(limit);
+    }
+    if train_indices.len() < batch_size || validation_indices.is_empty() {
+        anyhow::bail!(
+            "insufficient v0.19 pairs: train={} validation={} batch={batch_size}",
+            train_indices.len(),
+            validation_indices.len()
+        );
+    }
+    if mode == "full" && validation_indices.len() != 125 {
+        anyhow::bail!(
+            "frozen v0.19 VALIDATION contract requires exactly 125 usable records, found {}",
+            validation_indices.len()
+        );
+    }
+
+    fs::create_dir_all(&output_root)?;
+    let device = Device::cuda_if_available(0)?;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideSpectrumCausalModel::new(metadata.inverse_config.clone(), vb)?;
+    let parent_model = resolve_model_safetensors(&parent);
+    let warm = load_direct_decoder_from_unified_checkpoint(&varmap, &parent_model, &device)?;
+    let causal_collator = FoundationCausalCollator::new(metadata.inverse_config.clone())?;
+    let spectrum_collator =
+        FoundationSpectrumCollator::new(metadata.inverse_config.spectrum.clone())?;
+    let mut optimizer = FoundationAdamW::new(
+        &varmap,
+        FoundationAdamWConfig {
+            learning_rate: 1.0e-4,
+            weight_decay: 1.0e-4,
+            ..FoundationAdamWConfig::default()
+        },
+    )?;
+
+    println!("version\tv0.19.0");
+    println!("architecture\tmasked_self_attention+full_peak_cross_attention+ff");
+    println!("objective\t{FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190}");
+    println!("proposal_generation_required\tfalse");
+    println!("test_partition_consumed\tfalse");
+    println!("mode\t{mode}");
+    println!("device\t{device:?}");
+    println!("train_records\t{}", train_indices.len());
+    println!("validation_records\t{}", validation_indices.len());
+    println!("train_steps\t{train_steps}");
+    println!("batch_size\t{batch_size}");
+    println!("beam_width\t{beam_width}");
+    println!(
+        "spectrum_encoder_warm_started_variables\t{}",
+        warm.spectrum_encoder_variables
+    );
+    println!("decoder_warm_started_variables\t{}", warm.decoder_variables);
+    println!(
+        "ignored_parent_variables\t{}",
+        warm.ignored_parent_variables
+    );
+    println!("conditioning_margin_nats\t{FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190}");
+    println!("conditioning_weight\t{FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190}");
+
+    let initial = evaluate_conditioning_v0190(
+        &model,
+        &corpus.records,
+        &validation_indices,
+        batch_size,
+        &causal_collator,
+        &spectrum_collator,
+        &device,
+        20_260_919,
+    )?;
+    print_conditioning_v0190("initial_validation", 0, initial);
+    save_v0190_checkpoint(
+        &output_root.join("initial"),
+        &varmap,
+        &metadata.inverse_config,
+        mode,
+        0,
+        initial,
+        &parent_model,
+    )?;
+    save_v0190_checkpoint(
+        &output_root.join("best"),
+        &varmap,
+        &metadata.inverse_config,
+        mode,
+        0,
+        initial,
+        &parent_model,
+    )?;
+    let mut best_objective = initial.objective;
+
+    for step in 1..=train_steps {
+        let selected = deterministic_batch(
+            &train_indices,
+            batch_size,
+            20_260_919 ^ (step as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        );
+        let records: Vec<&FoundationTrainingRecord> =
+            selected.iter().map(|&i| &corpus.records[i]).collect();
+        let packed = collate_records(&records, &causal_collator, &spectrum_collator, &device)?;
+        let matched_output = model.forward_t(
+            &packed.causal.input,
+            &packed.spectrum,
+            &packed.precursor,
+            true,
+        )?;
+        let matched = foundation_causal_next_token_loss(&matched_output, &packed.causal)?;
+        let order = foundation_direct_shuffled_order(records.len(), 20_260_919 ^ step as u64)?;
+        let shuffled_spectra: Vec<FoundationSpectrum> = order
+            .iter()
+            .map(|&i| FoundationSpectrum::from_training_record(records[i]).unwrap())
+            .collect();
+        let shuffled_batch = spectrum_collator.collate(&shuffled_spectra, &device)?;
+        let shuffled_output = model.forward_t(
+            &packed.causal.input,
+            &shuffled_batch,
+            &packed.precursor,
+            true,
+        )?;
+        let shuffled = foundation_causal_next_token_loss(&shuffled_output, &packed.causal)?;
+        let loss = foundation_direct_conditioning_loss(
+            &matched,
+            &shuffled,
+            FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+            FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
+        )?;
+        let matched_value = f64::from(matched.to_scalar::<f32>()?);
+        let shuffled_value = f64::from(shuffled.to_scalar::<f32>()?);
+        let objective_value = f64::from(loss.to_scalar::<f32>()?);
+        let update = optimizer.backward_step(&loss, Some(5.0))?;
+        if step == 1 || step % 25 == 0 || step == train_steps {
+            println!(
+                "train\tstep={step}\tobjective={objective_value:.6}\tmatched_nll={matched_value:.6}\tshuffled_nll={shuffled_value:.6}\tconditioning_gap={:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                shuffled_value - matched_value, update.gradient_norm, update.gradient_scale
+            );
+        }
+        if step % 100 == 0 || step == train_steps {
+            let metrics = evaluate_conditioning_v0190(
+                &model,
+                &corpus.records,
+                &validation_indices,
+                batch_size,
+                &causal_collator,
+                &spectrum_collator,
+                &device,
+                20_260_919 ^ step as u64,
+            )?;
+            print_conditioning_v0190("validation", step, metrics);
+            save_v0190_checkpoint(
+                &output_root.join("latest"),
+                &varmap,
+                &metadata.inverse_config,
+                mode,
+                step,
+                metrics,
+                &parent_model,
+            )?;
+            if metrics.objective < best_objective && metrics.conditioning_gap > 0.0 {
+                best_objective = metrics.objective;
+                save_v0190_checkpoint(
+                    &output_root.join("best"),
+                    &varmap,
+                    &metadata.inverse_config,
+                    mode,
+                    step,
+                    metrics,
+                    &parent_model,
+                )?;
+            }
+        }
+    }
+
+    let best_path = output_root.join("best/model.safetensors");
+    let best_tensors = candle_core::safetensors::load(&best_path, &device)?;
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("v0.19 VarMap lock poisoned"))?;
+    for (name, variable) in data.iter() {
+        variable.set(
+            best_tensors
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("best checkpoint missing {name}"))?,
+        )?;
+    }
+    drop(data);
+    let generation = evaluate_direct_generation_v0190(
+        &model,
+        &corpus.records,
+        &validation_indices,
+        &causal_collator,
+        &spectrum_collator,
+        &metadata.inverse_config,
+        beam_width,
+        &device,
+    )?;
+    println!("final_literal_top1\t{}", generation.literal_top1);
+    println!("final_sequence_top1\t{}", generation.sequence_top1);
+    println!("final_il_top1\t{}", generation.il_top1);
+    for &(k, literal, il) in &generation.topk {
+        println!("final_top{k}_literal\t{literal}");
+        println!("final_top{k}_il\t{il}");
+    }
+    println!("mass_valid_beams\t{}", generation.mass_valid_beams);
+    println!("returned_beams\t{}", generation.returned_beams);
+    println!(
+        "mass_valid_beam_fraction\t{:.8}",
+        generation.mass_valid_fraction()
+    );
+    let gate = if generation.literal_top1 >= 28 && generation.il_top1 >= 42 {
+        "PROGRESS_MILESTONE"
+    } else if generation.literal_top1 >= 24 && generation.il_top1 >= 38 {
+        "BASELINE_RECOVERY"
+    } else {
+        "BELOW_BASELINE_RECOVERY"
+    };
+    println!("scientific_gate\t{gate}");
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct UnifiedV0190Metadata {
+    inverse_config: FoundationDiffusionConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct ConditioningV0190 {
+    matched_nll: f64,
+    shuffled_nll: f64,
+    conditioning_gap: f64,
+    objective: f64,
+}
+
+fn evaluate_conditioning_v0190(
+    model: &PeptideSpectrumCausalModel,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    batch_size: usize,
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    device: &Device,
+    seed: u64,
+) -> Result<ConditioningV0190> {
+    let mut matched_sum = 0.0;
+    let mut shuffled_sum = 0.0;
+    let mut batches = 0usize;
+    for (chunk_index, chunk) in indices.chunks(batch_size).enumerate() {
+        if chunk.len() < 2 {
+            continue;
+        }
+        let selected: Vec<&FoundationTrainingRecord> = chunk.iter().map(|&i| &records[i]).collect();
+        let packed = collate_records(&selected, causal_collator, spectrum_collator, device)?;
+        let matched = foundation_causal_next_token_loss(
+            &model.forward_t(
+                &packed.causal.input,
+                &packed.spectrum,
+                &packed.precursor,
+                false,
+            )?,
+            &packed.causal,
+        )?;
+        let order = foundation_direct_shuffled_order(selected.len(), seed ^ chunk_index as u64)?;
+        let spectra: Vec<FoundationSpectrum> = order
+            .iter()
+            .map(|&i| FoundationSpectrum::from_training_record(selected[i]).unwrap())
+            .collect();
+        let shuffled_spectrum = spectrum_collator.collate(&spectra, device)?;
+        let shuffled = foundation_causal_next_token_loss(
+            &model.forward_t(
+                &packed.causal.input,
+                &shuffled_spectrum,
+                &packed.precursor,
+                false,
+            )?,
+            &packed.causal,
+        )?;
+        matched_sum += f64::from(matched.to_scalar::<f32>()?);
+        shuffled_sum += f64::from(shuffled.to_scalar::<f32>()?);
+        batches += 1;
+    }
+    if batches == 0 {
+        anyhow::bail!("v0.19 conditioning evaluation produced no batches");
+    }
+    let matched_nll = matched_sum / batches as f64;
+    let shuffled_nll = shuffled_sum / batches as f64;
+    let conditioning_gap = shuffled_nll - matched_nll;
+    let objective = matched_nll
+        + FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190
+            * (FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190 - conditioning_gap).max(0.0);
+    Ok(ConditioningV0190 {
+        matched_nll,
+        shuffled_nll,
+        conditioning_gap,
+        objective,
+    })
+}
+
+fn print_conditioning_v0190(label: &str, step: usize, metrics: ConditioningV0190) {
+    println!(
+        "{label}\tstep={step}\tobjective={:.6}\tmatched_spectrum_token_nll={:.6}\tshuffled_spectrum_token_nll={:.6}\tconditioning_gap={:.6}",
+        metrics.objective, metrics.matched_nll, metrics.shuffled_nll, metrics.conditioning_gap
+    );
+}
+
+#[derive(Debug, Serialize)]
+struct DirectCheckpointV0190<'a> {
+    version: &'a str,
+    objective: &'a str,
+    architecture: &'a str,
+    run_mode: &'a str,
+    test_partition_consumed: bool,
+    global_step: usize,
+    validation: ConditioningV0190,
+    unified_parent: String,
+    inverse_config: FoundationDiffusionConfig,
+}
+
+fn save_v0190_checkpoint(
+    directory: &Path,
+    varmap: &VarMap,
+    config: &FoundationDiffusionConfig,
+    mode: &str,
+    step: usize,
+    validation: ConditioningV0190,
+    parent: &Path,
+) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    varmap.save(directory.join("model.safetensors"))?;
+    let metadata = DirectCheckpointV0190 {
+        version: "v0.19.0",
+        objective: FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
+        architecture: "masked_self_attention+full_peak_cross_attention+ff",
+        run_mode: mode,
+        test_partition_consumed: false,
+        global_step: step,
+        validation,
+        unified_parent: parent.display().to_string(),
+        inverse_config: config.clone(),
+    };
+    fs::write(
+        directory.join("metadata.yaml"),
+        serde_yaml::to_string(&metadata)?,
+    )?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct GenerationV0190 {
+    literal_top1: usize,
+    sequence_top1: usize,
+    il_top1: usize,
+    topk: Vec<(usize, usize, usize)>,
+    mass_valid_beams: usize,
+    returned_beams: usize,
+}
+
+impl GenerationV0190 {
+    fn mass_valid_fraction(&self) -> f64 {
+        if self.returned_beams == 0 {
+            0.0
+        } else {
+            self.mass_valid_beams as f64 / self.returned_beams as f64
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_direct_generation_v0190(
+    model: &PeptideSpectrumCausalModel,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    config: &FoundationDiffusionConfig,
+    beam_width: usize,
+    device: &Device,
+) -> Result<GenerationV0190> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let ks = [5usize, 10, 32, 128];
+    let mut out = GenerationV0190 {
+        literal_top1: 0,
+        sequence_top1: 0,
+        il_top1: 0,
+        topk: ks.iter().copied().map(|k| (k, 0, 0)).collect(),
+        mass_valid_beams: 0,
+        returned_beams: 0,
+    };
+    for &index in indices {
+        let record = &records[index];
+        let mz = record
+            .context
+            .precursor_mz
+            .ok_or_else(|| anyhow::anyhow!("validation record {index} lacks precursor m/z"))?;
+        let charge = record
+            .context
+            .charge
+            .ok_or_else(|| anyhow::anyhow!("validation record {index} lacks charge"))?;
+        let neutral_mass =
+            foundation_precursor_neutral_mass(f64::from(mz), charge).map_err(anyhow::Error::msg)?;
+        let spectrum = FoundationSpectrum::from_training_record(record)
+            .ok_or_else(|| anyhow::anyhow!("validation record {index} lacks spectrum"))?;
+        let spectrum_batch = spectrum_collator.collate(&[spectrum], device)?;
+        let precursor = precursor_context(&[record], device)?;
+        let context = model.prepare_context(&spectrum_batch, &precursor, false)?;
+        let candidates = foundation_direct_beam_search(
+            neutral_mass,
+            DirectDecoderBeamConfig {
+                beam_width,
+                top_k: 128,
+                mass_tolerance_da: config.precursor_mass_tolerance_da,
+                max_tokens: config.max_tokens,
+            },
+            |prefixes| {
+                let input = causal_collator
+                    .collate_compact_prefix_rows(prefixes, device)
+                    .map_err(|e| e.to_string())?;
+                model
+                    .forward_next_t_with_context(&input, &context, false)
+                    .and_then(|t| t.to_vec2::<f32>())
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        out.returned_beams += candidates.len();
+        out.mass_valid_beams += candidates
+            .iter()
+            .filter(|c| c.mass_error_da.abs() <= config.precursor_mass_tolerance_da)
+            .count();
+        let decoded: Vec<PeptidoformInput> = candidates
+            .iter()
+            .filter_map(|candidate| vocabulary.decode(&candidate.tokens).ok())
+            .collect();
+        if let Some(first) = decoded.first() {
+            out.literal_top1 += usize::from(first == &record.peptidoform);
+            out.sequence_top1 += usize::from(first.sequence == record.peptidoform.sequence);
+            out.il_top1 += usize::from(
+                il_sequence(&first.sequence) == il_sequence(&record.peptidoform.sequence),
+            );
+        }
+        for metric in &mut out.topk {
+            let limit = metric.0.min(decoded.len());
+            metric.1 += usize::from(decoded[..limit].iter().any(|p| p == &record.peptidoform));
+            metric.2 +=
+                usize::from(decoded[..limit].iter().any(|p| {
+                    il_sequence(&p.sequence) == il_sequence(&record.peptidoform.sequence)
+                }));
+        }
+    }
+    Ok(out)
+}
+
+fn il_sequence(sequence: &str) -> String {
+    sequence
+        .chars()
+        .map(|aa| if aa == 'I' { 'L' } else { aa })
+        .collect()
+}
+
+fn reject_test_path_v0190(path: &Path) -> Result<()> {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    if lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == "test")
+    {
+        anyhow::bail!(
+            "v0.19 refuses TEST-labelled input/output path: {}",
+            path.display()
+        );
+    }
     Ok(())
 }
 

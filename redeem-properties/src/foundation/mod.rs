@@ -24,6 +24,7 @@ pub mod corpus;
 pub mod data;
 pub mod dataset;
 pub mod diffusion;
+pub mod direct_decoder;
 pub mod experiment;
 pub mod featurize;
 pub mod interaction;
@@ -143,6 +144,13 @@ pub use diffusion::{
     FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_OXIDATION,
     FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
     FOUNDATION_PEPTIDE_WATER_MASS_DA,
+};
+pub use direct_decoder::{
+    foundation_direct_beam_search, foundation_direct_conditioning_loss,
+    foundation_direct_shuffled_order, load_direct_decoder_from_unified_checkpoint,
+    DirectDecoderBeamCandidate, DirectDecoderBeamConfig, DirectDecoderWarmStartReport,
+    PeptideSpectrumDirectDecoder, FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+    FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190, FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
 };
 pub use experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,
