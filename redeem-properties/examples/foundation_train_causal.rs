@@ -1271,7 +1271,7 @@ pub(crate) fn v0200_main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 5 || args.len() > 6 {
         anyhow::bail!(
-            "usage: foundation_train_chemistry_decoder_v0200 RUN.yaml MODEL_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke]"
+            "usage: foundation_train_chemistry_decoder_v0200 RUN.yaml MODEL_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke|decode]"
         );
     }
     let training_yaml = PathBuf::from(&args[1]);
@@ -1279,10 +1279,15 @@ pub(crate) fn v0200_main() -> Result<()> {
     let validation_candidates = PathBuf::from(&args[3]);
     let output_root = PathBuf::from(&args[4]);
     let mode = args.get(5).map(String::as_str).unwrap_or("full");
+    let decode_only = mode == "decode";
     let (train_steps, batch_size, validation_limit, beam_width) = match mode {
         "full" => (4_000usize, 32usize, None, 128usize),
         "smoke" => (2usize, 2usize, Some(4usize), 8usize),
-        other => anyhow::bail!("unsupported v0.20 mode {other:?}; expected full or smoke"),
+        // Decode-only exists solely to finish the frozen v0.20 evaluation from
+        // an already-trained checkpoint after an inference-only runtime fix.
+        // It performs zero optimizer steps and evaluates all 125 frozen rows.
+        "decode" => (0usize, 32usize, None, 128usize),
+        other => anyhow::bail!("unsupported v0.20 mode {other:?}; expected full, smoke, or decode"),
     };
     reject_test_path_v0190(&training_yaml)?;
     reject_test_path_v0190(&parent)?;
@@ -1296,7 +1301,7 @@ pub(crate) fn v0200_main() -> Result<()> {
     let metadata_path = parent.join("metadata.yaml");
     let metadata: UnifiedV0190Metadata = serde_yaml::from_str(
         &fs::read_to_string(&metadata_path)
-            .with_context(|| format!("read accepted unified metadata {metadata_path:?}"))?,
+            .with_context(|| format!("read v0.20 model metadata {metadata_path:?}"))?,
     )?;
     metadata
         .inverse_config
@@ -1379,11 +1384,25 @@ pub(crate) fn v0200_main() -> Result<()> {
 
     fs::create_dir_all(&output_root)?;
     let device = Device::cuda_if_available(0)?;
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = PeptideSpectrumChemistryDecoder::new(metadata.inverse_config.clone(), vb)?;
     let parent_model = resolve_model_safetensors(&parent);
-    let warm = load_chemistry_decoder_from_unified_checkpoint(&varmap, &parent_model, &device)?;
+    let warm = if decode_only {
+        varmap.load(&parent_model).with_context(|| {
+            format!(
+                "failed to load trained v0.20 decode checkpoint {}",
+                parent_model.display()
+            )
+        })?;
+        None
+    } else {
+        Some(load_chemistry_decoder_from_unified_checkpoint(
+            &varmap,
+            &parent_model,
+            &device,
+        )?)
+    };
     let causal_collator = FoundationCausalCollator::new(metadata.inverse_config.clone())?;
     let spectrum_collator =
         FoundationSpectrumCollator::new(metadata.inverse_config.spectrum.clone())?;
@@ -1392,9 +1411,17 @@ pub(crate) fn v0200_main() -> Result<()> {
     println!("architecture\t{FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200}");
     println!("objective\t{FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200}");
     println!("scientific_change\texplicit_residual_mass_residue_ptm_and_complementary_fragment_transition_scoring");
-    println!("initialization\taccepted_unified_parent_only");
+    println!(
+        "initialization\t{}",
+        if decode_only {
+            "trained_v0200_checkpoint_decode_only"
+        } else {
+            "accepted_unified_parent_only"
+        }
+    );
     println!("rejected_v0190_checkpoint_reused\tfalse");
     println!("rejected_v0191_checkpoint_reused\tfalse");
+    println!("decode_only_no_optimizer_steps\t{decode_only}");
     println!("prefix_margin_objective\tREMOVED");
     println!("compatibility_reranking_lane\tCLOSED");
     println!("search_breadth_lane\tCLOSED");
@@ -1437,20 +1464,69 @@ pub(crate) fn v0200_main() -> Result<()> {
     println!("training_seed\t20260919");
     println!("conditioning_margin_nats\t{FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190}");
     println!("conditioning_weight\t{FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190}");
-    println!("chemistry_transition_head_zero_initialized\ttrue");
     println!(
-        "spectrum_encoder_warm_started_variables\t{}",
-        warm.spectrum_encoder_variables
+        "chemistry_transition_head_zero_initialized\t{}",
+        !decode_only
     );
-    println!("decoder_warm_started_variables\t{}", warm.decoder_variables);
-    println!(
-        "chemistry_transition_new_variables\t{}",
-        warm.chemistry_transition_variables
-    );
-    println!(
-        "ignored_parent_variables\t{}",
-        warm.ignored_parent_variables
-    );
+    if let Some(warm) = warm.as_ref() {
+        println!(
+            "spectrum_encoder_warm_started_variables\t{}",
+            warm.spectrum_encoder_variables
+        );
+        println!("decoder_warm_started_variables\t{}", warm.decoder_variables);
+        println!(
+            "chemistry_transition_new_variables\t{}",
+            warm.chemistry_transition_variables
+        );
+        println!(
+            "ignored_parent_variables\t{}",
+            warm.ignored_parent_variables
+        );
+    } else {
+        println!("decode_checkpoint_loaded\t{}", parent_model.display());
+        println!(
+            "decode_checkpoint_global_step\t{}",
+            metadata.global_step.unwrap_or(0)
+        );
+    }
+
+    if decode_only {
+        let checkpoint_step = metadata.global_step.unwrap_or(0);
+        let metrics = evaluate_chemistry_v0200(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            batch_size,
+            &causal_collator,
+            &spectrum_collator,
+            &chemistry_featurizer,
+            &device,
+            20_260_919 ^ checkpoint_step as u64,
+        )?;
+        print_chemistry_v0200("decode_validation", checkpoint_step, metrics);
+        let generation = evaluate_chemistry_generation_v0200(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            &causal_collator,
+            &spectrum_collator,
+            &chemistry_featurizer,
+            &metadata.inverse_config,
+            beam_width,
+            &device,
+        )?;
+        print_generation_v0190("final", &generation);
+        print_chemistry_v0200("final_best_validation", checkpoint_step, metrics);
+        let conditioning_guard =
+            metrics.conditioning_gap >= FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190;
+        println!(
+            "conditioning_guard\t{}",
+            if conditioning_guard { "PASS" } else { "FAIL" }
+        );
+        print_v0200_scientific_gate(&generation, conditioning_guard);
+        println!("v0200_decode_stop_rule\tV0200_FROZEN_DECODE_COMPLETE_NO_RETRAINING");
+        return Ok(());
+    }
 
     let mut optimizer = FoundationAdamW::new(
         &varmap,
@@ -1666,6 +1742,11 @@ pub(crate) fn v0200_main() -> Result<()> {
         return Ok(());
     }
 
+    print_v0200_scientific_gate(&generation, conditioning_guard);
+    Ok(())
+}
+
+fn print_v0200_scientific_gate(generation: &GenerationV0190, conditioning_guard: bool) {
     let gate = if generation.literal_top1 >= 28 && generation.il_top1 >= 42 && conditioning_guard {
         "PROGRESS_MILESTONE"
     } else if generation.literal_top1 >= 24 && generation.il_top1 >= 38 && conditioning_guard {
@@ -1685,7 +1766,6 @@ pub(crate) fn v0200_main() -> Result<()> {
         _ => "V0200_CHEMISTRY_GATE_NOT_MET_CLOSE_AUTOREGRESSIVE_FAMILY_PIVOT_DIFFUSION",
     };
     println!("v0200_stop_rule\t{stop}");
-    Ok(())
 }
 
 #[derive(Debug, Clone)]

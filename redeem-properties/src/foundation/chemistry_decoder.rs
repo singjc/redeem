@@ -954,18 +954,13 @@ impl PeptideSpectrumChemistryDecoder {
         train: bool,
     ) -> Result<Tensor> {
         let output = self.base.forward_t_with_context(input, context, train)?;
-        let (_, token_len, _) = output.decoder_hidden.dims3()?;
-        if token_len == 0 {
-            candle_core::bail!("v0.20 next-token decoder requires an active START position");
-        }
-        let hidden = output
-            .decoder_hidden
-            .narrow(1, token_len - 1, 1)?
-            .squeeze(1)?;
-        let base_logits = output
-            .token_logits
-            .narrow(1, token_len - 1, 1)?
-            .squeeze(1)?;
+        // `narrow(...).squeeze(...)` keeps the parent row stride. Candle's
+        // Linear/GEMM path requires the `[batch, hidden]` input to be
+        // contiguous, so materialize both selected final-position views before
+        // the chemistry projection. Teacher-forced training uses the full
+        // contiguous hidden tensor and therefore does not exercise this view.
+        let hidden = contiguous_last_decoder_position(&output.decoder_hidden)?;
+        let base_logits = contiguous_last_decoder_position(&output.token_logits)?;
         self.apply_next_transition_logits(&hidden, &base_logits, chemistry_features)
     }
 
@@ -1061,6 +1056,14 @@ impl PeptideSpectrumChemistryDecoder {
     }
 }
 
+fn contiguous_last_decoder_position(tensor: &Tensor) -> Result<Tensor> {
+    let (_, token_len, _) = tensor.dims3()?;
+    if token_len == 0 {
+        candle_core::bail!("v0.20 next-token decoder requires an active START position");
+    }
+    tensor.narrow(1, token_len - 1, 1)?.squeeze(1)?.contiguous()
+}
+
 /// Warm-start the accepted spectrum/causal tensors and retain the new chemistry
 /// transition parameters at their explicit zero initialization.
 pub fn load_chemistry_decoder_from_unified_checkpoint(
@@ -1126,6 +1129,19 @@ pub fn load_chemistry_decoder_from_unified_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_last_position_is_materialized_before_linear_projection() {
+        let device = Device::Cpu;
+        let values = (0..(2 * 2 * 96))
+            .map(|value| value as f32 / 100.0)
+            .collect::<Vec<_>>();
+        let hidden = Tensor::from_vec(values, (2, 2, 96), &device).unwrap();
+        let last = contiguous_last_decoder_position(&hidden).unwrap();
+        assert_eq!(last.dims2().unwrap(), (2, 96));
+        let projection = Tensor::zeros((96, 44), DType::F32, &device).unwrap();
+        assert_eq!(last.matmul(&projection).unwrap().dims2().unwrap(), (2, 44));
+    }
 
     #[test]
     fn suffix_lattice_accepts_known_residue_compositions() {
