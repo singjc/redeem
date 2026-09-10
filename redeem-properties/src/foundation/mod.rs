@@ -147,10 +147,12 @@ pub use diffusion::{
 };
 pub use direct_decoder::{
     foundation_direct_beam_search, foundation_direct_conditioning_loss,
-    foundation_direct_shuffled_order, load_direct_decoder_from_unified_checkpoint,
-    DirectDecoderBeamCandidate, DirectDecoderBeamConfig, DirectDecoderWarmStartReport,
+    foundation_direct_prefix_competitive_loss, foundation_direct_shuffled_order,
+    load_direct_decoder_from_unified_checkpoint, DirectDecoderBeamCandidate,
+    DirectDecoderBeamConfig, DirectDecoderWarmStartReport, DirectPrefixCompetition,
     PeptideSpectrumDirectDecoder, FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
     FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190, FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
+    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0191, FOUNDATION_DIRECT_PREFIX_MARGIN_V0191,
 };
 pub use experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,

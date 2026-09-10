@@ -8,14 +8,17 @@
 //! beam search.  It deliberately contains no proposal or scalar compatibility
 //! head.
 
-use super::causal::{foundation_causal_conditioning_margin_loss, PeptideSpectrumCausalModel};
+use super::causal::{
+    foundation_causal_conditioning_margin_loss, FoundationCausalBatch, FoundationCausalOutput,
+    PeptideSpectrumCausalModel,
+};
 use super::diffusion::{
     foundation_diffusion_residue_ptm_valid, foundation_diffusion_token_mass_da,
     foundation_diffusion_token_residue, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK,
     FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_VOCAB_SIZE,
     FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarMap;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -27,6 +30,19 @@ pub const FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190: &str =
 pub const FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190: f64 = 0.25;
 /// Required per-token matched-spectrum advantage, in nats.
 pub const FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190: f64 = 0.10;
+
+/// Frozen v0.19.1 objective identifier.
+///
+/// The architecture is unchanged from v0.19.0. The added term mines the
+/// current model's strongest search-legal wrong token at each gold prefix and
+/// requires the true next token to outrank it by a fixed margin. This directly
+/// targets gold-prefix loss from cumulative beam competition without reviving
+/// candidate-energy/reranking objectives.
+pub const FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0191: &str =
+    "teacher_forced_ce_plus_on_policy_prefix_margin_plus_matched_shuffled_guard_v0191";
+/// Fixed logit margin between the true next token and the strongest current
+/// search-legal wrong token in the one v0.19.1 experiment.
+pub const FOUNDATION_DIRECT_PREFIX_MARGIN_V0191: f64 = 0.25;
 
 /// The v0.19 model is the existing, semantically matching causal architecture.
 ///
@@ -47,6 +63,182 @@ pub fn foundation_direct_conditioning_loss(
     }
     let guard = foundation_causal_conditioning_margin_loss(matched_nll, shuffled_nll, margin)?;
     matched_nll + (guard * weight)?
+}
+
+/// Diagnostics accompanying the v0.19.1 search-aligned prefix loss.
+#[derive(Debug)]
+pub struct DirectPrefixCompetition {
+    /// Differentiable hard-competitor hinge loss.
+    pub loss: Tensor,
+    /// Active next-token positions compared.
+    pub positions: usize,
+    /// Mean rank of the true token among search-legal local alternatives.
+    pub mean_legal_rank: f64,
+    /// Fraction of active positions where the true token is locally rank 1.
+    pub top1_fraction: f64,
+    /// Fraction of active positions where the true token is within rank 5.
+    pub top5_fraction: f64,
+    /// Fraction of active positions where the true token is within rank 10.
+    pub top10_fraction: f64,
+}
+
+/// Mine the model's strongest legal wrong next token at every gold prefix and
+/// require the true token to beat it by `margin` logits.
+///
+/// Hard-negative token identities are selected from detached current logits,
+/// then the selected true/wrong logits are gathered again from the live tensor
+/// so gradients flow through both sides of the hinge. The prefix itself remains
+/// the clean autoregressive target prefix; the *competitor* is on-policy because
+/// it is re-mined from the current model at every optimization step.
+pub fn foundation_direct_prefix_competitive_loss(
+    output: &FoundationCausalOutput,
+    batch: &FoundationCausalBatch,
+    margin: f64,
+) -> Result<DirectPrefixCompetition> {
+    if !(margin >= 0.0 && margin.is_finite()) {
+        candle_core::bail!("direct prefix margin must be finite and non-negative");
+    }
+    let (b, l, classes) = output.token_logits.dims3()?;
+    if classes != FOUNDATION_DIFFUSION_VOCAB_SIZE {
+        candle_core::bail!(
+            "direct prefix competition saw {classes} classes, expected {}",
+            FOUNDATION_DIFFUSION_VOCAB_SIZE
+        );
+    }
+    let flat_logits = output.token_logits.reshape((b * l, classes))?;
+    let selected_logits = flat_logits.index_select(&batch.active_indices, 0)?;
+    let selected_rows = selected_logits.to_vec2::<f32>()?;
+    let target_classes = batch.target_classes.to_vec1::<u32>()?;
+    let target_rows = batch.target_tokens.to_vec2::<u32>()?;
+
+    let mut prefixes = Vec::<Vec<u32>>::with_capacity(target_classes.len());
+    let mut reconstructed_targets = Vec::<u32>::with_capacity(target_classes.len());
+    for row in &target_rows {
+        let active = row
+            .iter()
+            .position(|&token| token == FOUNDATION_DIFFUSION_PAD)
+            .unwrap_or(row.len());
+        for position in 0..active {
+            prefixes.push(row[..position].to_vec());
+            reconstructed_targets.push(row[position]);
+        }
+    }
+    if reconstructed_targets != target_classes
+        || selected_rows.len() != target_classes.len()
+        || prefixes.len() != target_classes.len()
+    {
+        candle_core::bail!(
+            "direct prefix competition active-position contract mismatch: logits={} targets={} prefixes={}",
+            selected_rows.len(),
+            target_classes.len(),
+            prefixes.len()
+        );
+    }
+
+    let (hard_tokens, mean_rank, top1, top5, top10) =
+        select_prefix_hard_competitors(&selected_rows, &prefixes, &target_classes)
+            .map_err(candle_core::Error::Msg)?;
+    let positions = target_classes.len();
+    if positions == 0 {
+        candle_core::bail!("direct prefix competition requires active target positions");
+    }
+
+    let true_flat_indices: Vec<u32> = target_classes
+        .iter()
+        .enumerate()
+        .map(|(row, &token)| (row * classes + token as usize) as u32)
+        .collect();
+    let hard_flat_indices: Vec<u32> = hard_tokens
+        .iter()
+        .enumerate()
+        .map(|(row, &token)| (row * classes + token as usize) as u32)
+        .collect();
+    let device = selected_logits.device();
+    let true_indices =
+        Tensor::from_vec(true_flat_indices, positions, device)?.to_dtype(DType::U32)?;
+    let hard_indices =
+        Tensor::from_vec(hard_flat_indices, positions, device)?.to_dtype(DType::U32)?;
+    let flat_selected = selected_logits.flatten_all()?;
+    let true_logits = flat_selected.index_select(&true_indices, 0)?;
+    let hard_logits = flat_selected.index_select(&hard_indices, 0)?;
+    let loss = (hard_logits - true_logits)?
+        .affine(1.0, margin)?
+        .relu()?
+        .mean_all()?;
+
+    Ok(DirectPrefixCompetition {
+        loss,
+        positions,
+        mean_legal_rank: mean_rank,
+        top1_fraction: top1,
+        top5_fraction: top5,
+        top10_fraction: top10,
+    })
+}
+
+fn select_prefix_hard_competitors(
+    logits: &[Vec<f32>],
+    prefixes: &[Vec<u32>],
+    targets: &[u32],
+) -> std::result::Result<(Vec<u32>, f64, f64, f64, f64), String> {
+    if logits.len() != prefixes.len() || logits.len() != targets.len() || logits.is_empty() {
+        return Err("direct prefix hard-competitor inputs have inconsistent lengths".into());
+    }
+    let mut hard_tokens = Vec::with_capacity(logits.len());
+    let mut rank_sum = 0usize;
+    let mut top1 = 0usize;
+    let mut top5 = 0usize;
+    let mut top10 = 0usize;
+
+    for ((row, prefix), &target) in logits.iter().zip(prefixes).zip(targets) {
+        if row.len() != FOUNDATION_DIFFUSION_VOCAB_SIZE || target as usize >= row.len() {
+            return Err("direct prefix hard-competitor row/target is invalid".into());
+        }
+        let target_score = row[target as usize];
+        if !target_score.is_finite() {
+            return Err("direct prefix target logit is not finite".into());
+        }
+        let mut best: Option<(u32, f32)> = None;
+        let mut better = 0usize;
+        for token in FOUNDATION_DIFFUSION_EOS + 1..FOUNDATION_DIFFUSION_VOCAB_SIZE as u32 {
+            if token == target || !token_allowed(prefix, token) {
+                continue;
+            }
+            let score = row[token as usize];
+            if !score.is_finite() {
+                continue;
+            }
+            if score > target_score || (score == target_score && token < target) {
+                better += 1;
+            }
+            match best {
+                None => best = Some((token, score)),
+                Some((best_token, best_score))
+                    if score > best_score || (score == best_score && token < best_token) =>
+                {
+                    best = Some((token, score));
+                }
+                _ => {}
+            }
+        }
+        let Some((hard, _)) = best else {
+            return Err("direct prefix position has no legal wrong-token competitor".into());
+        };
+        hard_tokens.push(hard);
+        let rank = better + 1;
+        rank_sum += rank;
+        top1 += usize::from(rank <= 1);
+        top5 += usize::from(rank <= 5);
+        top10 += usize::from(rank <= 10);
+    }
+    let n = logits.len() as f64;
+    Ok((
+        hard_tokens,
+        rank_sum as f64 / n,
+        top1 as f64 / n,
+        top5 as f64 / n,
+        top10 as f64 / n,
+    ))
 }
 
 /// Deterministic derangement used to pair each peptide with another spectrum.
@@ -372,6 +564,29 @@ mod tests {
         let second = foundation_direct_shuffled_order(8, 20260919).unwrap();
         assert_eq!(first, second);
         assert!(first.iter().enumerate().all(|(i, &j)| i != j));
+    }
+
+    #[test]
+    fn prefix_hard_competitor_tracks_current_legal_top_wrong_token() {
+        let alanine = 3u32;
+        let cysteine = alanine + 1;
+        let aspartate = alanine + 2;
+        let mut row = vec![-10.0f32; FOUNDATION_DIFFUSION_VOCAB_SIZE];
+        row[alanine as usize] = 1.0;
+        row[cysteine as usize] = 3.0;
+        row[aspartate as usize] = 2.0;
+        // PAD/MASK/EOS are deliberately larger but are not live expansion
+        // competitors for a nonterminal true token.
+        row[FOUNDATION_DIFFUSION_PAD as usize] = 20.0;
+        row[FOUNDATION_DIFFUSION_MASK as usize] = 19.0;
+        row[FOUNDATION_DIFFUSION_EOS as usize] = 18.0;
+        let (hard, mean_rank, top1, top5, top10) =
+            select_prefix_hard_competitors(&[row], &[Vec::new()], &[alanine]).unwrap();
+        assert_eq!(hard, vec![cysteine]);
+        assert_eq!(mean_rank, 3.0);
+        assert_eq!(top1, 0.0);
+        assert_eq!(top5, 1.0);
+        assert_eq!(top10, 1.0);
     }
 
     #[test]

@@ -1,0 +1,117 @@
+ARG CUDA_VERSION=12.2.2
+
+# -----------------------------------------------------------------------------
+# ReDeeM v0.19.1 prefix-competitive direct-decoder Rust/CUDA builder.
+#
+# This image profile intentionally builds only the redeem-properties v0.19.1
+# research executable. The other workspace crates are copied solely so Cargo
+# can resolve the root workspace metadata; they are not selected as build
+# targets and therefore are not compiled/linked unless redeem-properties itself
+# acquires an explicit dependency on one of them in the future.
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
+
+ARG RUST_TOOLCHAIN=stable
+ARG CUDA_COMPUTE_CAP=80
+ARG CARGO_BUILD_JOBS=1
+ARG CARGO_RELEASE_LTO=off
+ARG CARGO_RELEASE_CODEGEN_UNITS=8
+ARG CARGO_RELEASE_DEBUG=0
+ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        git \
+        libssl-dev \
+        libstdc++-12-dev \
+        pkg-config && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf \
+        --retry 6 --retry-all-errors --retry-delay 5 \
+        --connect-timeout 30 --max-time 300 \
+        https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}"
+
+ENV PATH=/root/.cargo/bin:${PATH}
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_RELEASE_LTO}
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_RELEASE_CODEGEN_UNITS}
+ENV CARGO_PROFILE_RELEASE_DEBUG=${CARGO_RELEASE_DEBUG}
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+# Cargo resolves the root workspace before selecting -p redeem-properties, so
+# retain the workspace members in the build context without building them.
+COPY redeem-openms-ffi ./redeem-openms-ffi
+COPY redeem-classifiers ./redeem-classifiers
+COPY redeem-cli ./redeem-cli
+COPY redeem-properties ./redeem-properties
+COPY redeem-properties-py ./redeem-properties-py
+
+RUN set -eux; \
+    echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"; \
+    test -f redeem-properties/examples/foundation_train_direct_decoder_v0191.rs; \
+    cargo build --release --locked \
+        -p redeem-properties \
+        --features cuda \
+        --example foundation_train_direct_decoder_v0191; \
+    mkdir -p /opt/redeem/bin; \
+    cp target/release/examples/foundation_train_direct_decoder_v0191 \
+        /opt/redeem/bin/foundation_train_direct_decoder_v0191
+
+# -----------------------------------------------------------------------------
+# Minimal v0.19.1 runtime.
+#
+# AlphaPeptDeep, PyTorch, Python, the production redeem CLI, classifiers, and
+# historical foundation executables are intentionally absent. v0.19.1 corpus
+# loading still needs gzip/zstd, while /usr/bin/time is used by the Slurm
+# launcher for resource accounting.
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        gzip \
+        libgomp1 \
+        libssl3 \
+        libstdc++6 \
+        time \
+        zstd && \
+    update-ca-certificates && \
+    command -v gzip && \
+    command -v zstd && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+ENV PATH=/opt/redeem/bin:/usr/local/bin:${PATH}
+ENV REDEEM_FOUNDATION_IMAGE_PROFILE=v0191-prefix-competitive
+
+COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
+COPY scripts/redeem-foundation /usr/local/bin/redeem-foundation
+COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
+
+RUN chmod 0755 \
+        /usr/local/bin/redeem-foundation \
+        /usr/local/bin/redeem-container-info \
+        /opt/redeem/bin/foundation_train_direct_decoder_v0191 && \
+    /usr/local/bin/redeem-container-info --build-check
+
+WORKDIR /work
+CMD ["redeem-foundation", "help"]
