@@ -10,13 +10,19 @@ use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_causal_next_token_loss, foundation_diffusion_dataset_fingerprint,
     foundation_direct_beam_search, foundation_direct_conditioning_loss,
-    foundation_direct_shuffled_order, foundation_precursor_neutral_mass,
+    foundation_direct_shuffled_order, foundation_peptidoform_neutral_mass,
+    foundation_precursor_neutral_mass, foundation_diffusion_residue_ptm_valid,
+    foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
     load_causal_from_diffusion_checkpoint, load_direct_decoder_from_unified_checkpoint,
     load_foundation_corpus, read_foundation_training_run_config, DirectDecoderBeamConfig,
     FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCausalCollator,
     FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
     FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
-    PeptideSpectrumCausalModel, PeptidoformInput, PrecursorContextBatch, FOUNDATION_DIFFUSION_EOS,
+    PeptideSpectrumCausalModel, PeptidoformInput, PrecursorContextBatch,
+    FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
+    FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
+    FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL,
+    FOUNDATION_PEPTIDE_WATER_MASS_DA,
     FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190, FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
     FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
 };
@@ -24,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -337,7 +343,7 @@ pub(crate) fn v0190_main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 5 || args.len() > 6 {
         anyhow::bail!(
-            "usage: foundation_train_direct_decoder_v0190 RUN.yaml UNIFIED_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke]"
+            "usage: foundation_train_direct_decoder_v0190 RUN.yaml MODEL_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke|audit]"
         );
     }
     let training_yaml = PathBuf::from(&args[1]);
@@ -348,7 +354,8 @@ pub(crate) fn v0190_main() -> Result<()> {
     let (train_steps, batch_size, validation_limit, beam_width) = match mode {
         "full" => (4_000usize, 32usize, None, 128usize),
         "smoke" => (2usize, 2usize, Some(4usize), 8usize),
-        other => anyhow::bail!("unsupported v0.19 mode {other:?}; expected full or smoke"),
+        "audit" => (0usize, 32usize, None, 128usize),
+        other => anyhow::bail!("unsupported v0.19 mode {other:?}; expected full, smoke, or audit"),
     };
     reject_test_path_v0190(&training_yaml)?;
     reject_test_path_v0190(&parent)?;
@@ -393,7 +400,7 @@ pub(crate) fn v0190_main() -> Result<()> {
     if let Some(limit) = validation_limit {
         validation_indices.truncate(limit);
     }
-    if train_indices.len() < batch_size || validation_indices.is_empty() {
+    if (mode != "audit" && train_indices.len() < batch_size) || validation_indices.is_empty() {
         anyhow::bail!(
             "insufficient v0.19 pairs: train={} validation={} batch={batch_size}",
             train_indices.len(),
@@ -411,15 +418,6 @@ pub(crate) fn v0190_main() -> Result<()> {
     let causal_collator = FoundationCausalCollator::new(metadata.inverse_config.clone())?;
     let spectrum_collator =
         FoundationSpectrumCollator::new(metadata.inverse_config.spectrum.clone())?;
-    let mut optimizer = FoundationAdamW::new(
-        &varmap,
-        FoundationAdamWConfig {
-            learning_rate: 1.0e-4,
-            weight_decay: 1.0e-4,
-            ..FoundationAdamWConfig::default()
-        },
-    )?;
-
     println!("version\tv0.19.0");
     println!("architecture\tmasked_self_attention+full_peak_cross_attention+ff");
     println!("objective\t{FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190}");
@@ -461,6 +459,47 @@ pub(crate) fn v0190_main() -> Result<()> {
     println!("conditioning_margin_nats\t{FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190}");
     println!("conditioning_weight\t{FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190}");
 
+    if mode == "audit" {
+        let metrics = evaluate_conditioning_v0190(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            batch_size,
+            &causal_collator,
+            &spectrum_collator,
+            &device,
+            20_260_919,
+        )?;
+        print_conditioning_v0190(
+            "audit_validation",
+            metadata.global_step.unwrap_or(0),
+            metrics,
+        );
+        let audit = evaluate_direct_decoder_audit_v0190(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            &causal_collator,
+            &spectrum_collator,
+            &metadata.inverse_config,
+            beam_width,
+            &device,
+            &output_root,
+        )?;
+        print_direct_decoder_audit_v0190(&audit);
+        println!("v0190_audit_stop_rule\tV0190_DECODER_AUDIT_COMPLETE_NO_RETRAINING");
+        return Ok(());
+    }
+
+    let mut optimizer = FoundationAdamW::new(
+        &varmap,
+        FoundationAdamWConfig {
+            learning_rate: 1.0e-4,
+            weight_decay: 1.0e-4,
+            ..FoundationAdamWConfig::default()
+        },
+    )?;
+
     let initial = evaluate_conditioning_v0190(
         &model,
         &corpus.records,
@@ -492,6 +531,7 @@ pub(crate) fn v0190_main() -> Result<()> {
     )?;
     let mut best_objective = initial.objective;
     let mut best_conditioning = initial;
+    let mut best_step = 0usize;
 
     for step in 1..=train_steps {
         let selected = deterministic_batch(
@@ -562,6 +602,7 @@ pub(crate) fn v0190_main() -> Result<()> {
             if metrics.objective < best_objective && metrics.conditioning_gap > 0.0 {
                 best_objective = metrics.objective;
                 best_conditioning = metrics;
+                best_step = step;
                 save_v0190_checkpoint(
                     &output_root.join("best"),
                     &varmap,
@@ -612,7 +653,7 @@ pub(crate) fn v0190_main() -> Result<()> {
         "mass_valid_beam_fraction\t{:.8}",
         generation.mass_valid_fraction()
     );
-    print_conditioning_v0190("final_best_validation", 0, best_conditioning);
+    print_conditioning_v0190("final_best_validation", best_step, best_conditioning);
     let conditioning_guard = best_conditioning.conditioning_gap > 0.0;
     println!(
         "conditioning_guard\t{}",
@@ -868,6 +909,8 @@ mod v0190_validation_cohort_tests {
 #[derive(Debug, Deserialize)]
 struct UnifiedV0190Metadata {
     inverse_config: FoundationDiffusionConfig,
+    #[serde(default)]
+    global_step: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -1009,6 +1052,319 @@ impl GenerationV0190 {
             self.mass_valid_beams as f64 / self.returned_beams as f64
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct DirectDecoderAuditV0190 {
+    records: usize,
+    target_mass_feasible: usize,
+    target_path_valid: usize,
+    target_returned_literal: usize,
+    target_returned_il: usize,
+    zero_returned_beam_records: usize,
+    returned_beams: usize,
+    target_tokens: usize,
+    target_token_rank_sum: usize,
+    target_token_top1: usize,
+    target_token_top5: usize,
+    target_token_top10: usize,
+    target_token_top20: usize,
+    target_score_beats_best_returned: usize,
+    target_score_would_rank_top128_vs_returned: usize,
+}
+
+fn print_direct_decoder_audit_v0190(audit: &DirectDecoderAuditV0190) {
+    let token_fraction = |count: usize| -> f64 {
+        if audit.target_tokens == 0 {
+            0.0
+        } else {
+            count as f64 / audit.target_tokens as f64
+        }
+    };
+    let mean_rank = if audit.target_tokens == 0 {
+        0.0
+    } else {
+        audit.target_token_rank_sum as f64 / audit.target_tokens as f64
+    };
+    println!("decoder_audit_records\t{}", audit.records);
+    println!("decoder_audit_target_mass_feasible\t{}", audit.target_mass_feasible);
+    println!("decoder_audit_target_path_valid\t{}", audit.target_path_valid);
+    println!("decoder_audit_target_returned_literal\t{}", audit.target_returned_literal);
+    println!("decoder_audit_target_returned_il\t{}", audit.target_returned_il);
+    println!("decoder_audit_zero_returned_beam_records\t{}", audit.zero_returned_beam_records);
+    println!("decoder_audit_returned_beams\t{}", audit.returned_beams);
+    println!("decoder_audit_target_tokens\t{}", audit.target_tokens);
+    println!("decoder_audit_target_token_mean_raw_rank\t{mean_rank:.6}");
+    println!("decoder_audit_target_token_top1_fraction\t{:.8}", token_fraction(audit.target_token_top1));
+    println!("decoder_audit_target_token_top5_fraction\t{:.8}", token_fraction(audit.target_token_top5));
+    println!("decoder_audit_target_token_top10_fraction\t{:.8}", token_fraction(audit.target_token_top10));
+    println!("decoder_audit_target_token_top20_fraction\t{:.8}", token_fraction(audit.target_token_top20));
+    println!("decoder_audit_target_score_beats_best_returned\t{}", audit.target_score_beats_best_returned);
+    println!("decoder_audit_target_score_would_rank_top128_vs_returned\t{}", audit.target_score_would_rank_top128_vs_returned);
+}
+
+fn v0190_target_token_allowed(prefix: &[u32], token: u32) -> bool {
+    if token == FOUNDATION_DIFFUSION_PAD
+        || token == FOUNDATION_DIFFUSION_MASK
+        || token == FOUNDATION_DIFFUSION_EOS
+    {
+        return false;
+    }
+    if token == FOUNDATION_DIFFUSION_NTERM_ACETYL {
+        return prefix.is_empty();
+    }
+    if foundation_diffusion_token_residue(token).is_some() {
+        return true;
+    }
+    if !matches!(
+        token,
+        FOUNDATION_DIFFUSION_RESIDUE_ACETYL
+            | FOUNDATION_DIFFUSION_CARBAMIDOMETHYL
+            | FOUNDATION_DIFFUSION_DEAMIDATED
+            | FOUNDATION_DIFFUSION_OXIDATION
+    ) {
+        return false;
+    }
+    let Some(previous) = prefix.last().copied() else {
+        return false;
+    };
+    let Some(residue) = foundation_diffusion_token_residue(previous) else {
+        return false;
+    };
+    foundation_diffusion_residue_ptm_valid(token, residue)
+}
+
+fn v0190_selected_log_softmax(logits: &[f32], selected: usize) -> Result<f64> {
+    if selected >= logits.len() || !logits[selected].is_finite() {
+        anyhow::bail!("selected v0.19 audit logit is invalid");
+    }
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let denominator: f64 = logits
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(|value| f64::from(value - max).exp())
+        .sum();
+    if !(denominator > 0.0 && denominator.is_finite()) {
+        anyhow::bail!("v0.19 audit softmax denominator is invalid");
+    }
+    Ok(f64::from(logits[selected] - max) - denominator.ln())
+}
+
+fn active_target_tokens_v0190(
+    vocabulary: FoundationDiffusionVocabulary,
+    peptide: &PeptidoformInput,
+    max_tokens: usize,
+) -> Result<Vec<u32>> {
+    let encoded = vocabulary
+        .encode(peptide, max_tokens)
+        .map_err(anyhow::Error::msg)?;
+    let active = encoded
+        .into_iter()
+        .take_while(|&token| token != FOUNDATION_DIFFUSION_PAD)
+        .collect::<Vec<_>>();
+    if active.last().copied() != Some(FOUNDATION_DIFFUSION_EOS) {
+        anyhow::bail!("v0.19 audit target token row does not terminate in EOS");
+    }
+    Ok(active)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_direct_decoder_audit_v0190(
+    model: &PeptideSpectrumCausalModel,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    config: &FoundationDiffusionConfig,
+    beam_width: usize,
+    device: &Device,
+    output_root: &Path,
+) -> Result<DirectDecoderAuditV0190> {
+    fs::create_dir_all(output_root)?;
+    let path = output_root.join("direct_decoder_v0190_audit_records.tsv");
+    let mut writer = BufWriter::new(
+        fs::File::create(&path).with_context(|| format!("create v0.19 decoder audit {path:?}"))?,
+    );
+    writeln!(
+        writer,
+        "record_index\ttarget_sequence\ttarget_mass_error_da\ttarget_mass_feasible\ttarget_path_valid\ttarget_active_tokens\ttarget_mean_raw_token_rank\ttarget_token_top1_fraction\ttarget_token_top5_fraction\ttarget_token_top10_fraction\ttarget_token_top20_fraction\ttarget_total_log_probability\treturned_beams\tbest_returned_log_probability\treturned_literal\treturned_il\ttarget_score_beats_best_returned\ttarget_score_rank_vs_returned"
+    )?;
+
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut audit = DirectDecoderAuditV0190::default();
+    for &index in indices {
+        let record = &records[index];
+        let mz = record
+            .context
+            .precursor_mz
+            .ok_or_else(|| anyhow::anyhow!("validation record {index} lacks precursor m/z"))?;
+        let charge = record
+            .context
+            .charge
+            .ok_or_else(|| anyhow::anyhow!("validation record {index} lacks charge"))?;
+        let precursor_mass =
+            foundation_precursor_neutral_mass(f64::from(mz), charge).map_err(anyhow::Error::msg)?;
+        let target_mass =
+            foundation_peptidoform_neutral_mass(&record.peptidoform).map_err(anyhow::Error::msg)?;
+        let target_mass_error = target_mass - precursor_mass;
+        let target_mass_feasible = target_mass_error.abs() <= config.precursor_mass_tolerance_da;
+
+        let target_tokens = active_target_tokens_v0190(vocabulary, &record.peptidoform, config.max_tokens)?;
+        let target_nonterminal = &target_tokens[..target_tokens.len() - 1];
+        let mut target_path_valid = true;
+        let mut running_mass = FOUNDATION_PEPTIDE_WATER_MASS_DA;
+        let mut prefix = Vec::<u32>::new();
+        for &token in target_nonterminal {
+            if !v0190_target_token_allowed(&prefix, token) {
+                target_path_valid = false;
+                break;
+            }
+            let Some(token_mass) = foundation_diffusion_token_mass_da(token) else {
+                target_path_valid = false;
+                break;
+            };
+            running_mass += token_mass;
+            if running_mass > precursor_mass + config.precursor_mass_tolerance_da {
+                target_path_valid = false;
+                break;
+            }
+            prefix.push(token);
+        }
+        if (running_mass - precursor_mass).abs() > config.precursor_mass_tolerance_da {
+            target_path_valid = false;
+        }
+
+        let spectrum = FoundationSpectrum::from_training_record(record)
+            .ok_or_else(|| anyhow::anyhow!("validation record {index} lacks spectrum"))?;
+        let spectrum_batch = spectrum_collator.collate(&[spectrum], device)?;
+        let precursor = precursor_context(&[record], device)?;
+        let context = model.prepare_context(&spectrum_batch, &precursor, false)?;
+
+        let mut target_total_log_probability = 0.0f64;
+        let mut token_rank_sum = 0usize;
+        let mut token_top1 = 0usize;
+        let mut token_top5 = 0usize;
+        let mut token_top10 = 0usize;
+        let mut token_top20 = 0usize;
+        let mut prefix = Vec::<u32>::new();
+        for &target_token in &target_tokens {
+            let rows = vec![prefix.clone()];
+            let input = causal_collator.collate_compact_prefix_rows(&rows, device)?;
+            let logits = model
+                .forward_next_t_with_context(&input, &context, false)?
+                .to_vec2::<f32>()?;
+            let row = logits
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("v0.19 audit produced no next-token logits"))?;
+            let selected = target_token as usize;
+            let rank = 1 + row
+                .iter()
+                .enumerate()
+                .filter(|(token_index, value)| {
+                    *token_index != selected && value.is_finite() && **value > row[selected]
+                })
+                .count();
+            target_total_log_probability += v0190_selected_log_softmax(row, selected)?;
+            token_rank_sum += rank;
+            token_top1 += usize::from(rank <= 1);
+            token_top5 += usize::from(rank <= 5);
+            token_top10 += usize::from(rank <= 10);
+            token_top20 += usize::from(rank <= 20);
+            if target_token != FOUNDATION_DIFFUSION_EOS {
+                prefix.push(target_token);
+            }
+        }
+
+        let candidates = foundation_direct_beam_search(
+            precursor_mass,
+            DirectDecoderBeamConfig {
+                beam_width,
+                top_k: 128,
+                mass_tolerance_da: config.precursor_mass_tolerance_da,
+                max_tokens: config.max_tokens,
+            },
+            |prefixes| {
+                let input = causal_collator
+                    .collate_compact_prefix_rows(prefixes, device)
+                    .map_err(|error| error.to_string())?;
+                model
+                    .forward_next_t_with_context(&input, &context, false)
+                    .and_then(|tensor| tensor.to_vec2::<f32>())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        let decoded = candidates
+            .iter()
+            .map(|candidate| vocabulary.decode(&candidate.tokens))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::msg)?;
+        let returned_literal = decoded.iter().any(|peptide| peptide == &record.peptidoform);
+        let returned_il = decoded.iter().any(|peptide| {
+            il_sequence(&peptide.sequence) == il_sequence(&record.peptidoform.sequence)
+        });
+        let best_returned = candidates.first().map(|candidate| candidate.log_probability);
+        let target_score_beats_best = best_returned
+            .map(|score| target_total_log_probability > score)
+            .unwrap_or(target_mass_feasible && target_path_valid);
+        let better_than_target = candidates
+            .iter()
+            .filter(|candidate| candidate.log_probability > target_total_log_probability)
+            .count();
+        let target_rank_vs_returned = better_than_target + 1;
+
+        audit.records += 1;
+        audit.target_mass_feasible += usize::from(target_mass_feasible);
+        audit.target_path_valid += usize::from(target_path_valid);
+        audit.target_returned_literal += usize::from(returned_literal);
+        audit.target_returned_il += usize::from(returned_il);
+        audit.zero_returned_beam_records += usize::from(candidates.is_empty());
+        audit.returned_beams += candidates.len();
+        audit.target_tokens += target_tokens.len();
+        audit.target_token_rank_sum += token_rank_sum;
+        audit.target_token_top1 += token_top1;
+        audit.target_token_top5 += token_top5;
+        audit.target_token_top10 += token_top10;
+        audit.target_token_top20 += token_top20;
+        audit.target_score_beats_best_returned += usize::from(
+            target_mass_feasible && target_path_valid && target_score_beats_best,
+        );
+        audit.target_score_would_rank_top128_vs_returned += usize::from(
+            target_mass_feasible && target_path_valid && target_rank_vs_returned <= 128,
+        );
+
+        let target_token_count = target_tokens.len().max(1) as f64;
+        let mean_rank = token_rank_sum as f64 / target_token_count;
+        let best_returned_text = best_returned
+            .map(|value| format!("{value:.8}"))
+            .unwrap_or_default();
+        writeln!(
+            writer,
+            "{index}\t{}\t{target_mass_error:.8}\t{}\t{}\t{}\t{mean_rank:.6}\t{:.8}\t{:.8}\t{:.8}\t{:.8}\t{target_total_log_probability:.8}\t{}\t{}\t{}\t{}\t{}\t{}",
+            record.peptidoform.sequence,
+            target_mass_feasible,
+            target_path_valid,
+            target_tokens.len(),
+            token_top1 as f64 / target_token_count,
+            token_top5 as f64 / target_token_count,
+            token_top10 as f64 / target_token_count,
+            token_top20 as f64 / target_token_count,
+            candidates.len(),
+            best_returned_text,
+            returned_literal,
+            returned_il,
+            target_score_beats_best,
+            target_rank_vs_returned,
+        )?;
+    }
+    writer.flush()?;
+    println!("decoder_audit_records_tsv\t{}", path.display());
+    Ok(audit)
 }
 
 #[allow(clippy::too_many_arguments)]
