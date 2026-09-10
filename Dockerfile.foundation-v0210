@@ -49,22 +49,26 @@ ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_RELEASE_LTO}
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_RELEASE_CODEGEN_UNITS}
 ENV CARGO_PROFILE_RELEASE_DEBUG=${CARGO_RELEASE_DEBUG}
 
-WORKDIR /app/redeem-properties
+WORKDIR /app
 
-# Cargo.lock is copied beside the standalone manifest so --locked retains the
-# repository's resolved versions without requiring the parent workspace.
-COPY Cargo.lock ./Cargo.lock
-COPY redeem-properties/Cargo.toml ./Cargo.toml
-COPY redeem-properties/README.md ./README.md
-COPY redeem-properties/LICENSE ./LICENSE
-COPY redeem-properties/assets ./assets
-COPY redeem-properties/src ./src
-COPY redeem-properties/examples ./examples
+# Keep the repository workspace/lockfile relationship intact. Cargo resolves
+# workspace metadata before selecting -p redeem-properties, so using the root
+# Cargo.lock beside a standalone member manifest is not a valid --locked build.
+# The non-selected workspace crates are present only in this disposable builder
+# stage for metadata/lock resolution; they are not compiled, linked, or copied
+# into the lean runtime image. This is the proven v0.20 packaging pattern.
+COPY Cargo.toml Cargo.lock ./
+COPY redeem-openms-ffi ./redeem-openms-ffi
+COPY redeem-classifiers ./redeem-classifiers
+COPY redeem-cli ./redeem-cli
+COPY redeem-properties ./redeem-properties
+COPY redeem-properties-py ./redeem-properties-py
 
 RUN set -eux; \
     echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"; \
-    test -f examples/foundation_train_chemistry_diffusion_v0210.rs; \
+    test -f redeem-properties/examples/foundation_train_chemistry_diffusion_v0210.rs; \
     cargo build --release --locked \
+        -p redeem-properties \
         --no-default-features \
         --features cuda \
         --example foundation_train_chemistry_diffusion_v0210; \
