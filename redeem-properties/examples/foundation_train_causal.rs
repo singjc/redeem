@@ -9,10 +9,10 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_causal_next_token_loss, foundation_diffusion_dataset_fingerprint,
-    foundation_direct_beam_search, foundation_direct_conditioning_loss,
-    foundation_direct_shuffled_order, foundation_peptidoform_neutral_mass,
-    foundation_precursor_neutral_mass, foundation_diffusion_residue_ptm_valid,
-    foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
+    foundation_diffusion_residue_ptm_valid, foundation_diffusion_token_mass_da,
+    foundation_diffusion_token_residue, foundation_direct_beam_search,
+    foundation_direct_conditioning_loss, foundation_direct_shuffled_order,
+    foundation_peptidoform_neutral_mass, foundation_precursor_neutral_mass,
     load_causal_from_diffusion_checkpoint, load_direct_decoder_from_unified_checkpoint,
     load_foundation_corpus, read_foundation_training_run_config, DirectDecoderBeamConfig,
     FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCausalCollator,
@@ -22,9 +22,8 @@ use redeem_properties::foundation::{
     FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
     FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
     FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL,
-    FOUNDATION_PEPTIDE_WATER_MASS_DA,
     FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190, FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
-    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
+    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190, FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -343,7 +342,7 @@ pub(crate) fn v0190_main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 5 || args.len() > 6 {
         anyhow::bail!(
-            "usage: foundation_train_direct_decoder_v0190 RUN.yaml MODEL_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke|audit]"
+            "usage: foundation_train_direct_decoder_v0190 RUN.yaml MODEL_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke|audit|rescue]"
         );
     }
     let training_yaml = PathBuf::from(&args[1]);
@@ -355,7 +354,15 @@ pub(crate) fn v0190_main() -> Result<()> {
         "full" => (4_000usize, 32usize, None, 128usize),
         "smoke" => (2usize, 2usize, Some(4usize), 8usize),
         "audit" => (0usize, 32usize, None, 128usize),
-        other => anyhow::bail!("unsupported v0.19 mode {other:?}; expected full, smoke, or audit"),
+        // No-retraining search-recovery experiment. 4096 is the one fixed
+        // breadth escalation after the v0.19 audit showed 123/125 valid target
+        // paths but 61/125 records with no returned beam at width 128. The
+        // A100-80GB run used only ~1.2 GiB at width 128, so this 32x breadth is
+        // intentionally bounded and is not a width sweep.
+        "rescue" => (0usize, 32usize, None, 4_096usize),
+        other => anyhow::bail!(
+            "unsupported v0.19 mode {other:?}; expected full, smoke, audit, or rescue"
+        ),
     };
     reject_test_path_v0190(&training_yaml)?;
     reject_test_path_v0190(&parent)?;
@@ -428,9 +435,7 @@ pub(crate) fn v0190_main() -> Result<()> {
         "validation_cohort_source\t{}",
         validation_candidates.display()
     );
-    println!(
-        "validation_cohort_policy\tfrozen_v01323_mass_valid_record_ids_only"
-    );
+    println!("validation_cohort_policy\tfrozen_v01323_mass_valid_record_ids_only");
     println!(
         "validation_cohort_contract\trecords={}\toracle_literal={}\toracle_il={}\tlegacy_top1_literal={}\tlegacy_top1_il={}",
         validation_cohort.indices.len(),
@@ -447,6 +452,12 @@ pub(crate) fn v0190_main() -> Result<()> {
     println!("train_steps\t{train_steps}");
     println!("batch_size\t{batch_size}");
     println!("beam_width\t{beam_width}");
+    println!("decoder_search_policy\tfull_prefix_distinct_standard_beam_no_mass_state_merge");
+    if mode == "rescue" {
+        println!(
+            "decoder_search_rescue_policy\tdiagnostic_width128_then_fixed_width4096_no_retraining"
+        );
+    }
     println!(
         "spectrum_encoder_warm_started_variables\t{}",
         warm.spectrum_encoder_variables
@@ -488,6 +499,78 @@ pub(crate) fn v0190_main() -> Result<()> {
         )?;
         print_direct_decoder_audit_v0190(&audit);
         println!("v0190_audit_stop_rule\tV0190_DECODER_AUDIT_COMPLETE_NO_RETRAINING");
+        return Ok(());
+    }
+
+    if mode == "rescue" {
+        let metrics = evaluate_conditioning_v0190(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            batch_size,
+            &causal_collator,
+            &spectrum_collator,
+            &device,
+            20_260_919,
+        )?;
+        print_conditioning_v0190(
+            "rescue_validation",
+            metadata.global_step.unwrap_or(0),
+            metrics,
+        );
+
+        // Width 128 is a diagnostic rerun under corrected prefix-distinct beam
+        // semantics. It separates the invalid mass-bin state merge from the
+        // one predeclared breadth rescue below; it is not used to select a
+        // checkpoint or tune a width.
+        let diagnostic = evaluate_direct_generation_v0190(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            &causal_collator,
+            &spectrum_collator,
+            &metadata.inverse_config,
+            128,
+            &device,
+        )?;
+        print_generation_v0190("decoder_rescue_width128", &diagnostic);
+
+        // One fixed breadth escalation only. If this remains below the frozen
+        // baseline, do not continue widening the beam in circles; escalate the
+        // sequence-training objective instead.
+        let rescue = evaluate_direct_generation_v0190(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            &causal_collator,
+            &spectrum_collator,
+            &metadata.inverse_config,
+            beam_width,
+            &device,
+        )?;
+        print_generation_v0190("decoder_rescue_width4096", &rescue);
+        let conditioning_guard = metrics.conditioning_gap > 0.0;
+        println!(
+            "conditioning_guard\t{}",
+            if conditioning_guard { "PASS" } else { "FAIL" }
+        );
+        let gate = if rescue.literal_top1 >= 28 && rescue.il_top1 >= 42 && conditioning_guard {
+            "PROGRESS_MILESTONE"
+        } else if rescue.literal_top1 >= 24 && rescue.il_top1 >= 38 && conditioning_guard {
+            "BASELINE_RECOVERY"
+        } else if !conditioning_guard {
+            "CONDITIONING_GUARD_NOT_MET"
+        } else {
+            "BELOW_BASELINE_RECOVERY"
+        };
+        println!("v0190_search_rescue_gate\t{gate}");
+        let stop = match gate {
+            "PROGRESS_MILESTONE" => "V0190_SEARCH_RESCUE_PROGRESS_MILESTONE",
+            "BASELINE_RECOVERY" => "V0190_SEARCH_RESCUE_BASELINE_RECOVERED",
+            "CONDITIONING_GUARD_NOT_MET" => "V0190_SEARCH_RESCUE_CONDITIONING_GUARD_FAILED",
+            _ => "V0190_SEARCH_RESCUE_BELOW_BASELINE_CLOSE_BREADTH_LANE",
+        };
+        println!("v0190_search_rescue_stop_rule\t{stop}");
         return Ok(());
     }
 
@@ -664,15 +747,9 @@ pub(crate) fn v0190_main() -> Result<()> {
         println!("v0190_stop_rule\tSMOKE_RUNTIME_ONLY_NO_SCIENTIFIC_DECISION");
         return Ok(());
     }
-    let gate = if generation.literal_top1 >= 28
-        && generation.il_top1 >= 42
-        && conditioning_guard
-    {
+    let gate = if generation.literal_top1 >= 28 && generation.il_top1 >= 42 && conditioning_guard {
         "PROGRESS_MILESTONE"
-    } else if generation.literal_top1 >= 24
-        && generation.il_top1 >= 38
-        && conditioning_guard
-    {
+    } else if generation.literal_top1 >= 24 && generation.il_top1 >= 38 && conditioning_guard {
         "BASELINE_RECOVERY"
     } else if !conditioning_guard {
         "CONDITIONING_GUARD_NOT_MET"
@@ -832,10 +909,7 @@ fn parse_frozen_validation_cohort_v0190<R: BufRead>(
             .values()
             .filter(|group| group.legacy_literal_top1)
             .count(),
-        legacy_il_top1: groups
-            .values()
-            .filter(|group| group.legacy_il_top1)
-            .count(),
+        legacy_il_top1: groups.values().filter(|group| group.legacy_il_top1).count(),
     };
     if cohort.indices.len() != FROZEN_V0190_VALIDATION_RECORDS
         || cohort.oracle_literal != FROZEN_V0190_ORACLE_LITERAL
@@ -898,10 +972,7 @@ mod v0190_validation_cohort_tests {
         );
         assert_eq!(cohort.oracle_literal, FROZEN_V0190_ORACLE_LITERAL);
         assert_eq!(cohort.oracle_il, FROZEN_V0190_ORACLE_IL);
-        assert_eq!(
-            cohort.legacy_literal_top1,
-            FROZEN_V0190_LEGACY_LITERAL_TOP1
-        );
+        assert_eq!(cohort.legacy_literal_top1, FROZEN_V0190_LEGACY_LITERAL_TOP1);
         assert_eq!(cohort.legacy_il_top1, FROZEN_V0190_LEGACY_IL_TOP1);
     }
 }
@@ -1036,12 +1107,14 @@ fn save_v0190_checkpoint(
 
 #[derive(Debug)]
 struct GenerationV0190 {
+    records: usize,
     literal_top1: usize,
     sequence_top1: usize,
     il_top1: usize,
     topk: Vec<(usize, usize, usize)>,
     mass_valid_beams: usize,
     returned_beams: usize,
+    zero_returned_beam_records: usize,
 }
 
 impl GenerationV0190 {
@@ -1052,6 +1125,39 @@ impl GenerationV0190 {
             self.mass_valid_beams as f64 / self.returned_beams as f64
         }
     }
+
+    fn mean_returned_beams(&self) -> f64 {
+        if self.records == 0 {
+            0.0
+        } else {
+            self.returned_beams as f64 / self.records as f64
+        }
+    }
+}
+
+fn print_generation_v0190(prefix: &str, generation: &GenerationV0190) {
+    println!("{prefix}_records\t{}", generation.records);
+    println!("{prefix}_literal_top1\t{}", generation.literal_top1);
+    println!("{prefix}_sequence_top1\t{}", generation.sequence_top1);
+    println!("{prefix}_il_top1\t{}", generation.il_top1);
+    for &(k, literal, il) in &generation.topk {
+        println!("{prefix}_top{k}_literal\t{literal}");
+        println!("{prefix}_top{k}_il\t{il}");
+    }
+    println!("{prefix}_mass_valid_beams\t{}", generation.mass_valid_beams);
+    println!("{prefix}_returned_beams\t{}", generation.returned_beams);
+    println!(
+        "{prefix}_zero_returned_beam_records\t{}",
+        generation.zero_returned_beam_records
+    );
+    println!(
+        "{prefix}_mean_returned_beams\t{:.6}",
+        generation.mean_returned_beams()
+    );
+    println!(
+        "{prefix}_mass_valid_beam_fraction\t{:.8}",
+        generation.mass_valid_fraction()
+    );
 }
 
 #[derive(Debug, Default)]
@@ -1087,20 +1193,53 @@ fn print_direct_decoder_audit_v0190(audit: &DirectDecoderAuditV0190) {
         audit.target_token_rank_sum as f64 / audit.target_tokens as f64
     };
     println!("decoder_audit_records\t{}", audit.records);
-    println!("decoder_audit_target_mass_feasible\t{}", audit.target_mass_feasible);
-    println!("decoder_audit_target_path_valid\t{}", audit.target_path_valid);
-    println!("decoder_audit_target_returned_literal\t{}", audit.target_returned_literal);
-    println!("decoder_audit_target_returned_il\t{}", audit.target_returned_il);
-    println!("decoder_audit_zero_returned_beam_records\t{}", audit.zero_returned_beam_records);
+    println!(
+        "decoder_audit_target_mass_feasible\t{}",
+        audit.target_mass_feasible
+    );
+    println!(
+        "decoder_audit_target_path_valid\t{}",
+        audit.target_path_valid
+    );
+    println!(
+        "decoder_audit_target_returned_literal\t{}",
+        audit.target_returned_literal
+    );
+    println!(
+        "decoder_audit_target_returned_il\t{}",
+        audit.target_returned_il
+    );
+    println!(
+        "decoder_audit_zero_returned_beam_records\t{}",
+        audit.zero_returned_beam_records
+    );
     println!("decoder_audit_returned_beams\t{}", audit.returned_beams);
     println!("decoder_audit_target_tokens\t{}", audit.target_tokens);
     println!("decoder_audit_target_token_mean_raw_rank\t{mean_rank:.6}");
-    println!("decoder_audit_target_token_top1_fraction\t{:.8}", token_fraction(audit.target_token_top1));
-    println!("decoder_audit_target_token_top5_fraction\t{:.8}", token_fraction(audit.target_token_top5));
-    println!("decoder_audit_target_token_top10_fraction\t{:.8}", token_fraction(audit.target_token_top10));
-    println!("decoder_audit_target_token_top20_fraction\t{:.8}", token_fraction(audit.target_token_top20));
-    println!("decoder_audit_target_score_beats_best_returned\t{}", audit.target_score_beats_best_returned);
-    println!("decoder_audit_target_score_would_rank_top128_vs_returned\t{}", audit.target_score_would_rank_top128_vs_returned);
+    println!(
+        "decoder_audit_target_token_top1_fraction\t{:.8}",
+        token_fraction(audit.target_token_top1)
+    );
+    println!(
+        "decoder_audit_target_token_top5_fraction\t{:.8}",
+        token_fraction(audit.target_token_top5)
+    );
+    println!(
+        "decoder_audit_target_token_top10_fraction\t{:.8}",
+        token_fraction(audit.target_token_top10)
+    );
+    println!(
+        "decoder_audit_target_token_top20_fraction\t{:.8}",
+        token_fraction(audit.target_token_top20)
+    );
+    println!(
+        "decoder_audit_target_score_beats_best_returned\t{}",
+        audit.target_score_beats_best_returned
+    );
+    println!(
+        "decoder_audit_target_score_would_rank_top128_vs_returned\t{}",
+        audit.target_score_would_rank_top128_vs_returned
+    );
 }
 
 fn v0190_target_token_allowed(prefix: &[u32], token: u32) -> bool {
@@ -1214,7 +1353,8 @@ fn evaluate_direct_decoder_audit_v0190(
         let target_mass_error = target_mass - precursor_mass;
         let target_mass_feasible = target_mass_error.abs() <= config.precursor_mass_tolerance_da;
 
-        let target_tokens = active_target_tokens_v0190(vocabulary, &record.peptidoform, config.max_tokens)?;
+        let target_tokens =
+            active_target_tokens_v0190(vocabulary, &record.peptidoform, config.max_tokens)?;
         let target_nonterminal = &target_tokens[..target_tokens.len() - 1];
         let mut target_path_valid = true;
         let mut running_mass = FOUNDATION_PEPTIDE_WATER_MASS_DA;
@@ -1308,7 +1448,9 @@ fn evaluate_direct_decoder_audit_v0190(
         let returned_il = decoded.iter().any(|peptide| {
             il_sequence(&peptide.sequence) == il_sequence(&record.peptidoform.sequence)
         });
-        let best_returned = candidates.first().map(|candidate| candidate.log_probability);
+        let best_returned = candidates
+            .first()
+            .map(|candidate| candidate.log_probability);
         let target_score_beats_best = best_returned
             .map(|score| target_total_log_probability > score)
             .unwrap_or(target_mass_feasible && target_path_valid);
@@ -1331,9 +1473,8 @@ fn evaluate_direct_decoder_audit_v0190(
         audit.target_token_top5 += token_top5;
         audit.target_token_top10 += token_top10;
         audit.target_token_top20 += token_top20;
-        audit.target_score_beats_best_returned += usize::from(
-            target_mass_feasible && target_path_valid && target_score_beats_best,
-        );
+        audit.target_score_beats_best_returned +=
+            usize::from(target_mass_feasible && target_path_valid && target_score_beats_best);
         audit.target_score_would_rank_top128_vs_returned += usize::from(
             target_mass_feasible && target_path_valid && target_rank_vs_returned <= 128,
         );
@@ -1381,12 +1522,14 @@ fn evaluate_direct_generation_v0190(
     let vocabulary = FoundationDiffusionVocabulary;
     let ks = [5usize, 10, 32, 128];
     let mut out = GenerationV0190 {
+        records: 0,
         literal_top1: 0,
         sequence_top1: 0,
         il_top1: 0,
         topk: ks.iter().copied().map(|k| (k, 0, 0)).collect(),
         mass_valid_beams: 0,
         returned_beams: 0,
+        zero_returned_beam_records: 0,
     };
     for &index in indices {
         let record = &records[index];
@@ -1424,6 +1567,8 @@ fn evaluate_direct_generation_v0190(
             },
         )
         .map_err(anyhow::Error::msg)?;
+        out.records += 1;
+        out.zero_returned_beam_records += usize::from(candidates.is_empty());
         out.returned_beams += candidates.len();
         out.mass_valid_beams += candidates
             .iter()

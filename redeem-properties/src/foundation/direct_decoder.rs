@@ -224,12 +224,15 @@ where
         {
             return Err("direct decoder logit callback returned an invalid shape".into());
         }
-        // Preserve mass-path diversity before the global beam cap. Without
-        // this, many near-identical high-language-probability prefixes can
-        // crowd out lower-probability paths that are the only ones capable of
-        // exact precursor closure.
-        let mass_bin_width = config.mass_tolerance_da.max(0.05);
-        let mut expanded = HashMap::<(i64, u32), BeamState>::new();
+        // Every autoregressive prefix is a distinct neural state. Prefixes
+        // with the same approximate neutral mass and final token are *not*
+        // interchangeable because the complete prefix changes all subsequent
+        // decoder logits. Earlier v0.19 search collapsed such states by
+        // `(mass_bin, last_token)`, which is invalid for a full-prefix causal
+        // decoder and can discard a lower-scoring prefix whose continuation is
+        // ultimately much better. Keep all physically valid expansions until
+        // the ordinary global beam cap is applied below.
+        let mut expanded = Vec::<BeamState>::new();
         for (state, row) in live.iter().zip(logits.iter()) {
             if state.residues > 0 {
                 let error = state.neutral_mass - precursor_neutral_mass;
@@ -291,19 +294,9 @@ where
                     residues: state.residues
                         + usize::from(foundation_diffusion_token_residue(token).is_some()),
                 };
-                let key = ((neutral_mass / mass_bin_width).round() as i64, token);
-                match expanded.get_mut(&key) {
-                    Some(existing) if candidate.log_probability > existing.log_probability => {
-                        *existing = candidate;
-                    }
-                    None => {
-                        expanded.insert(key, candidate);
-                    }
-                    _ => {}
-                }
+                expanded.push(candidate);
             }
         }
-        let mut expanded: Vec<_> = expanded.into_values().collect();
         expanded.sort_by(|a, b| b.log_probability.total_cmp(&a.log_probability));
         expanded.truncate(config.beam_width);
         live = expanded;
@@ -379,6 +372,85 @@ mod tests {
         let second = foundation_direct_shuffled_order(8, 20260919).unwrap();
         assert_eq!(first, second);
         assert!(first.iter().enumerate().all(|(i, &j)| i != j));
+    }
+
+    #[test]
+    fn beam_does_not_merge_distinct_autoregressive_prefixes_with_same_mass_and_last_token() {
+        let alanine = 3u32;
+        let glycine = 8u32;
+        let isoleucine = 10u32;
+        let leucine = 12u32;
+        assert_eq!(foundation_diffusion_token_residue(isoleucine), Some('I'));
+        assert_eq!(foundation_diffusion_token_residue(leucine), Some('L'));
+        assert_eq!(
+            foundation_diffusion_token_mass_da(isoleucine),
+            foundation_diffusion_token_mass_da(leucine)
+        );
+
+        let target = FOUNDATION_PEPTIDE_WATER_MASS_DA
+            + foundation_diffusion_token_mass_da(leucine).unwrap()
+            + foundation_diffusion_token_mass_da(alanine).unwrap()
+            + foundation_diffusion_token_mass_da(glycine).unwrap();
+        let candidates = foundation_direct_beam_search(
+            target,
+            DirectDecoderBeamConfig {
+                beam_width: 4,
+                top_k: 4,
+                mass_tolerance_da: 1.0e-5,
+                max_tokens: 5,
+            },
+            |prefixes| {
+                Ok(prefixes
+                    .iter()
+                    .map(|prefix| {
+                        let mut row = vec![-50.0; FOUNDATION_DIFFUSION_VOCAB_SIZE];
+                        match prefix.as_slice() {
+                            [] => {
+                                // The I-prefix is initially slightly better than L.
+                                row[isoleucine as usize] = 10.0;
+                                row[leucine as usize] = 9.8;
+                            }
+                            [token] if *token == isoleucine => {
+                                row[alanine as usize] = 10.0;
+                            }
+                            [token] if *token == leucine => {
+                                row[alanine as usize] = 10.0;
+                            }
+                            [first, second] if *first == isoleucine && *second == alanine => {
+                                // After the mass-isobaric [I,A] / [L,A] collision,
+                                // the lower-scoring L-prefix has the much stronger
+                                // continuation. A `(mass_bin,last_token)` merge would
+                                // have destroyed this path before these logits exist.
+                                row[glycine as usize] = -5.0;
+                            }
+                            [first, second] if *first == leucine && *second == alanine => {
+                                row[glycine as usize] = 10.0;
+                            }
+                            [first, second, third]
+                                if (*first == isoleucine || *first == leucine)
+                                    && *second == alanine
+                                    && *third == glycine =>
+                            {
+                                row[FOUNDATION_DIFFUSION_EOS as usize] = 10.0;
+                            }
+                            _ => {
+                                row[FOUNDATION_DIFFUSION_EOS as usize] = 0.0;
+                            }
+                        }
+                        row
+                    })
+                    .collect())
+            },
+        )
+        .unwrap();
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.tokens == vec![leucine, alanine, glycine, FOUNDATION_DIFFUSION_EOS]
+        }));
+        assert_eq!(
+            candidates[0].tokens,
+            vec![leucine, alanine, glycine, FOUNDATION_DIFFUSION_EOS,]
+        );
     }
 
     #[test]
