@@ -492,6 +492,12 @@ fn residue_modification_token(
 pub struct FoundationDiffusionBatch {
     /// Noised token ids `[batch, max_tokens]`.
     pub noisy_tokens: Tensor,
+    /// CPU mirror of the exact noised token rows. This avoids device round-trips
+    /// for chemistry featurization in whole-sequence refinement models.
+    pub noisy_token_rows: Vec<Vec<u32>>,
+    /// Active non-padding length (including EOS in the clean sequence contract)
+    /// for each noised row.
+    pub active_lengths: Vec<usize>,
     /// Clean token ids `[batch, max_tokens]`.
     pub clean_tokens: Tensor,
     /// Valid clean sequence mask including EOS `[batch, max_tokens]`.
@@ -641,8 +647,11 @@ impl FoundationDiffusionCollator {
         }
 
         let active_count = active_indices.len();
+        let noisy_token_rows = noisy.chunks(width).map(|row| row.to_vec()).collect();
         Ok(FoundationDiffusionBatch {
             noisy_tokens: Tensor::from_vec(noisy, (batch, width), device)?.to_dtype(DType::U32)?,
+            noisy_token_rows,
+            active_lengths: active_lengths.to_vec(),
             clean_tokens: Tensor::from_vec(clean, (batch, width), device)?.to_dtype(DType::U32)?,
             token_mask: Tensor::from_vec(mask, (batch, width), device)?,
             timesteps: Tensor::from_vec(timesteps, batch, device)?.to_dtype(DType::U32)?,
@@ -726,8 +735,15 @@ impl FoundationDiffusionCollator {
         let active_count = target_classes.len();
         debug_assert_eq!(active_indices.len(), active_count);
 
+        let noisy_token_rows = noisy.chunks(l).map(|row| row.to_vec()).collect();
+        let active_lengths = length_targets
+            .iter()
+            .map(|&value| value as usize + 1)
+            .collect();
         Ok(FoundationDiffusionBatch {
             noisy_tokens: Tensor::from_vec(noisy, (b, l), device)?.to_dtype(DType::U32)?,
+            noisy_token_rows,
+            active_lengths,
             clean_tokens: Tensor::from_vec(clean, (b, l), device)?.to_dtype(DType::U32)?,
             token_mask: Tensor::from_vec(mask, (b, l), device)?,
             timesteps: Tensor::from_vec(timestep_ids, b, device)?.to_dtype(DType::U32)?,
@@ -1028,6 +1044,8 @@ impl SpectrumConditionedDiffusionBlock {
 pub struct FoundationDiffusionOutput {
     /// Clean-token logits `[batch, max_tokens, vocabulary]`.
     pub token_logits: Tensor,
+    /// Bidirectional decoder hidden state before the clean-token head.
+    pub decoder_hidden: Tensor,
     /// Cross-attention memory `[batch, 1 + peaks, model_dim]`, with the
     /// precursor summary prepended to the contextualized observed peaks.
     pub spectrum_memory: Tensor,
@@ -1218,6 +1236,7 @@ impl PeptideSpectrumDiffusionModel {
         let token_logits = self.token_head.forward(&hidden)?;
         Ok(FoundationDiffusionOutput {
             token_logits,
+            decoder_hidden: hidden,
             spectrum_memory,
             spectrum_embedding: spectrum_encoding.spectrum_embedding,
             length_logits,

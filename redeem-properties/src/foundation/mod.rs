@@ -16,6 +16,7 @@ pub mod ccs_physics;
 pub mod checkpoint;
 pub mod chemistry;
 pub mod chemistry_decoder;
+pub mod chemistry_diffusion;
 pub mod cleavage_graph;
 pub mod collate;
 pub mod compatibility;
@@ -80,6 +81,21 @@ pub use chemistry_decoder::{
     FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200,
     FOUNDATION_CHEMISTRY_FRAGMENT_ABS_TOLERANCE_DA_V0200, FOUNDATION_CHEMISTRY_FRAGMENT_PPM_V0200,
     FOUNDATION_CHEMISTRY_SUFFIX_BIN_DA_V0200, FOUNDATION_CHEMISTRY_TRANSITION_FEATURE_DIM_V0200,
+};
+pub use chemistry_diffusion::{
+    foundation_chemistry_diffusion_argmax_refine, foundation_chemistry_diffusion_final_mass_valid,
+    foundation_chemistry_diffusion_partition_isolated,
+    foundation_chemistry_diffusion_project_mass_valid,
+    foundation_chemistry_diffusion_refinement_timesteps,
+    foundation_chemistry_diffusion_row_neutral_mass,
+    load_chemistry_diffusion_from_v0200_checkpoint, ChemistryDiffusionFeatureBatch,
+    ChemistryDiffusionFeaturizer, ChemistryDiffusionWarmStartReport,
+    PeptideSpectrumChemistryDiffusionModel, FOUNDATION_CHEMISTRY_DIFFUSION_ARCHITECTURE_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_FULL_STATE_FEATURE_DIM_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_INITIAL_BEAM_WIDTH_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_OBJECTIVE_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_START_TIMESTEP_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_STEPS_V0210,
 };
 pub use cleavage_graph::{
     foundation_build_cleavage_graph, foundation_cleavage_graph_edge_features,

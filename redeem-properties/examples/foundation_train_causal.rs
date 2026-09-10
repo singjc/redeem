@@ -8,20 +8,32 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_causal_next_token_loss, foundation_diffusion_dataset_fingerprint,
+    foundation_causal_next_token_loss, foundation_chemistry_diffusion_argmax_refine,
+    foundation_chemistry_diffusion_final_mass_valid,
+    foundation_chemistry_diffusion_partition_isolated,
+    foundation_chemistry_diffusion_project_mass_valid,
+    foundation_chemistry_diffusion_refinement_timesteps,
+    foundation_chemistry_diffusion_row_neutral_mass, foundation_diffusion_dataset_fingerprint,
     foundation_diffusion_residue_ptm_valid, foundation_diffusion_token_mass_da,
-    foundation_diffusion_token_residue, foundation_direct_beam_search,
-    foundation_direct_conditioning_loss, foundation_direct_prefix_competitive_loss,
-    foundation_direct_shuffled_order, foundation_peptidoform_neutral_mass,
-    foundation_precursor_neutral_mass, load_causal_from_diffusion_checkpoint,
-    load_chemistry_decoder_from_unified_checkpoint, load_direct_decoder_from_unified_checkpoint,
-    load_foundation_corpus, read_foundation_training_run_config, ChemistrySuffixMassLattice,
-    ChemistryTransitionFeaturizer, DirectDecoderBeamConfig, FoundationAdamW, FoundationAdamWConfig,
-    FoundationBenchmarkManifest, FoundationCausalCollator, FoundationDiffusionConfig,
-    FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
-    FoundationSpectrumCollator, FoundationTrainingRecord, PeptideSpectrumCausalModel,
-    PeptideSpectrumChemistryDecoder, PeptidoformInput, PrecursorContextBatch,
+    foundation_diffusion_token_residue, foundation_diffusion_x0_loss,
+    foundation_direct_beam_search, foundation_direct_conditioning_loss,
+    foundation_direct_prefix_competitive_loss, foundation_direct_shuffled_order,
+    foundation_peptidoform_neutral_mass, foundation_precursor_neutral_mass,
+    load_causal_from_diffusion_checkpoint, load_chemistry_decoder_from_unified_checkpoint,
+    load_chemistry_diffusion_from_v0200_checkpoint, load_direct_decoder_from_unified_checkpoint,
+    load_foundation_corpus, read_foundation_training_run_config, ChemistryDiffusionFeaturizer,
+    ChemistrySuffixMassLattice, ChemistryTransitionFeaturizer, DirectDecoderBeamConfig,
+    FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCausalCollator,
+    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
+    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
+    PeptideSpectrumCausalModel, PeptideSpectrumChemistryDecoder,
+    PeptideSpectrumChemistryDiffusionModel, PeptidoformInput, PrecursorContextBatch,
     FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200, FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200,
+    FOUNDATION_CHEMISTRY_DIFFUSION_ARCHITECTURE_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_INITIAL_BEAM_WIDTH_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_OBJECTIVE_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_START_TIMESTEP_V0210,
+    FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_STEPS_V0210,
     FOUNDATION_CHEMISTRY_FRAGMENT_ABS_TOLERANCE_DA_V0200, FOUNDATION_CHEMISTRY_FRAGMENT_PPM_V0200,
     FOUNDATION_CHEMISTRY_SUFFIX_BIN_DA_V0200, FOUNDATION_CHEMISTRY_TRANSITION_FEATURE_DIM_V0200,
     FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
@@ -3288,4 +3300,1044 @@ fn mix64(mut value: u64) -> u64 {
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+// -----------------------------------------------------------------------------
+// v0.21 chemistry-conditioned whole-sequence diffusion / iterative refinement.
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+struct ChemistryDiffusionMetricsV0210 {
+    timestep: usize,
+    matched_nll: f64,
+    shuffled_nll: f64,
+    conditioning_gap: f64,
+    token_accuracy: f64,
+    exact_sequence_rate: f64,
+    active_tokens: usize,
+    sequences: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChemistryDiffusionCheckpointV0210<'a> {
+    version: &'a str,
+    objective: &'a str,
+    architecture: &'a str,
+    run_mode: &'a str,
+    test_partition_consumed: bool,
+    global_step: usize,
+    fixed_refinement_steps: usize,
+    refinement_timesteps: Vec<usize>,
+    fixed_initial_beam_width: usize,
+    corruption_schedule: &'a str,
+    initialization: &'a str,
+    final_mass_policy: &'a str,
+    validation_selection_timestep: usize,
+    validation: ChemistryDiffusionMetricsV0210,
+    v0200_checkpoint: String,
+    inverse_config: FoundationDiffusionConfig,
+}
+
+#[derive(Debug, Default)]
+struct RefinementMetricsV0210 {
+    records: usize,
+    initialized_records: usize,
+    zero_initial_records: usize,
+    initial_literal_top1: usize,
+    initial_sequence_top1: usize,
+    initial_il_top1: usize,
+    final_literal_top1: usize,
+    final_sequence_top1: usize,
+    final_il_top1: usize,
+    initial_mass_error_abs_sum: f64,
+    pre_projection_mass_error_abs_sum: f64,
+    final_mass_error_abs_sum: f64,
+    initial_mass_error_records: usize,
+    pre_projection_mass_error_records: usize,
+    final_mass_error_records: usize,
+    pre_projection_mass_valid: usize,
+    final_mass_valid: usize,
+    changed_positions: usize,
+    compared_positions: usize,
+    initially_incorrect_positions: usize,
+    incorrect_positions_corrected: usize,
+    initially_correct_positions: usize,
+    correct_positions_damaged: usize,
+    per_step_changed_positions: Vec<usize>,
+    per_step_converged_records: Vec<usize>,
+    mass_projection_used: usize,
+    mass_projection_failed: usize,
+}
+
+impl RefinementMetricsV0210 {
+    fn print(&self) {
+        println!("final_records\t{}", self.records);
+        println!("v0200_initialized_records\t{}", self.initialized_records);
+        println!("v0200_zero_initial_records\t{}", self.zero_initial_records);
+        println!("initial_literal_top1\t{}", self.initial_literal_top1);
+        println!("initial_sequence_top1\t{}", self.initial_sequence_top1);
+        println!("initial_il_top1\t{}", self.initial_il_top1);
+        println!("final_literal_top1\t{}", self.final_literal_top1);
+        println!("final_sequence_top1\t{}", self.final_sequence_top1);
+        println!("final_il_top1\t{}", self.final_il_top1);
+        println!(
+            "initial_mean_abs_precursor_mass_error_da\t{:.8}",
+            if self.initial_mass_error_records == 0 {
+                f64::NAN
+            } else {
+                self.initial_mass_error_abs_sum / self.initial_mass_error_records as f64
+            }
+        );
+        println!(
+            "pre_projection_mean_abs_precursor_mass_error_da\t{:.8}",
+            if self.pre_projection_mass_error_records == 0 {
+                f64::NAN
+            } else {
+                self.pre_projection_mass_error_abs_sum
+                    / self.pre_projection_mass_error_records as f64
+            }
+        );
+        println!(
+            "final_mean_abs_precursor_mass_error_da\t{:.8}",
+            if self.final_mass_error_records == 0 {
+                f64::NAN
+            } else {
+                self.final_mass_error_abs_sum / self.final_mass_error_records as f64
+            }
+        );
+        println!(
+            "pre_projection_mass_valid_records\t{}",
+            self.pre_projection_mass_valid
+        );
+        println!("final_mass_valid_records\t{}", self.final_mass_valid);
+        println!(
+            "final_mass_valid_fraction\t{:.8}",
+            if self.records == 0 {
+                0.0
+            } else {
+                self.final_mass_valid as f64 / self.records as f64
+            }
+        );
+        println!("positions_compared_to_v0200\t{}", self.compared_positions);
+        println!("positions_changed_from_v0200\t{}", self.changed_positions);
+        println!(
+            "position_change_fraction_from_v0200\t{:.8}",
+            if self.compared_positions == 0 {
+                0.0
+            } else {
+                self.changed_positions as f64 / self.compared_positions as f64
+            }
+        );
+        println!(
+            "initially_incorrect_positions\t{}",
+            self.initially_incorrect_positions
+        );
+        println!(
+            "incorrect_v0200_positions_corrected\t{}",
+            self.incorrect_positions_corrected
+        );
+        println!(
+            "incorrect_position_correction_fraction\t{:.8}",
+            if self.initially_incorrect_positions == 0 {
+                0.0
+            } else {
+                self.incorrect_positions_corrected as f64
+                    / self.initially_incorrect_positions as f64
+            }
+        );
+        println!(
+            "initially_correct_positions\t{}",
+            self.initially_correct_positions
+        );
+        println!(
+            "correct_v0200_positions_damaged\t{}",
+            self.correct_positions_damaged
+        );
+        println!(
+            "correct_position_damage_fraction\t{:.8}",
+            if self.initially_correct_positions == 0 {
+                0.0
+            } else {
+                self.correct_positions_damaged as f64 / self.initially_correct_positions as f64
+            }
+        );
+        println!("final_mass_projection_used\t{}", self.mass_projection_used);
+        println!(
+            "final_mass_projection_failed\t{}",
+            self.mass_projection_failed
+        );
+        for (step, (&changed, &converged)) in self
+            .per_step_changed_positions
+            .iter()
+            .zip(&self.per_step_converged_records)
+            .enumerate()
+        {
+            println!(
+                "refinement_step\tstep={}\tpositions_changed={}\tconverged_records={}",
+                step + 1,
+                changed,
+                converged
+            );
+        }
+    }
+}
+
+/// v0.21 fixed first experiment.
+///
+/// The TRAIN objective is categorical x0 reconstruction from one fixed
+/// multinomial schedule plus the already-validated matched-vs-shuffled spectrum
+/// guard. Frozen validation initialization comes only from the trained v0.20
+/// width-128 chemistry decoder. TEST is never opened.
+pub(crate) fn v0210_main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 5 || args.len() > 6 {
+        anyhow::bail!(
+            "usage: foundation_train_chemistry_diffusion_v0210 RUN.yaml V0200_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke]"
+        );
+    }
+    let training_yaml = PathBuf::from(&args[1]);
+    let v0200_checkpoint = PathBuf::from(&args[2]);
+    let validation_candidates = PathBuf::from(&args[3]);
+    let output_root = PathBuf::from(&args[4]);
+    let mode = args.get(5).map(String::as_str).unwrap_or("full");
+    let (train_steps, batch_size, validation_limit) = match mode {
+        "full" => (4_000usize, 32usize, None),
+        "smoke" => (2usize, 2usize, Some(4usize)),
+        other => anyhow::bail!("unsupported v0.21 mode {other:?}; expected full or smoke"),
+    };
+    for path in [
+        training_yaml.as_path(),
+        v0200_checkpoint.as_path(),
+        validation_candidates.as_path(),
+        output_root.as_path(),
+    ] {
+        reject_test_path_v0190(path)?;
+    }
+
+    let run = read_foundation_training_run_config(&training_yaml)?;
+    let corpus = load_foundation_corpus(&run.corpus)?;
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&run.benchmark_manifest)?;
+    benchmark.validate_against_records(&corpus.records)?;
+
+    let v0200_metadata_path = if v0200_checkpoint.is_dir() {
+        v0200_checkpoint.join("metadata.yaml")
+    } else {
+        v0200_checkpoint
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("metadata.yaml")
+    };
+    let v0200_metadata: UnifiedV0190Metadata = serde_yaml::from_str(
+        &fs::read_to_string(&v0200_metadata_path)
+            .with_context(|| format!("read v0.20 metadata {v0200_metadata_path:?}"))?,
+    )?;
+    let mut config = v0200_metadata.inverse_config.clone();
+    // Freeze one schedule and width for the first v0.21 experiment regardless
+    // of incidental historical metadata drift.
+    config.model_dim = 96;
+    config.diffusion_steps = 20;
+    config.beta_start = 0.02;
+    config.beta_end = 0.35;
+    config.validate().map_err(anyhow::Error::msg)?;
+
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut train_indices = usable_indices(
+        &corpus.records,
+        &benchmark,
+        FoundationPartition::Train,
+        &config,
+        vocabulary,
+    );
+    train_indices.retain(|&index| v0200_precursor_mass(&corpus.records[index]).is_ok());
+    let validation_cohort = read_frozen_validation_cohort_v0190(
+        &validation_candidates,
+        &corpus.records,
+        &benchmark,
+        &config,
+        vocabulary,
+    )?;
+    let mut validation_indices = validation_cohort.indices.clone();
+    if let Some(limit) = validation_limit {
+        validation_indices.truncate(limit);
+    }
+    if train_indices.len() < batch_size || validation_indices.is_empty() {
+        anyhow::bail!(
+            "insufficient v0.21 records: train={} validation={} batch={batch_size}",
+            train_indices.len(),
+            validation_indices.len()
+        );
+    }
+
+    // Runtime partition isolation: all optimizer records are TRAIN and every
+    // frozen evaluation record is VALIDATION. The TEST set is not materialized.
+    let partition_for = |record_index: usize| {
+        benchmark
+            .entries
+            .iter()
+            .find(|entry| entry.record_index == record_index)
+            .map(|entry| entry.partition)
+            .ok_or_else(|| anyhow::anyhow!("benchmark missing record index {record_index}"))
+    };
+    let train_labels = train_indices
+        .iter()
+        .map(|&index| partition_for(index))
+        .collect::<Result<Vec<_>>>()?;
+    let validation_labels = validation_cohort
+        .indices
+        .iter()
+        .map(|&index| partition_for(index))
+        .collect::<Result<Vec<_>>>()?;
+    if !foundation_chemistry_diffusion_partition_isolated(&train_labels, &validation_labels) {
+        anyhow::bail!("v0.21 partition isolation failed before model construction");
+    }
+
+    fs::create_dir_all(&output_root)?;
+    let device = Device::cuda_if_available(0)?;
+    let diffusion_collator = FoundationDiffusionCollator::new(config.clone())?;
+    let causal_collator = FoundationCausalCollator::new(config.clone())?;
+    let spectrum_collator = FoundationSpectrumCollator::new(config.spectrum.clone())?;
+    let chemistry_diffusion =
+        ChemistryDiffusionFeaturizer::new(&config).map_err(anyhow::Error::msg)?;
+
+    let max_validation_mass = validation_cohort
+        .indices
+        .iter()
+        .map(|&index| v0200_precursor_mass(&corpus.records[index]))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(0.0f64, f64::max);
+    let initial_suffix_lattice =
+        ChemistrySuffixMassLattice::new(config.max_tokens, max_validation_mass + 100.0)
+            .map_err(anyhow::Error::msg)?;
+    let v0200_featurizer = ChemistryTransitionFeaturizer::new(&config, initial_suffix_lattice)
+        .map_err(anyhow::Error::msg)?;
+
+    let v0200_model_path = resolve_model_safetensors(&v0200_checkpoint);
+    let mut v0200_varmap = VarMap::new();
+    let v0200_vb = VarBuilder::from_varmap(&v0200_varmap, DType::F32, &device);
+    let v0200_model = PeptideSpectrumChemistryDecoder::new(config.clone(), v0200_vb)?;
+    v0200_varmap.load(&v0200_model_path).with_context(|| {
+        format!(
+            "load frozen trained v0.20 initialization checkpoint {}",
+            v0200_model_path.display()
+        )
+    })?;
+
+    let mut varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideSpectrumChemistryDiffusionModel::new(config.clone(), vb)?;
+    let warm = load_chemistry_diffusion_from_v0200_checkpoint(&varmap, &v0200_model_path, &device)?;
+    if warm.chemistry_variables != 4
+        || warm.new_diffusion_variables != 4
+        || warm.new_full_state_variables != 4
+        || warm.ignored_v0200_variables != 1
+    {
+        anyhow::bail!(
+            "v0.21 warm-start namespace contract drift: chemistry={} new_diffusion={} new_full_state={} ignored_v0200={} (expected 4/4/4/1)",
+            warm.chemistry_variables,
+            warm.new_diffusion_variables,
+            warm.new_full_state_variables,
+            warm.ignored_v0200_variables,
+        );
+    }
+
+    let refinement_timesteps =
+        foundation_chemistry_diffusion_refinement_timesteps(config.diffusion_steps)
+            .map_err(anyhow::Error::msg)?;
+    let refinement_start_cumulative_corruption = 1.0
+        - config
+            .alpha_bar(FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_START_TIMESTEP_V0210)
+            .map_err(anyhow::Error::msg)?;
+    println!("version\tv0.21.0");
+    println!("architecture\t{FOUNDATION_CHEMISTRY_DIFFUSION_ARCHITECTURE_V0210}");
+    println!("objective\t{FOUNDATION_CHEMISTRY_DIFFUSION_OBJECTIVE_V0210}");
+    println!("scientific_change\twhole_sequence_bidirectional_revision_of_v0200_hypotheses");
+    println!("autoregressive_family\tCLOSED_INITIALIZATION_ONLY");
+    println!("initialization\tfrozen_v0200_width128_top1");
+    println!("initial_beam_width\t{FOUNDATION_CHEMISTRY_DIFFUSION_INITIAL_BEAM_WIDTH_V0210}");
+    println!("diffusion_steps\t{}", config.diffusion_steps);
+    println!("beta_start\t{:.6}", config.beta_start);
+    println!("beta_end\t{:.6}", config.beta_end);
+    println!("refinement_steps\t{FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_STEPS_V0210}");
+    println!("refinement_timesteps\t{:?}", refinement_timesteps);
+    println!(
+        "refinement_start_timestep\t{}",
+        FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_START_TIMESTEP_V0210
+    );
+    println!("refinement_start_cumulative_corruption\t{refinement_start_cumulative_corruption:.6}");
+    println!("sequence_length_policy\tpreserve_v0200_initial_active_length");
+    println!("early_mid_mass_policy\tsoft_conditioning_only");
+    println!("final_mass_policy\thard_validity_plus_fixed_hamming_radius2_projection_then_v0200_valid_fallback");
+    println!("fragment_peaks_define_state_existence\tfalse");
+    println!("fragment_peaks_are_soft_evidence\ttrue");
+    println!("model_dim\t{}", config.model_dim);
+    println!("train_steps\t{train_steps}");
+    println!("batch_size\t{batch_size}");
+    println!("learning_rate\t0.0001");
+    println!("weight_decay\t0.0001");
+    println!("max_gradient_norm\t5");
+    println!("training_seed\t20260921");
+    println!("device\t{device:?}");
+    println!("warm_shared_variables\t{}", warm.shared_variables);
+    println!("warm_chemistry_variables\t{}", warm.chemistry_variables);
+    println!("new_diffusion_variables\t{}", warm.new_diffusion_variables);
+    println!(
+        "new_full_state_variables\t{}",
+        warm.new_full_state_variables
+    );
+    println!("ignored_v0200_variables\t{}", warm.ignored_v0200_variables);
+    println!("validation_cohort_policy\tfrozen_v01323_mass_valid_record_ids_only");
+    println!("validation_records\t{}", validation_indices.len());
+    println!("frozen_v0200_reference\ttop1_literal=7\ttop1_il=12\ttop5_literal=12\ttop5_il=20\ttop10_literal=18\ttop10_il=24\ttop32_literal=24\ttop32_il=28\ttop128_literal=27\ttop128_il=33");
+    println!("accepted_v01323_baseline\ttop1_literal=24\ttop1_il=38");
+    println!("progress_target\ttop1_literal=28\ttop1_il=42");
+    println!("final_candidate_policy\tone_refined_hypothesis_per_initialized_spectrum");
+    println!("test_partition_consumed\tfalse");
+    println!("mode\t{mode}");
+
+    let validation_timestep = 8usize;
+    let initial_metrics = evaluate_chemistry_diffusion_v0210(
+        &model,
+        &corpus.records,
+        &validation_indices,
+        batch_size,
+        validation_timestep,
+        &diffusion_collator,
+        &spectrum_collator,
+        &chemistry_diffusion,
+        &device,
+        20_260_921,
+    )?;
+    print_chemistry_diffusion_v0210("initial_validation", 0, initial_metrics);
+    save_v0210_checkpoint(
+        &output_root.join("initial"),
+        &varmap,
+        &config,
+        mode,
+        0,
+        validation_timestep,
+        initial_metrics,
+        &v0200_model_path,
+    )?;
+    save_v0210_checkpoint(
+        &output_root.join("best"),
+        &varmap,
+        &config,
+        mode,
+        0,
+        validation_timestep,
+        initial_metrics,
+        &v0200_model_path,
+    )?;
+    let mut best_step = 0usize;
+    let mut best_metrics = initial_metrics;
+    let mut best_objective = v0210_validation_objective(initial_metrics);
+
+    let mut optimizer = FoundationAdamW::new(
+        &varmap,
+        FoundationAdamWConfig {
+            learning_rate: 1.0e-4,
+            weight_decay: 1.0e-4,
+            ..FoundationAdamWConfig::default()
+        },
+    )?;
+
+    for step in 1..=train_steps {
+        let selected = deterministic_batch(
+            &train_indices,
+            batch_size,
+            20_260_921 ^ (step as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        );
+        let records = selected
+            .iter()
+            .map(|&i| &corpus.records[i])
+            .collect::<Vec<_>>();
+        let components = v0200_batch_components(&records)?;
+        let diffusion = diffusion_collator.collate_random_timesteps(
+            &components.peptides,
+            20_260_921 ^ step as u64,
+            &device,
+        )?;
+        let spectrum = spectrum_collator.collate(&components.spectra, &device)?;
+        let precursor = precursor_context(&records, &device)?;
+        let chemistry = chemistry_diffusion.featurize(
+            &diffusion.noisy_token_rows,
+            &diffusion.active_lengths,
+            &components.spectra,
+            &components.precursor_masses,
+            &components.charges,
+            &device,
+        )?;
+        let matched_output =
+            model.forward_t(&diffusion, &spectrum, &precursor, &chemistry, true)?;
+        let matched = foundation_diffusion_x0_loss(&matched_output, &diffusion)?;
+
+        let order = foundation_direct_shuffled_order(records.len(), 20_260_921 ^ step as u64)?;
+        let shuffled_spectra = order
+            .iter()
+            .map(|&i| components.spectra[i].clone())
+            .collect::<Vec<_>>();
+        let shuffled_spectrum = spectrum_collator.collate(&shuffled_spectra, &device)?;
+        let shuffled_chemistry = chemistry_diffusion.featurize(
+            &diffusion.noisy_token_rows,
+            &diffusion.active_lengths,
+            &shuffled_spectra,
+            &components.precursor_masses,
+            &components.charges,
+            &device,
+        )?;
+        let shuffled_output = model.forward_t(
+            &diffusion,
+            &shuffled_spectrum,
+            &precursor,
+            &shuffled_chemistry,
+            true,
+        )?;
+        let shuffled = foundation_diffusion_x0_loss(&shuffled_output, &diffusion)?;
+        let loss = foundation_direct_conditioning_loss(
+            &matched,
+            &shuffled,
+            FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+            FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
+        )?;
+        let matched_value = f64::from(matched.to_scalar::<f32>()?);
+        let shuffled_value = f64::from(shuffled.to_scalar::<f32>()?);
+        let objective_value = f64::from(loss.to_scalar::<f32>()?);
+        let update = optimizer.backward_step(&loss, Some(5.0))?;
+        if step == 1 || step % 25 == 0 || step == train_steps {
+            println!(
+                "train\tstep={step}\tobjective={objective_value:.6}\tmatched_nll={matched_value:.6}\tshuffled_nll={shuffled_value:.6}\tconditioning_gap={:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                shuffled_value - matched_value,
+                update.gradient_norm,
+                update.gradient_scale
+            );
+        }
+        if step % 100 == 0 || step == train_steps {
+            let metrics = evaluate_chemistry_diffusion_v0210(
+                &model,
+                &corpus.records,
+                &validation_indices,
+                batch_size,
+                validation_timestep,
+                &diffusion_collator,
+                &spectrum_collator,
+                &chemistry_diffusion,
+                &device,
+                20_260_921 ^ step as u64,
+            )?;
+            print_chemistry_diffusion_v0210("validation", step, metrics);
+            save_v0210_checkpoint(
+                &output_root.join("latest"),
+                &varmap,
+                &config,
+                mode,
+                step,
+                validation_timestep,
+                metrics,
+                &v0200_model_path,
+            )?;
+            let objective = v0210_validation_objective(metrics);
+            if objective < best_objective
+                && metrics.conditioning_gap >= FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190
+            {
+                best_objective = objective;
+                best_metrics = metrics;
+                best_step = step;
+                save_v0210_checkpoint(
+                    &output_root.join("best"),
+                    &varmap,
+                    &config,
+                    mode,
+                    step,
+                    validation_timestep,
+                    metrics,
+                    &v0200_model_path,
+                )?;
+            }
+        }
+    }
+
+    load_varmap_checkpoint_v0210(
+        &varmap,
+        &output_root.join("best/model.safetensors"),
+        &device,
+    )?;
+    println!("best_step\t{best_step}");
+    print_chemistry_diffusion_v0210("final_best_validation", best_step, best_metrics);
+
+    // Required reconstruction-by-timestep telemetry uses the same fixed cohort.
+    for timestep in [1usize, 5, 8, 10, 15, 20] {
+        let metrics = evaluate_chemistry_diffusion_v0210(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            batch_size,
+            timestep,
+            &diffusion_collator,
+            &spectrum_collator,
+            &chemistry_diffusion,
+            &device,
+            20_260_921 ^ 0x5a5a_0000 ^ timestep as u64,
+        )?;
+        print_chemistry_diffusion_v0210("reconstruction_by_timestep", best_step, metrics);
+    }
+
+    let refinement = evaluate_refinement_v0210(
+        &model,
+        &v0200_model,
+        &corpus.records,
+        &validation_indices,
+        &causal_collator,
+        &diffusion_collator,
+        &spectrum_collator,
+        &v0200_featurizer,
+        &chemistry_diffusion,
+        &config,
+        &device,
+    )?;
+    refinement.print();
+
+    if mode == "full" {
+        if refinement.initial_literal_top1 != 7
+            || refinement.initial_sequence_top1 != 7
+            || refinement.initial_il_top1 != 12
+            || refinement.initialized_records != 118
+            || refinement.zero_initial_records != 7
+        {
+            anyhow::bail!(
+                "v0.21 frozen v0.20 initialization drift: observed literal/sequence/I-L={}/{}/{} initialized/zero={}/{}; expected 7/7/12 and 118/7",
+                refinement.initial_literal_top1,
+                refinement.initial_sequence_top1,
+                refinement.initial_il_top1,
+                refinement.initialized_records,
+                refinement.zero_initial_records,
+            );
+        }
+        // Predeclare "material" as lifting top-1 to at least the frozen v0.20
+        // top-5 recovery in both literal and I/L space (12/20). This avoids
+        // granting another architecture iteration for a marginal fluctuation.
+        let materially_improved =
+            refinement.final_literal_top1 >= 12 && refinement.final_il_top1 >= 20;
+        let baseline_recovered =
+            refinement.final_literal_top1 >= 24 && refinement.final_il_top1 >= 38;
+        let progress = refinement.final_literal_top1 >= 28 && refinement.final_il_top1 >= 42;
+        println!(
+            "baseline_recovery_gate\t{}",
+            if baseline_recovered { "PASS" } else { "FAIL" }
+        );
+        println!("progress_gate\t{}", if progress { "PASS" } else { "FAIL" });
+        println!("material_improvement_threshold\tliteral>=12_and_il>=20");
+        println!(
+            "material_improvement_over_v0200\t{}",
+            if materially_improved { "YES" } else { "NO" }
+        );
+        let decision = if progress {
+            "PROGRESS_TARGET_MET_ADVANCE_FROM_V0210"
+        } else if baseline_recovered {
+            "BASELINE_RECOVERED_V0210_IS_VIABLE"
+        } else if materially_improved {
+            "PARTIAL_SUCCESS_ALLOW_AT_MOST_ONE_COHERENT_ARCHITECTURAL_CORRECTION"
+        } else {
+            "STOP_LOCAL_DIFFUSION_REASSESS_INVERSE_GENERATION_FORMULATION"
+        };
+        println!("v0210_stop_rule\t{decision}");
+    } else {
+        println!("v0210_stop_rule\tSMOKE_RUNTIME_ONLY_NO_SCIENTIFIC_DECISION");
+    }
+    println!("test_partition_consumed\tfalse");
+    Ok(())
+}
+
+fn v0210_validation_objective(metrics: ChemistryDiffusionMetricsV0210) -> f64 {
+    metrics.matched_nll
+        + FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190
+            * (FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190 - metrics.conditioning_gap).max(0.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_chemistry_diffusion_v0210(
+    model: &PeptideSpectrumChemistryDiffusionModel,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    batch_size: usize,
+    timestep: usize,
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    chemistry: &ChemistryDiffusionFeaturizer,
+    device: &Device,
+    seed: u64,
+) -> Result<ChemistryDiffusionMetricsV0210> {
+    let mut matched_weighted = 0.0f64;
+    let mut shuffled_weighted = 0.0f64;
+    let mut active_tokens = 0usize;
+    let mut correct_tokens = 0usize;
+    let mut exact_sequences = 0usize;
+    let mut sequences = 0usize;
+    for (chunk_index, chunk) in indices.chunks(batch_size).enumerate() {
+        if chunk.len() < 2 {
+            continue;
+        }
+        let selected = chunk.iter().map(|&i| &records[i]).collect::<Vec<_>>();
+        let components = v0200_batch_components(&selected)?;
+        let timesteps = vec![timestep; selected.len()];
+        let diffusion = diffusion_collator.collate(
+            &components.peptides,
+            &timesteps,
+            seed ^ chunk_index as u64,
+            device,
+        )?;
+        let spectrum = spectrum_collator.collate(&components.spectra, device)?;
+        let precursor = precursor_context(&selected, device)?;
+        let matched_chemistry = chemistry.featurize(
+            &diffusion.noisy_token_rows,
+            &diffusion.active_lengths,
+            &components.spectra,
+            &components.precursor_masses,
+            &components.charges,
+            device,
+        )?;
+        let matched_output =
+            model.forward_t(&diffusion, &spectrum, &precursor, &matched_chemistry, false)?;
+        let matched = foundation_diffusion_x0_loss(&matched_output, &diffusion)?;
+
+        let order =
+            foundation_direct_shuffled_order(selected.len(), seed ^ 0x7777 ^ chunk_index as u64)?;
+        let shuffled_spectra = order
+            .iter()
+            .map(|&i| components.spectra[i].clone())
+            .collect::<Vec<_>>();
+        let shuffled_spectrum = spectrum_collator.collate(&shuffled_spectra, device)?;
+        let shuffled_chemistry = chemistry.featurize(
+            &diffusion.noisy_token_rows,
+            &diffusion.active_lengths,
+            &shuffled_spectra,
+            &components.precursor_masses,
+            &components.charges,
+            device,
+        )?;
+        let shuffled_output = model.forward_t(
+            &diffusion,
+            &shuffled_spectrum,
+            &precursor,
+            &shuffled_chemistry,
+            false,
+        )?;
+        let shuffled = foundation_diffusion_x0_loss(&shuffled_output, &diffusion)?;
+        let chunk_active = diffusion.active_indices.dims1()?;
+        matched_weighted += f64::from(matched.to_scalar::<f32>()?) * chunk_active as f64;
+        shuffled_weighted += f64::from(shuffled.to_scalar::<f32>()?) * chunk_active as f64;
+
+        let logits = matched_output.token_logits.to_vec3::<f32>()?;
+        let targets = diffusion.clean_tokens.to_vec2::<u32>()?;
+        for row in 0..selected.len() {
+            let mut exact = true;
+            for position in 0..diffusion.active_lengths[row] {
+                let predicted = argmax(&logits[row][position]) as u32;
+                let target = targets[row][position];
+                correct_tokens += usize::from(predicted == target);
+                active_tokens += 1;
+                exact &= predicted == target;
+            }
+            exact_sequences += usize::from(exact);
+            sequences += 1;
+        }
+    }
+    if active_tokens == 0 || sequences == 0 {
+        anyhow::bail!("v0.21 denoising validation produced no active tokens");
+    }
+    let matched_nll = matched_weighted / active_tokens as f64;
+    let shuffled_nll = shuffled_weighted / active_tokens as f64;
+    Ok(ChemistryDiffusionMetricsV0210 {
+        timestep,
+        matched_nll,
+        shuffled_nll,
+        conditioning_gap: shuffled_nll - matched_nll,
+        token_accuracy: correct_tokens as f64 / active_tokens as f64,
+        exact_sequence_rate: exact_sequences as f64 / sequences as f64,
+        active_tokens,
+        sequences,
+    })
+}
+
+fn print_chemistry_diffusion_v0210(
+    label: &str,
+    step: usize,
+    metrics: ChemistryDiffusionMetricsV0210,
+) {
+    println!(
+        "{label}\tstep={step}\ttimestep={}\tmatched_spectrum_token_nll={:.6}\tshuffled_spectrum_token_nll={:.6}\tconditioning_gap={:.6}\ttoken_reconstruction_accuracy={:.8}\tcomplete_sequence_reconstruction_rate={:.8}\tactive_tokens={}\tsequences={}",
+        metrics.timestep,
+        metrics.matched_nll,
+        metrics.shuffled_nll,
+        metrics.conditioning_gap,
+        metrics.token_accuracy,
+        metrics.exact_sequence_rate,
+        metrics.active_tokens,
+        metrics.sequences,
+    );
+}
+
+fn save_v0210_checkpoint(
+    directory: &Path,
+    varmap: &VarMap,
+    config: &FoundationDiffusionConfig,
+    mode: &str,
+    step: usize,
+    validation_timestep: usize,
+    validation: ChemistryDiffusionMetricsV0210,
+    v0200_checkpoint: &Path,
+) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    varmap.save(directory.join("model.safetensors"))?;
+    let metadata = ChemistryDiffusionCheckpointV0210 {
+        version: "v0.21.0",
+        objective: FOUNDATION_CHEMISTRY_DIFFUSION_OBJECTIVE_V0210,
+        architecture: FOUNDATION_CHEMISTRY_DIFFUSION_ARCHITECTURE_V0210,
+        run_mode: mode,
+        test_partition_consumed: false,
+        global_step: step,
+        fixed_refinement_steps: FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_STEPS_V0210,
+        refinement_timesteps: foundation_chemistry_diffusion_refinement_timesteps(
+            config.diffusion_steps,
+        )
+        .map_err(anyhow::Error::msg)?,
+        fixed_initial_beam_width: FOUNDATION_CHEMISTRY_DIFFUSION_INITIAL_BEAM_WIDTH_V0210,
+        corruption_schedule: "linear_beta_0.02_to_0.35_over_20_steps",
+        initialization: "frozen_v0200_width128_top1_preserve_length",
+        final_mass_policy: "hard_exact_precursor_mass_with_fixed_hamming_radius2_projection_then_valid_v0200_fallback",
+        validation_selection_timestep: validation_timestep,
+        validation,
+        v0200_checkpoint: v0200_checkpoint.display().to_string(),
+        inverse_config: config.clone(),
+    };
+    fs::write(
+        directory.join("metadata.yaml"),
+        serde_yaml::to_string(&metadata)?,
+    )?;
+    Ok(())
+}
+
+fn load_varmap_checkpoint_v0210(varmap: &VarMap, path: &Path, device: &Device) -> Result<()> {
+    let checkpoint = candle_core::safetensors::load(path, device)?;
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("v0.21 VarMap lock poisoned"))?;
+    for (name, variable) in data.iter() {
+        variable.set(
+            checkpoint
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("v0.21 checkpoint missing {name}"))?,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_refinement_v0210(
+    model: &PeptideSpectrumChemistryDiffusionModel,
+    v0200_model: &PeptideSpectrumChemistryDecoder,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    causal_collator: &FoundationCausalCollator,
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    v0200_featurizer: &ChemistryTransitionFeaturizer,
+    chemistry: &ChemistryDiffusionFeaturizer,
+    config: &FoundationDiffusionConfig,
+    device: &Device,
+) -> Result<RefinementMetricsV0210> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let timesteps = foundation_chemistry_diffusion_refinement_timesteps(config.diffusion_steps)
+        .map_err(anyhow::Error::msg)?;
+    let mut metrics = RefinementMetricsV0210 {
+        per_step_changed_positions: vec![0; timesteps.len()],
+        per_step_converged_records: vec![0; timesteps.len()],
+        ..RefinementMetricsV0210::default()
+    };
+
+    for &index in indices {
+        metrics.records += 1;
+        let record = &records[index];
+        let precursor_mass = v0200_precursor_mass(record)?;
+        let charge = record
+            .context
+            .charge
+            .ok_or_else(|| anyhow::anyhow!("v0.21 validation record {index} lacks charge"))?;
+        let spectrum = FoundationSpectrum::from_training_record(record)
+            .ok_or_else(|| anyhow::anyhow!("v0.21 validation record {index} lacks spectrum"))?;
+        let spectrum_batch = spectrum_collator.collate(&[spectrum.clone()], device)?;
+        let precursor = precursor_context(&[record], device)?;
+        let context = v0200_model.prepare_context(&spectrum_batch, &precursor, false)?;
+        let candidates = foundation_direct_beam_search(
+            precursor_mass,
+            DirectDecoderBeamConfig {
+                beam_width: FOUNDATION_CHEMISTRY_DIFFUSION_INITIAL_BEAM_WIDTH_V0210,
+                top_k: 1,
+                mass_tolerance_da: config.precursor_mass_tolerance_da,
+                max_tokens: config.max_tokens,
+            },
+            |prefixes| {
+                let input = causal_collator
+                    .collate_compact_prefix_rows(prefixes, device)
+                    .map_err(|error| error.to_string())?;
+                let candidate_chemistry = v0200_featurizer
+                    .next_prefixes(prefixes, &spectrum, precursor_mass, charge, device)
+                    .map_err(|error| error.to_string())?;
+                let mut rows = v0200_model
+                    .forward_next_t_with_context(&input, &context, &candidate_chemistry, false)
+                    .and_then(|tensor| tensor.to_vec2::<f32>())
+                    .map_err(|error| error.to_string())?;
+                v0200_featurizer.mask_infeasible_next_logits(
+                    prefixes,
+                    &mut rows,
+                    precursor_mass,
+                )?;
+                Ok(rows)
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        let Some(initial_candidate) = candidates.first() else {
+            metrics.zero_initial_records += 1;
+            continue;
+        };
+        metrics.initialized_records += 1;
+        let mut initial = vec![FOUNDATION_DIFFUSION_PAD; config.max_tokens];
+        if initial_candidate.tokens.len() > config.max_tokens {
+            anyhow::bail!("v0.21 v0.20 initialization exceeds configured token width");
+        }
+        initial[..initial_candidate.tokens.len()].copy_from_slice(&initial_candidate.tokens);
+        let active_length = initial_candidate.tokens.len();
+        let initial_decoded = vocabulary.decode(&initial).map_err(anyhow::Error::msg)?;
+        metrics.initial_literal_top1 += usize::from(initial_decoded == record.peptidoform);
+        metrics.initial_sequence_top1 +=
+            usize::from(initial_decoded.sequence == record.peptidoform.sequence);
+        metrics.initial_il_top1 += usize::from(
+            il_sequence(&initial_decoded.sequence) == il_sequence(&record.peptidoform.sequence),
+        );
+        if let Ok(mass) = foundation_chemistry_diffusion_row_neutral_mass(&initial, active_length) {
+            metrics.initial_mass_error_abs_sum += (mass - precursor_mass).abs();
+            metrics.initial_mass_error_records += 1;
+        }
+
+        let target = vocabulary
+            .encode(&record.peptidoform, config.max_tokens)
+            .map_err(anyhow::Error::msg)?;
+        let target_active = target
+            .iter()
+            .position(|&token| token == FOUNDATION_DIFFUSION_PAD)
+            .unwrap_or(config.max_tokens);
+        let editable_len = active_length.saturating_sub(1);
+        let compare_len = editable_len.min(target_active.saturating_sub(1));
+
+        let mut current = initial.clone();
+        let mut last_logits = None::<Vec<Vec<f32>>>;
+        for (step_index, &timestep) in timesteps.iter().enumerate() {
+            let diffusion = diffusion_collator.collate_inference_tokens(
+                &[current.clone()],
+                &[active_length],
+                timestep,
+                device,
+            )?;
+            let candidate_chemistry = chemistry.featurize(
+                &diffusion.noisy_token_rows,
+                &diffusion.active_lengths,
+                &[spectrum.clone()],
+                &[precursor_mass],
+                &[charge],
+                device,
+            )?;
+            let output = model.forward_t(
+                &diffusion,
+                &spectrum_batch,
+                &precursor,
+                &candidate_chemistry,
+                false,
+            )?;
+            let logits = output.token_logits.to_vec3::<f32>()?;
+            let (next, changed) = foundation_chemistry_diffusion_argmax_refine(
+                &[current.clone()],
+                &[active_length],
+                &logits,
+            )
+            .map_err(anyhow::Error::msg)?;
+            metrics.per_step_changed_positions[step_index] += changed;
+            metrics.per_step_converged_records[step_index] += usize::from(changed == 0);
+            current = next.into_iter().next().unwrap();
+            last_logits = Some(logits.into_iter().next().unwrap());
+        }
+
+        let final_logits =
+            last_logits.ok_or_else(|| anyhow::anyhow!("v0.21 no refinement logits"))?;
+        if let Ok(mass) = foundation_chemistry_diffusion_row_neutral_mass(&current, active_length) {
+            metrics.pre_projection_mass_error_abs_sum += (mass - precursor_mass).abs();
+            metrics.pre_projection_mass_error_records += 1;
+        }
+        metrics.pre_projection_mass_valid +=
+            usize::from(foundation_chemistry_diffusion_final_mass_valid(
+                &current,
+                active_length,
+                precursor_mass,
+                config.precursor_mass_tolerance_da,
+            ));
+        let projected = foundation_chemistry_diffusion_project_mass_valid(
+            &current,
+            active_length,
+            &final_logits,
+            precursor_mass,
+            config.precursor_mass_tolerance_da,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let final_row = if let Some(projected) = projected {
+            metrics.mass_projection_used += usize::from(projected != current);
+            projected
+        } else if foundation_chemistry_diffusion_final_mass_valid(
+            &initial,
+            active_length,
+            precursor_mass,
+            config.precursor_mass_tolerance_da,
+        ) {
+            metrics.mass_projection_failed += 1;
+            initial.clone()
+        } else {
+            metrics.mass_projection_failed += 1;
+            current.clone()
+        };
+
+        metrics.final_mass_valid += usize::from(foundation_chemistry_diffusion_final_mass_valid(
+            &final_row,
+            active_length,
+            precursor_mass,
+            config.precursor_mass_tolerance_da,
+        ));
+        if let Ok(mass) = foundation_chemistry_diffusion_row_neutral_mass(&final_row, active_length)
+        {
+            metrics.final_mass_error_abs_sum += (mass - precursor_mass).abs();
+            metrics.final_mass_error_records += 1;
+        }
+        let final_decoded = vocabulary.decode(&final_row).map_err(anyhow::Error::msg)?;
+        metrics.final_literal_top1 += usize::from(final_decoded == record.peptidoform);
+        metrics.final_sequence_top1 +=
+            usize::from(final_decoded.sequence == record.peptidoform.sequence);
+        metrics.final_il_top1 += usize::from(
+            il_sequence(&final_decoded.sequence) == il_sequence(&record.peptidoform.sequence),
+        );
+
+        metrics.compared_positions += editable_len;
+        metrics.changed_positions += (0..editable_len)
+            .filter(|&position| initial[position] != final_row[position])
+            .count();
+        for position in 0..compare_len {
+            if initial[position] == target[position] {
+                metrics.initially_correct_positions += 1;
+                metrics.correct_positions_damaged +=
+                    usize::from(final_row[position] != target[position]);
+            } else {
+                metrics.initially_incorrect_positions += 1;
+                metrics.incorrect_positions_corrected +=
+                    usize::from(final_row[position] == target[position]);
+            }
+        }
+    }
+    Ok(metrics)
 }
