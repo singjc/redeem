@@ -21,8 +21,10 @@ use redeem_properties::foundation::{
     FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -327,21 +329,22 @@ fn main() -> Result<()> {
 /// v0.19 entry point reused by `foundation_train_direct_decoder_v0190`.
 ///
 /// It lives here so the established, audited corpus/partition/collation helpers
-/// remain the single implementation used by both causal generations.  Unlike
+/// remain the single implementation used by both causal generations. Unlike
 /// the historical executable, v0.19 trains on CUDA, adds the spectrum-use
-/// objective, evaluates the entire frozen VALIDATION partition, and finishes
-/// with direct mass-constrained beam decoding.
+/// objective, evaluates the frozen 125-record v0.13.23 validation cohort, and
+/// finishes with direct mass-constrained beam decoding.
 pub(crate) fn v0190_main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 || args.len() > 5 {
+    if args.len() < 5 || args.len() > 6 {
         anyhow::bail!(
-            "usage: foundation_train_direct_decoder_v0190 RUN.yaml UNIFIED_CHECKPOINT OUTPUT_DIR [full|smoke]"
+            "usage: foundation_train_direct_decoder_v0190 RUN.yaml UNIFIED_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke]"
         );
     }
     let training_yaml = PathBuf::from(&args[1]);
     let parent = PathBuf::from(&args[2]);
-    let output_root = PathBuf::from(&args[3]);
-    let mode = args.get(4).map(String::as_str).unwrap_or("full");
+    let validation_candidates = PathBuf::from(&args[3]);
+    let output_root = PathBuf::from(&args[4]);
+    let mode = args.get(5).map(String::as_str).unwrap_or("full");
     let (train_steps, batch_size, validation_limit, beam_width) = match mode {
         "full" => (4_000usize, 32usize, None, 128usize),
         "smoke" => (2usize, 2usize, Some(4usize), 8usize),
@@ -349,6 +352,7 @@ pub(crate) fn v0190_main() -> Result<()> {
     };
     reject_test_path_v0190(&training_yaml)?;
     reject_test_path_v0190(&parent)?;
+    reject_test_path_v0190(&validation_candidates)?;
     reject_test_path_v0190(&output_root)?;
 
     let run = read_foundation_training_run_config(&training_yaml)?;
@@ -378,13 +382,14 @@ pub(crate) fn v0190_main() -> Result<()> {
         &metadata.inverse_config,
         vocabulary,
     );
-    let mut validation_indices = usable_indices(
+    let validation_cohort = read_frozen_validation_cohort_v0190(
+        &validation_candidates,
         &corpus.records,
         &benchmark,
-        FoundationPartition::Validation,
         &metadata.inverse_config,
         vocabulary,
-    );
+    )?;
+    let mut validation_indices = validation_cohort.indices.clone();
     if let Some(limit) = validation_limit {
         validation_indices.truncate(limit);
     }
@@ -392,12 +397,6 @@ pub(crate) fn v0190_main() -> Result<()> {
         anyhow::bail!(
             "insufficient v0.19 pairs: train={} validation={} batch={batch_size}",
             train_indices.len(),
-            validation_indices.len()
-        );
-    }
-    if mode == "full" && validation_indices.len() != 125 {
-        anyhow::bail!(
-            "frozen v0.19 VALIDATION contract requires exactly 125 usable records, found {}",
             validation_indices.len()
         );
     }
@@ -425,6 +424,23 @@ pub(crate) fn v0190_main() -> Result<()> {
     println!("architecture\tmasked_self_attention+full_peak_cross_attention+ff");
     println!("objective\t{FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190}");
     println!("proposal_generation_required\tfalse");
+    println!("proposal_candidates_used_for_training\tfalse");
+    println!("proposal_candidates_used_for_decoding\tfalse");
+    println!(
+        "validation_cohort_source\t{}",
+        validation_candidates.display()
+    );
+    println!(
+        "validation_cohort_policy\tfrozen_v01323_mass_valid_record_ids_only"
+    );
+    println!(
+        "validation_cohort_contract\trecords={}\toracle_literal={}\toracle_il={}\tlegacy_top1_literal={}\tlegacy_top1_il={}",
+        validation_cohort.indices.len(),
+        validation_cohort.oracle_literal,
+        validation_cohort.oracle_il,
+        validation_cohort.legacy_literal_top1,
+        validation_cohort.legacy_il_top1
+    );
     println!("test_partition_consumed\tfalse");
     println!("mode\t{mode}");
     println!("device\t{device:?}");
@@ -475,6 +491,7 @@ pub(crate) fn v0190_main() -> Result<()> {
         &parent_model,
     )?;
     let mut best_objective = initial.objective;
+    let mut best_conditioning = initial;
 
     for step in 1..=train_steps {
         let selected = deterministic_batch(
@@ -544,6 +561,7 @@ pub(crate) fn v0190_main() -> Result<()> {
             )?;
             if metrics.objective < best_objective && metrics.conditioning_gap > 0.0 {
                 best_objective = metrics.objective;
+                best_conditioning = metrics;
                 save_v0190_checkpoint(
                     &output_root.join("best"),
                     &varmap,
@@ -594,15 +612,257 @@ pub(crate) fn v0190_main() -> Result<()> {
         "mass_valid_beam_fraction\t{:.8}",
         generation.mass_valid_fraction()
     );
-    let gate = if generation.literal_top1 >= 28 && generation.il_top1 >= 42 {
+    print_conditioning_v0190("final_best_validation", 0, best_conditioning);
+    let conditioning_guard = best_conditioning.conditioning_gap > 0.0;
+    println!(
+        "conditioning_guard\t{}",
+        if conditioning_guard { "PASS" } else { "FAIL" }
+    );
+    if mode == "smoke" {
+        println!("v0190_representation_gate\tNOT_EVALUATED_SMOKE_RUNTIME_ONLY");
+        println!("v0190_stop_rule\tSMOKE_RUNTIME_ONLY_NO_SCIENTIFIC_DECISION");
+        return Ok(());
+    }
+    let gate = if generation.literal_top1 >= 28
+        && generation.il_top1 >= 42
+        && conditioning_guard
+    {
         "PROGRESS_MILESTONE"
-    } else if generation.literal_top1 >= 24 && generation.il_top1 >= 38 {
+    } else if generation.literal_top1 >= 24
+        && generation.il_top1 >= 38
+        && conditioning_guard
+    {
         "BASELINE_RECOVERY"
+    } else if !conditioning_guard {
+        "CONDITIONING_GUARD_NOT_MET"
     } else {
         "BELOW_BASELINE_RECOVERY"
     };
     println!("scientific_gate\t{gate}");
     Ok(())
+}
+
+const FROZEN_V0190_VALIDATION_RECORDS: usize = 125;
+const FROZEN_V0190_ORACLE_LITERAL: usize = 44;
+const FROZEN_V0190_ORACLE_IL: usize = 54;
+const FROZEN_V0190_LEGACY_LITERAL_TOP1: usize = 24;
+const FROZEN_V0190_LEGACY_IL_TOP1: usize = 38;
+
+#[derive(Debug, Clone)]
+struct FrozenValidationCohortV0190 {
+    indices: Vec<usize>,
+    oracle_literal: usize,
+    oracle_il: usize,
+    legacy_literal_top1: usize,
+    legacy_il_top1: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenValidationGroupV0190 {
+    oracle_literal: bool,
+    oracle_il: bool,
+    legacy_rank: usize,
+    legacy_literal_top1: bool,
+    legacy_il_top1: bool,
+}
+
+impl Default for FrozenValidationGroupV0190 {
+    fn default() -> Self {
+        Self {
+            oracle_literal: false,
+            oracle_il: false,
+            legacy_rank: usize::MAX,
+            legacy_literal_top1: false,
+            legacy_il_top1: false,
+        }
+    }
+}
+
+fn read_frozen_validation_cohort_v0190(
+    path: &Path,
+    records: &[FoundationTrainingRecord],
+    benchmark: &FoundationBenchmarkManifest,
+    config: &FoundationDiffusionConfig,
+    vocabulary: FoundationDiffusionVocabulary,
+) -> Result<FrozenValidationCohortV0190> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("read frozen v0.19 validation cohort {path:?}"))?;
+    let cohort = parse_frozen_validation_cohort_v0190(BufReader::new(file))?;
+
+    let validation_partition = benchmark
+        .partition_indices(FoundationPartition::Validation)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for &index in &cohort.indices {
+        let record = records.get(index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen v0.19 validation cohort contains out-of-range record index {index}"
+            )
+        })?;
+        if !validation_partition.contains(&index) {
+            anyhow::bail!(
+                "frozen v0.19 validation cohort record {index} is not assigned to VALIDATION"
+            );
+        }
+        if FoundationSpectrum::from_training_record(record).is_none()
+            || vocabulary
+                .encode(&record.peptidoform, config.max_tokens)
+                .is_err()
+        {
+            anyhow::bail!(
+                "frozen v0.19 validation cohort record {index} is not usable by the direct decoder"
+            );
+        }
+    }
+    Ok(cohort)
+}
+
+fn parse_frozen_validation_cohort_v0190<R: BufRead>(
+    mut reader: R,
+) -> Result<FrozenValidationCohortV0190> {
+    let mut header = String::new();
+    if reader.read_line(&mut header)? == 0 {
+        anyhow::bail!("frozen v0.19 validation candidate TSV is empty");
+    }
+    let columns = header
+        .trim_end_matches(&['\r', '\n'][..])
+        .split('\t')
+        .collect::<Vec<_>>();
+    let mut column_index = BTreeMap::<&str, usize>::new();
+    for (index, name) in columns.iter().enumerate() {
+        column_index.insert(*name, index);
+    }
+    for required in [
+        "record_index",
+        "fragment_causal_mass_rank",
+        "mass_valid",
+        "peptidoform_exact",
+        "il_sequence_exact",
+    ] {
+        if !column_index.contains_key(required) {
+            anyhow::bail!(
+                "frozen v0.19 validation candidate TSV missing required column '{required}'"
+            );
+        }
+    }
+
+    let mut groups = BTreeMap::<usize, FrozenValidationGroupV0190>::new();
+    let mut group_order = Vec::<usize>::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let get = |name: &str| -> Result<&str> {
+            let index = *column_index
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("internal missing candidate TSV column {name}"))?;
+            fields
+                .get(index)
+                .copied()
+                .with_context(|| format!("candidate row missing column {name}"))
+        };
+        if !parse_bool_v0190(get("mass_valid")?) {
+            continue;
+        }
+        let record_index: usize = get("record_index")?.parse()?;
+        let rank: usize = get("fragment_causal_mass_rank")?.parse()?;
+        let exact = parse_bool_v0190(get("peptidoform_exact")?);
+        let il_exact = parse_bool_v0190(get("il_sequence_exact")?);
+        if !groups.contains_key(&record_index) {
+            group_order.push(record_index);
+        }
+        let group = groups.entry(record_index).or_default();
+        group.oracle_literal |= exact;
+        group.oracle_il |= il_exact;
+        if rank < group.legacy_rank {
+            group.legacy_rank = rank;
+            group.legacy_literal_top1 = exact;
+            group.legacy_il_top1 = il_exact;
+        }
+    }
+
+    let cohort = FrozenValidationCohortV0190 {
+        indices: group_order,
+        oracle_literal: groups.values().filter(|group| group.oracle_literal).count(),
+        oracle_il: groups.values().filter(|group| group.oracle_il).count(),
+        legacy_literal_top1: groups
+            .values()
+            .filter(|group| group.legacy_literal_top1)
+            .count(),
+        legacy_il_top1: groups
+            .values()
+            .filter(|group| group.legacy_il_top1)
+            .count(),
+    };
+    if cohort.indices.len() != FROZEN_V0190_VALIDATION_RECORDS
+        || cohort.oracle_literal != FROZEN_V0190_ORACLE_LITERAL
+        || cohort.oracle_il != FROZEN_V0190_ORACLE_IL
+        || cohort.legacy_literal_top1 != FROZEN_V0190_LEGACY_LITERAL_TOP1
+        || cohort.legacy_il_top1 != FROZEN_V0190_LEGACY_IL_TOP1
+    {
+        anyhow::bail!(
+            "frozen v0.19 validation cohort mismatch: records={} oracle={}/{} legacy_top1={}/{} expected records={} oracle={}/{} legacy_top1={}/{}",
+            cohort.indices.len(),
+            cohort.oracle_literal,
+            cohort.oracle_il,
+            cohort.legacy_literal_top1,
+            cohort.legacy_il_top1,
+            FROZEN_V0190_VALIDATION_RECORDS,
+            FROZEN_V0190_ORACLE_LITERAL,
+            FROZEN_V0190_ORACLE_IL,
+            FROZEN_V0190_LEGACY_LITERAL_TOP1,
+            FROZEN_V0190_LEGACY_IL_TOP1
+        );
+    }
+    Ok(cohort)
+}
+
+fn parse_bool_v0190(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y"
+    )
+}
+
+#[cfg(test)]
+mod v0190_validation_cohort_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn frozen_validation_candidate_contract_reconstructs_accepted_125_record_cohort() {
+        let mut tsv = String::from(
+            "record_index\tfragment_causal_mass_rank\tmass_valid\tpeptidoform_exact\til_sequence_exact\n",
+        );
+        for record_index in 0..FROZEN_V0190_VALIDATION_RECORDS {
+            let top1_exact = record_index < FROZEN_V0190_LEGACY_LITERAL_TOP1;
+            let top1_il = record_index < FROZEN_V0190_LEGACY_IL_TOP1;
+            tsv.push_str(&format!(
+                "{record_index}\t0\ttrue\t{top1_exact}\t{top1_il}\n"
+            ));
+            if (24..44).contains(&record_index) {
+                tsv.push_str(&format!("{record_index}\t1\ttrue\ttrue\ttrue\n"));
+            } else if (44..54).contains(&record_index) {
+                tsv.push_str(&format!("{record_index}\t1\ttrue\tfalse\ttrue\n"));
+            }
+        }
+
+        let cohort = parse_frozen_validation_cohort_v0190(Cursor::new(tsv)).unwrap();
+        assert_eq!(cohort.indices.len(), FROZEN_V0190_VALIDATION_RECORDS);
+        assert_eq!(
+            cohort.indices,
+            (0..FROZEN_V0190_VALIDATION_RECORDS).collect::<Vec<_>>()
+        );
+        assert_eq!(cohort.oracle_literal, FROZEN_V0190_ORACLE_LITERAL);
+        assert_eq!(cohort.oracle_il, FROZEN_V0190_ORACLE_IL);
+        assert_eq!(
+            cohort.legacy_literal_top1,
+            FROZEN_V0190_LEGACY_LITERAL_TOP1
+        );
+        assert_eq!(cohort.legacy_il_top1, FROZEN_V0190_LEGACY_IL_TOP1);
+    }
 }
 
 #[derive(Debug, Deserialize)]
