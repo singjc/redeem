@@ -14,12 +14,16 @@ use redeem_properties::foundation::{
     foundation_direct_conditioning_loss, foundation_direct_prefix_competitive_loss,
     foundation_direct_shuffled_order, foundation_peptidoform_neutral_mass,
     foundation_precursor_neutral_mass, load_causal_from_diffusion_checkpoint,
-    load_direct_decoder_from_unified_checkpoint, load_foundation_corpus,
-    read_foundation_training_run_config, DirectDecoderBeamConfig, FoundationAdamW,
-    FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCausalCollator,
-    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationPartition,
-    FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
-    PeptideSpectrumCausalModel, PeptidoformInput, PrecursorContextBatch,
+    load_chemistry_decoder_from_unified_checkpoint, load_direct_decoder_from_unified_checkpoint,
+    load_foundation_corpus, read_foundation_training_run_config, ChemistrySuffixMassLattice,
+    ChemistryTransitionFeaturizer, DirectDecoderBeamConfig, FoundationAdamW, FoundationAdamWConfig,
+    FoundationBenchmarkManifest, FoundationCausalCollator, FoundationDiffusionConfig,
+    FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
+    FoundationSpectrumCollator, FoundationTrainingRecord, PeptideSpectrumCausalModel,
+    PeptideSpectrumChemistryDecoder, PeptidoformInput, PrecursorContextBatch,
+    FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200, FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200,
+    FOUNDATION_CHEMISTRY_FRAGMENT_ABS_TOLERANCE_DA_V0200, FOUNDATION_CHEMISTRY_FRAGMENT_PPM_V0200,
+    FOUNDATION_CHEMISTRY_SUFFIX_BIN_DA_V0200, FOUNDATION_CHEMISTRY_TRANSITION_FEATURE_DIM_V0200,
     FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
     FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
     FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL,
@@ -1254,6 +1258,774 @@ fn save_v0191_checkpoint(
         serde_yaml::to_string(&metadata)?,
     )?;
     Ok(())
+}
+
+/// v0.20 chemistry-structured direct decoder.
+///
+/// This is the single predeclared autoregressive architecture escalation after
+/// v0.19.0/0.19.1. It restarts from the accepted unified parent, retains the
+/// full-spectrum causal decoder, removes the rejected local prefix-margin loss,
+/// and adds explicit candidate-transition chemistry plus a conservative
+/// chemistry-only suffix feasibility mask at generation time.
+pub(crate) fn v0200_main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 5 || args.len() > 6 {
+        anyhow::bail!(
+            "usage: foundation_train_chemistry_decoder_v0200 RUN.yaml MODEL_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke]"
+        );
+    }
+    let training_yaml = PathBuf::from(&args[1]);
+    let parent = PathBuf::from(&args[2]);
+    let validation_candidates = PathBuf::from(&args[3]);
+    let output_root = PathBuf::from(&args[4]);
+    let mode = args.get(5).map(String::as_str).unwrap_or("full");
+    let (train_steps, batch_size, validation_limit, beam_width) = match mode {
+        "full" => (4_000usize, 32usize, None, 128usize),
+        "smoke" => (2usize, 2usize, Some(4usize), 8usize),
+        other => anyhow::bail!("unsupported v0.20 mode {other:?}; expected full or smoke"),
+    };
+    reject_test_path_v0190(&training_yaml)?;
+    reject_test_path_v0190(&parent)?;
+    reject_test_path_v0190(&validation_candidates)?;
+    reject_test_path_v0190(&output_root)?;
+
+    let run = read_foundation_training_run_config(&training_yaml)?;
+    let corpus = load_foundation_corpus(&run.corpus)?;
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&run.benchmark_manifest)?;
+    benchmark.validate_against_records(&corpus.records)?;
+    let metadata_path = parent.join("metadata.yaml");
+    let metadata: UnifiedV0190Metadata = serde_yaml::from_str(
+        &fs::read_to_string(&metadata_path)
+            .with_context(|| format!("read accepted unified metadata {metadata_path:?}"))?,
+    )?;
+    metadata
+        .inverse_config
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    if metadata.inverse_config.model_dim != 96 {
+        anyhow::bail!(
+            "v0.20 is anchored to the accepted 96-d unified checkpoint, found {}",
+            metadata.inverse_config.model_dim
+        );
+    }
+
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut train_indices = usable_indices(
+        &corpus.records,
+        &benchmark,
+        FoundationPartition::Train,
+        &metadata.inverse_config,
+        vocabulary,
+    );
+    // Explicit transition mass features require measured precursor m/z/charge.
+    // Missing precursor context is not replaced by theoretical target mass.
+    train_indices.retain(|&index| v0200_precursor_mass(&corpus.records[index]).is_ok());
+
+    let validation_cohort = read_frozen_validation_cohort_v0190(
+        &validation_candidates,
+        &corpus.records,
+        &benchmark,
+        &metadata.inverse_config,
+        vocabulary,
+    )?;
+    let mut validation_indices = validation_cohort.indices.clone();
+    if let Some(limit) = validation_limit {
+        validation_indices.truncate(limit);
+    }
+    if train_indices.len() < batch_size || validation_indices.is_empty() {
+        anyhow::bail!(
+            "insufficient v0.20 pairs with measured precursor context: train={} validation={} batch={batch_size}",
+            train_indices.len(),
+            validation_indices.len()
+        );
+    }
+
+    let max_validation_mass = validation_cohort
+        .indices
+        .iter()
+        .map(|&index| v0200_precursor_mass(&corpus.records[index]))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(0.0f64, f64::max);
+    let suffix_lattice = ChemistrySuffixMassLattice::new(
+        metadata.inverse_config.max_tokens,
+        max_validation_mass + 100.0,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let chemistry_featurizer =
+        ChemistryTransitionFeaturizer::new(&metadata.inverse_config, suffix_lattice)
+            .map_err(anyhow::Error::msg)?;
+
+    // The old v0.19 audit established 123/125 true targets as physically mass
+    // feasible. The new hard suffix constraint may not destroy any of those
+    // paths. This gate always audits the complete frozen cohort, including smoke.
+    let (mass_feasible_targets, suffix_feasible_targets) = v0200_true_path_contract(
+        &corpus.records,
+        &validation_cohort.indices,
+        &metadata.inverse_config,
+        &chemistry_featurizer,
+    )?;
+    if mass_feasible_targets != 123 {
+        anyhow::bail!(
+            "v0.20 frozen mass-feasibility contract changed: expected 123/125, found {mass_feasible_targets}/{}",
+            validation_cohort.indices.len()
+        );
+    }
+    if suffix_feasible_targets < mass_feasible_targets {
+        anyhow::bail!(
+            "v0.20 suffix lattice deletes true paths: mass_feasible={mass_feasible_targets} suffix_feasible={suffix_feasible_targets}"
+        );
+    }
+
+    fs::create_dir_all(&output_root)?;
+    let device = Device::cuda_if_available(0)?;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideSpectrumChemistryDecoder::new(metadata.inverse_config.clone(), vb)?;
+    let parent_model = resolve_model_safetensors(&parent);
+    let warm = load_chemistry_decoder_from_unified_checkpoint(&varmap, &parent_model, &device)?;
+    let causal_collator = FoundationCausalCollator::new(metadata.inverse_config.clone())?;
+    let spectrum_collator =
+        FoundationSpectrumCollator::new(metadata.inverse_config.spectrum.clone())?;
+
+    println!("version\tv0.20.0");
+    println!("architecture\t{FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200}");
+    println!("objective\t{FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200}");
+    println!("scientific_change\texplicit_residual_mass_residue_ptm_and_complementary_fragment_transition_scoring");
+    println!("initialization\taccepted_unified_parent_only");
+    println!("rejected_v0190_checkpoint_reused\tfalse");
+    println!("rejected_v0191_checkpoint_reused\tfalse");
+    println!("prefix_margin_objective\tREMOVED");
+    println!("compatibility_reranking_lane\tCLOSED");
+    println!("search_breadth_lane\tCLOSED");
+    println!("fragment_peaks_define_transition_existence\tfalse");
+    println!("fragment_peaks_are_soft_transition_evidence\ttrue");
+    println!("suffix_lattice_policy\tconservative_supported_residue_ptm_mass_reachability_inference_hard_mask");
+    println!("decoder_search_policy\tfull_prefix_distinct_standard_width128_plus_suffix_mass_feasibility");
+    println!("transition_feature_dim\t{FOUNDATION_CHEMISTRY_TRANSITION_FEATURE_DIM_V0200}");
+    println!("fragment_match_ppm\t{FOUNDATION_CHEMISTRY_FRAGMENT_PPM_V0200}");
+    println!("fragment_match_abs_floor_da\t{FOUNDATION_CHEMISTRY_FRAGMENT_ABS_TOLERANCE_DA_V0200}");
+    println!("suffix_mass_bin_da\t{FOUNDATION_CHEMISTRY_SUFFIX_BIN_DA_V0200}");
+    println!(
+        "chemistry_true_path_contract\trecords={}\tmass_feasible={}\tsuffix_feasible={}\trequired_suffix_feasible=123",
+        validation_cohort.indices.len(), mass_feasible_targets, suffix_feasible_targets
+    );
+    println!(
+        "validation_cohort_source\t{}",
+        validation_candidates.display()
+    );
+    println!("validation_cohort_policy\tfrozen_v01323_mass_valid_record_ids_only");
+    println!(
+        "validation_cohort_contract\trecords={}\toracle_literal={}\toracle_il={}\tlegacy_top1_literal={}\tlegacy_top1_il={}",
+        validation_cohort.indices.len(),
+        validation_cohort.oracle_literal,
+        validation_cohort.oracle_il,
+        validation_cohort.legacy_literal_top1,
+        validation_cohort.legacy_il_top1
+    );
+    println!("test_partition_consumed\tfalse");
+    println!("mode\t{mode}");
+    println!("device\t{device:?}");
+    println!("train_records_with_precursor\t{}", train_indices.len());
+    println!("validation_records\t{}", validation_indices.len());
+    println!("train_steps\t{train_steps}");
+    println!("batch_size\t{batch_size}");
+    println!("beam_width\t{beam_width}");
+    println!("learning_rate\t0.0001");
+    println!("weight_decay\t0.0001");
+    println!("max_gradient_norm\t5");
+    println!("training_seed\t20260919");
+    println!("conditioning_margin_nats\t{FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190}");
+    println!("conditioning_weight\t{FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190}");
+    println!("chemistry_transition_head_zero_initialized\ttrue");
+    println!(
+        "spectrum_encoder_warm_started_variables\t{}",
+        warm.spectrum_encoder_variables
+    );
+    println!("decoder_warm_started_variables\t{}", warm.decoder_variables);
+    println!(
+        "chemistry_transition_new_variables\t{}",
+        warm.chemistry_transition_variables
+    );
+    println!(
+        "ignored_parent_variables\t{}",
+        warm.ignored_parent_variables
+    );
+
+    let mut optimizer = FoundationAdamW::new(
+        &varmap,
+        FoundationAdamWConfig {
+            learning_rate: 1.0e-4,
+            weight_decay: 1.0e-4,
+            ..FoundationAdamWConfig::default()
+        },
+    )?;
+
+    let initial = evaluate_chemistry_v0200(
+        &model,
+        &corpus.records,
+        &validation_indices,
+        batch_size,
+        &causal_collator,
+        &spectrum_collator,
+        &chemistry_featurizer,
+        &device,
+        20_260_919,
+    )?;
+    print_chemistry_v0200("initial_validation", 0, initial);
+    save_v0200_checkpoint(
+        &output_root.join("initial"),
+        &varmap,
+        &metadata.inverse_config,
+        mode,
+        0,
+        initial,
+        &parent_model,
+    )?;
+    save_v0200_checkpoint(
+        &output_root.join("best"),
+        &varmap,
+        &metadata.inverse_config,
+        mode,
+        0,
+        initial,
+        &parent_model,
+    )?;
+    let mut best_objective = initial.objective;
+    let mut best_metrics = initial;
+    let mut best_step = 0usize;
+
+    for step in 1..=train_steps {
+        let selected = deterministic_batch(
+            &train_indices,
+            batch_size,
+            20_260_919 ^ (step as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        );
+        let selected_records: Vec<&FoundationTrainingRecord> =
+            selected.iter().map(|&i| &corpus.records[i]).collect();
+        let packed = collate_records(
+            &selected_records,
+            &causal_collator,
+            &spectrum_collator,
+            &device,
+        )?;
+        let components = v0200_batch_components(&selected_records)?;
+        let matched_chemistry = chemistry_featurizer.teacher_forced(
+            &components.peptides,
+            &components.spectra,
+            &components.precursor_masses,
+            &components.charges,
+            &device,
+        )?;
+        let matched_output = model.forward_t(
+            &packed.causal.input,
+            &packed.spectrum,
+            &packed.precursor,
+            &matched_chemistry,
+            true,
+        )?;
+        let matched = foundation_causal_next_token_loss(&matched_output, &packed.causal)?;
+
+        let order =
+            foundation_direct_shuffled_order(selected_records.len(), 20_260_919 ^ step as u64)?;
+        let shuffled_spectra = order
+            .iter()
+            .map(|&index| components.spectra[index].clone())
+            .collect::<Vec<_>>();
+        let shuffled_batch = spectrum_collator.collate(&shuffled_spectra, &device)?;
+        let shuffled_chemistry = chemistry_featurizer.teacher_forced(
+            &components.peptides,
+            &shuffled_spectra,
+            &components.precursor_masses,
+            &components.charges,
+            &device,
+        )?;
+        let shuffled_output = model.forward_t(
+            &packed.causal.input,
+            &shuffled_batch,
+            &packed.precursor,
+            &shuffled_chemistry,
+            true,
+        )?;
+        let shuffled = foundation_causal_next_token_loss(&shuffled_output, &packed.causal)?;
+        let loss = foundation_direct_conditioning_loss(
+            &matched,
+            &shuffled,
+            FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+            FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
+        )?;
+        let matched_value = f64::from(matched.to_scalar::<f32>()?);
+        let shuffled_value = f64::from(shuffled.to_scalar::<f32>()?);
+        let objective_value = f64::from(loss.to_scalar::<f32>()?);
+        let should_print = step == 1 || step % 25 == 0 || step == train_steps;
+        let rank_diagnostic = if should_print {
+            let rank =
+                foundation_direct_prefix_competitive_loss(&matched_output, &packed.causal, 0.0)?;
+            Some((
+                rank.mean_legal_rank,
+                rank.top1_fraction,
+                rank.top5_fraction,
+                rank.top10_fraction,
+            ))
+        } else {
+            None
+        };
+        let update = optimizer.backward_step(&loss, Some(5.0))?;
+        if let Some((mean_legal_rank, top1_fraction, top5_fraction, top10_fraction)) =
+            rank_diagnostic
+        {
+            println!(
+                "train\tstep={step}\tobjective={objective_value:.6}\tmatched_nll={matched_value:.6}\tshuffled_nll={shuffled_value:.6}\tconditioning_gap={:.6}\ttarget_token_mean_legal_rank={:.6}\ttarget_token_top1_fraction={:.8}\ttarget_token_top5_fraction={:.8}\ttarget_token_top10_fraction={:.8}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                shuffled_value - matched_value,
+                mean_legal_rank,
+                top1_fraction,
+                top5_fraction,
+                top10_fraction,
+                update.gradient_norm,
+                update.gradient_scale
+            );
+        }
+        if step % 100 == 0 || step == train_steps {
+            let metrics = evaluate_chemistry_v0200(
+                &model,
+                &corpus.records,
+                &validation_indices,
+                batch_size,
+                &causal_collator,
+                &spectrum_collator,
+                &chemistry_featurizer,
+                &device,
+                20_260_919 ^ step as u64,
+            )?;
+            print_chemistry_v0200("validation", step, metrics);
+            save_v0200_checkpoint(
+                &output_root.join("latest"),
+                &varmap,
+                &metadata.inverse_config,
+                mode,
+                step,
+                metrics,
+                &parent_model,
+            )?;
+            if metrics.objective < best_objective
+                && metrics.conditioning_gap >= FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190
+            {
+                best_objective = metrics.objective;
+                best_metrics = metrics;
+                best_step = step;
+                save_v0200_checkpoint(
+                    &output_root.join("best"),
+                    &varmap,
+                    &metadata.inverse_config,
+                    mode,
+                    step,
+                    metrics,
+                    &parent_model,
+                )?;
+            }
+        }
+    }
+
+    let best_path = output_root.join("best/model.safetensors");
+    let best_tensors = candle_core::safetensors::load(&best_path, &device)?;
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("v0.20 VarMap lock poisoned"))?;
+    for (name, variable) in data.iter() {
+        variable.set(
+            best_tensors
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("v0.20 best checkpoint missing {name}"))?,
+        )?;
+    }
+    drop(data);
+
+    let generation = evaluate_chemistry_generation_v0200(
+        &model,
+        &corpus.records,
+        &validation_indices,
+        &causal_collator,
+        &spectrum_collator,
+        &chemistry_featurizer,
+        &metadata.inverse_config,
+        beam_width,
+        &device,
+    )?;
+    print_generation_v0190("final", &generation);
+    print_chemistry_v0200("final_best_validation", best_step, best_metrics);
+    let conditioning_guard =
+        best_metrics.conditioning_gap >= FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190;
+    println!(
+        "conditioning_guard\t{}",
+        if conditioning_guard { "PASS" } else { "FAIL" }
+    );
+    if mode == "smoke" {
+        println!("v0200_representation_gate\tNOT_EVALUATED_SMOKE_RUNTIME_ONLY");
+        println!("v0200_stop_rule\tSMOKE_RUNTIME_ONLY_NO_SCIENTIFIC_DECISION");
+        return Ok(());
+    }
+
+    let gate = if generation.literal_top1 >= 28 && generation.il_top1 >= 42 && conditioning_guard {
+        "PROGRESS_MILESTONE"
+    } else if generation.literal_top1 >= 24 && generation.il_top1 >= 38 && conditioning_guard {
+        "BASELINE_RECOVERY"
+    } else if !conditioning_guard {
+        "CONDITIONING_GUARD_NOT_MET"
+    } else {
+        "BELOW_BASELINE_RECOVERY"
+    };
+    println!("scientific_gate\t{gate}");
+    let stop = match gate {
+        "PROGRESS_MILESTONE" => "ACCEPT_V0200_CHEMISTRY_STRUCTURED_DECODER_PROGRESS",
+        "BASELINE_RECOVERY" => "V0200_CHEMISTRY_STRUCTURED_BASELINE_RECOVERED",
+        "CONDITIONING_GUARD_NOT_MET" => {
+            "V0200_CHEMISTRY_CONDITIONING_GUARD_FAILED_CLOSE_AUTOREGRESSIVE_FAMILY_PIVOT_DIFFUSION"
+        }
+        _ => "V0200_CHEMISTRY_GATE_NOT_MET_CLOSE_AUTOREGRESSIVE_FAMILY_PIVOT_DIFFUSION",
+    };
+    println!("v0200_stop_rule\t{stop}");
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ChemistryBatchComponentsV0200 {
+    peptides: Vec<PeptidoformInput>,
+    spectra: Vec<FoundationSpectrum>,
+    precursor_masses: Vec<f64>,
+    charges: Vec<i32>,
+}
+
+fn v0200_batch_components(
+    records: &[&FoundationTrainingRecord],
+) -> Result<ChemistryBatchComponentsV0200> {
+    let mut peptides = Vec::with_capacity(records.len());
+    let mut spectra = Vec::with_capacity(records.len());
+    let mut precursor_masses = Vec::with_capacity(records.len());
+    let mut charges = Vec::with_capacity(records.len());
+    for record in records {
+        peptides.push(record.peptidoform.clone());
+        spectra.push(
+            FoundationSpectrum::from_training_record(record)
+                .ok_or_else(|| anyhow::anyhow!("v0.20 selected record lacks observed spectrum"))?,
+        );
+        precursor_masses.push(v0200_precursor_mass(record)?);
+        charges.push(
+            record
+                .context
+                .charge
+                .ok_or_else(|| anyhow::anyhow!("v0.20 selected record lacks precursor charge"))?,
+        );
+    }
+    Ok(ChemistryBatchComponentsV0200 {
+        peptides,
+        spectra,
+        precursor_masses,
+        charges,
+    })
+}
+
+fn v0200_precursor_mass(record: &FoundationTrainingRecord) -> Result<f64> {
+    let mz = record
+        .context
+        .precursor_mz
+        .ok_or_else(|| anyhow::anyhow!("v0.20 record lacks precursor m/z"))?;
+    let charge = record
+        .context
+        .charge
+        .ok_or_else(|| anyhow::anyhow!("v0.20 record lacks precursor charge"))?;
+    foundation_precursor_neutral_mass(f64::from(mz), charge).map_err(anyhow::Error::msg)
+}
+
+fn v0200_true_path_contract(
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    config: &FoundationDiffusionConfig,
+    chemistry_featurizer: &ChemistryTransitionFeaturizer,
+) -> Result<(usize, usize)> {
+    let mut mass_feasible = 0usize;
+    let mut suffix_feasible = 0usize;
+    for &index in indices {
+        let record = &records[index];
+        let precursor_mass = v0200_precursor_mass(record)?;
+        let target_mass =
+            foundation_peptidoform_neutral_mass(&record.peptidoform).map_err(anyhow::Error::msg)?;
+        let physical = (target_mass - precursor_mass).abs() <= config.precursor_mass_tolerance_da;
+        mass_feasible += usize::from(physical);
+        if physical
+            && chemistry_featurizer
+                .true_path_feasible(&record.peptidoform, precursor_mass)
+                .map_err(anyhow::Error::msg)?
+        {
+            suffix_feasible += 1;
+        }
+    }
+    Ok((mass_feasible, suffix_feasible))
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct ChemistryMetricsV0200 {
+    matched_nll: f64,
+    shuffled_nll: f64,
+    conditioning_gap: f64,
+    target_token_mean_legal_rank: f64,
+    target_token_top1_fraction: f64,
+    target_token_top5_fraction: f64,
+    target_token_top10_fraction: f64,
+    objective: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_chemistry_v0200(
+    model: &PeptideSpectrumChemistryDecoder,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    batch_size: usize,
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    chemistry_featurizer: &ChemistryTransitionFeaturizer,
+    device: &Device,
+    seed: u64,
+) -> Result<ChemistryMetricsV0200> {
+    let mut matched_sum = 0.0;
+    let mut shuffled_sum = 0.0;
+    let mut rank_sum = 0.0;
+    let mut top1_sum = 0.0;
+    let mut top5_sum = 0.0;
+    let mut top10_sum = 0.0;
+    let mut batches = 0usize;
+    for (chunk_index, chunk) in indices.chunks(batch_size).enumerate() {
+        if chunk.len() < 2 {
+            continue;
+        }
+        let selected = chunk.iter().map(|&i| &records[i]).collect::<Vec<_>>();
+        let packed = collate_records(&selected, causal_collator, spectrum_collator, device)?;
+        let components = v0200_batch_components(&selected)?;
+        let matched_chemistry = chemistry_featurizer.teacher_forced(
+            &components.peptides,
+            &components.spectra,
+            &components.precursor_masses,
+            &components.charges,
+            device,
+        )?;
+        let matched_output = model.forward_t(
+            &packed.causal.input,
+            &packed.spectrum,
+            &packed.precursor,
+            &matched_chemistry,
+            false,
+        )?;
+        let matched = foundation_causal_next_token_loss(&matched_output, &packed.causal)?;
+        let rank = foundation_direct_prefix_competitive_loss(&matched_output, &packed.causal, 0.0)?;
+
+        let order = foundation_direct_shuffled_order(selected.len(), seed ^ chunk_index as u64)?;
+        let shuffled_spectra = order
+            .iter()
+            .map(|&i| components.spectra[i].clone())
+            .collect::<Vec<_>>();
+        let shuffled_batch = spectrum_collator.collate(&shuffled_spectra, device)?;
+        let shuffled_chemistry = chemistry_featurizer.teacher_forced(
+            &components.peptides,
+            &shuffled_spectra,
+            &components.precursor_masses,
+            &components.charges,
+            device,
+        )?;
+        let shuffled_output = model.forward_t(
+            &packed.causal.input,
+            &shuffled_batch,
+            &packed.precursor,
+            &shuffled_chemistry,
+            false,
+        )?;
+        let shuffled = foundation_causal_next_token_loss(&shuffled_output, &packed.causal)?;
+
+        matched_sum += f64::from(matched.to_scalar::<f32>()?);
+        shuffled_sum += f64::from(shuffled.to_scalar::<f32>()?);
+        rank_sum += rank.mean_legal_rank;
+        top1_sum += rank.top1_fraction;
+        top5_sum += rank.top5_fraction;
+        top10_sum += rank.top10_fraction;
+        batches += 1;
+    }
+    if batches == 0 {
+        anyhow::bail!("v0.20 validation produced no batches");
+    }
+    let n = batches as f64;
+    let matched_nll = matched_sum / n;
+    let shuffled_nll = shuffled_sum / n;
+    let conditioning_gap = shuffled_nll - matched_nll;
+    let objective = matched_nll
+        + FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190
+            * (FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190 - conditioning_gap).max(0.0);
+    Ok(ChemistryMetricsV0200 {
+        matched_nll,
+        shuffled_nll,
+        conditioning_gap,
+        target_token_mean_legal_rank: rank_sum / n,
+        target_token_top1_fraction: top1_sum / n,
+        target_token_top5_fraction: top5_sum / n,
+        target_token_top10_fraction: top10_sum / n,
+        objective,
+    })
+}
+
+fn print_chemistry_v0200(label: &str, step: usize, metrics: ChemistryMetricsV0200) {
+    println!(
+        "{label}\tstep={step}\tobjective={:.6}\tmatched_spectrum_token_nll={:.6}\tshuffled_spectrum_token_nll={:.6}\tconditioning_gap={:.6}\ttarget_token_mean_legal_rank={:.6}\ttarget_token_top1_fraction={:.8}\ttarget_token_top5_fraction={:.8}\ttarget_token_top10_fraction={:.8}",
+        metrics.objective,
+        metrics.matched_nll,
+        metrics.shuffled_nll,
+        metrics.conditioning_gap,
+        metrics.target_token_mean_legal_rank,
+        metrics.target_token_top1_fraction,
+        metrics.target_token_top5_fraction,
+        metrics.target_token_top10_fraction,
+    );
+}
+
+#[derive(Debug, Serialize)]
+struct ChemistryCheckpointV0200<'a> {
+    version: &'a str,
+    objective: &'a str,
+    architecture: &'a str,
+    run_mode: &'a str,
+    test_partition_consumed: bool,
+    global_step: usize,
+    transition_feature_dim: usize,
+    fragment_match_ppm: f64,
+    fragment_match_abs_floor_da: f64,
+    suffix_mass_bin_da: f64,
+    validation: ChemistryMetricsV0200,
+    unified_parent: String,
+    inverse_config: FoundationDiffusionConfig,
+}
+
+fn save_v0200_checkpoint(
+    directory: &Path,
+    varmap: &VarMap,
+    config: &FoundationDiffusionConfig,
+    mode: &str,
+    step: usize,
+    validation: ChemistryMetricsV0200,
+    parent: &Path,
+) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    varmap.save(directory.join("model.safetensors"))?;
+    let metadata = ChemistryCheckpointV0200 {
+        version: "v0.20.0",
+        objective: FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200,
+        architecture: FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200,
+        run_mode: mode,
+        test_partition_consumed: false,
+        global_step: step,
+        transition_feature_dim: FOUNDATION_CHEMISTRY_TRANSITION_FEATURE_DIM_V0200,
+        fragment_match_ppm: FOUNDATION_CHEMISTRY_FRAGMENT_PPM_V0200,
+        fragment_match_abs_floor_da: FOUNDATION_CHEMISTRY_FRAGMENT_ABS_TOLERANCE_DA_V0200,
+        suffix_mass_bin_da: FOUNDATION_CHEMISTRY_SUFFIX_BIN_DA_V0200,
+        validation,
+        unified_parent: parent.display().to_string(),
+        inverse_config: config.clone(),
+    };
+    fs::write(
+        directory.join("metadata.yaml"),
+        serde_yaml::to_string(&metadata)?,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_chemistry_generation_v0200(
+    model: &PeptideSpectrumChemistryDecoder,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    chemistry_featurizer: &ChemistryTransitionFeaturizer,
+    config: &FoundationDiffusionConfig,
+    beam_width: usize,
+    device: &Device,
+) -> Result<GenerationV0190> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let ks = [5usize, 10, 32, 128];
+    let mut out = GenerationV0190 {
+        records: 0,
+        literal_top1: 0,
+        sequence_top1: 0,
+        il_top1: 0,
+        topk: ks.iter().copied().map(|k| (k, 0, 0)).collect(),
+        mass_valid_beams: 0,
+        returned_beams: 0,
+        zero_returned_beam_records: 0,
+    };
+    for &index in indices {
+        let record = &records[index];
+        let neutral_mass = v0200_precursor_mass(record)?;
+        let charge = record
+            .context
+            .charge
+            .ok_or_else(|| anyhow::anyhow!("v0.20 validation record {index} lacks charge"))?;
+        let spectrum = FoundationSpectrum::from_training_record(record)
+            .ok_or_else(|| anyhow::anyhow!("v0.20 validation record {index} lacks spectrum"))?;
+        let spectrum_batch = spectrum_collator.collate(&[spectrum.clone()], device)?;
+        let precursor = precursor_context(&[record], device)?;
+        let context = model.prepare_context(&spectrum_batch, &precursor, false)?;
+        let candidates = foundation_direct_beam_search(
+            neutral_mass,
+            DirectDecoderBeamConfig {
+                beam_width,
+                top_k: 128,
+                mass_tolerance_da: config.precursor_mass_tolerance_da,
+                max_tokens: config.max_tokens,
+            },
+            |prefixes| {
+                let input = causal_collator
+                    .collate_compact_prefix_rows(prefixes, device)
+                    .map_err(|error| error.to_string())?;
+                let chemistry = chemistry_featurizer
+                    .next_prefixes(prefixes, &spectrum, neutral_mass, charge, device)
+                    .map_err(|error| error.to_string())?;
+                let mut rows = model
+                    .forward_next_t_with_context(&input, &context, &chemistry, false)
+                    .and_then(|tensor| tensor.to_vec2::<f32>())
+                    .map_err(|error| error.to_string())?;
+                chemistry_featurizer.mask_infeasible_next_logits(
+                    prefixes,
+                    &mut rows,
+                    neutral_mass,
+                )?;
+                Ok(rows)
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        out.records += 1;
+        out.zero_returned_beam_records += usize::from(candidates.is_empty());
+        out.returned_beams += candidates.len();
+        out.mass_valid_beams += candidates
+            .iter()
+            .filter(|candidate| candidate.mass_error_da.abs() <= config.precursor_mass_tolerance_da)
+            .count();
+        let decoded = candidates
+            .iter()
+            .filter_map(|candidate| vocabulary.decode(&candidate.tokens).ok())
+            .collect::<Vec<_>>();
+        if let Some(first) = decoded.first() {
+            out.literal_top1 += usize::from(first == &record.peptidoform);
+            out.sequence_top1 += usize::from(first.sequence == record.peptidoform.sequence);
+            out.il_top1 += usize::from(
+                il_sequence(&first.sequence) == il_sequence(&record.peptidoform.sequence),
+            );
+        }
+        for metric in &mut out.topk {
+            let limit = metric.0.min(decoded.len());
+            metric.1 += usize::from(decoded[..limit].iter().any(|p| p == &record.peptidoform));
+            metric.2 +=
+                usize::from(decoded[..limit].iter().any(|p| {
+                    il_sequence(&p.sequence) == il_sequence(&record.peptidoform.sequence)
+                }));
+        }
+    }
+    Ok(out)
 }
 
 const FROZEN_V0190_VALIDATION_RECORDS: usize = 125;

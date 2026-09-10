@@ -15,6 +15,7 @@ pub mod causal;
 pub mod ccs_physics;
 pub mod checkpoint;
 pub mod chemistry;
+pub mod chemistry_decoder;
 pub mod cleavage_graph;
 pub mod collate;
 pub mod compatibility;
@@ -71,6 +72,14 @@ pub use checkpoint::{
 pub use chemistry::{
     common_unimod_definition, exact_graph_modification, ElementalComposition,
     ExactGraphModification, FoundationModificationDefinition, ModificationAttachmentSite,
+};
+pub use chemistry_decoder::{
+    load_chemistry_decoder_from_unified_checkpoint, ChemistryDecoderWarmStartReport,
+    ChemistrySuffixMassLattice, ChemistryTransitionBatch, ChemistryTransitionFeaturizer,
+    PeptideSpectrumChemistryDecoder, FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200,
+    FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200,
+    FOUNDATION_CHEMISTRY_FRAGMENT_ABS_TOLERANCE_DA_V0200, FOUNDATION_CHEMISTRY_FRAGMENT_PPM_V0200,
+    FOUNDATION_CHEMISTRY_SUFFIX_BIN_DA_V0200, FOUNDATION_CHEMISTRY_TRANSITION_FEATURE_DIM_V0200,
 };
 pub use cleavage_graph::{
     foundation_build_cleavage_graph, foundation_cleavage_graph_edge_features,
