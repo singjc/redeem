@@ -1,4 +1,9 @@
+# syntax=docker/dockerfile:1
+
 ARG CUDA_VERSION=12.2.2
+ARG UV_VERSION=0.12.11
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 # -----------------------------------------------------------------------------
 # Rust / CUDA builder
@@ -112,8 +117,6 @@ RUN apt-get -o Acquire::Retries=5 update && \
         libssl3 \
         libstdc++6 \
         python3 \
-        python3-pip \
-        python3-venv \
         time && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -126,6 +129,10 @@ ENV REDEEM_PEPTDEEP_HOME=/opt/redeem/peptdeep
 ENV MPLCONFIGDIR=/tmp/redeem-matplotlib
 ENV NUMBA_CACHE_DIR=/tmp/redeem-numba
 ENV XDG_CACHE_HOME=/tmp/redeem-cache
+ENV UV_PYTHON_DOWNLOADS=0
+ENV UV_LINK_MODE=copy
+ENV UV_HTTP_RETRIES=10
+ENV UV_HTTP_TIMEOUT=120
 
 FROM runtime-base AS runtime
 
@@ -140,6 +147,7 @@ ARG PYTHON_BUILD_THREADS=1
 # Python / torch / AlphaPeptDeep installation cannot begin until the complete
 # CUDA/Rust builder has finished and its binaries have been copied.
 COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 WORKDIR /work
 
@@ -153,29 +161,31 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=${PYTHON_BUILD_THREADS}
 ENV OMP_NUM_THREADS=${PYTHON_BUILD_THREADS}
 ENV OPENBLAS_NUM_THREADS=${PYTHON_BUILD_THREADS}
 ENV MKL_NUM_THREADS=${PYTHON_BUILD_THREADS}
+ENV UV_CONCURRENT_BUILDS=${PYTHON_BUILD_THREADS}
 
 # AlphaPeptDeep comparison is intentionally CPU-only. ReDeeM/Candle remains CUDA-enabled.
-# Installing the official CPU torch wheel first prevents pip from pulling a second
-# CUDA runtime (currently cu124 for torch 2.5.1), which conflicts with the image's
-# CUDA 12.2 runtime and is unnecessary for the small held-out comparison.
-# Keep each expensive Python step in its own Docker layer so successful downloads
-# remain cached even if a later model-preload step fails.
-RUN python3 -m venv "${VIRTUAL_ENV}" && \
-    "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 --upgrade pip setuptools wheel
+# Use pinned uv for virtualenv creation and Python dependency installation. The
+# official CPU torch index remains explicit so the descriptive AlphaPeptDeep lane
+# cannot pull a second CUDA runtime into the CUDA 12.2 ReDeeM image. BuildKit's
+# uv cache mount persists downloaded wheels and resolver metadata across rebuilds.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv --python /usr/bin/python3 "${VIRTUAL_ENV}"
 
-RUN if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
         test "${PEPTDEEP_TORCH_VARIANT}" = "cpu"; \
-        "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 \
-            --index-url https://download.pytorch.org/whl/cpu \
+        uv pip install --python "${VIRTUAL_ENV}/bin/python" \
+            --default-index https://download.pytorch.org/whl/cpu \
             "torch==${PEPTDEEP_TORCH_VERSION}"; \
     fi
 
-RUN if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
-        "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --retries 10 --timeout 120 \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "${INSTALL_ALPHAPEPTDEEP}" = "1" ]; then \
+        uv pip install --python "${VIRTUAL_ENV}/bin/python" \
             "peptdeep[stable]==${PEPTDEEP_VERSION}" \
             "nbconvert>=7,<8" \
             "matplotlib>=3.7"; \
-        "${VIRTUAL_ENV}/bin/python" -m pip check; \
+        uv pip check --python "${VIRTUAL_ENV}/bin/python"; \
         "${VIRTUAL_ENV}/bin/python" -c 'import torch; print("AlphaPeptDeep torch:", torch.__version__, "cuda_available=", torch.cuda.is_available()); assert "+cpu" in torch.__version__; assert not torch.cuda.is_available()'; \
     fi
 
