@@ -49,6 +49,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
 struct DiffusionCheckpointMetadata {
@@ -3502,9 +3503,14 @@ pub(crate) fn v0210_main() -> Result<()> {
     let mode = args.get(5).map(String::as_str).unwrap_or("full");
     let (train_steps, batch_size, validation_limit) = match mode {
         "full" => (4_000usize, 32usize, None),
-        "smoke" => (2usize, 2usize, Some(4usize)),
+        // Technical smoke is intentionally tiny. One optimizer update and two
+        // validation records exercise matched/shuffled training plumbing; the
+        // frozen full scientific protocol remains unchanged.
+        "smoke" => (1usize, 2usize, Some(2usize)),
         other => anyhow::bail!("unsupported v0.21 mode {other:?}; expected full or smoke"),
     };
+    let runtime_started = Instant::now();
+    v0210_stage("start", &runtime_started);
     for path in [
         training_yaml.as_path(),
         v0200_checkpoint.as_path(),
@@ -3515,9 +3521,12 @@ pub(crate) fn v0210_main() -> Result<()> {
     }
 
     let run = read_foundation_training_run_config(&training_yaml)?;
+    v0210_stage("run_config_loaded", &runtime_started);
     let corpus = load_foundation_corpus(&run.corpus)?;
+    v0210_stage("corpus_loaded", &runtime_started);
     let benchmark = FoundationBenchmarkManifest::read_tsv(&run.benchmark_manifest)?;
     benchmark.validate_against_records(&corpus.records)?;
+    v0210_stage("benchmark_validated", &runtime_started);
 
     let v0200_metadata_path = if v0200_checkpoint.is_dir() {
         v0200_checkpoint.join("metadata.yaml")
@@ -3568,28 +3577,40 @@ pub(crate) fn v0210_main() -> Result<()> {
         );
     }
 
-    // Runtime partition isolation: all optimizer records are TRAIN and every
-    // frozen evaluation record is VALIDATION. The TEST set is not materialized.
-    let partition_for = |record_index: usize| {
-        benchmark
-            .entries
-            .iter()
-            .find(|entry| entry.record_index == record_index)
-            .map(|entry| entry.partition)
-            .ok_or_else(|| anyhow::anyhow!("benchmark missing record index {record_index}"))
-    };
-    let train_labels = train_indices
-        .iter()
-        .map(|&index| partition_for(index))
-        .collect::<Result<Vec<_>>>()?;
-    let validation_labels = validation_cohort
-        .indices
-        .iter()
-        .map(|&index| partition_for(index))
-        .collect::<Result<Vec<_>>>()?;
-    if !foundation_chemistry_diffusion_partition_isolated(&train_labels, &validation_labels) {
+    // Runtime partition isolation must be O(records + manifest entries). The
+    // first v0.21 implementation accidentally performed a full manifest scan
+    // for every TRAIN record (O(N^2)), which made technical smoke CPU-bound for
+    // hours before model construction. Materialize one direct lookup table and
+    // verify membership without ever materializing the TEST record set.
+    let mut partition_by_record = vec![None; corpus.records.len()];
+    for entry in &benchmark.entries {
+        let slot = partition_by_record
+            .get_mut(entry.record_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "benchmark record index {} outside corpus length {}",
+                    entry.record_index,
+                    corpus.records.len()
+                )
+            })?;
+        if slot.replace(entry.partition).is_some() {
+            anyhow::bail!(
+                "benchmark contains duplicate record index {}",
+                entry.record_index
+            );
+        }
+    }
+    let train_isolated = train_indices.iter().all(|&index| {
+        partition_by_record.get(index).copied().flatten() == Some(FoundationPartition::Train)
+    });
+    let validation_isolated = validation_cohort.indices.iter().all(|&index| {
+        partition_by_record.get(index).copied().flatten() == Some(FoundationPartition::Validation)
+    });
+    if !train_isolated || !validation_isolated {
         anyhow::bail!("v0.21 partition isolation failed before model construction");
     }
+    drop(partition_by_record);
+    v0210_stage("partitions_and_frozen_cohort_ready", &runtime_started);
 
     fs::create_dir_all(&output_root)?;
     let device = Device::cuda_if_available(0)?;
@@ -3599,29 +3620,11 @@ pub(crate) fn v0210_main() -> Result<()> {
     let chemistry_diffusion =
         ChemistryDiffusionFeaturizer::new(&config).map_err(anyhow::Error::msg)?;
 
-    let max_validation_mass = validation_cohort
-        .indices
-        .iter()
-        .map(|&index| v0200_precursor_mass(&corpus.records[index]))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .fold(0.0f64, f64::max);
-    let initial_suffix_lattice =
-        ChemistrySuffixMassLattice::new(config.max_tokens, max_validation_mass + 100.0)
-            .map_err(anyhow::Error::msg)?;
-    let v0200_featurizer = ChemistryTransitionFeaturizer::new(&config, initial_suffix_lattice)
-        .map_err(anyhow::Error::msg)?;
-
+    // v0.20 autoregressive initialization is needed only for the final
+    // refinement exercise. Construct its suffix lattice/model lazily after
+    // denoising training/telemetry, so technical smoke startup cannot be
+    // dominated by unrelated AR preprocessing.
     let v0200_model_path = resolve_model_safetensors(&v0200_checkpoint);
-    let mut v0200_varmap = VarMap::new();
-    let v0200_vb = VarBuilder::from_varmap(&v0200_varmap, DType::F32, &device);
-    let v0200_model = PeptideSpectrumChemistryDecoder::new(config.clone(), v0200_vb)?;
-    v0200_varmap.load(&v0200_model_path).with_context(|| {
-        format!(
-            "load frozen trained v0.20 initialization checkpoint {}",
-            v0200_model_path.display()
-        )
-    })?;
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -3640,6 +3643,8 @@ pub(crate) fn v0210_main() -> Result<()> {
             warm.ignored_v0200_variables,
         );
     }
+
+    v0210_stage("diffusion_model_warm_started", &runtime_started);
 
     let refinement_timesteps =
         foundation_chemistry_diffusion_refinement_timesteps(config.diffusion_steps)
@@ -3729,6 +3734,10 @@ pub(crate) fn v0210_main() -> Result<()> {
         initial_metrics,
         &v0200_model_path,
     )?;
+    v0210_stage(
+        "initial_validation_and_checkpoint_complete",
+        &runtime_started,
+    );
     let mut best_step = 0usize;
     let mut best_metrics = initial_metrics;
     let mut best_objective = v0210_validation_objective(initial_metrics);
@@ -3857,6 +3866,7 @@ pub(crate) fn v0210_main() -> Result<()> {
         }
     }
 
+    v0210_stage("optimizer_loop_complete", &runtime_started);
     load_varmap_checkpoint_v0210(
         &varmap,
         &output_root.join("best/model.safetensors"),
@@ -3865,8 +3875,14 @@ pub(crate) fn v0210_main() -> Result<()> {
     println!("best_step\t{best_step}");
     print_chemistry_diffusion_v0210("final_best_validation", best_step, best_metrics);
 
-    // Required reconstruction-by-timestep telemetry uses the same fixed cohort.
-    for timestep in [1usize, 5, 8, 10, 15, 20] {
+    // Full scientific telemetry remains the frozen six-timestep curve. The
+    // technical smoke exercises only the actual inference start level t=8.
+    let reconstruction_timesteps: &[usize] = if mode == "smoke" {
+        &[FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_START_TIMESTEP_V0210]
+    } else {
+        &[1usize, 5, 8, 10, 15, 20]
+    };
+    for &timestep in reconstruction_timesteps {
         let metrics = evaluate_chemistry_diffusion_v0210(
             &model,
             &corpus.records,
@@ -3881,12 +3897,50 @@ pub(crate) fn v0210_main() -> Result<()> {
         )?;
         print_chemistry_diffusion_v0210("reconstruction_by_timestep", best_step, metrics);
     }
+    v0210_stage("reconstruction_telemetry_complete", &runtime_started);
+
+    // Exercise the expensive v0.20 initializer on exactly one frozen record in
+    // smoke mode. Full mode still evaluates all 125 records with all eight
+    // refinement passes.
+    let refinement_indices: Vec<usize> = if mode == "smoke" {
+        validation_indices.iter().copied().take(1).collect()
+    } else {
+        validation_indices.clone()
+    };
+    let refinement_timesteps_eval: Vec<usize> = if mode == "smoke" {
+        vec![FOUNDATION_CHEMISTRY_DIFFUSION_REFINEMENT_START_TIMESTEP_V0210]
+    } else {
+        refinement_timesteps.clone()
+    };
+    v0210_stage("v0200_initializer_setup_begin", &runtime_started);
+    let max_refinement_mass = refinement_indices
+        .iter()
+        .map(|&index| v0200_precursor_mass(&corpus.records[index]))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(0.0f64, f64::max);
+    let initial_suffix_lattice =
+        ChemistrySuffixMassLattice::new(config.max_tokens, max_refinement_mass + 100.0)
+            .map_err(anyhow::Error::msg)?;
+    let v0200_featurizer = ChemistryTransitionFeaturizer::new(&config, initial_suffix_lattice)
+        .map_err(anyhow::Error::msg)?;
+    let mut v0200_varmap = VarMap::new();
+    let v0200_vb = VarBuilder::from_varmap(&v0200_varmap, DType::F32, &device);
+    let v0200_model = PeptideSpectrumChemistryDecoder::new(config.clone(), v0200_vb)?;
+    v0200_varmap.load(&v0200_model_path).with_context(|| {
+        format!(
+            "load frozen trained v0.20 initialization checkpoint {}",
+            v0200_model_path.display()
+        )
+    })?;
+    v0210_stage("v0200_initializer_setup_complete", &runtime_started);
 
     let refinement = evaluate_refinement_v0210(
         &model,
         &v0200_model,
         &corpus.records,
-        &validation_indices,
+        &refinement_indices,
+        &refinement_timesteps_eval,
         &causal_collator,
         &diffusion_collator,
         &spectrum_collator,
@@ -3895,6 +3949,7 @@ pub(crate) fn v0210_main() -> Result<()> {
         &config,
         &device,
     )?;
+    v0210_stage("refinement_runtime_exercise_complete", &runtime_started);
     refinement.print();
 
     if mode == "full" {
@@ -3945,7 +4000,16 @@ pub(crate) fn v0210_main() -> Result<()> {
         println!("v0210_stop_rule\tSMOKE_RUNTIME_ONLY_NO_SCIENTIFIC_DECISION");
     }
     println!("test_partition_consumed\tfalse");
+    v0210_stage("complete", &runtime_started);
     Ok(())
+}
+
+fn v0210_stage(stage: &str, started: &Instant) {
+    eprintln!(
+        "v0210_stage\tstage={stage}\telapsed_seconds={:.3}",
+        started.elapsed().as_secs_f64()
+    );
+    let _ = std::io::stderr().flush();
 }
 
 fn v0210_validation_objective(metrics: ChemistryDiffusionMetricsV0210) -> f64 {
@@ -4139,6 +4203,7 @@ fn evaluate_refinement_v0210(
     v0200_model: &PeptideSpectrumChemistryDecoder,
     records: &[FoundationTrainingRecord],
     indices: &[usize],
+    timesteps: &[usize],
     causal_collator: &FoundationCausalCollator,
     diffusion_collator: &FoundationDiffusionCollator,
     spectrum_collator: &FoundationSpectrumCollator,
@@ -4148,15 +4213,28 @@ fn evaluate_refinement_v0210(
     device: &Device,
 ) -> Result<RefinementMetricsV0210> {
     let vocabulary = FoundationDiffusionVocabulary;
-    let timesteps = foundation_chemistry_diffusion_refinement_timesteps(config.diffusion_steps)
-        .map_err(anyhow::Error::msg)?;
+    if timesteps.is_empty()
+        || timesteps
+            .iter()
+            .any(|&timestep| timestep == 0 || timestep > config.diffusion_steps)
+    {
+        anyhow::bail!("v0.21 refinement runtime received invalid timestep schedule");
+    }
     let mut metrics = RefinementMetricsV0210 {
         per_step_changed_positions: vec![0; timesteps.len()],
         per_step_converged_records: vec![0; timesteps.len()],
         ..RefinementMetricsV0210::default()
     };
 
-    for &index in indices {
+    for (record_ordinal, &index) in indices.iter().enumerate() {
+        if record_ordinal == 0 || record_ordinal % 10 == 0 {
+            eprintln!(
+                "v0210_refinement_progress\trecord={}/{}",
+                record_ordinal + 1,
+                indices.len()
+            );
+            let _ = std::io::stderr().flush();
+        }
         metrics.records += 1;
         let record = &records[index];
         let precursor_mass = v0200_precursor_mass(record)?;
