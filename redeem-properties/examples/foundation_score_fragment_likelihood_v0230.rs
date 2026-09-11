@@ -315,12 +315,12 @@ fn main() -> Result<()> {
                 &device,
                 20260923 ^ group.record_index as u64,
             )?;
-            let output =
+            let predicted_ms2 =
                 predictor
                     .model
                     .forward()
-                    .forward_t(&batch.input, &batch.context, false)?;
-            let predicted = output.ms2.to_vec3::<f32>()?;
+                    .forward_ms2_t(&batch.input, &batch.context, false)?;
+            let predicted = predicted_ms2.to_vec3::<f32>()?;
             for ((row, peptide), prediction) in chunk.iter().zip(peptides).zip(predicted) {
                 let score = foundation_fragment_likelihood_score(&peptide, spectrum, &prediction)
                     .map_err(anyhow::Error::msg)?;

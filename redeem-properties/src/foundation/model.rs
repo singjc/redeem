@@ -302,6 +302,24 @@ impl PeptideFoundationMultiTaskModel {
         self.forward_t_with_shared_gradient_scales(batch, context, train, 1.0, 1.0)
     }
 
+    /// Forward only the frozen MS2 branch.
+    ///
+    /// v0.23 scores large candidate batches on CUDA. Candle's CUDA matmul does
+    /// not accept the zero/strided batch strides produced when a 3-D activation
+    /// is fed directly through `Linear`. The MS2 branch therefore flattens the
+    /// cleavage axis to one contiguous 2-D matrix before the projection and
+    /// reshapes the result afterwards. This is numerically identical to the
+    /// ordinary linear layer while avoiding a broadcasted batched GEMM.
+    pub fn forward_ms2_t(
+        &self,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+    ) -> Result<Tensor> {
+        let foundation = self.encoder.forward_t(batch, train)?;
+        self.forward_ms2_from_foundation(&foundation, context)
+    }
+
     /// Forward pass with independent control over the RT gradient entering the shared encoder.
     ///
     /// The forward value supplied to the RT head is unchanged. During backpropagation,
@@ -380,46 +398,7 @@ impl PeptideFoundationMultiTaskModel {
             ccs_residual
         };
 
-        let (batch_size, sequence_len, _) = foundation.residue_embeddings.dims3()?;
-        let left = foundation
-            .residue_embeddings
-            .narrow(1, 0, sequence_len - 1)?;
-        let right = foundation
-            .residue_embeddings
-            .narrow(1, 1, sequence_len - 1)?;
-        let instrument = self.instrument_embedding.forward(&context.instrument_ids)?;
-        let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
-        let scaled_nce = context.nce.affine(1.0 / 100.0, 0.0)?.unsqueeze(1)?;
-        let charge_present = context.charge_present.unsqueeze(1)?;
-        let nce_present = context.nce_present.unsqueeze(1)?;
-        let instrument_present = context.instrument_present.unsqueeze(1)?;
-        let scalar_context = Tensor::cat(
-            &[
-                &scaled_charge,
-                &scaled_nce,
-                &charge_present,
-                &nce_present,
-                &instrument_present,
-            ],
-            1,
-        )?;
-        let context_features = Tensor::cat(&[&instrument, &scalar_context], 1)?
-            .unsqueeze(1)?
-            .broadcast_as((batch_size, sequence_len - 1, 21))?;
-        let cleavage_features = Tensor::cat(&[&left, &right, &context_features], 2)?;
-        let ms2_logits = self.ms2_head.forward(&cleavage_features)?;
-        let ms2 = apply_ms2_output_activation(&ms2_logits, self.config.ms2_output_activation)?;
-        let left_mask = foundation.residue_mask.narrow(1, 0, sequence_len - 1)?;
-        let right_mask = foundation.residue_mask.narrow(1, 1, sequence_len - 1)?;
-        let cleavage_mask = left_mask
-            .broadcast_mul(&right_mask)?
-            .unsqueeze(2)?
-            .broadcast_as((
-                batch_size,
-                sequence_len - 1,
-                self.config.ms2_fragment_channels,
-            ))?;
-        let ms2 = ms2.broadcast_mul(&cleavage_mask)?;
+        let ms2 = self.forward_ms2_from_foundation(&foundation, context)?;
 
         let residue_logits = self.residue_head.forward(&foundation.residue_embeddings)?;
         let chemistry_reconstruction = self
@@ -438,6 +417,62 @@ impl PeptideFoundationMultiTaskModel {
             chemistry_reconstruction,
             contrastive_projection,
         })
+    }
+
+    fn forward_ms2_from_foundation(
+        &self,
+        foundation: &FoundationOutput,
+        context: &PrecursorContextBatch,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, _) = foundation.residue_embeddings.dims3()?;
+        if sequence_len < 2 {
+            candle_core::bail!("MS2 forward requires at least two sequence positions");
+        }
+        let cleavage_count = sequence_len - 1;
+        let left = foundation.residue_embeddings.narrow(1, 0, cleavage_count)?;
+        let right = foundation.residue_embeddings.narrow(1, 1, cleavage_count)?;
+        let instrument = self.instrument_embedding.forward(&context.instrument_ids)?;
+        let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
+        let scaled_nce = context.nce.affine(1.0 / 100.0, 0.0)?.unsqueeze(1)?;
+        let charge_present = context.charge_present.unsqueeze(1)?;
+        let nce_present = context.nce_present.unsqueeze(1)?;
+        let instrument_present = context.instrument_present.unsqueeze(1)?;
+        let scalar_context = Tensor::cat(
+            &[
+                &scaled_charge,
+                &scaled_nce,
+                &charge_present,
+                &nce_present,
+                &instrument_present,
+            ],
+            1,
+        )?;
+        let context_features = Tensor::cat(&[&instrument, &scalar_context], 1)?
+            .unsqueeze(1)?
+            .broadcast_as((batch_size, cleavage_count, 21))?;
+        let cleavage_features =
+            Tensor::cat(&[&left, &right, &context_features], 2)?.contiguous()?;
+        let (_, _, feature_dim) = cleavage_features.dims3()?;
+        let flat = cleavage_features
+            .reshape((batch_size * cleavage_count, feature_dim))?
+            .contiguous()?;
+        let ms2_logits = self.ms2_head.forward(&flat)?.reshape((
+            batch_size,
+            cleavage_count,
+            self.config.ms2_fragment_channels,
+        ))?;
+        let ms2 = apply_ms2_output_activation(&ms2_logits, self.config.ms2_output_activation)?;
+        let left_mask = foundation.residue_mask.narrow(1, 0, cleavage_count)?;
+        let right_mask = foundation.residue_mask.narrow(1, 1, cleavage_count)?;
+        let cleavage_mask = left_mask
+            .broadcast_mul(&right_mask)?
+            .unsqueeze(2)?
+            .broadcast_as((
+                batch_size,
+                cleavage_count,
+                self.config.ms2_fragment_channels,
+            ))?;
+        ms2.broadcast_mul(&cleavage_mask)
     }
 
     /// Return the shared encoder for embedding-only inference or transfer learning.

@@ -1,5 +1,9 @@
+use candle_core::{DType, Device};
+use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
-    foundation_fragment_likelihood_score, FoundationSpectrum, PeptidoformInput,
+    foundation_fragment_likelihood_score, FoundationConfig, FoundationSpectrum,
+    PeptideFoundationMultiTaskModel, PeptideGraphFeaturizer, PeptidoformInput,
+    PrecursorContextBatch,
 };
 
 #[test]
@@ -49,4 +53,39 @@ fn complete_candidate_score_is_deterministic() {
     let first = foundation_fragment_likelihood_score(&peptide, &spectrum, &predicted).unwrap();
     let second = foundation_fragment_likelihood_score(&peptide, &spectrum, &predicted).unwrap();
     assert_eq!(first, second);
+}
+
+#[test]
+fn v0230_batch128_ms2_only_forward_uses_cuda_safe_projection_shape() {
+    let device = Device::Cpu;
+    let config = FoundationConfig {
+        // Keep the exact v0.23 checkpoint geometry seen by the CUDA smoke:
+        // 64 positions, 96 model dimensions -> 2*96 + 21 = 213 cleavage
+        // features and 63 cleavages. FoundationConfig::default() uses a
+        // wider model, so pin model_dim explicitly for this regression.
+        model_dim: 96,
+        transformer_layers: 1,
+        dropout: 0.0,
+        ..FoundationConfig::default()
+    };
+    assert_eq!(config.max_sequence_len, 64);
+    assert_eq!(config.model_dim * 2 + 21, 213);
+
+    let featurizer = PeptideGraphFeaturizer::new(config.clone()).unwrap();
+    let peptides = vec![PeptidoformInput::unmodified("PEPTIDE"); 128];
+    let batch = featurizer.featurize(&peptides, &device).unwrap();
+    let context = PrecursorContextBatch::unknown(128, &device).unwrap();
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultiTaskModel::new(config.clone(), vb).unwrap();
+
+    let ms2 = model.forward_ms2_t(&batch, &context, false).unwrap();
+    assert_eq!(
+        ms2.dims(),
+        &[
+            128,
+            config.max_sequence_len - 1,
+            config.ms2_fragment_channels
+        ]
+    );
 }
