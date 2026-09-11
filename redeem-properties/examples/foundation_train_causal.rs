@@ -14,21 +14,27 @@ use redeem_properties::foundation::{
     foundation_chemistry_diffusion_project_mass_valid,
     foundation_chemistry_diffusion_refinement_timesteps,
     foundation_chemistry_diffusion_row_neutral_mass, foundation_diffusion_dataset_fingerprint,
-    foundation_diffusion_residue_ptm_valid, foundation_diffusion_token_mass_da,
-    foundation_diffusion_token_residue, foundation_diffusion_x0_loss,
-    foundation_direct_beam_search, foundation_direct_conditioning_loss,
-    foundation_direct_prefix_competitive_loss, foundation_direct_shuffled_order,
-    foundation_peptidoform_neutral_mass, foundation_precursor_neutral_mass,
-    load_causal_from_diffusion_checkpoint, load_chemistry_decoder_from_unified_checkpoint,
-    load_chemistry_diffusion_from_v0200_checkpoint, load_direct_decoder_from_unified_checkpoint,
-    load_foundation_corpus, read_foundation_training_run_config, ChemistryDiffusionFeaturizer,
-    ChemistrySuffixMassLattice, ChemistryTransitionFeaturizer, DirectDecoderBeamConfig,
-    FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCausalCollator,
-    FoundationDiffusionCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
-    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
+    foundation_diffusion_length_loss, foundation_diffusion_residue_ptm_valid,
+    foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
+    foundation_diffusion_x0_loss, foundation_direct_beam_search,
+    foundation_direct_conditioning_loss, foundation_direct_prefix_competitive_loss,
+    foundation_direct_shuffled_order, foundation_peptidoform_neutral_mass,
+    foundation_precursor_neutral_mass, foundation_structured_edit_argmax,
+    foundation_structured_edit_finalize, foundation_structured_edit_gate_loss,
+    foundation_structured_edit_open_row, foundation_structured_edit_partition_isolated,
+    foundation_structured_edit_set_targets, load_causal_from_diffusion_checkpoint,
+    load_chemistry_decoder_from_unified_checkpoint, load_chemistry_diffusion_from_v0200_checkpoint,
+    load_direct_decoder_from_unified_checkpoint, load_foundation_corpus,
+    load_structured_editor_from_v0210_checkpoint, read_foundation_training_run_config,
+    ChemistryDiffusionFeaturizer, ChemistrySuffixMassLattice, ChemistryTransitionFeaturizer,
+    DirectDecoderBeamConfig, FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest,
+    FoundationCausalCollator, FoundationDiffusionCollator, FoundationDiffusionConfig,
+    FoundationDiffusionVocabulary, FoundationPartition, FoundationSpectrum,
+    FoundationSpectrumCollator, FoundationStructuredEditOutput, FoundationTrainingRecord,
     PeptideSpectrumCausalModel, PeptideSpectrumChemistryDecoder,
-    PeptideSpectrumChemistryDiffusionModel, PeptidoformInput, PrecursorContextBatch,
-    FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200, FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200,
+    PeptideSpectrumChemistryDiffusionModel, PeptideSpectrumStructuredEditor, PeptidoformInput,
+    PrecursorContextBatch, FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200,
+    FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200,
     FOUNDATION_CHEMISTRY_DIFFUSION_ARCHITECTURE_V0210,
     FOUNDATION_CHEMISTRY_DIFFUSION_INITIAL_BEAM_WIDTH_V0210,
     FOUNDATION_CHEMISTRY_DIFFUSION_OBJECTIVE_V0210,
@@ -39,9 +45,15 @@ use redeem_properties::foundation::{
     FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
     FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
     FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL,
-    FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190, FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
-    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190, FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0191,
-    FOUNDATION_DIRECT_PREFIX_MARGIN_V0191, FOUNDATION_PEPTIDE_WATER_MASS_DA,
+    FOUNDATION_DIFFUSION_VOCAB_SIZE, FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+    FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190, FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
+    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0191, FOUNDATION_DIRECT_PREFIX_MARGIN_V0191,
+    FOUNDATION_PEPTIDE_WATER_MASS_DA, FOUNDATION_STRUCTURED_EDIT_ARCHITECTURE_V0220,
+    FOUNDATION_STRUCTURED_EDIT_CONTEXT_TIMESTEP_V0220,
+    FOUNDATION_STRUCTURED_EDIT_GATE_WEIGHT_V0220,
+    FOUNDATION_STRUCTURED_EDIT_INITIAL_BEAM_WIDTH_V0220,
+    FOUNDATION_STRUCTURED_EDIT_LENGTH_WEIGHT_V0220, FOUNDATION_STRUCTURED_EDIT_OBJECTIVE_V0220,
+    FOUNDATION_STRUCTURED_EDIT_PASSES_V0220, FOUNDATION_STRUCTURED_EDIT_TRAIN_INITIALIZERS_V0220,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -4414,6 +4426,1414 @@ fn evaluate_refinement_v0210(
                 metrics.initially_incorrect_positions += 1;
                 metrics.incorrect_positions_corrected +=
                     usize::from(final_row[position] == target[position]);
+            }
+        }
+    }
+    Ok(metrics)
+}
+
+// -----------------------------------------------------------------------------
+// v0.22 on-policy structured edit transducer
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct V0210ParentMetadataV0220 {
+    inverse_config: FoundationDiffusionConfig,
+    global_step: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StructuredEditPairV0220 {
+    record_index: usize,
+    initial_row: Vec<u32>,
+    initial_active: usize,
+    target_row: Vec<u32>,
+    target_active: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct StructuredEditValidationMetricsV0220 {
+    token_nll: f64,
+    shuffled_token_nll: f64,
+    conditioning_gap: f64,
+    gate_nll: f64,
+    length_nll: f64,
+    token_accuracy: f64,
+    gate_accuracy: f64,
+    length_accuracy: f64,
+    raw_exact_rate: f64,
+    active_tokens: usize,
+    sequences: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct StructuredEditCheckpointV0220<'a> {
+    version: u32,
+    architecture: &'a str,
+    objective: &'a str,
+    mode: &'a str,
+    global_step: usize,
+    training_seed: u64,
+    train_steps: usize,
+    batch_size: usize,
+    train_initializers: usize,
+    validation_initializers: usize,
+    validation_zero_initializers: usize,
+    v0200_checkpoint: String,
+    v0210_checkpoint: String,
+    v0210_parent_step: usize,
+    validation: StructuredEditValidationMetricsV0220,
+    inverse_config: FoundationDiffusionConfig,
+}
+
+#[derive(Debug, Default)]
+struct StructuredEditFrozenMetricsV0220 {
+    records: usize,
+    initialized_records: usize,
+    zero_initial_records: usize,
+    initial_literal_top1: usize,
+    initial_sequence_top1: usize,
+    initial_il_top1: usize,
+    final_literal_top1: usize,
+    final_sequence_top1: usize,
+    final_il_top1: usize,
+    initial_length_exact: usize,
+    final_length_exact: usize,
+    length_mismatch_records: usize,
+    length_mismatches_corrected: usize,
+    positions_compared: usize,
+    initially_incorrect_positions: usize,
+    incorrect_positions_corrected: usize,
+    initially_correct_positions: usize,
+    correct_positions_damaged: usize,
+    changed_positions: usize,
+    mass_projection_used: usize,
+    initial_fallback_used: usize,
+    final_mass_valid: usize,
+    initial_mass_error_abs_sum: f64,
+    final_mass_error_abs_sum: f64,
+    initial_mass_error_records: usize,
+    final_mass_error_records: usize,
+}
+
+impl StructuredEditFrozenMetricsV0220 {
+    fn print(&self) {
+        println!("final_records\t{}", self.records);
+        println!("v0200_initialized_records\t{}", self.initialized_records);
+        println!("v0200_zero_initial_records\t{}", self.zero_initial_records);
+        println!("initial_literal_top1\t{}", self.initial_literal_top1);
+        println!("initial_sequence_top1\t{}", self.initial_sequence_top1);
+        println!("initial_il_top1\t{}", self.initial_il_top1);
+        println!("final_literal_top1\t{}", self.final_literal_top1);
+        println!("final_sequence_top1\t{}", self.final_sequence_top1);
+        println!("final_il_top1\t{}", self.final_il_top1);
+        println!(
+            "initial_length_exact_records\t{}",
+            self.initial_length_exact
+        );
+        println!("final_length_exact_records\t{}", self.final_length_exact);
+        println!(
+            "initial_length_mismatch_records\t{}",
+            self.length_mismatch_records
+        );
+        println!(
+            "length_mismatches_corrected\t{}",
+            self.length_mismatches_corrected
+        );
+        println!("positions_compared_to_v0200\t{}", self.positions_compared);
+        println!("positions_changed_from_v0200\t{}", self.changed_positions);
+        println!(
+            "position_change_fraction_from_v0200\t{:.8}",
+            if self.positions_compared == 0 {
+                0.0
+            } else {
+                self.changed_positions as f64 / self.positions_compared as f64
+            }
+        );
+        println!(
+            "initially_incorrect_positions\t{}",
+            self.initially_incorrect_positions
+        );
+        println!(
+            "incorrect_v0200_positions_corrected\t{}",
+            self.incorrect_positions_corrected
+        );
+        println!(
+            "incorrect_position_correction_fraction\t{:.8}",
+            if self.initially_incorrect_positions == 0 {
+                0.0
+            } else {
+                self.incorrect_positions_corrected as f64
+                    / self.initially_incorrect_positions as f64
+            }
+        );
+        println!(
+            "initially_correct_positions\t{}",
+            self.initially_correct_positions
+        );
+        println!(
+            "correct_v0200_positions_damaged\t{}",
+            self.correct_positions_damaged
+        );
+        println!(
+            "correct_position_damage_fraction\t{:.8}",
+            if self.initially_correct_positions == 0 {
+                0.0
+            } else {
+                self.correct_positions_damaged as f64 / self.initially_correct_positions as f64
+            }
+        );
+        println!("final_mass_projection_used\t{}", self.mass_projection_used);
+        println!(
+            "final_initial_fallback_used\t{}",
+            self.initial_fallback_used
+        );
+        println!("final_mass_valid_records\t{}", self.final_mass_valid);
+        println!(
+            "final_mass_valid_fraction\t{:.8}",
+            if self.records == 0 {
+                0.0
+            } else {
+                self.final_mass_valid as f64 / self.records as f64
+            }
+        );
+        println!(
+            "initial_mean_abs_precursor_mass_error_da\t{:.8}",
+            if self.initial_mass_error_records == 0 {
+                f64::NAN
+            } else {
+                self.initial_mass_error_abs_sum / self.initial_mass_error_records as f64
+            }
+        );
+        println!(
+            "final_mean_abs_precursor_mass_error_da\t{:.8}",
+            if self.final_mass_error_records == 0 {
+                f64::NAN
+            } else {
+                self.final_mass_error_abs_sum / self.final_mass_error_records as f64
+            }
+        );
+    }
+}
+
+fn v0220_stage(stage: &str, started: &Instant) {
+    println!(
+        "v0220_stage\tstage={stage}\telapsed_seconds={:.3}",
+        started.elapsed().as_secs_f64()
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// v0.22 first experiment: learn one whole-sequence edit directly from actual
+/// frozen v0.20 TRAIN top-1 hypotheses. No categorical corruption and no
+/// candidate-ranking objective are used.
+pub(crate) fn v0220_main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 6 || args.len() > 7 {
+        anyhow::bail!(
+            "usage: foundation_train_structured_edit_v0220 RUN.yaml V0200_CHECKPOINT V0210_CHECKPOINT VALIDATION_CANDIDATES.tsv OUTPUT_DIR [full|smoke]"
+        );
+    }
+    let training_yaml = PathBuf::from(&args[1]);
+    let v0200_checkpoint = PathBuf::from(&args[2]);
+    let v0210_checkpoint = PathBuf::from(&args[3]);
+    let validation_candidates = PathBuf::from(&args[4]);
+    let output_root = PathBuf::from(&args[5]);
+    let mode = args.get(6).map(String::as_str).unwrap_or("full");
+    let (train_steps, batch_size, train_initializer_target, validation_limit) = match mode {
+        "full" => (
+            4_000usize,
+            32usize,
+            FOUNDATION_STRUCTURED_EDIT_TRAIN_INITIALIZERS_V0220,
+            None,
+        ),
+        "smoke" => (1usize, 2usize, 8usize, Some(2usize)),
+        other => anyhow::bail!("unsupported v0.22 mode {other:?}; expected full or smoke"),
+    };
+    let seed = 20_260_922u64;
+    let runtime_started = Instant::now();
+    v0220_stage("start", &runtime_started);
+    for path in [
+        training_yaml.as_path(),
+        v0200_checkpoint.as_path(),
+        v0210_checkpoint.as_path(),
+        validation_candidates.as_path(),
+        output_root.as_path(),
+    ] {
+        reject_test_path_v0190(path)?;
+    }
+
+    let run = read_foundation_training_run_config(&training_yaml)?;
+    v0220_stage("run_config_loaded", &runtime_started);
+    let corpus = load_foundation_corpus(&run.corpus)?;
+    v0220_stage("corpus_loaded", &runtime_started);
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&run.benchmark_manifest)?;
+    benchmark.validate_against_records(&corpus.records)?;
+    v0220_stage("benchmark_validated", &runtime_started);
+
+    let v0210_metadata_path = if v0210_checkpoint.is_dir() {
+        v0210_checkpoint.join("metadata.yaml")
+    } else {
+        v0210_checkpoint
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("metadata.yaml")
+    };
+    let v0210_metadata: V0210ParentMetadataV0220 = serde_yaml::from_str(
+        &fs::read_to_string(&v0210_metadata_path)
+            .with_context(|| format!("read v0.21 metadata {v0210_metadata_path:?}"))?,
+    )?;
+    let config = v0210_metadata.inverse_config.clone();
+    config.validate().map_err(anyhow::Error::msg)?;
+    let v0200_model_path = resolve_model_safetensors(&v0200_checkpoint);
+    let v0210_model_path = resolve_model_safetensors(&v0210_checkpoint);
+
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut train_indices = usable_indices(
+        &corpus.records,
+        &benchmark,
+        FoundationPartition::Train,
+        &config,
+        vocabulary,
+    );
+    train_indices.retain(|&index| v0200_precursor_mass(&corpus.records[index]).is_ok());
+    let validation_cohort = read_frozen_validation_cohort_v0190(
+        &validation_candidates,
+        &corpus.records,
+        &benchmark,
+        &config,
+        vocabulary,
+    )?;
+    let mut validation_indices = validation_cohort.indices.clone();
+    if let Some(limit) = validation_limit {
+        validation_indices.truncate(limit);
+    }
+    if train_indices.len() < train_initializer_target || validation_indices.is_empty() {
+        anyhow::bail!(
+            "insufficient v0.22 records: train={} requested_train_initializers={} validation={}",
+            train_indices.len(),
+            train_initializer_target,
+            validation_indices.len()
+        );
+    }
+
+    let mut partition_by_record = vec![None; corpus.records.len()];
+    for entry in &benchmark.entries {
+        let slot = partition_by_record
+            .get_mut(entry.record_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "benchmark record index {} outside corpus",
+                    entry.record_index
+                )
+            })?;
+        *slot = Some(entry.partition);
+    }
+    let train_labels = train_indices
+        .iter()
+        .map(|&index| {
+            partition_by_record[index]
+                .ok_or_else(|| anyhow::anyhow!("missing TRAIN partition label for {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let validation_labels = validation_indices
+        .iter()
+        .map(|&index| {
+            partition_by_record[index]
+                .ok_or_else(|| anyhow::anyhow!("missing VALIDATION partition label for {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !foundation_structured_edit_partition_isolated(&train_labels, &validation_labels) {
+        anyhow::bail!("v0.22 partition isolation failed");
+    }
+    drop(partition_by_record);
+    println!("test_partition_consumed\tfalse");
+    v0220_stage("partitions_and_frozen_cohort_ready", &runtime_started);
+
+    let device = Device::cuda_if_available(0)?;
+    let spectrum_collator = FoundationSpectrumCollator::new(config.spectrum.clone())?;
+    let causal_collator = FoundationCausalCollator::new(config.clone())?;
+    let diffusion_collator = FoundationDiffusionCollator::new(config.clone())?;
+    let chemistry = ChemistryDiffusionFeaturizer::new(&config).map_err(anyhow::Error::msg)?;
+
+    // Build the frozen v0.20 initializer once. Full mode uses a deterministic
+    // TRAIN subset and the exact frozen validation cohort; no TEST record ids are
+    // materialized.
+    let train_candidate_count =
+        (train_initializer_target + train_initializer_target / 4 + 32).min(train_indices.len());
+    let train_materialization_indices =
+        deterministic_subset(&train_indices, train_candidate_count, seed ^ 0x2200_0001);
+    let max_initializer_mass = train_materialization_indices
+        .iter()
+        .chain(validation_indices.iter())
+        .map(|&index| v0200_precursor_mass(&corpus.records[index]))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(0.0f64, f64::max);
+    let suffix_lattice =
+        ChemistrySuffixMassLattice::new(config.max_tokens, max_initializer_mass + 100.0)
+            .map_err(anyhow::Error::msg)?;
+    let v0200_featurizer =
+        ChemistryTransitionFeaturizer::new(&config, suffix_lattice).map_err(anyhow::Error::msg)?;
+    let mut v0200_varmap = VarMap::new();
+    let v0200_vb = VarBuilder::from_varmap(&v0200_varmap, DType::F32, &device);
+    let v0200_model = PeptideSpectrumChemistryDecoder::new(config.clone(), v0200_vb)?;
+    v0200_varmap.load(&v0200_model_path).with_context(|| {
+        format!(
+            "load frozen v0.20 checkpoint {}",
+            v0200_model_path.display()
+        )
+    })?;
+    v0220_stage("v0200_initializer_ready", &runtime_started);
+
+    let mut train_pairs = Vec::with_capacity(train_initializer_target);
+    for (ordinal, &index) in train_materialization_indices.iter().enumerate() {
+        if ordinal == 0 || ordinal % 256 == 0 {
+            eprintln!(
+                "v0220_train_initializer_progress\trecord={}/{}\tpairs={}",
+                ordinal + 1,
+                train_materialization_indices.len(),
+                train_pairs.len()
+            );
+            let _ = std::io::stderr().flush();
+        }
+        if let Some(pair) = generate_v0200_pair_v0220(
+            &v0200_model,
+            &corpus.records,
+            index,
+            &causal_collator,
+            &spectrum_collator,
+            &v0200_featurizer,
+            &config,
+            &device,
+        )? {
+            train_pairs.push(pair);
+            if train_pairs.len() >= train_initializer_target {
+                break;
+            }
+        }
+    }
+    if train_pairs.len() < train_initializer_target {
+        anyhow::bail!(
+            "v0.22 could materialize only {} of {} requested v0.20 TRAIN initializers",
+            train_pairs.len(),
+            train_initializer_target
+        );
+    }
+
+    let mut validation_pairs = Vec::with_capacity(validation_indices.len());
+    let mut validation_zero_initializers = 0usize;
+    for (ordinal, &index) in validation_indices.iter().enumerate() {
+        if ordinal == 0 || ordinal % 25 == 0 {
+            eprintln!(
+                "v0220_validation_initializer_progress\trecord={}/{}",
+                ordinal + 1,
+                validation_indices.len()
+            );
+            let _ = std::io::stderr().flush();
+        }
+        let pair = generate_v0200_pair_v0220(
+            &v0200_model,
+            &corpus.records,
+            index,
+            &causal_collator,
+            &spectrum_collator,
+            &v0200_featurizer,
+            &config,
+            &device,
+        )?;
+        validation_zero_initializers += usize::from(pair.is_none());
+        validation_pairs.push(pair);
+    }
+    v0220_stage("on_policy_initializers_materialized", &runtime_started);
+
+    fs::create_dir_all(&output_root)?;
+    write_structured_edit_pair_manifest_v0220(
+        &output_root.join("v0200_train_initializers.tsv"),
+        &train_pairs,
+        &corpus.records,
+    )?;
+    let validation_present = validation_pairs
+        .iter()
+        .filter_map(|pair| pair.clone())
+        .collect::<Vec<_>>();
+    write_structured_edit_pair_manifest_v0220(
+        &output_root.join("v0200_validation_initializers.tsv"),
+        &validation_present,
+        &corpus.records,
+    )?;
+    print_initializer_summary_v0220("train_initializer", &train_pairs, &corpus.records)?;
+    print_initializer_summary_v0220(
+        "validation_initializer",
+        &validation_present,
+        &corpus.records,
+    )?;
+
+    // The scientific baseline must remain the frozen v0.20 result before any
+    // structured-editor training is accepted.
+    if mode == "full" {
+        let baseline = baseline_counts_v0220(&validation_pairs, &corpus.records)?;
+        println!("frozen_v0200_initializer_literal_top1\t{}", baseline.0);
+        println!("frozen_v0200_initializer_sequence_top1\t{}", baseline.1);
+        println!("frozen_v0200_initializer_il_top1\t{}", baseline.2);
+        println!("frozen_v0200_initializer_records\t{}", baseline.3);
+        println!(
+            "frozen_v0200_zero_initializer_records\t{}",
+            validation_zero_initializers
+        );
+        if baseline != (7, 7, 12, 118) || validation_zero_initializers != 7 {
+            anyhow::bail!(
+                "v0.22 frozen v0.20 initializer drift: observed {:?} zero={} expected (7,7,12,118) zero=7",
+                baseline,
+                validation_zero_initializers
+            );
+        }
+    }
+
+    let mut varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideSpectrumStructuredEditor::new(config.clone(), vb)?;
+    let warm = load_structured_editor_from_v0210_checkpoint(&varmap, &v0210_model_path, &device)?;
+    if warm.new_gate_variables != 2 {
+        anyhow::bail!(
+            "v0.22 warm-start expected exactly two new gate tensors, observed {}",
+            warm.new_gate_variables
+        );
+    }
+    v0220_stage("structured_editor_warm_started", &runtime_started);
+
+    println!("version\tv0.22.0");
+    println!("architecture\t{FOUNDATION_STRUCTURED_EDIT_ARCHITECTURE_V0220}");
+    println!("objective\t{FOUNDATION_STRUCTURED_EDIT_OBJECTIVE_V0220}");
+    println!("scientific_change\ton_policy_full_sequence_editing_of_real_v0200_top1_errors");
+    println!("synthetic_corruption\tNONE");
+    println!("candidate_reranking\tNONE");
+    println!("edit_passes\t{FOUNDATION_STRUCTURED_EDIT_PASSES_V0220}");
+    println!("context_timestep_plumbing_only\t{FOUNDATION_STRUCTURED_EDIT_CONTEXT_TIMESTEP_V0220}");
+    println!("initial_beam_width\t{FOUNDATION_STRUCTURED_EDIT_INITIAL_BEAM_WIDTH_V0220}");
+    println!("train_initializers\t{}", train_pairs.len());
+    println!("validation_records\t{}", validation_indices.len());
+    println!("validation_initializers\t{}", validation_present.len());
+    println!("validation_zero_initializers\t{validation_zero_initializers}");
+    println!("train_steps\t{train_steps}");
+    println!("batch_size\t{batch_size}");
+    println!("training_seed\t{seed}");
+    println!("gate_loss_weight\t{FOUNDATION_STRUCTURED_EDIT_GATE_WEIGHT_V0220}");
+    println!("length_loss_weight\t{FOUNDATION_STRUCTURED_EDIT_LENGTH_WEIGHT_V0220}");
+    println!("shared_v0210_variables\t{}", warm.shared_v0210_variables);
+    println!("new_gate_variables\t{}", warm.new_gate_variables);
+    println!("ignored_v0210_variables\t{}", warm.ignored_v0210_variables);
+    println!("v0210_parent_global_step\t{}", v0210_metadata.global_step);
+    println!("test_partition_consumed\tfalse");
+
+    let initial_metrics = evaluate_structured_edit_v0220(
+        &model,
+        &validation_present,
+        &corpus.records,
+        batch_size,
+        &diffusion_collator,
+        &spectrum_collator,
+        &chemistry,
+        &device,
+        seed ^ 0x2200_1000,
+    )?;
+    print_structured_edit_metrics_v0220("initial_validation", 0, initial_metrics);
+    save_v0220_checkpoint(
+        &output_root.join("initial"),
+        &varmap,
+        &config,
+        mode,
+        0,
+        seed,
+        train_steps,
+        batch_size,
+        train_pairs.len(),
+        validation_present.len(),
+        validation_zero_initializers,
+        initial_metrics,
+        &v0200_checkpoint,
+        &v0210_checkpoint,
+        v0210_metadata.global_step,
+    )?;
+    save_v0220_checkpoint(
+        &output_root.join("best"),
+        &varmap,
+        &config,
+        mode,
+        0,
+        seed,
+        train_steps,
+        batch_size,
+        train_pairs.len(),
+        validation_present.len(),
+        validation_zero_initializers,
+        initial_metrics,
+        &v0200_checkpoint,
+        &v0210_checkpoint,
+        v0210_metadata.global_step,
+    )?;
+    let mut best_step = 0usize;
+    let mut best_metrics = initial_metrics;
+    let mut best_objective = structured_edit_validation_objective_v0220(initial_metrics);
+    v0220_stage(
+        "initial_validation_and_checkpoint_complete",
+        &runtime_started,
+    );
+
+    let mut optimizer = FoundationAdamW::new(
+        &varmap,
+        FoundationAdamWConfig {
+            learning_rate: 1.0e-4,
+            weight_decay: 1.0e-4,
+            ..FoundationAdamWConfig::default()
+        },
+    )?;
+    let pair_indices = (0..train_pairs.len()).collect::<Vec<_>>();
+    for step in 1..=train_steps {
+        let selected = deterministic_batch(
+            &pair_indices,
+            batch_size,
+            seed ^ (step as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        );
+        let selected_pairs = selected
+            .iter()
+            .map(|&index| train_pairs[index].clone())
+            .collect::<Vec<_>>();
+        let train = structured_edit_forward_batch_v0220(
+            &model,
+            &selected_pairs,
+            &corpus.records,
+            &diffusion_collator,
+            &spectrum_collator,
+            &chemistry,
+            &device,
+            true,
+            false,
+            seed ^ step as u64,
+        )?;
+        let token_loss = foundation_diffusion_x0_loss(&train.output.sequence, &train.batch)?;
+        let gate_loss = foundation_structured_edit_gate_loss(
+            &train.output,
+            &train.input_rows,
+            &train.target_rows,
+            &train.target_active_lengths,
+        )?;
+        let length_loss = foundation_diffusion_length_loss(&train.output.sequence, &train.batch)?;
+
+        let shuffled = structured_edit_forward_batch_v0220(
+            &model,
+            &selected_pairs,
+            &corpus.records,
+            &diffusion_collator,
+            &spectrum_collator,
+            &chemistry,
+            &device,
+            true,
+            true,
+            seed ^ 0x7777_0000 ^ step as u64,
+        )?;
+        let shuffled_token =
+            foundation_diffusion_x0_loss(&shuffled.output.sequence, &shuffled.batch)?;
+        let conditioned = foundation_direct_conditioning_loss(
+            &token_loss,
+            &shuffled_token,
+            FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+            FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
+        )?;
+        let loss = (&conditioned
+            + &gate_loss.affine(FOUNDATION_STRUCTURED_EDIT_GATE_WEIGHT_V0220, 0.0)?)?;
+        let loss =
+            (&loss + &length_loss.affine(FOUNDATION_STRUCTURED_EDIT_LENGTH_WEIGHT_V0220, 0.0)?)?;
+        let token_value = f64::from(token_loss.to_scalar::<f32>()?);
+        let shuffled_value = f64::from(shuffled_token.to_scalar::<f32>()?);
+        let gate_value = f64::from(gate_loss.to_scalar::<f32>()?);
+        let length_value = f64::from(length_loss.to_scalar::<f32>()?);
+        let objective_value = f64::from(loss.to_scalar::<f32>()?);
+        let update = optimizer.backward_step(&loss, Some(5.0))?;
+        if step == 1 || step % 25 == 0 || step == train_steps {
+            println!(
+                "train\tstep={step}\tobjective={objective_value:.6}\ttoken_nll={token_value:.6}\tshuffled_token_nll={shuffled_value:.6}\tconditioning_gap={:.6}\tgate_nll={gate_value:.6}\tlength_nll={length_value:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                shuffled_value - token_value,
+                update.gradient_norm,
+                update.gradient_scale
+            );
+        }
+        if step % 100 == 0 || step == train_steps {
+            let metrics = evaluate_structured_edit_v0220(
+                &model,
+                &validation_present,
+                &corpus.records,
+                batch_size,
+                &diffusion_collator,
+                &spectrum_collator,
+                &chemistry,
+                &device,
+                seed ^ step as u64,
+            )?;
+            print_structured_edit_metrics_v0220("validation", step, metrics);
+            save_v0220_checkpoint(
+                &output_root.join("latest"),
+                &varmap,
+                &config,
+                mode,
+                step,
+                seed,
+                train_steps,
+                batch_size,
+                train_pairs.len(),
+                validation_present.len(),
+                validation_zero_initializers,
+                metrics,
+                &v0200_checkpoint,
+                &v0210_checkpoint,
+                v0210_metadata.global_step,
+            )?;
+            let objective = structured_edit_validation_objective_v0220(metrics);
+            if objective < best_objective
+                && metrics.conditioning_gap >= FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190
+            {
+                best_objective = objective;
+                best_metrics = metrics;
+                best_step = step;
+                save_v0220_checkpoint(
+                    &output_root.join("best"),
+                    &varmap,
+                    &config,
+                    mode,
+                    step,
+                    seed,
+                    train_steps,
+                    batch_size,
+                    train_pairs.len(),
+                    validation_present.len(),
+                    validation_zero_initializers,
+                    metrics,
+                    &v0200_checkpoint,
+                    &v0210_checkpoint,
+                    v0210_metadata.global_step,
+                )?;
+            }
+        }
+    }
+    v0220_stage("optimizer_loop_complete", &runtime_started);
+    println!("best_step\t{best_step}");
+    print_structured_edit_metrics_v0220("final_best_validation", best_step, best_metrics);
+    load_varmap_checkpoint_v0210(
+        &varmap,
+        &output_root.join("best/model.safetensors"),
+        &device,
+    )?;
+
+    if mode == "smoke" {
+        let smoke_pair = validation_pairs
+            .iter()
+            .find(|pair| pair.is_some())
+            .cloned()
+            .context("v0.22 smoke requires at least one initialized validation peptide")?;
+        let smoke_metrics = evaluate_frozen_structured_edit_v0220(
+            &model,
+            &[smoke_pair],
+            &corpus.records,
+            &diffusion_collator,
+            &spectrum_collator,
+            &chemistry,
+            &config,
+            &device,
+        )?;
+        smoke_metrics.print();
+        println!("v0220_stop_rule\tSMOKE_RUNTIME_ONLY_NO_SCIENTIFIC_DECISION");
+        println!("test_partition_consumed\tfalse");
+        v0220_stage("complete", &runtime_started);
+        return Ok(());
+    }
+
+    let frozen_metrics = evaluate_frozen_structured_edit_v0220(
+        &model,
+        &validation_pairs,
+        &corpus.records,
+        &diffusion_collator,
+        &spectrum_collator,
+        &chemistry,
+        &config,
+        &device,
+    )?;
+    frozen_metrics.print();
+    let baseline_recovery =
+        frozen_metrics.final_literal_top1 >= 24 && frozen_metrics.final_il_top1 >= 38;
+    let progress = frozen_metrics.final_literal_top1 >= 28 && frozen_metrics.final_il_top1 >= 42;
+    let material = frozen_metrics.final_literal_top1 >= 12 && frozen_metrics.final_il_top1 >= 20;
+    println!(
+        "baseline_recovery_gate\t{}",
+        if baseline_recovery { "PASS" } else { "FAIL" }
+    );
+    println!("progress_gate\t{}", if progress { "PASS" } else { "FAIL" });
+    println!("material_improvement_threshold\tliteral>=12_and_il>=20");
+    println!(
+        "material_improvement_over_v0200\t{}",
+        if material { "YES" } else { "NO" }
+    );
+    let stop_rule = if progress {
+        "V0220_PROGRESS_TARGET_MET"
+    } else if baseline_recovery {
+        "V0220_BASELINE_RECOVERED"
+    } else if material {
+        "V0220_PARTIAL_SUCCESS_ALLOW_AT_MOST_ONE_COHERENT_ARCHITECTURAL_CORRECTION"
+    } else {
+        "STOP_STRUCTURED_EDIT_REASSESS_PROPOSAL_SPACE"
+    };
+    println!("v0220_stop_rule\t{stop_rule}");
+    println!("test_partition_consumed\tfalse");
+    v0220_stage("complete", &runtime_started);
+    Ok(())
+}
+
+struct StructuredEditForwardBatchV0220 {
+    output: FoundationStructuredEditOutput,
+    batch: redeem_properties::foundation::FoundationDiffusionBatch,
+    input_rows: Vec<Vec<u32>>,
+    target_rows: Vec<Vec<u32>>,
+    target_active_lengths: Vec<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn structured_edit_forward_batch_v0220(
+    model: &PeptideSpectrumStructuredEditor,
+    pairs: &[StructuredEditPairV0220],
+    records: &[FoundationTrainingRecord],
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    chemistry: &ChemistryDiffusionFeaturizer,
+    device: &Device,
+    train: bool,
+    shuffle_spectra: bool,
+    seed: u64,
+) -> Result<StructuredEditForwardBatchV0220> {
+    if pairs.is_empty() {
+        anyhow::bail!("v0.22 forward batch is empty");
+    }
+    let width = model.config().max_tokens;
+    let input_rows = pairs
+        .iter()
+        .map(|pair| {
+            foundation_structured_edit_open_row(&pair.initial_row, pair.initial_active, width)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::msg)?;
+    let active_lengths = vec![width; pairs.len()];
+    let inference = diffusion_collator.collate_inference_tokens(
+        &input_rows,
+        &active_lengths,
+        FOUNDATION_STRUCTURED_EDIT_CONTEXT_TIMESTEP_V0220,
+        device,
+    )?;
+    let target_rows = pairs
+        .iter()
+        .map(|pair| pair.target_row.clone())
+        .collect::<Vec<_>>();
+    let target_active_lengths = pairs
+        .iter()
+        .map(|pair| pair.target_active)
+        .collect::<Vec<_>>();
+    let batch =
+        foundation_structured_edit_set_targets(inference, &target_rows, &target_active_lengths)?;
+    let selected_records = pairs
+        .iter()
+        .map(|pair| &records[pair.record_index])
+        .collect::<Vec<_>>();
+    let components = v0200_batch_components(&selected_records)?;
+    let spectra = if shuffle_spectra {
+        let order = foundation_direct_shuffled_order(components.spectra.len(), seed)?;
+        order
+            .into_iter()
+            .map(|index| components.spectra[index].clone())
+            .collect::<Vec<_>>()
+    } else {
+        components.spectra.clone()
+    };
+    let spectrum = spectrum_collator.collate(&spectra, device)?;
+    let precursor = precursor_context(&selected_records, device)?;
+    let chemistry_batch = chemistry.featurize(
+        &input_rows,
+        &active_lengths,
+        &spectra,
+        &components.precursor_masses,
+        &components.charges,
+        device,
+    )?;
+    let output = model.forward_t(&batch, &spectrum, &precursor, &chemistry_batch, train)?;
+    Ok(StructuredEditForwardBatchV0220 {
+        output,
+        batch,
+        input_rows,
+        target_rows,
+        target_active_lengths,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_v0200_pair_v0220(
+    v0200_model: &PeptideSpectrumChemistryDecoder,
+    records: &[FoundationTrainingRecord],
+    index: usize,
+    causal_collator: &FoundationCausalCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    v0200_featurizer: &ChemistryTransitionFeaturizer,
+    config: &FoundationDiffusionConfig,
+    device: &Device,
+) -> Result<Option<StructuredEditPairV0220>> {
+    let record = records
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("v0.22 record index {index} missing"))?;
+    let precursor_mass = v0200_precursor_mass(record)?;
+    let charge = record
+        .context
+        .charge
+        .ok_or_else(|| anyhow::anyhow!("v0.22 record {index} lacks charge"))?;
+    let spectrum = FoundationSpectrum::from_training_record(record)
+        .ok_or_else(|| anyhow::anyhow!("v0.22 record {index} lacks observed spectrum"))?;
+    let spectrum_batch = spectrum_collator.collate(&[spectrum.clone()], device)?;
+    let precursor = precursor_context(&[record], device)?;
+    let context = v0200_model.prepare_context(&spectrum_batch, &precursor, false)?;
+    let candidates = foundation_direct_beam_search(
+        precursor_mass,
+        DirectDecoderBeamConfig {
+            beam_width: FOUNDATION_STRUCTURED_EDIT_INITIAL_BEAM_WIDTH_V0220,
+            top_k: 1,
+            mass_tolerance_da: config.precursor_mass_tolerance_da,
+            max_tokens: config.max_tokens,
+        },
+        |prefixes| {
+            let input = causal_collator
+                .collate_compact_prefix_rows(prefixes, device)
+                .map_err(|error| error.to_string())?;
+            let candidate_chemistry = v0200_featurizer
+                .next_prefixes(prefixes, &spectrum, precursor_mass, charge, device)
+                .map_err(|error| error.to_string())?;
+            let mut rows = v0200_model
+                .forward_next_t_with_context(&input, &context, &candidate_chemistry, false)
+                .and_then(|tensor| tensor.to_vec2::<f32>())
+                .map_err(|error| error.to_string())?;
+            v0200_featurizer.mask_infeasible_next_logits(prefixes, &mut rows, precursor_mass)?;
+            Ok(rows)
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    let Some(candidate) = candidates.first() else {
+        return Ok(None);
+    };
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut initial_row = vec![FOUNDATION_DIFFUSION_PAD; config.max_tokens];
+    if candidate.tokens.len() > config.max_tokens {
+        anyhow::bail!("v0.22 v0.20 initializer exceeds max_tokens");
+    }
+    initial_row[..candidate.tokens.len()].copy_from_slice(&candidate.tokens);
+    let target_row = vocabulary
+        .encode(&record.peptidoform, config.max_tokens)
+        .map_err(anyhow::Error::msg)?;
+    let target_active = target_row
+        .iter()
+        .position(|&token| token == FOUNDATION_DIFFUSION_PAD)
+        .unwrap_or(config.max_tokens);
+    Ok(Some(StructuredEditPairV0220 {
+        record_index: index,
+        initial_row,
+        initial_active: candidate.tokens.len(),
+        target_row,
+        target_active,
+    }))
+}
+
+fn write_structured_edit_pair_manifest_v0220(
+    path: &Path,
+    pairs: &[StructuredEditPairV0220],
+    records: &[FoundationTrainingRecord],
+) -> Result<()> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let file = fs::File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "record_index\tinitial_active\ttarget_active\tinitial_sequence\ttarget_sequence\tliteral_exact\tsequence_exact\til_exact"
+    )?;
+    for pair in pairs {
+        let initial = vocabulary
+            .decode(&pair.initial_row)
+            .map_err(anyhow::Error::msg)?;
+        let target = &records[pair.record_index].peptidoform;
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            pair.record_index,
+            pair.initial_active,
+            pair.target_active,
+            initial.sequence,
+            target.sequence,
+            initial == *target,
+            initial.sequence == target.sequence,
+            il_sequence(&initial.sequence) == il_sequence(&target.sequence),
+        )?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn print_initializer_summary_v0220(
+    label: &str,
+    pairs: &[StructuredEditPairV0220],
+    records: &[FoundationTrainingRecord],
+) -> Result<()> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut literal = 0usize;
+    let mut sequence = 0usize;
+    let mut il = 0usize;
+    let mut length_exact = 0usize;
+    let mut edit_sum = 0usize;
+    let mut edit_max = 0usize;
+    for pair in pairs {
+        let initial = vocabulary
+            .decode(&pair.initial_row)
+            .map_err(anyhow::Error::msg)?;
+        let target = &records[pair.record_index].peptidoform;
+        literal += usize::from(initial == *target);
+        sequence += usize::from(initial.sequence == target.sequence);
+        il += usize::from(il_sequence(&initial.sequence) == il_sequence(&target.sequence));
+        length_exact += usize::from(pair.initial_active == pair.target_active);
+        let initial_content = pair.initial_active.saturating_sub(1);
+        let target_content = pair.target_active.saturating_sub(1);
+        let compare = initial_content.max(target_content);
+        let edits = (0..compare)
+            .filter(|&position| {
+                let left = if position < initial_content {
+                    pair.initial_row[position]
+                } else {
+                    FOUNDATION_DIFFUSION_PAD
+                };
+                let right = if position < target_content {
+                    pair.target_row[position]
+                } else {
+                    FOUNDATION_DIFFUSION_PAD
+                };
+                left != right
+            })
+            .count();
+        edit_sum += edits;
+        edit_max = edit_max.max(edits);
+    }
+    let n = pairs.len().max(1) as f64;
+    println!("{label}_records\t{}", pairs.len());
+    println!("{label}_literal_exact\t{literal}");
+    println!("{label}_sequence_exact\t{sequence}");
+    println!("{label}_il_exact\t{il}");
+    println!("{label}_length_exact\t{length_exact}");
+    println!(
+        "{label}_length_mismatch\t{}",
+        pairs.len().saturating_sub(length_exact)
+    );
+    println!(
+        "{label}_mean_positional_edit_distance\t{:.6}",
+        edit_sum as f64 / n
+    );
+    println!("{label}_max_positional_edit_distance\t{edit_max}");
+    Ok(())
+}
+
+fn baseline_counts_v0220(
+    pairs: &[Option<StructuredEditPairV0220>],
+    records: &[FoundationTrainingRecord],
+) -> Result<(usize, usize, usize, usize)> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut literal = 0usize;
+    let mut sequence = 0usize;
+    let mut il = 0usize;
+    let mut initialized = 0usize;
+    for pair in pairs.iter().flatten() {
+        initialized += 1;
+        let initial = vocabulary
+            .decode(&pair.initial_row)
+            .map_err(anyhow::Error::msg)?;
+        let target = &records[pair.record_index].peptidoform;
+        literal += usize::from(initial == *target);
+        sequence += usize::from(initial.sequence == target.sequence);
+        il += usize::from(il_sequence(&initial.sequence) == il_sequence(&target.sequence));
+    }
+    Ok((literal, sequence, il, initialized))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_structured_edit_v0220(
+    model: &PeptideSpectrumStructuredEditor,
+    pairs: &[StructuredEditPairV0220],
+    records: &[FoundationTrainingRecord],
+    batch_size: usize,
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    chemistry: &ChemistryDiffusionFeaturizer,
+    device: &Device,
+    seed: u64,
+) -> Result<StructuredEditValidationMetricsV0220> {
+    if pairs.is_empty() {
+        anyhow::bail!("v0.22 validation has no initialized pairs");
+    }
+    let mut token_weighted = 0.0f64;
+    let mut shuffled_weighted = 0.0f64;
+    let mut gate_weighted = 0.0f64;
+    let mut length_weighted = 0.0f64;
+    let mut active_tokens = 0usize;
+    let mut token_correct = 0usize;
+    let mut gate_correct = 0usize;
+    let mut gate_total = 0usize;
+    let mut length_correct = 0usize;
+    let mut raw_exact = 0usize;
+    for (chunk_index, chunk) in pairs.chunks(batch_size).enumerate() {
+        let selected = chunk.to_vec();
+        let matched = structured_edit_forward_batch_v0220(
+            model,
+            &selected,
+            records,
+            diffusion_collator,
+            spectrum_collator,
+            chemistry,
+            device,
+            false,
+            false,
+            seed ^ chunk_index as u64,
+        )?;
+        let token_loss = foundation_diffusion_x0_loss(&matched.output.sequence, &matched.batch)?;
+        let gate_loss = foundation_structured_edit_gate_loss(
+            &matched.output,
+            &matched.input_rows,
+            &matched.target_rows,
+            &matched.target_active_lengths,
+        )?;
+        let length_loss =
+            foundation_diffusion_length_loss(&matched.output.sequence, &matched.batch)?;
+        let shuffled = structured_edit_forward_batch_v0220(
+            model,
+            &selected,
+            records,
+            diffusion_collator,
+            spectrum_collator,
+            chemistry,
+            device,
+            false,
+            true,
+            seed ^ 0x7777 ^ chunk_index as u64,
+        )?;
+        let shuffled_loss =
+            foundation_diffusion_x0_loss(&shuffled.output.sequence, &shuffled.batch)?;
+        let chunk_active: usize = matched.target_active_lengths.iter().sum();
+        token_weighted += f64::from(token_loss.to_scalar::<f32>()?) * chunk_active as f64;
+        shuffled_weighted += f64::from(shuffled_loss.to_scalar::<f32>()?) * chunk_active as f64;
+        gate_weighted += f64::from(gate_loss.to_scalar::<f32>()?) * chunk_active as f64;
+        length_weighted += f64::from(length_loss.to_scalar::<f32>()?) * selected.len() as f64;
+        active_tokens += chunk_active;
+
+        let token_logits = matched.output.sequence.token_logits.to_vec3::<f32>()?;
+        let gate_logits = matched.output.gate_logits.to_vec3::<f32>()?;
+        let length_logits = matched.output.sequence.length_logits.to_vec2::<f32>()?;
+        for row_index in 0..selected.len() {
+            let target_active = matched.target_active_lengths[row_index];
+            let mut all_correct = true;
+            for position in 0..target_active {
+                let predicted = argmax(&token_logits[row_index][position]) as u32;
+                let target = matched.target_rows[row_index][position];
+                token_correct += usize::from(predicted == target);
+                all_correct &= predicted == target;
+                let gate_pred = argmax(&gate_logits[row_index][position]) as u32;
+                let gate_target = if matched.input_rows[row_index][position]
+                    != matched.target_rows[row_index][position]
+                {
+                    1
+                } else {
+                    0
+                };
+                gate_correct += usize::from(gate_pred == gate_target);
+                gate_total += 1;
+            }
+            raw_exact += usize::from(all_correct);
+            let predicted_length = argmax(&length_logits[row_index]) + 1;
+            length_correct += usize::from(predicted_length == target_active);
+        }
+    }
+    let sequences = pairs.len();
+    let token_nll = token_weighted / active_tokens as f64;
+    let shuffled_token_nll = shuffled_weighted / active_tokens as f64;
+    Ok(StructuredEditValidationMetricsV0220 {
+        token_nll,
+        shuffled_token_nll,
+        conditioning_gap: shuffled_token_nll - token_nll,
+        gate_nll: gate_weighted / active_tokens as f64,
+        length_nll: length_weighted / sequences as f64,
+        token_accuracy: token_correct as f64 / active_tokens as f64,
+        gate_accuracy: gate_correct as f64 / gate_total.max(1) as f64,
+        length_accuracy: length_correct as f64 / sequences as f64,
+        raw_exact_rate: raw_exact as f64 / sequences as f64,
+        active_tokens,
+        sequences,
+    })
+}
+
+fn structured_edit_validation_objective_v0220(
+    metrics: StructuredEditValidationMetricsV0220,
+) -> f64 {
+    metrics.token_nll
+        + FOUNDATION_STRUCTURED_EDIT_GATE_WEIGHT_V0220 * metrics.gate_nll
+        + FOUNDATION_STRUCTURED_EDIT_LENGTH_WEIGHT_V0220 * metrics.length_nll
+}
+
+fn print_structured_edit_metrics_v0220(
+    label: &str,
+    step: usize,
+    metrics: StructuredEditValidationMetricsV0220,
+) {
+    println!(
+        "{label}\tstep={step}\ttoken_nll={:.6}\tshuffled_token_nll={:.6}\tconditioning_gap={:.6}\tgate_nll={:.6}\tlength_nll={:.6}\ttoken_accuracy={:.8}\tgate_accuracy={:.8}\tlength_accuracy={:.8}\traw_exact_rate={:.8}\tactive_tokens={}\tsequences={}",
+        metrics.token_nll,
+        metrics.shuffled_token_nll,
+        metrics.conditioning_gap,
+        metrics.gate_nll,
+        metrics.length_nll,
+        metrics.token_accuracy,
+        metrics.gate_accuracy,
+        metrics.length_accuracy,
+        metrics.raw_exact_rate,
+        metrics.active_tokens,
+        metrics.sequences,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_v0220_checkpoint(
+    directory: &Path,
+    varmap: &VarMap,
+    config: &FoundationDiffusionConfig,
+    mode: &str,
+    global_step: usize,
+    seed: u64,
+    train_steps: usize,
+    batch_size: usize,
+    train_initializers: usize,
+    validation_initializers: usize,
+    validation_zero_initializers: usize,
+    validation: StructuredEditValidationMetricsV0220,
+    v0200_checkpoint: &Path,
+    v0210_checkpoint: &Path,
+    v0210_parent_step: usize,
+) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    varmap.save(directory.join("model.safetensors"))?;
+    let metadata = StructuredEditCheckpointV0220 {
+        version: 1,
+        architecture: FOUNDATION_STRUCTURED_EDIT_ARCHITECTURE_V0220,
+        objective: FOUNDATION_STRUCTURED_EDIT_OBJECTIVE_V0220,
+        mode,
+        global_step,
+        training_seed: seed,
+        train_steps,
+        batch_size,
+        train_initializers,
+        validation_initializers,
+        validation_zero_initializers,
+        v0200_checkpoint: v0200_checkpoint.display().to_string(),
+        v0210_checkpoint: v0210_checkpoint.display().to_string(),
+        v0210_parent_step,
+        validation,
+        inverse_config: config.clone(),
+    };
+    fs::write(
+        directory.join("metadata.yaml"),
+        serde_yaml::to_string(&metadata)?,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn structured_edit_inference_v0220(
+    model: &PeptideSpectrumStructuredEditor,
+    pair: &StructuredEditPairV0220,
+    record: &FoundationTrainingRecord,
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    chemistry: &ChemistryDiffusionFeaturizer,
+    device: &Device,
+) -> Result<StructuredEditForwardBatchV0220> {
+    let width = model.config().max_tokens;
+    let input_row =
+        foundation_structured_edit_open_row(&pair.initial_row, pair.initial_active, width)
+            .map_err(anyhow::Error::msg)?;
+    let active_lengths = vec![width];
+    // Target-free inference: collate_inference_tokens fills inert clean/target
+    // tensors from the input itself. The true peptide is not passed into the
+    // model or chemistry featurizer anywhere in this path.
+    let batch = diffusion_collator.collate_inference_tokens(
+        &[input_row.clone()],
+        &active_lengths,
+        FOUNDATION_STRUCTURED_EDIT_CONTEXT_TIMESTEP_V0220,
+        device,
+    )?;
+    let components = v0200_batch_components(&[record])?;
+    let spectrum = spectrum_collator.collate(&components.spectra, device)?;
+    let precursor = precursor_context(&[record], device)?;
+    let chemistry_batch = chemistry.featurize(
+        &[input_row.clone()],
+        &active_lengths,
+        &components.spectra,
+        &components.precursor_masses,
+        &components.charges,
+        device,
+    )?;
+    let output = model.forward_t(&batch, &spectrum, &precursor, &chemistry_batch, false)?;
+    Ok(StructuredEditForwardBatchV0220 {
+        output,
+        batch,
+        input_rows: vec![input_row],
+        target_rows: Vec::new(),
+        target_active_lengths: Vec::new(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_frozen_structured_edit_v0220(
+    model: &PeptideSpectrumStructuredEditor,
+    pairs: &[Option<StructuredEditPairV0220>],
+    records: &[FoundationTrainingRecord],
+    diffusion_collator: &FoundationDiffusionCollator,
+    spectrum_collator: &FoundationSpectrumCollator,
+    chemistry: &ChemistryDiffusionFeaturizer,
+    config: &FoundationDiffusionConfig,
+    device: &Device,
+) -> Result<StructuredEditFrozenMetricsV0220> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut metrics = StructuredEditFrozenMetricsV0220::default();
+    metrics.records = pairs.len();
+    for (ordinal, pair) in pairs.iter().enumerate() {
+        if ordinal == 0 || ordinal % 10 == 0 {
+            eprintln!(
+                "v0220_frozen_edit_progress\trecord={}/{}",
+                ordinal + 1,
+                pairs.len()
+            );
+            let _ = std::io::stderr().flush();
+        }
+        let Some(pair) = pair else {
+            metrics.zero_initial_records += 1;
+            continue;
+        };
+        metrics.initialized_records += 1;
+        let record = &records[pair.record_index];
+        let initial = vocabulary
+            .decode(&pair.initial_row)
+            .map_err(anyhow::Error::msg)?;
+        metrics.initial_literal_top1 += usize::from(initial == record.peptidoform);
+        metrics.initial_sequence_top1 +=
+            usize::from(initial.sequence == record.peptidoform.sequence);
+        metrics.initial_il_top1 += usize::from(
+            il_sequence(&initial.sequence) == il_sequence(&record.peptidoform.sequence),
+        );
+        metrics.initial_length_exact += usize::from(pair.initial_active == pair.target_active);
+        if pair.initial_active != pair.target_active {
+            metrics.length_mismatch_records += 1;
+        }
+        let precursor_mass = v0200_precursor_mass(record)?;
+        if let Ok(mass) =
+            foundation_chemistry_diffusion_row_neutral_mass(&pair.initial_row, pair.initial_active)
+        {
+            metrics.initial_mass_error_abs_sum += (mass - precursor_mass).abs();
+            metrics.initial_mass_error_records += 1;
+        }
+
+        let forward = structured_edit_inference_v0220(
+            model,
+            pair,
+            record,
+            diffusion_collator,
+            spectrum_collator,
+            chemistry,
+            device,
+        )?;
+        let mut token_logits_rows = forward.output.sequence.token_logits.to_vec3::<f32>()?;
+        let token_logits = token_logits_rows.remove(0);
+        let mut gate_logits_rows = forward.output.gate_logits.to_vec3::<f32>()?;
+        let gate_logits = gate_logits_rows.remove(0);
+        let mut length_logits_rows = forward.output.sequence.length_logits.to_vec2::<f32>()?;
+        let length_logits = length_logits_rows.remove(0);
+        let (draft, draft_active, _) = foundation_structured_edit_argmax(
+            &forward.input_rows[0],
+            &token_logits,
+            &gate_logits,
+            &length_logits,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let (final_row, projected, fallback) = foundation_structured_edit_finalize(
+            &draft,
+            draft_active,
+            &token_logits,
+            &pair.initial_row,
+            pair.initial_active,
+            precursor_mass,
+            config.precursor_mass_tolerance_da,
+        )
+        .map_err(anyhow::Error::msg)?;
+        metrics.mass_projection_used += usize::from(projected);
+        metrics.initial_fallback_used += usize::from(fallback);
+        let final_active = final_row
+            .iter()
+            .position(|&token| token == FOUNDATION_DIFFUSION_PAD)
+            .unwrap_or(config.max_tokens);
+        metrics.final_mass_valid += usize::from(foundation_chemistry_diffusion_final_mass_valid(
+            &final_row,
+            final_active,
+            precursor_mass,
+            config.precursor_mass_tolerance_da,
+        ));
+        if let Ok(mass) = foundation_chemistry_diffusion_row_neutral_mass(&final_row, final_active)
+        {
+            metrics.final_mass_error_abs_sum += (mass - precursor_mass).abs();
+            metrics.final_mass_error_records += 1;
+        }
+        let final_peptide = vocabulary.decode(&final_row).map_err(anyhow::Error::msg)?;
+        metrics.final_literal_top1 += usize::from(final_peptide == record.peptidoform);
+        metrics.final_sequence_top1 +=
+            usize::from(final_peptide.sequence == record.peptidoform.sequence);
+        metrics.final_il_top1 += usize::from(
+            il_sequence(&final_peptide.sequence) == il_sequence(&record.peptidoform.sequence),
+        );
+        metrics.final_length_exact += usize::from(final_active == pair.target_active);
+        metrics.length_mismatches_corrected += usize::from(
+            pair.initial_active != pair.target_active && final_active == pair.target_active,
+        );
+
+        let initial_content = pair.initial_active.saturating_sub(1);
+        let target_content = pair.target_active.saturating_sub(1);
+        let final_content = final_active.saturating_sub(1);
+        let compare = initial_content
+            .max(target_content)
+            .max(final_content)
+            .min(config.max_tokens - 1);
+        metrics.positions_compared += compare;
+        for position in 0..compare {
+            let initial_token = if position < initial_content {
+                pair.initial_row[position]
+            } else {
+                FOUNDATION_DIFFUSION_PAD
+            };
+            let target_token = if position < target_content {
+                pair.target_row[position]
+            } else {
+                FOUNDATION_DIFFUSION_PAD
+            };
+            let final_token = if position < final_content {
+                final_row[position]
+            } else {
+                FOUNDATION_DIFFUSION_PAD
+            };
+            metrics.changed_positions += usize::from(initial_token != final_token);
+            if initial_token == target_token {
+                metrics.initially_correct_positions += 1;
+                metrics.correct_positions_damaged += usize::from(final_token != target_token);
+            } else {
+                metrics.initially_incorrect_positions += 1;
+                metrics.incorrect_positions_corrected += usize::from(final_token == target_token);
             }
         }
     }

@@ -44,6 +44,7 @@ pub mod run;
 pub mod sampling;
 pub mod spectrum;
 pub mod split;
+pub mod structured_edit;
 pub mod trainer;
 pub mod unified;
 pub mod wrapper;
@@ -250,6 +251,19 @@ pub use spectrum::{
 pub use split::{
     foundation_split_group_key, split_foundation_record_indices, split_foundation_records,
     FoundationSplitConfig, FoundationSplitIndices, FoundationSplitMode, FoundationSplitSummary,
+};
+pub use structured_edit::{
+    foundation_structured_edit_argmax, foundation_structured_edit_finalize,
+    foundation_structured_edit_gate_loss, foundation_structured_edit_open_row,
+    foundation_structured_edit_partition_isolated, foundation_structured_edit_set_targets,
+    load_structured_editor_from_v0210_checkpoint, FoundationStructuredEditOutput,
+    PeptideSpectrumStructuredEditor, StructuredEditWarmStartReport,
+    FOUNDATION_STRUCTURED_EDIT_ARCHITECTURE_V0220,
+    FOUNDATION_STRUCTURED_EDIT_CONTEXT_TIMESTEP_V0220,
+    FOUNDATION_STRUCTURED_EDIT_GATE_WEIGHT_V0220,
+    FOUNDATION_STRUCTURED_EDIT_INITIAL_BEAM_WIDTH_V0220,
+    FOUNDATION_STRUCTURED_EDIT_LENGTH_WEIGHT_V0220, FOUNDATION_STRUCTURED_EDIT_OBJECTIVE_V0220,
+    FOUNDATION_STRUCTURED_EDIT_PASSES_V0220, FOUNDATION_STRUCTURED_EDIT_TRAIN_INITIALIZERS_V0220,
 };
 pub use trainer::{
     FoundationEpochMetrics, FoundationEvaluationConfig, FoundationFitEpochMetrics,
