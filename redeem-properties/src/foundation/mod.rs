@@ -29,6 +29,7 @@ pub mod diffusion;
 pub mod direct_decoder;
 pub mod experiment;
 pub mod featurize;
+pub mod fragment_likelihood;
 pub mod interaction;
 pub mod iterative_refinement;
 pub mod layers;
@@ -188,6 +189,13 @@ pub use experiment::{
 pub use featurize::{
     exact_graph_modification_for, FoundationBatch, FoundationModification,
     FoundationModificationSite, PeptideGraphFeaturizer, PeptidoformInput,
+};
+pub use fragment_likelihood::{
+    foundation_fragment_likelihood_score, FoundationFragmentLikelihoodScore,
+    FOUNDATION_FRAGMENT_LIKELIHOOD_ABS_TOLERANCE_DA_V0230,
+    FOUNDATION_FRAGMENT_LIKELIHOOD_ARCHITECTURE_V0230,
+    FOUNDATION_FRAGMENT_LIKELIHOOD_MAX_PEAKS_V0230, FOUNDATION_FRAGMENT_LIKELIHOOD_PPM_V0230,
+    FOUNDATION_FRAGMENT_LIKELIHOOD_PRIMARY_SCORE_V0230,
 };
 pub use interaction::FoundationSpectrumCandidateInteractionAdapter;
 pub use iterative_refinement::{
