@@ -563,14 +563,30 @@ fn main() -> Result<()> {
                 "unsupported bidirectional_mitm policy '{value}'; expected 'none', 'v01319', 'v01320', 'v01321', 'v01322', or 'v01323'"
             ),
         };
-    let generation_partition_train = match env::var("REDEEM_GENERATION_PARTITION") {
-        Ok(value) if value.eq_ignore_ascii_case("train") => true,
-        Ok(value) if value.eq_ignore_ascii_case("validation") || value.trim().is_empty() => false,
-        Ok(value) => anyhow::bail!(
-            "unsupported REDEEM_GENERATION_PARTITION='{value}'; only 'train' or 'validation' are allowed, and TEST is intentionally unavailable"
-        ),
-        Err(_) => false,
-    };
+    let generation_partition_value =
+        env::var("REDEEM_GENERATION_PARTITION").unwrap_or_else(|_| "validation".to_string());
+    let generation_partition_train = generation_partition_value.eq_ignore_ascii_case("train");
+    let generation_partition_test = generation_partition_value.eq_ignore_ascii_case("test");
+    if !(generation_partition_train
+        || generation_partition_test
+        || generation_partition_value.eq_ignore_ascii_case("validation")
+        || generation_partition_value.trim().is_empty())
+    {
+        anyhow::bail!(
+            "unsupported REDEEM_GENERATION_PARTITION='{generation_partition_value}'; expected train, validation, or the locked v0.24 test evaluation"
+        );
+    }
+    if generation_partition_test {
+        let acknowledgement = env::var("REDEEM_V0240_TEST_ACK").unwrap_or_default();
+        if acknowledgement != "OPEN_FROZEN_TEST_ONCE_V0240_31_47" {
+            anyhow::bail!(
+                "TEST is locked. Set REDEEM_V0240_TEST_ACK=OPEN_FROZEN_TEST_ONCE_V0240_31_47 only for the accepted frozen v0.24 one-shot evaluation"
+            );
+        }
+        if !bidirectional_mitm_final_two_view {
+            anyhow::bail!("v0.24 TEST evaluation requires frozen v0.13.23 two-view MITM");
+        }
+    }
     let generation_shard_count = match env::var("REDEEM_GENERATION_SHARD_COUNT") {
         Ok(value) => value
             .parse::<usize>()
@@ -592,7 +608,7 @@ fn main() -> Result<()> {
     }
     if !generation_partition_train && generation_shard_count != 1 {
         anyhow::bail!(
-            "generation sharding is TRAIN-only; validation must use one unsharded frozen candidate run"
+            "generation sharding is TRAIN-only; validation/TEST must use one unsharded frozen candidate run"
         );
     }
     if generation_partition_train && !bidirectional_mitm_final_two_view {
@@ -728,6 +744,8 @@ fn main() -> Result<()> {
     let vocabulary = FoundationDiffusionVocabulary;
     let generation_partition = if generation_partition_train {
         FoundationPartition::Train
+    } else if generation_partition_test {
+        FoundationPartition::Test
     } else {
         FoundationPartition::Validation
     };
@@ -1075,6 +1093,8 @@ fn main() -> Result<()> {
         "generation_partition\t{}",
         if generation_partition_train {
             "TRAIN"
+        } else if generation_partition_test {
+            "TEST"
         } else {
             "VALIDATION"
         }
@@ -1087,7 +1107,14 @@ fn main() -> Result<()> {
     println!("generation_shard_end_exclusive\t{generation_shard_end}");
     println!("generation_shard_records\t{}", selected.len());
     println!("generation_shard_rng_policy\tglobal_selection_index_preserved");
-    println!("test_partition_consumed\tNO");
+    println!(
+        "test_partition_consumed\t{}",
+        if generation_partition_test {
+            "YES"
+        } else {
+            "NO"
+        }
+    );
     if generation_partition_train {
         println!("v0140_candidate_export_role\tTRAIN_supervision_candidates");
         println!("v0140_candidate_export_target_usage\tpost_generation_labels_only");
@@ -3405,7 +3432,7 @@ fn main() -> Result<()> {
             );
         }
 
-        if bidirectional_mitm && !generation_partition_train {
+        if bidirectional_mitm && !generation_partition_train && !generation_partition_test {
             println!(
                 "generation_summary\tfrozen_v01313_pool_mass_valid_peptidoform_exact\t{:.6}",
                 metrics.frozen_v01313_pool_mass_valid_peptidoform_exact as f64 / records
