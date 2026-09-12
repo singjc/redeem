@@ -30,6 +30,7 @@ pub mod direct_decoder;
 pub mod experiment;
 pub mod featurize;
 pub mod fragment_likelihood;
+pub mod fragment_relation;
 pub mod interaction;
 pub mod iterative_refinement;
 pub mod layers;
@@ -196,6 +197,17 @@ pub use fragment_likelihood::{
     FOUNDATION_FRAGMENT_LIKELIHOOD_ARCHITECTURE_V0230,
     FOUNDATION_FRAGMENT_LIKELIHOOD_MAX_PEAKS_V0230, FOUNDATION_FRAGMENT_LIKELIHOOD_PPM_V0230,
     FOUNDATION_FRAGMENT_LIKELIHOOD_PRIMARY_SCORE_V0230,
+};
+pub use fragment_relation::{
+    foundation_fragment_relation_features, foundation_fragment_relation_legacy_log_prior,
+    FoundationFragmentRelationBatch, FoundationFragmentRelationFeatureRows,
+    PeptideSpectrumFragmentRelationEnergy, FOUNDATION_FRAGMENT_RELATION_ABS_TOLERANCE_DA_V0240,
+    FOUNDATION_FRAGMENT_RELATION_ARCHITECTURE_V0240,
+    FOUNDATION_FRAGMENT_RELATION_CANDIDATE_HIDDEN_V0240,
+    FOUNDATION_FRAGMENT_RELATION_CORE_CHANNELS_V0240,
+    FOUNDATION_FRAGMENT_RELATION_FEATURE_DIM_V0240, FOUNDATION_FRAGMENT_RELATION_HIDDEN_V0240,
+    FOUNDATION_FRAGMENT_RELATION_MAX_PEAKS_V0240, FOUNDATION_FRAGMENT_RELATION_OBJECTIVE_V0240,
+    FOUNDATION_FRAGMENT_RELATION_POOLED_V0240, FOUNDATION_FRAGMENT_RELATION_PPM_V0240,
 };
 pub use interaction::FoundationSpectrumCandidateInteractionAdapter;
 pub use iterative_refinement::{
