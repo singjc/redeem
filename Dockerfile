@@ -153,6 +153,7 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 WORKDIR /work
 
 COPY scripts/compare_foundation_alphapeptdeep.py /opt/redeem/scripts/compare_foundation_alphapeptdeep.py
+COPY scripts/render_foundation_alphapeptdeep_report.py /opt/redeem/scripts/render_foundation_alphapeptdeep_report.py
 COPY redeem-properties/nbs/redeem_foundation_validation_report.ipynb /opt/redeem/notebooks/redeem_foundation_validation_report.ipynb
 COPY scripts/redeem-foundation /usr/local/bin/redeem-foundation
 COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
@@ -219,7 +220,8 @@ RUN apt-get -o Acquire::Retries=5 update && \
 RUN chmod 0755 \
         /usr/local/bin/redeem-foundation \
         /usr/local/bin/redeem-container-info \
-        /opt/redeem/scripts/compare_foundation_alphapeptdeep.py && \
+        /opt/redeem/scripts/compare_foundation_alphapeptdeep.py \
+        /opt/redeem/scripts/render_foundation_alphapeptdeep_report.py && \
     /usr/local/bin/redeem-container-info --build-check
 
 CMD ["redeem-foundation", "help"]

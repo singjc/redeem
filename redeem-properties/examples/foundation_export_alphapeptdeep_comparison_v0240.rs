@@ -204,7 +204,7 @@ fn main() -> Result<()> {
     let mut fragments = BufWriter::new(File::create(&fragment_path)?);
     writeln!(
         fragments,
-        "record_index\tsequence\tcleavage_index\tchannel\tcharged_frag_type\tfragment_number\ttarget_intensity\tfoundation_intensity"
+        "record_index\tsequence\tcleavage_index\tchannel\tcharged_frag_type\tfragment_number\tproduct_mz\ttarget_intensity\tfoundation_intensity"
     )?;
     for &index in &ms2_validation {
         let record = &corpus.records[index];
@@ -230,13 +230,14 @@ fn main() -> Result<()> {
             )?;
             writeln!(
                 fragments,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}",
                 index,
                 record.peptidoform.sequence,
                 fragment.cleavage_index,
                 fragment.channel,
                 frag_type,
                 number,
+                option_f32(fragment.product_mz),
                 fragment.intensity,
                 predicted,
             )?;
