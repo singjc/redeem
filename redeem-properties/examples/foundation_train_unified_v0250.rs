@@ -27,7 +27,7 @@ use redeem_properties::foundation::{
     FOUNDATION_DIFFUSION_VOCAB_SIZE, FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -296,10 +296,11 @@ fn main() -> Result<()> {
         / batch_size)
         .min(4_096)
         .max(1);
-    let dev_batches = (dev_forward_indices.len().min(dev_inverse_indices.len()) / batch_size)
+    let requested_dev_batches = (dev_forward_indices.len().min(dev_inverse_indices.len())
+        / batch_size)
         .min(256)
         .max(1);
-    let holdout_batches = (holdout_forward_indices
+    let requested_holdout_batches = (holdout_forward_indices
         .len()
         .min(holdout_inverse_indices.len())
         / batch_size)
@@ -314,7 +315,6 @@ fn main() -> Result<()> {
         &dev_forward_indices,
     );
     forward_sampling.train_steps_per_epoch = Some(steps_per_epoch);
-    forward_sampling.validation_steps = Some(dev_batches);
     let mut inverse_sampling = filtered_sampling_config(
         &run.trainer.sampling,
         &corpus.provenance,
@@ -322,6 +322,29 @@ fn main() -> Result<()> {
         &dev_inverse_indices,
     );
     inverse_sampling.train_steps_per_epoch = Some(steps_per_epoch);
+
+    // Historical validation-source weights describe the desired source mixture,
+    // but the new TRAIN-derived DEV partition can contain fewer records from a
+    // rare source than the old fixed validation budget requested. Validation is
+    // strictly without replacement, so choose the largest common batch count
+    // whose exact weighted quotas fit both forward and inverse DEV pools.
+    let dev_batches = feasible_validation_batches(
+        "dev_forward",
+        &forward_sampling,
+        &corpus.provenance,
+        &dev_forward_indices,
+        batch_size,
+        requested_dev_batches,
+    )?
+    .min(feasible_validation_batches(
+        "dev_inverse",
+        &inverse_sampling,
+        &corpus.provenance,
+        &dev_inverse_indices,
+        batch_size,
+        requested_dev_batches,
+    )?);
+    forward_sampling.validation_steps = Some(dev_batches);
     inverse_sampling.validation_steps = Some(dev_batches);
 
     let dev_forward_plan = sample_foundation_validation_indices(
@@ -343,8 +366,39 @@ fn main() -> Result<()> {
     let dev_forward = dev_forward_plan.indices.clone();
     let dev_inverse = dev_inverse_plan.indices.clone();
 
-    let mut holdout_sampling = forward_sampling.clone();
+    // Filter validation weights against HOLDOUT independently of DEV, then
+    // choose a quota-feasible common holdout size. This keeps HOLDOUT fixed and
+    // without replacement while avoiding assumptions about per-source counts.
+    let mut holdout_sampling = filtered_sampling_config(
+        &run.trainer.sampling,
+        &corpus.provenance,
+        &train_forward_indices,
+        &holdout_forward_indices,
+    );
+    let mut holdout_inverse_sampling = filtered_sampling_config(
+        &run.trainer.sampling,
+        &corpus.provenance,
+        &train_inverse_indices,
+        &holdout_inverse_indices,
+    );
+    let holdout_batches = feasible_validation_batches(
+        "holdout_forward",
+        &holdout_sampling,
+        &corpus.provenance,
+        &holdout_forward_indices,
+        batch_size,
+        requested_holdout_batches,
+    )?
+    .min(feasible_validation_batches(
+        "holdout_inverse",
+        &holdout_inverse_sampling,
+        &corpus.provenance,
+        &holdout_inverse_indices,
+        batch_size,
+        requested_holdout_batches,
+    )?);
     holdout_sampling.validation_steps = Some(holdout_batches);
+    holdout_inverse_sampling.validation_steps = Some(holdout_batches);
     let holdout_forward_plan = sample_foundation_validation_indices(
         &corpus.records,
         &corpus.provenance,
@@ -353,8 +407,6 @@ fn main() -> Result<()> {
         seed ^ 0x484f_4c44_4f55_5430,
         &holdout_sampling,
     )?;
-    let mut holdout_inverse_sampling = inverse_sampling.clone();
-    holdout_inverse_sampling.validation_steps = Some(holdout_batches);
     let holdout_inverse_plan = sample_foundation_validation_indices(
         &corpus.records,
         &corpus.provenance,
@@ -499,8 +551,13 @@ fn main() -> Result<()> {
     println!("dev_inverse_records\t{}", dev_inverse_indices.len());
     println!("holdout_inverse_records\t{}", holdout_inverse_indices.len());
     println!("steps_per_epoch\t{steps_per_epoch}");
+    println!("requested_dev_batches\t{requested_dev_batches}");
     println!("dev_batches\t{dev_batches}");
+    println!("requested_holdout_batches\t{requested_holdout_batches}");
     println!("holdout_batches\t{holdout_batches}");
+    println!(
+        "validation_sampling_policy\thistorical_source_weights_quota_capped_without_replacement"
+    );
     println!("max_epochs\t{max_epochs}");
     println!("early_stopping_patience\t{patience}");
     println!("early_stopping_min_delta\t{min_delta}");
@@ -2245,6 +2302,106 @@ fn filtered_sampling_config(
             .retain(|source, _| validation_sources.contains(source));
     }
     config
+}
+
+fn feasible_validation_batches(
+    label: &str,
+    config: &FoundationSamplingConfig,
+    provenance: &[redeem_properties::foundation::FoundationRecordProvenance],
+    validation_indices: &[usize],
+    batch_size: usize,
+    requested_batches: usize,
+) -> Result<usize> {
+    if batch_size == 0 || requested_batches == 0 {
+        anyhow::bail!("v0.25 {label} validation requires positive batch_size/requested_batches");
+    }
+    let max_batches = requested_batches.min(validation_indices.len() / batch_size);
+    if max_batches == 0 {
+        anyhow::bail!(
+            "v0.25 {label} has only {} records, fewer than batch_size={batch_size}",
+            validation_indices.len()
+        );
+    }
+    if config.validation_source_weights.is_empty() {
+        return Ok(max_batches);
+    }
+
+    let mut available = BTreeMap::<String, usize>::new();
+    for &index in validation_indices {
+        let source = provenance.get(index).ok_or_else(|| {
+            anyhow::anyhow!("v0.25 {label} provenance index {index} is out of bounds")
+        })?;
+        *available.entry(source.source_id.clone()).or_default() += 1;
+    }
+    for source in available.keys() {
+        if !config.validation_source_weights.contains_key(source) {
+            anyhow::bail!(
+                "v0.25 {label} validation weights are missing represented source '{source}'"
+            );
+        }
+    }
+    for source in config.validation_source_weights.keys() {
+        if !available.contains_key(source) {
+            anyhow::bail!("v0.25 {label} validation weight refers to absent source '{source}'");
+        }
+    }
+
+    let total_weight: f64 = config.validation_source_weights.values().copied().sum();
+    if !(total_weight > 0.0 && total_weight.is_finite()) {
+        anyhow::bail!("v0.25 {label} validation source weights have no positive finite mass");
+    }
+
+    for batches in (1..=max_batches).rev() {
+        let target_records = batches.saturating_mul(batch_size);
+        let quotas = weighted_quotas_v0250(
+            target_records,
+            &config.validation_source_weights,
+            total_weight,
+        );
+        let fits = quotas
+            .iter()
+            .all(|(source, desired)| *desired <= available.get(source).copied().unwrap_or(0));
+        if fits {
+            return Ok(batches);
+        }
+    }
+
+    anyhow::bail!(
+        "v0.25 {label} cannot satisfy validation source weights for even one full batch without replacement"
+    )
+}
+
+fn weighted_quotas_v0250(
+    target_records: usize,
+    weights: &BTreeMap<String, f64>,
+    total_weight: f64,
+) -> BTreeMap<String, usize> {
+    let mut quotas = BTreeMap::<String, usize>::new();
+    let mut fractions = Vec::<(f64, String)>::new();
+    let mut assigned = 0usize;
+    for (source, weight) in weights {
+        let exact = target_records as f64 * *weight / total_weight;
+        let base = exact.floor() as usize;
+        assigned = assigned.saturating_add(base);
+        quotas.insert(source.clone(), base);
+        fractions.push((exact - base as f64, source.clone()));
+    }
+    fractions.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let mut remaining = target_records.saturating_sub(assigned);
+    for (_, source) in fractions {
+        if remaining == 0 {
+            break;
+        }
+        *quotas.entry(source).or_default() += 1;
+        remaining -= 1;
+    }
+    quotas
 }
 
 fn require_plan_records(label: &str, plan: &FoundationSamplePlan, expected: usize) -> Result<()> {
