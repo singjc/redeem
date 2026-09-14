@@ -38,6 +38,7 @@ pub mod loss;
 pub mod metadata;
 pub mod model;
 pub mod msp;
+pub mod multimodal_v0260;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -206,6 +207,7 @@ pub use fragment_relation::{
     FOUNDATION_FRAGMENT_RELATION_CANDIDATE_HIDDEN_V0240,
     FOUNDATION_FRAGMENT_RELATION_CORE_CHANNELS_V0240,
     FOUNDATION_FRAGMENT_RELATION_FEATURE_DIM_V0240, FOUNDATION_FRAGMENT_RELATION_HIDDEN_V0240,
+    FOUNDATION_FRAGMENT_RELATION_MATCHED_OFFSET_V0240,
     FOUNDATION_FRAGMENT_RELATION_MAX_PEAKS_V0240, FOUNDATION_FRAGMENT_RELATION_OBJECTIVE_V0240,
     FOUNDATION_FRAGMENT_RELATION_POOLED_V0240, FOUNDATION_FRAGMENT_RELATION_PPM_V0240,
 };
@@ -236,6 +238,15 @@ pub use model::{
     PeptideFoundationMultiTaskModel, PrecursorContextBatch,
 };
 pub use msp::{load_foundation_msp_reader, FoundationMspLoadReport};
+pub use multimodal_v0260::{
+    foundation_multimodal_ms2_loss_v0260, foundation_multimodal_relation_margin_loss_v0260,
+    FoundationMultimodalForwardOutputV0260, FoundationMultimodalMs2LossesV0260,
+    PeptideFoundationMultimodalForwardV0260, PeptideFoundationMultimodalV0260Model,
+    FOUNDATION_MULTIMODAL_ARCHITECTURE_V0260, FOUNDATION_MULTIMODAL_MS2_COSINE_WEIGHT_V0260,
+    FOUNDATION_MULTIMODAL_MS2_INTENSITY_WEIGHT_V0260,
+    FOUNDATION_MULTIMODAL_MS2_PRESENCE_WEIGHT_V0260, FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0260,
+    FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0260,
+};
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
     FoundationTargetNormalizationConfig,

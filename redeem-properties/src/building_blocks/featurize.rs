@@ -288,6 +288,7 @@ mod tests {
         // assert_eq!(result.to_vec3::<f32>().unwrap(), expect_out.to_vec3::<f32>().unwrap());
     }
 
+    #[cfg(feature = "legacy-peptdeep-models")]
     #[test]
     fn test_get_mod_features_from_parsed() {
         ensure_models();

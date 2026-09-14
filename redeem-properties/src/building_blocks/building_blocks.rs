@@ -1979,6 +1979,7 @@ mod tests {
         println!("mod_loss_nn : {:?}", mod_loss_nn);
     }
 
+    #[cfg(feature = "legacy-peptdeep-models")]
     #[test]
     fn test_seq_cnn() {
         ensure_models();
@@ -2013,6 +2014,7 @@ mod tests {
         println!("seq_cnn : {:?}", seq_cnn);
     }
 
+    #[cfg(feature = "legacy-peptdeep-models")]
     #[test]
     fn test_seq_lstm() {
         ensure_models();
@@ -2034,6 +2036,7 @@ mod tests {
         println!("seq_lstm : {:?}", seq_lstm);
     }
 
+    #[cfg(feature = "legacy-peptdeep-models")]
     #[test]
     fn test_seq_attention_sum() {
         ensure_models();

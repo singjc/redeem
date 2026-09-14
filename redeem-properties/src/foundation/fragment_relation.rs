@@ -674,7 +674,7 @@ mod tests {
     fn spectrum_at_b1_a() -> FoundationSpectrum {
         FoundationSpectrum {
             peaks: vec![FoundationSpectrumPeak {
-                mz: 71.037_113_805 + PROTON_MASS_DA,
+                mz: (71.037_113_805 + PROTON_MASS_DA) as f32,
                 intensity: 100.0,
             }],
         }

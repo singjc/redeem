@@ -297,7 +297,7 @@ impl fmt::Debug for CCSCNNLSTMModel {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-peptdeep-models"))]
 mod tests {
     use super::*;
     use crate::models::ccs_cnn_lstm_model::CCSCNNLSTMModel;

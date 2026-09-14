@@ -333,7 +333,7 @@ impl ModelInterface for RTCNNLSTMModel {
 //     }
 // }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-peptdeep-models"))]
 mod tests {
     use crate::models::model_interface::{ModelInterface, PredictionResult};
     use crate::models::rt_cnn_lstm_model::RTCNNLSTMModel;
