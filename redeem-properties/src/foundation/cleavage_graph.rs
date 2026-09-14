@@ -14,7 +14,8 @@ use super::diffusion::{
     foundation_diffusion_token_residue, foundation_precursor_neutral_mass,
     FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
     FOUNDATION_DIFFUSION_FIRST_RESIDUE, FOUNDATION_DIFFUSION_OXIDATION,
-    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_PEPTIDE_WATER_MASS_DA,
+    FOUNDATION_DIFFUSION_PHOSPHO, FOUNDATION_DIFFUSION_RESIDUE_ACETYL,
+    FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
 use super::featurize::{FoundationModification, FoundationModificationSite, PeptidoformInput};
 use super::spectrum::FoundationSpectrum;
@@ -1841,6 +1842,7 @@ fn unimod_token(unimod_id: u32) -> std::result::Result<u32, String> {
         1 => Ok(FOUNDATION_DIFFUSION_RESIDUE_ACETYL),
         4 => Ok(FOUNDATION_DIFFUSION_CARBAMIDOMETHYL),
         7 => Ok(FOUNDATION_DIFFUSION_DEAMIDATED),
+        21 => Ok(FOUNDATION_DIFFUSION_PHOSPHO),
         35 => Ok(FOUNDATION_DIFFUSION_OXIDATION),
         _ => Err(format!("unsupported cleavage-graph UniMod:{unimod_id}")),
     }

@@ -43,8 +43,10 @@ pub const FOUNDATION_DIFFUSION_CARBAMIDOMETHYL: u32 = 25;
 pub const FOUNDATION_DIFFUSION_DEAMIDATED: u32 = 26;
 /// Residue-local UniMod:35 oxidation marker.
 pub const FOUNDATION_DIFFUSION_OXIDATION: u32 = 27;
-/// Size of the initial residue/PTM vocabulary.
-pub const FOUNDATION_DIFFUSION_VOCAB_SIZE: usize = 28;
+/// Residue-local UniMod:21 phosphorylation marker.
+pub const FOUNDATION_DIFFUSION_PHOSPHO: u32 = 28;
+/// Size of the residue/PTM vocabulary.
+pub const FOUNDATION_DIFFUSION_VOCAB_SIZE: usize = 29;
 
 const PROTON_MASS_DA: f64 = 1.007_276_466_77;
 pub const FOUNDATION_PEPTIDE_WATER_MASS_DA: f64 = 18.010_564_684;
@@ -178,9 +180,9 @@ impl FoundationDiffusionConfig {
 ///
 /// PTM markers are separate sequence tokens rather than atom-graph states. A
 /// residue-local PTM marker follows the residue it modifies. N-terminal acetyl
-/// precedes the first residue. The current vocabulary exactly covers the four
-/// canonical modification families observed in the validated OpenSWATH/IP2
-/// corpus; unsupported PTMs fail explicitly rather than being silently dropped.
+/// precedes the first residue. The vocabulary covers the canonical modification
+/// families used by the foundation inverse lanes, including phosphorylation on
+/// S/T/Y. Unsupported PTMs fail explicitly rather than being silently dropped.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FoundationDiffusionVocabulary;
 
@@ -233,14 +235,15 @@ impl FoundationDiffusionVocabulary {
                 .collect();
             modifications.sort_by_key(|modification| modification.unimod_id.unwrap_or(u32::MAX));
             for modification in modifications {
-                if exact_graph_modification_for(residue, modification).is_none() {
+                let token = residue_modification_token(modification)?;
+                if !foundation_diffusion_residue_ptm_valid(token, residue) {
                     return Err(format!(
                         "diffusion vocabulary cannot encode {} on residue {}",
                         modification.identity_label(),
                         residue
                     ));
                 }
-                tokens.push(residue_modification_token(modification)?);
+                tokens.push(token);
             }
         }
 
@@ -300,7 +303,8 @@ impl FoundationDiffusionVocabulary {
                 FOUNDATION_DIFFUSION_RESIDUE_ACETYL
                 | FOUNDATION_DIFFUSION_CARBAMIDOMETHYL
                 | FOUNDATION_DIFFUSION_DEAMIDATED
-                | FOUNDATION_DIFFUSION_OXIDATION => {
+                | FOUNDATION_DIFFUSION_OXIDATION
+                | FOUNDATION_DIFFUSION_PHOSPHO => {
                     let residue_index =
                         sequence.chars().count().checked_sub(1).ok_or_else(|| {
                             "residue PTM token appeared before any residue".to_string()
@@ -310,6 +314,7 @@ impl FoundationDiffusionVocabulary {
                         FOUNDATION_DIFFUSION_CARBAMIDOMETHYL => 4,
                         FOUNDATION_DIFFUSION_DEAMIDATED => 7,
                         FOUNDATION_DIFFUSION_OXIDATION => 35,
+                        FOUNDATION_DIFFUSION_PHOSPHO => 21,
                         _ => unreachable!(),
                     };
                     let definition = common_unimod_definition(unimod_id)
@@ -324,7 +329,7 @@ impl FoundationDiffusionVocabulary {
                         unimod_id,
                         definition.mass_delta,
                     );
-                    if exact_graph_modification_for(residue, &modification).is_none() {
+                    if !foundation_diffusion_residue_ptm_valid(token, residue) {
                         return Err(format!(
                             "diffusion token {} is not valid on residue {}",
                             self.token_label(token),
@@ -364,6 +369,7 @@ impl FoundationDiffusionVocabulary {
             FOUNDATION_DIFFUSION_CARBAMIDOMETHYL => "[UniMod:4]",
             FOUNDATION_DIFFUSION_DEAMIDATED => "[UniMod:7]",
             FOUNDATION_DIFFUSION_OXIDATION => "[UniMod:35]",
+            FOUNDATION_DIFFUSION_PHOSPHO => "[UniMod:21]",
             3 => "A",
             4 => "C",
             5 => "D",
@@ -447,6 +453,7 @@ pub fn foundation_diffusion_token_mass_da(token: u32) -> Option<f64> {
         FOUNDATION_DIFFUSION_CARBAMIDOMETHYL => Some(57.021_465),
         FOUNDATION_DIFFUSION_DEAMIDATED => Some(0.984_016),
         FOUNDATION_DIFFUSION_OXIDATION => Some(15.994_915),
+        FOUNDATION_DIFFUSION_PHOSPHO => Some(79.966_33),
         _ => None,
     }
 }
@@ -458,8 +465,12 @@ pub fn foundation_diffusion_residue_ptm_valid(token: u32, residue: char) -> bool
         FOUNDATION_DIFFUSION_CARBAMIDOMETHYL => 4,
         FOUNDATION_DIFFUSION_DEAMIDATED => 7,
         FOUNDATION_DIFFUSION_OXIDATION => 35,
+        FOUNDATION_DIFFUSION_PHOSPHO => 21,
         _ => return false,
     };
+    if unimod_id == 21 {
+        return matches!(residue, 'S' | 'T' | 'Y');
+    }
     let Some(definition) = common_unimod_definition(unimod_id) else {
         return false;
     };
@@ -479,6 +490,7 @@ fn residue_modification_token(
         Some(1) => Ok(FOUNDATION_DIFFUSION_RESIDUE_ACETYL),
         Some(4) => Ok(FOUNDATION_DIFFUSION_CARBAMIDOMETHYL),
         Some(7) => Ok(FOUNDATION_DIFFUSION_DEAMIDATED),
+        Some(21) => Ok(FOUNDATION_DIFFUSION_PHOSPHO),
         Some(35) => Ok(FOUNDATION_DIFFUSION_OXIDATION),
         _ => Err(format!(
             "diffusion vocabulary does not yet support residue {}",
@@ -1441,6 +1453,39 @@ mod tests {
         assert!(tokens.contains(&FOUNDATION_DIFFUSION_OXIDATION));
         let decoded = vocabulary.decode(&tokens).unwrap();
         assert_eq!(decoded, peptide);
+    }
+
+    #[test]
+    fn phosphorylation_round_trips_on_sty_and_uses_canonical_mass() {
+        let vocabulary = FoundationDiffusionVocabulary;
+        let phospho = common_unimod_definition(21).unwrap();
+        for (sequence, residue_index) in [
+            ("ASPEPTIDE", 1usize),
+            ("ATPEPTIDE", 1usize),
+            ("AYPEPTIDE", 1usize),
+        ] {
+            let peptide = PeptidoformInput {
+                sequence: sequence.into(),
+                modifications: vec![FoundationModification::unimod(
+                    FoundationModificationSite::Residue(residue_index),
+                    residue_index,
+                    21,
+                    phospho.mass_delta,
+                )],
+            };
+            let tokens = vocabulary.encode(&peptide, 32).unwrap();
+            assert!(tokens.contains(&FOUNDATION_DIFFUSION_PHOSPHO));
+            assert_eq!(vocabulary.decode(&tokens).unwrap(), peptide);
+        }
+        assert!(
+            (foundation_diffusion_token_mass_da(FOUNDATION_DIFFUSION_PHOSPHO).unwrap() - 79.966_33)
+                .abs()
+                < 1e-6
+        );
+        assert!(!foundation_diffusion_residue_ptm_valid(
+            FOUNDATION_DIFFUSION_PHOSPHO,
+            'A'
+        ));
     }
 
     #[test]

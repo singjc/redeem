@@ -19,8 +19,8 @@ use super::diffusion::{
     FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
     FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_FIRST_RESIDUE, FOUNDATION_DIFFUSION_MASK,
     FOUNDATION_DIFFUSION_NTERM_ACETYL, FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD,
-    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
-    FOUNDATION_PEPTIDE_WATER_MASS_DA,
+    FOUNDATION_DIFFUSION_PHOSPHO, FOUNDATION_DIFFUSION_RESIDUE_ACETYL,
+    FOUNDATION_DIFFUSION_VOCAB_SIZE, FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
 use super::featurize::PeptidoformInput;
 use super::model::PrecursorContextBatch;
@@ -125,6 +125,7 @@ impl ChemistrySuffixMassLattice {
             FOUNDATION_DIFFUSION_CARBAMIDOMETHYL,
             FOUNDATION_DIFFUSION_DEAMIDATED,
             FOUNDATION_DIFFUSION_OXIDATION,
+            FOUNDATION_DIFFUSION_PHOSPHO,
         ];
 
         for budget in 1..=max_tokens {
@@ -261,6 +262,7 @@ fn suffix_state_after_transition(prefix: &[u32], token: u32) -> Option<usize> {
             | FOUNDATION_DIFFUSION_CARBAMIDOMETHYL
             | FOUNDATION_DIFFUSION_DEAMIDATED
             | FOUNDATION_DIFFUSION_OXIDATION
+            | FOUNDATION_DIFFUSION_PHOSPHO
     ) && prefix
         .iter()
         .any(|&value| foundation_diffusion_token_residue(value).is_some())
@@ -645,6 +647,7 @@ impl ChemistryTransitionFeaturizer {
                 | FOUNDATION_DIFFUSION_CARBAMIDOMETHYL
                 | FOUNDATION_DIFFUSION_DEAMIDATED
                 | FOUNDATION_DIFFUSION_OXIDATION
+                | FOUNDATION_DIFFUSION_PHOSPHO
         ) {
             1.0
         } else {
@@ -816,6 +819,7 @@ fn token_chemistry_summary(token: u32) -> TokenChemistrySummary {
         FOUNDATION_DIFFUSION_CARBAMIDOMETHYL => Some(4),
         FOUNDATION_DIFFUSION_DEAMIDATED => Some(7),
         FOUNDATION_DIFFUSION_OXIDATION => Some(35),
+        FOUNDATION_DIFFUSION_PHOSPHO => Some(21),
         _ => None,
     };
     if let Some(definition) = unimod.and_then(common_unimod_definition) {

@@ -596,9 +596,14 @@ fn main() -> Result<()> {
     )?;
 
     fs::create_dir_all(&output_root)?;
-    println!("v0260_version\tv0.26.0-gpu-random-init-convergence");
+    println!("v0260_version\tv0.26.0-gpu-random-init-convergence-phospho29");
     println!("objective\tv0260_multimodal_task_adapters_factorized_ms2_crossmodal_relation");
     println!("architecture\t{}", FOUNDATION_MULTIMODAL_ARCHITECTURE_V0260);
+    println!(
+        "diffusion_vocabulary_size\t{}",
+        FOUNDATION_DIFFUSION_VOCAB_SIZE
+    );
+    println!("phosphorylation_unimod21_token\t28");
     println!("architecture_template\t{}", architecture_template.display());
     println!("architecture_template_weights_loaded\tfalse");
     println!("random_initialization\ttrue");

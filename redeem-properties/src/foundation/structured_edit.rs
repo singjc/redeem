@@ -24,8 +24,8 @@ use super::diffusion::{
     FoundationDiffusionBatch, FoundationDiffusionConfig, FoundationDiffusionOutput,
     FOUNDATION_DIFFUSION_CARBAMIDOMETHYL, FOUNDATION_DIFFUSION_DEAMIDATED,
     FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK, FOUNDATION_DIFFUSION_NTERM_ACETYL,
-    FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_RESIDUE_ACETYL,
-    FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FOUNDATION_DIFFUSION_OXIDATION, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_PHOSPHO,
+    FOUNDATION_DIFFUSION_RESIDUE_ACETYL, FOUNDATION_DIFFUSION_VOCAB_SIZE,
 };
 use super::experiment::FoundationPartition;
 use super::model::PrecursorContextBatch;
@@ -424,6 +424,7 @@ fn structured_token_valid_after_prefix(token: u32, prefix: &[u32], position: usi
             | FOUNDATION_DIFFUSION_CARBAMIDOMETHYL
             | FOUNDATION_DIFFUSION_DEAMIDATED
             | FOUNDATION_DIFFUSION_OXIDATION
+            | FOUNDATION_DIFFUSION_PHOSPHO
     ) {
         let Some(&previous) = prefix.last() else {
             return false;
