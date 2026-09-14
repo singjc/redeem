@@ -16,6 +16,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+const V0250_MAX_SEQUENCE_LEN: usize = 64;
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 || args.len() > 6 {
@@ -36,14 +38,47 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read {:?}", source_manifest_path))?;
     source_manifest.validate_against_records(&corpus.records)?;
 
-    let source_train: Vec<usize> = source_manifest
+    let source_train_all: Vec<usize> = source_manifest
         .entries
         .iter()
         .filter(|entry| entry.partition == FoundationPartition::Train)
         .map(|entry| entry.record_index)
         .collect();
-    if source_train.is_empty() {
+    if source_train_all.is_empty() {
         anyhow::bail!("historical benchmark TRAIN partition is empty");
+    }
+
+    // v0.25 deliberately preserves the accepted v0.13.10 architecture. Its
+    // encoder is defined only through 64 residues, so over-length peptides are
+    // outside the model's support and must not be truncated. Apply the
+    // architecture eligibility rule before sequence-disjoint splitting so the
+    // TRAIN-core/DEV/HOLDOUT proportions and audit describe only usable data.
+    let mut excluded_overlength_records = 0usize;
+    let mut excluded_overlength_groups = BTreeSet::<String>::new();
+    let mut max_observed_sequence_len = 0usize;
+    let mut max_excluded_sequence_len = 0usize;
+    let source_train: Vec<usize> = source_train_all
+        .iter()
+        .copied()
+        .filter(|&index| {
+            let sequence = &corpus.records[index].peptidoform.sequence;
+            let sequence_len = sequence.chars().count();
+            max_observed_sequence_len = max_observed_sequence_len.max(sequence_len);
+            if sequence_len > V0250_MAX_SEQUENCE_LEN {
+                excluded_overlength_records += 1;
+                max_excluded_sequence_len = max_excluded_sequence_len.max(sequence_len);
+                excluded_overlength_groups.insert(sequence.clone());
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if source_train.is_empty() {
+        anyhow::bail!(
+            "no historical TRAIN records remain after max_sequence_len={} eligibility filtering",
+            V0250_MAX_SEQUENCE_LEN
+        );
     }
 
     let split_config = FoundationSplitConfig {
@@ -57,13 +92,13 @@ fn main() -> Result<()> {
     let train: BTreeSet<usize> = split.train.iter().copied().collect();
     let dev: BTreeSet<usize> = split.validation.iter().copied().collect();
     let holdout: BTreeSet<usize> = split.test.iter().copied().collect();
+    let eligible_source_train: BTreeSet<usize> = source_train.iter().copied().collect();
 
     let mut entries = Vec::with_capacity(source_train.len());
-    for source_entry in source_manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.partition == FoundationPartition::Train)
-    {
+    for source_entry in source_manifest.entries.iter().filter(|entry| {
+        entry.partition == FoundationPartition::Train
+            && eligible_source_train.contains(&entry.record_index)
+    }) {
         let index = source_entry.record_index;
         let partition = if train.contains(&index) {
             FoundationPartition::Train
@@ -115,9 +150,21 @@ fn main() -> Result<()> {
     let run_path = output_dir.join("run_v0250.yaml");
     fs::write(&run_path, serde_yaml::to_string(&run)?)?;
 
-    println!("v0250_prepare_version\tv0.25.0-train-derived-sequence-split");
+    println!("v0250_prepare_version\tv0.25.0-train-derived-sequence-split-length64");
     println!("source_run_yaml\t{}", source_yaml.display());
     println!("source_benchmark\t{}", source_manifest_path.display());
+    println!(
+        "source_train_records_before_length_filter\t{}",
+        source_train_all.len()
+    );
+    println!("architecture_max_sequence_len\t{}", V0250_MAX_SEQUENCE_LEN);
+    println!("max_observed_train_sequence_len\t{max_observed_sequence_len}");
+    println!("excluded_overlength_records\t{excluded_overlength_records}");
+    println!(
+        "excluded_overlength_groups\t{}",
+        excluded_overlength_groups.len()
+    );
+    println!("max_excluded_sequence_len\t{max_excluded_sequence_len}");
     println!("source_train_records\t{}", source_train.len());
     println!("train_core_records\t{}", split.summary.train_records);
     println!("train_dev_records\t{}", split.summary.validation_records);

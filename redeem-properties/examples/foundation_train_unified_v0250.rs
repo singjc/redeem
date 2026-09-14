@@ -253,6 +253,32 @@ fn main() -> Result<()> {
     // parameters from random initialization.
     forward_config.ms2_output_activation = FoundationMs2OutputActivation::SoftplusV0138;
     forward_config.validate().map_err(anyhow::Error::msg)?;
+
+    // The v0.25 prepare step excludes peptides that cannot be represented by
+    // the frozen architecture. Re-check that invariant here so a malformed or
+    // stale prepared manifest fails before optimizer initialization rather than
+    // part-way through an epoch. Peptides are never truncated.
+    let mut prepared_max_sequence_len = 0usize;
+    let mut prepared_overlength_records = 0usize;
+    let mut first_overlength: Option<(usize, String, usize)> = None;
+    for entry in &benchmark.entries {
+        let sequence = &corpus.records[entry.record_index].peptidoform.sequence;
+        let sequence_len = sequence.chars().count();
+        prepared_max_sequence_len = prepared_max_sequence_len.max(sequence_len);
+        if sequence_len > forward_config.max_sequence_len {
+            prepared_overlength_records += 1;
+            if first_overlength.is_none() {
+                first_overlength = Some((entry.record_index, sequence.clone(), sequence_len));
+            }
+        }
+    }
+    if let Some((record_index, sequence, sequence_len)) = first_overlength {
+        anyhow::bail!(
+            "v0.25 prepared benchmark contains {prepared_overlength_records} peptide(s) longer than architecture max_sequence_len={}; first record_index={record_index} length={sequence_len} sequence={sequence}",
+            forward_config.max_sequence_len
+        );
+    }
+
     let inverse_config = template_metadata.inverse_config;
     inverse_config.validate().map_err(anyhow::Error::msg)?;
 
@@ -534,6 +560,12 @@ fn main() -> Result<()> {
     println!("architecture_template_weights_loaded\tfalse");
     println!("random_initialization\ttrue");
     println!("device\t{:?}", device);
+    println!(
+        "architecture_max_sequence_len\t{}",
+        forward_config.max_sequence_len
+    );
+    println!("prepared_max_sequence_len\t{prepared_max_sequence_len}");
+    println!("prepared_overlength_records\t{prepared_overlength_records}");
     println!(
         "corpus_fingerprint\tfnv1a64:{:016x}",
         corpus.corpus_fingerprint
