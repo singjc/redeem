@@ -205,9 +205,9 @@ struct CausalTrainObjective {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 || args.len() > 10 {
+    if args.len() < 4 || args.len() > 11 {
         anyhow::bail!(
-            "usage: foundation_train_multimodal_v0260 RUN_V0260.yaml OUTPUT_DIR ARCHITECTURE_TEMPLATE_UNIFIED [max_epochs=30] [batch_size=32] [patience=5] [min_delta=0.002] [seed=20260925] [learning_rate=1e-4]"
+            "usage: foundation_train_multimodal_v0260 RUN_V0260.yaml OUTPUT_DIR ARCHITECTURE_TEMPLATE_UNIFIED [max_epochs=30] [batch_size=32] [patience=5] [min_delta=0.002] [seed=20260925] [learning_rate=1e-4] [mode=train|finalize]"
         );
     }
 
@@ -220,6 +220,12 @@ fn main() -> Result<()> {
     let min_delta = parse_or(&args, 7, 0.002f64)?;
     let seed = parse_or(&args, 8, 20_260_925u64)?;
     let learning_rate = parse_or(&args, 9, 1.0e-4f64)?;
+    let run_mode = args.get(10).map(String::as_str).unwrap_or("train");
+    let finalize_only = match run_mode {
+        "train" => false,
+        "finalize" => true,
+        other => anyhow::bail!("unsupported v0.26 run mode {other:?}; expected train or finalize"),
+    };
 
     if max_epochs == 0 || batch_size < 2 || patience == 0 {
         anyhow::bail!("max_epochs/patience must be positive and batch_size must be >=2");
@@ -230,7 +236,24 @@ fn main() -> Result<()> {
     if !(learning_rate > 0.0 && learning_rate.is_finite()) {
         anyhow::bail!("learning_rate must be finite and positive");
     }
-    if output_root.exists() {
+    if finalize_only {
+        if !output_root.is_dir() {
+            anyhow::bail!(
+                "v0.26 finalize mode requires an existing model output directory: {:?}",
+                output_root
+            );
+        }
+        for name in [
+            "model.safetensors",
+            "optimizer.safetensors",
+            "metadata.yaml",
+        ] {
+            let path = output_root.join("best").join(name);
+            if !path.is_file() {
+                anyhow::bail!("v0.26 finalize mode is missing best checkpoint file: {path:?}");
+            }
+        }
+    } else if output_root.exists() {
         anyhow::bail!("v0.26 output directory already exists: {:?}", output_root);
     }
 
@@ -760,6 +783,11 @@ fn main() -> Result<()> {
         fragment_geometry_audit.max_mass.unwrap_or(0.0)
     );
 
+    println!(
+        "run_mode\t{}",
+        if finalize_only { "finalize" } else { "train" }
+    );
+
     let metadata = |completed_steps| UnifiedPilotMetadata {
         version: 261,
         objective: "v0261_multimodal_openptm_mass_sidecar".into(),
@@ -808,6 +836,92 @@ fn main() -> Result<()> {
         forward_config: forward_config.clone(),
         inverse_config: inverse_config.clone(),
     };
+
+    if finalize_only {
+        let best_dir = output_root.join("best");
+        let best_metadata = read_unified_pilot_metadata(&best_dir)?;
+        let expected_corpus_fingerprint = format!("fnv1a64:{:016x}", corpus.corpus_fingerprint);
+        let expected_benchmark_fingerprint =
+            format!("fnv1a64:{:016x}", benchmark.manifest_fingerprint());
+        if best_metadata.version != 261 {
+            anyhow::bail!(
+                "v0.26 finalize mode expected checkpoint metadata version 261, observed {}",
+                best_metadata.version
+            );
+        }
+        if best_metadata.corpus_fingerprint != expected_corpus_fingerprint {
+            anyhow::bail!(
+                "v0.26 finalize corpus fingerprint mismatch: checkpoint={} current={}",
+                best_metadata.corpus_fingerprint,
+                expected_corpus_fingerprint
+            );
+        }
+        if best_metadata.benchmark_manifest_fingerprint != expected_benchmark_fingerprint {
+            anyhow::bail!(
+                "v0.26 finalize benchmark fingerprint mismatch: checkpoint={} current={}",
+                best_metadata.benchmark_manifest_fingerprint,
+                expected_benchmark_fingerprint
+            );
+        }
+        if best_metadata.batch_size != batch_size {
+            anyhow::bail!(
+                "v0.26 finalize batch_size mismatch: checkpoint={} requested={batch_size}",
+                best_metadata.batch_size
+            );
+        }
+        if best_metadata.seed != seed {
+            anyhow::bail!(
+                "v0.26 finalize seed mismatch: checkpoint={} requested={seed}",
+                best_metadata.seed
+            );
+        }
+
+        let best_model = best_dir.join("model.safetensors");
+        varmap
+            .load(&best_model)
+            .with_context(|| format!("failed to restore best v0.26 model {best_model:?}"))?;
+        let best_step = best_metadata.completed_steps;
+        let best_epoch = if steps_per_epoch > 0 && best_step % steps_per_epoch == 0 {
+            Some(best_step / steps_per_epoch)
+        } else {
+            None
+        };
+        println!("v0261_finalize_only\ttrue");
+        println!("v0261_finalize_source_checkpoint\t{}", best_dir.display());
+        println!("v0261_finalize_best_step\t{best_step}");
+        println!(
+            "v0261_finalize_best_epoch\t{}",
+            best_epoch
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "NA".into())
+        );
+
+        let holdout_metrics = evaluate_all(
+            &model,
+            &corpus.records,
+            &holdout_forward_plan.indices,
+            &holdout_inverse_plan.indices,
+            batch_size,
+            &clean_collator,
+            &diffusion_collator,
+            &causal_collator,
+            &spectrum_collator,
+            &target_normalization,
+            ms2_loss,
+            alignment_temperature,
+            causal_conditioning_margin_nats,
+            &device,
+        )?;
+        print_evaluation("train_holdout_once", best_step, holdout_metrics);
+        println!("train_holdout_consumed_for_selection\tNO");
+        println!("historical_validation_consumed\tNO");
+        println!("historical_test_consumed\tNO");
+
+        copy_checkpoint_dir(&best_dir, &output_root.join("final"))?;
+        println!("v0261_finalize_complete\tbest_step={best_step}");
+        println!("final_checkpoint\t{}", output_root.join("final").display());
+        return Ok(());
+    }
 
     save_checkpoint(
         &output_root.join("initial"),
@@ -2655,6 +2769,15 @@ fn read_inverse_metadata(checkpoint: &Path) -> Result<InverseCheckpointMetadata>
         &fs::read_to_string(&metadata_path)
             .with_context(|| format!("failed to read inverse metadata {metadata_path:?}"))?,
     )?)
+}
+
+fn read_unified_pilot_metadata(checkpoint: &Path) -> Result<UnifiedPilotMetadata> {
+    let metadata_path = checkpoint.join("metadata.yaml");
+    serde_yaml::from_str(
+        &fs::read_to_string(&metadata_path)
+            .with_context(|| format!("failed to read v0.26 metadata {metadata_path:?}"))?,
+    )
+    .with_context(|| format!("failed to parse v0.26 metadata {metadata_path:?}"))
 }
 
 fn read_unified_parent_metadata(checkpoint: &Path) -> Result<UnifiedParentMetadata> {
