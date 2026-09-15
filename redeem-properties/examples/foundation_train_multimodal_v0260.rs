@@ -2423,8 +2423,12 @@ fn causal_sequence_nlls(
 
 fn token_accuracy(logits: &Tensor, active_indices: &Tensor, classes: &Tensor) -> Result<f64> {
     let (b, l, vocab) = logits.dims3()?;
-    if vocab != FOUNDATION_DIFFUSION_VOCAB_SIZE {
-        anyhow::bail!("unexpected unified token vocabulary {vocab}");
+    if vocab != FOUNDATION_DIFFUSION_VOCAB_SIZE && vocab != FOUNDATION_OPEN_PTM_VOCAB_SIZE {
+        anyhow::bail!(
+            "unexpected unified token vocabulary {vocab}; expected legacy {} or open-PTM {}",
+            FOUNDATION_DIFFUSION_VOCAB_SIZE,
+            FOUNDATION_OPEN_PTM_VOCAB_SIZE
+        );
     }
     let flat = logits.reshape((b * l, vocab))?;
     let selected = flat.index_select(active_indices, 0)?.to_vec2::<f32>()?;
