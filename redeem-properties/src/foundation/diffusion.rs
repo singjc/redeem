@@ -1751,6 +1751,15 @@ pub fn foundation_precursor_mass_consistent(
     Ok(foundation_precursor_mass_error_da(peptide, precursor_mz, charge)?.abs() <= tolerance_da)
 }
 
+/// Monoisotopic neutral mass of one canonical amino-acid residue.
+///
+/// This helper is intentionally PTM-agnostic and is used by open-PTM fragment
+/// geometry so arbitrary finite modification deltas never need to pass through
+/// the closed diffusion token vocabulary.
+pub fn foundation_residue_mass_da(residue: char) -> Option<f64> {
+    residue_mass(residue)
+}
+
 fn residue_mass(residue: char) -> Option<f64> {
     // Monoisotopic amino-acid residue masses (free amino acid minus H2O).
     Some(match residue {

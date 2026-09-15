@@ -14,7 +14,8 @@ use redeem_properties::foundation::{
     contrastive_info_nce_loss, fit_foundation_ccs_physics_baseline,
     foundation_causal_conditioning_margin_loss, foundation_causal_next_token_loss,
     foundation_diffusion_length_loss, foundation_diffusion_open_ptm_mass_loss,
-    foundation_diffusion_x0_loss, foundation_fragment_relation_features, foundation_ms2_loss,
+    foundation_diffusion_x0_loss, foundation_fragment_relation_features,
+    foundation_fragment_relation_validate_mass_geometry, foundation_ms2_loss,
     foundation_multimodal_ms2_loss_v0260, foundation_multimodal_relation_margin_loss_v0260,
     foundation_peptidoform_neutral_mass, foundation_spectrum_peptide_alignment_loss,
     load_foundation_corpus, load_unified_foundation_components, multi_task_loss_with_ms2_config,
@@ -491,6 +492,14 @@ fn main() -> Result<()> {
         inverse_config.max_tokens,
         FOUNDATION_OPEN_PTM_MASS_SCALE_DA,
     )?;
+    let fragment_geometry_audit = audit_fragment_relation_mass_geometry(
+        &corpus.records,
+        [
+            &train_forward_indices[..],
+            &dev_forward_indices[..],
+            &holdout_forward_indices[..],
+        ],
+    )?;
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -727,6 +736,28 @@ fn main() -> Result<()> {
     println!(
         "open_ptm_preflight_max_mass_delta_da\t{}",
         open_ptm_audit.max_mass.unwrap_or(0.0)
+    );
+    println!("fragment_mass_geometry_encoding\tcontinuous_peptidoform_mass_delta_v1");
+    println!("fragment_mass_geometry_preflight_status\tPASS");
+    println!(
+        "fragment_mass_geometry_preflight_records\t{}",
+        fragment_geometry_audit.records
+    );
+    println!(
+        "fragment_mass_geometry_preflight_modifications\t{}",
+        fragment_geometry_audit.modifications
+    );
+    println!(
+        "fragment_mass_geometry_preflight_open_mass\t{}",
+        fragment_geometry_audit.open_mass
+    );
+    println!(
+        "fragment_mass_geometry_preflight_min_mass_delta_da\t{}",
+        fragment_geometry_audit.min_mass.unwrap_or(0.0)
+    );
+    println!(
+        "fragment_mass_geometry_preflight_max_mass_delta_da\t{}",
+        fragment_geometry_audit.max_mass.unwrap_or(0.0)
     );
 
     let metadata = |completed_steps| UnifiedPilotMetadata {
@@ -2031,6 +2062,46 @@ fn audit_open_ptm_encoding<'a>(
     Ok(audit)
 }
 
+#[derive(Debug, Default)]
+struct FragmentMassGeometryAudit {
+    records: usize,
+    modifications: usize,
+    open_mass: usize,
+    min_mass: Option<f64>,
+    max_mass: Option<f64>,
+}
+
+fn audit_fragment_relation_mass_geometry<'a>(
+    records: &[FoundationTrainingRecord],
+    index_sets: impl IntoIterator<Item = &'a [usize]>,
+) -> Result<FragmentMassGeometryAudit> {
+    let mut audit = FragmentMassGeometryAudit::default();
+    for indices in index_sets {
+        for &index in indices {
+            let record = &records[index];
+            if record.observed_spectrum_peaks.is_empty() {
+                continue;
+            }
+            foundation_fragment_relation_validate_mass_geometry(&record.peptidoform)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!("fragment mass-geometry preflight failed for record index {index}")
+                })?;
+            audit.records += 1;
+            for modification in &record.peptidoform.modifications {
+                let mass = f64::from(modification.mass_delta);
+                audit.modifications += 1;
+                if modification.unimod_id.is_none() {
+                    audit.open_mass += 1;
+                }
+                audit.min_mass = Some(audit.min_mass.map_or(mass, |v| v.min(mass)));
+                audit.max_mass = Some(audit.max_mass.map_or(mass, |v| v.max(mass)));
+            }
+        }
+    }
+    Ok(audit)
+}
+
 fn pearson_correlation(first: &[f64], second: &[f64]) -> Option<f64> {
     if first.len() != second.len() || first.len() < 2 {
         return None;
@@ -2560,7 +2631,11 @@ fn usable_inverse_indices(
             let record = &records[entry.record_index];
             (FoundationSpectrum::from_training_record(record).is_some()
                 && vocabulary
-                    .encode(&record.peptidoform, config.max_tokens)
+                    .encode_open_ptm(
+                        &record.peptidoform,
+                        config.max_tokens,
+                        FOUNDATION_OPEN_PTM_MASS_SCALE_DA,
+                    )
                     .is_ok())
             .then_some(entry.record_index)
         })

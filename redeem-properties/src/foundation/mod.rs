@@ -206,8 +206,9 @@ pub use fragment_likelihood::{
 };
 pub use fragment_relation::{
     foundation_fragment_relation_features, foundation_fragment_relation_legacy_log_prior,
-    FoundationFragmentRelationBatch, FoundationFragmentRelationFeatureRows,
-    PeptideSpectrumFragmentRelationEnergy, FOUNDATION_FRAGMENT_RELATION_ABS_TOLERANCE_DA_V0240,
+    foundation_fragment_relation_validate_mass_geometry, FoundationFragmentRelationBatch,
+    FoundationFragmentRelationFeatureRows, PeptideSpectrumFragmentRelationEnergy,
+    FOUNDATION_FRAGMENT_RELATION_ABS_TOLERANCE_DA_V0240,
     FOUNDATION_FRAGMENT_RELATION_ARCHITECTURE_V0240,
     FOUNDATION_FRAGMENT_RELATION_CANDIDATE_HIDDEN_V0240,
     FOUNDATION_FRAGMENT_RELATION_CORE_CHANNELS_V0240,

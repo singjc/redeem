@@ -15,8 +15,7 @@
 //! Validation labels are consulted only after scores have been frozen.
 
 use super::diffusion::{
-    foundation_diffusion_token_mass_da, foundation_diffusion_token_residue,
-    FoundationDiffusionVocabulary, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_PAD,
+    foundation_peptidoform_neutral_mass, foundation_residue_mass_da,
     FOUNDATION_PEPTIDE_WATER_MASS_DA,
 };
 use super::featurize::{FoundationModificationSite, PeptidoformInput};
@@ -633,34 +632,79 @@ fn core_fragment_mz(prefix_mass: f64, suffix_with_water: f64) -> [f64; 4] {
     ]
 }
 
+/// Validate the exact continuous-mass geometry used by v0.24/v0.26 fragment relations.
+///
+/// This path is intentionally independent of the closed diffusion PTM token
+/// vocabulary: every finite residue/N-term/C-term mass delta is represented
+/// directly in theoretical fragment masses.
+pub fn foundation_fragment_relation_validate_mass_geometry(
+    peptide: &PeptidoformInput,
+) -> std::result::Result<(), String> {
+    let prefixes = cleavage_prefix_masses(peptide)?;
+    let expected = peptide.sequence.chars().count().saturating_sub(1);
+    if prefixes.len() != expected {
+        return Err(format!(
+            "fragment relation produced {} cleavage masses for peptide length {}",
+            prefixes.len(),
+            peptide.sequence.chars().count()
+        ));
+    }
+    let total = peptide_residue_mass(peptide)?;
+    if !total.is_finite() {
+        return Err("fragment relation peptidoform mass is non-finite".into());
+    }
+    Ok(())
+}
+
 fn peptide_residue_mass(peptide: &PeptidoformInput) -> std::result::Result<f64, String> {
-    let vocabulary = FoundationDiffusionVocabulary;
-    let tokens = vocabulary.encode(peptide, 256)?;
-    Ok(tokens
-        .into_iter()
-        .take_while(|&token| token != FOUNDATION_DIFFUSION_PAD && token != FOUNDATION_DIFFUSION_EOS)
-        .filter_map(foundation_diffusion_token_mass_da)
-        .sum())
+    Ok(foundation_peptidoform_neutral_mass(peptide)? - FOUNDATION_PEPTIDE_WATER_MASS_DA)
 }
 
 fn cleavage_prefix_masses(peptide: &PeptidoformInput) -> std::result::Result<Vec<f64>, String> {
-    let vocabulary = FoundationDiffusionVocabulary;
-    let tokens = vocabulary.encode(peptide, 256)?;
+    let residues = peptide.sequence.chars().collect::<Vec<_>>();
+    if residues.is_empty() {
+        return Err("fragment relation cannot build cleavage masses for an empty peptide".into());
+    }
+
+    // b-ion prefix masses include N-terminal modifications, residue masses, and
+    // modifications on residues already traversed. C-terminal modifications are
+    // deliberately excluded from the prefix and enter the complementary y-ion
+    // through the total peptidoform mass. This representation is fully open-PTM:
+    // every finite mass delta is accepted without consulting a token allow-list.
     let mut prefix_mass = 0.0f64;
-    let mut residue_count = 0usize;
-    let mut prefixes = Vec::<f64>::new();
-    for token in tokens {
-        if token == FOUNDATION_DIFFUSION_PAD || token == FOUNDATION_DIFFUSION_EOS {
-            break;
+    for modification in &peptide.modifications {
+        if !modification.mass_delta.is_finite() {
+            return Err(format!(
+                "non-finite modification mass for {}",
+                modification.identity_label()
+            ));
         }
-        if foundation_diffusion_token_residue(token).is_some() {
-            if residue_count > 0 {
-                prefixes.push(prefix_mass);
+        if modification.site == FoundationModificationSite::NTerm {
+            prefix_mass += f64::from(modification.mass_delta);
+        }
+        if let FoundationModificationSite::Residue(index) = modification.site {
+            if index >= residues.len() {
+                return Err(format!(
+                    "modification {} references residue index {} outside peptide length {}",
+                    modification.identity_label(),
+                    index,
+                    residues.len()
+                ));
             }
-            residue_count += 1;
         }
-        if let Some(mass) = foundation_diffusion_token_mass_da(token) {
-            prefix_mass += mass;
+    }
+
+    let mut prefixes = Vec::with_capacity(residues.len().saturating_sub(1));
+    for (residue_index, &residue) in residues.iter().enumerate() {
+        prefix_mass += foundation_residue_mass_da(residue)
+            .ok_or_else(|| format!("unsupported residue '{residue}' for fragment relation mass"))?;
+        for modification in peptide.modifications.iter().filter(|modification| {
+            modification.site == FoundationModificationSite::Residue(residue_index)
+        }) {
+            prefix_mass += f64::from(modification.mass_delta);
+        }
+        if residue_index + 1 < residues.len() {
+            prefixes.push(prefix_mass);
         }
     }
     Ok(prefixes)
@@ -668,6 +712,7 @@ fn cleavage_prefix_masses(peptide: &PeptidoformInput) -> std::result::Result<Vec
 
 #[cfg(test)]
 mod tests {
+    use super::super::featurize::FoundationModification;
     use super::*;
     use candle_nn::{VarBuilder, VarMap};
 
@@ -750,5 +795,26 @@ mod tests {
         let model = PeptideSpectrumFragmentRelationEnergy::new(vb).unwrap();
         let scores = model.forward_grouped(&batch, 2).unwrap();
         assert_eq!(scores.dims(), &[1, 2]);
+    }
+    #[test]
+    fn open_mass_ptms_are_supported_by_fragment_geometry_without_vocab_tokens() {
+        let unmodified = PeptidoformInput::unmodified("ACD");
+        let open_modified = PeptidoformInput {
+            sequence: "ACD".to_string(),
+            modifications: vec![FoundationModification::mass_delta(1, 299.1667)],
+        };
+
+        let unmodified_total = peptide_residue_mass(&unmodified).unwrap();
+        let modified_total = peptide_residue_mass(&open_modified).unwrap();
+        assert!((modified_total - unmodified_total - 299.1667).abs() < 1.0e-3);
+
+        let unmodified_prefix = cleavage_prefix_masses(&unmodified).unwrap();
+        let modified_prefix = cleavage_prefix_masses(&open_modified).unwrap();
+        assert_eq!(unmodified_prefix.len(), 2);
+        assert_eq!(modified_prefix.len(), 2);
+        // Modification is on residue C (index 1): cleavage A|C is unchanged,
+        // while cleavage AC|D contains the open modification mass.
+        assert!((modified_prefix[0] - unmodified_prefix[0]).abs() < 1.0e-9);
+        assert!((modified_prefix[1] - unmodified_prefix[1] - 299.1667).abs() < 1.0e-3);
     }
 }
