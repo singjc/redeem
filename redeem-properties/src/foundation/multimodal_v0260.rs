@@ -29,7 +29,7 @@ use candle_nn::{self as nn, ops, Embedding, Linear, VarBuilder};
 
 /// Stable architecture label used in metadata/logs.
 pub const FOUNDATION_MULTIMODAL_ARCHITECTURE_V0260: &str =
-    "v0.26.0-192d-task-adapters-ms2-presence-intensity-crossmodal-relation-phospho29";
+    "v0.26.1-192d-task-adapters-ms2-presence-intensity-crossmodal-relation-openptm32";
 /// Hidden width of the scalar-property adapters.
 pub const FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0260: usize = 384;
 /// Fixed margin used by the same-spectrum positive-vs-negative relation loss.
@@ -379,8 +379,9 @@ impl PeptideFoundationMultimodalV0260Model {
                 inverse_config.model_dim
             );
         }
-        let diffusion = PeptideSpectrumDiffusionModel::new(inverse_config.clone(), vb.clone())?;
-        let causal = PeptideSpectrumCausalModel::new(inverse_config.clone(), vb.clone())?;
+        let diffusion =
+            PeptideSpectrumDiffusionModel::new_open_ptm(inverse_config.clone(), vb.clone())?;
+        let causal = PeptideSpectrumCausalModel::new_open_ptm(inverse_config.clone(), vb.clone())?;
         // This resolves to the same `spectrum_encoder.*` variables instantiated
         // by the inverse auxiliaries, so relation/alignment training updates one
         // shared observed-spectrum representation.

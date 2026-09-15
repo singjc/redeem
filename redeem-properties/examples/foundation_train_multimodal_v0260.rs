@@ -13,8 +13,8 @@ use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     contrastive_info_nce_loss, fit_foundation_ccs_physics_baseline,
     foundation_causal_conditioning_margin_loss, foundation_causal_next_token_loss,
-    foundation_diffusion_length_loss, foundation_diffusion_x0_loss,
-    foundation_fragment_relation_features, foundation_ms2_loss,
+    foundation_diffusion_length_loss, foundation_diffusion_open_ptm_mass_loss,
+    foundation_diffusion_x0_loss, foundation_fragment_relation_features, foundation_ms2_loss,
     foundation_multimodal_ms2_loss_v0260, foundation_multimodal_relation_margin_loss_v0260,
     foundation_peptidoform_neutral_mass, foundation_spectrum_peptide_alignment_loss,
     load_foundation_corpus, load_unified_foundation_components, multi_task_loss_with_ms2_config,
@@ -35,7 +35,8 @@ use redeem_properties::foundation::{
     FOUNDATION_FRAGMENT_RELATION_FEATURE_DIM_V0240,
     FOUNDATION_FRAGMENT_RELATION_MATCHED_OFFSET_V0240, FOUNDATION_MS2_SOFTPLUS_BETA_V0138,
     FOUNDATION_MULTIMODAL_ARCHITECTURE_V0260, FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0260,
-    FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0260,
+    FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0260, FOUNDATION_OPEN_PTM_MASS_SCALE_DA,
+    FOUNDATION_OPEN_PTM_VOCAB_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,6 +77,7 @@ struct UnifiedPilotMetadata {
     learning_rate: f64,
     max_gradient_norm: f64,
     diffusion_length_weight: f64,
+    open_ptm_mass_loss_weight: f64,
     alignment_weight: f64,
     alignment_temperature: f64,
     alignment_initialization: String,
@@ -477,6 +479,19 @@ fn main() -> Result<()> {
         &holdout_inverse_sampling,
     )?;
 
+    // Full inverse-corpus PTM preflight happens before model/optimizer construction.
+    // This prevents another one-off PTM failure after GPU optimization has started.
+    let open_ptm_audit = audit_open_ptm_encoding(
+        &corpus.records,
+        [
+            &train_inverse_indices[..],
+            &dev_inverse_indices[..],
+            &holdout_inverse_indices[..],
+        ],
+        inverse_config.max_tokens,
+        FOUNDATION_OPEN_PTM_MASS_SCALE_DA,
+    )?;
+
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = PeptideFoundationMultimodalV0260Model::new(
@@ -556,8 +571,8 @@ fn main() -> Result<()> {
             },
         },
     )?;
-    let diffusion_collator = FoundationDiffusionCollator::new(inverse_config.clone())?;
-    let causal_collator = FoundationCausalCollator::new(inverse_config.clone())?;
+    let diffusion_collator = FoundationDiffusionCollator::new_open_ptm(inverse_config.clone())?;
+    let causal_collator = FoundationCausalCollator::new_open_ptm(inverse_config.clone())?;
     let spectrum_collator = FoundationSpectrumCollator::new(inverse_config.spectrum.clone())?;
 
     let ms2_loss = FoundationMs2LossConfig {
@@ -578,6 +593,7 @@ fn main() -> Result<()> {
     let causal_conditioning_margin_nats = 0.25f64;
     let max_gradient_norm = 1.0f64;
     let diffusion_length_weight = 0.1f64;
+    let open_ptm_mass_loss_weight = 0.10f64;
     let lr_schedule = FoundationLearningRateSchedule::WarmupCosine {
         warmup_steps: 1_000u64.min(max_total_steps.saturating_sub(1) as u64),
         total_steps: max_total_steps as u64,
@@ -596,14 +612,22 @@ fn main() -> Result<()> {
     )?;
 
     fs::create_dir_all(&output_root)?;
-    println!("v0260_version\tv0.26.0-gpu-random-init-convergence-phospho29");
+    println!("v0260_version\tv0.26.1-gpu-random-init-convergence-openptm32");
     println!("objective\tv0260_multimodal_task_adapters_factorized_ms2_crossmodal_relation");
     println!("architecture\t{}", FOUNDATION_MULTIMODAL_ARCHITECTURE_V0260);
+    println!("inverse_ptm_encoding\topen_site_token_plus_continuous_signed_mass_v1");
     println!(
-        "diffusion_vocabulary_size\t{}",
+        "legacy_diffusion_vocabulary_size\t{}",
         FOUNDATION_DIFFUSION_VOCAB_SIZE
     );
-    println!("phosphorylation_unimod21_token\t28");
+    println!(
+        "open_ptm_vocabulary_size\t{}",
+        FOUNDATION_OPEN_PTM_VOCAB_SIZE
+    );
+    println!(
+        "open_ptm_mass_scale_da\t{}",
+        FOUNDATION_OPEN_PTM_MASS_SCALE_DA
+    );
     println!("architecture_template\t{}", architecture_template.display());
     println!("architecture_template_weights_loaded\tfalse");
     println!("random_initialization\ttrue");
@@ -671,6 +695,7 @@ fn main() -> Result<()> {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "NA".into())
     );
+    println!("open_ptm_mass_loss_weight\t{open_ptm_mass_loss_weight}");
     println!("alignment_weight\t{alignment_weight}");
     println!("alignment_temperature\t{alignment_temperature}");
     println!("ms2_pointwise_weight\t{}", ms2_loss.pointwise_weight);
@@ -684,9 +709,29 @@ fn main() -> Result<()> {
     print_sample_plan("holdout_forward_reserved", &holdout_forward_plan);
     print_sample_plan("holdout_inverse_reserved", &holdout_inverse_plan);
 
+    println!("open_ptm_preflight_status\tPASS");
+    println!("open_ptm_preflight_records\t{}", open_ptm_audit.records);
+    println!(
+        "open_ptm_preflight_modifications\t{}",
+        open_ptm_audit.modifications
+    );
+    println!(
+        "open_ptm_preflight_known_unimod\t{}",
+        open_ptm_audit.known_unimod
+    );
+    println!("open_ptm_preflight_open_mass\t{}", open_ptm_audit.open_mass);
+    println!(
+        "open_ptm_preflight_min_mass_delta_da\t{}",
+        open_ptm_audit.min_mass.unwrap_or(0.0)
+    );
+    println!(
+        "open_ptm_preflight_max_mass_delta_da\t{}",
+        open_ptm_audit.max_mass.unwrap_or(0.0)
+    );
+
     let metadata = |completed_steps| UnifiedPilotMetadata {
-        version: 26,
-        objective: "v0260_multimodal_192d_task_adapters_factorized_ms2_relation".into(),
+        version: 261,
+        objective: "v0261_multimodal_openptm_mass_sidecar".into(),
         schedule: "epochwise_no_replacement_train_core+warmup_cosine+train_dev_early_stop".into(),
         corpus_fingerprint: format!("fnv1a64:{:016x}", corpus.corpus_fingerprint),
         benchmark_manifest_fingerprint: format!(
@@ -707,6 +752,7 @@ fn main() -> Result<()> {
         learning_rate,
         max_gradient_norm,
         diffusion_length_weight,
+        open_ptm_mass_loss_weight,
         alignment_weight,
         alignment_temperature,
         alignment_initialization: alignment_initialization.clone(),
@@ -873,6 +919,7 @@ fn main() -> Result<()> {
                 &spectrum_collator,
                 &target_normalization,
                 diffusion_length_weight,
+                open_ptm_mass_loss_weight,
                 alignment_weight,
                 alignment_temperature,
                 force_all_masked,
@@ -892,6 +939,7 @@ fn main() -> Result<()> {
                 &causal_collator,
                 &spectrum_collator,
                 &target_normalization,
+                open_ptm_mass_loss_weight,
                 alignment_weight,
                 alignment_temperature,
                 causal_conditioning_margin_weight,
@@ -1153,6 +1201,7 @@ fn diffusion_loss(
     spectrum_collator: &FoundationSpectrumCollator,
     _normalization: &FoundationTargetNormalizationConfig,
     length_weight: f64,
+    open_ptm_mass_loss_weight: f64,
     alignment_weight: f64,
     alignment_temperature: f64,
     force_all_masked: bool,
@@ -1188,8 +1237,10 @@ fn diffusion_loss(
         alignment_temperature,
     )?;
     let alignment_value = f64::from(alignment.to_scalar::<f32>()?);
-    let total =
-        ((x0 + length.affine(length_weight, 0.0)?)? + alignment.affine(alignment_weight, 0.0)?)?;
+    let open_ptm_mass = foundation_diffusion_open_ptm_mass_loss(&output, &diffusion)?;
+    let total = (((x0 + length.affine(length_weight, 0.0)?)?
+        + open_ptm_mass.affine(open_ptm_mass_loss_weight, 0.0)?)?
+        + alignment.affine(alignment_weight, 0.0)?)?;
     Ok((total, alignment_value))
 }
 
@@ -1201,6 +1252,7 @@ fn causal_loss(
     causal_collator: &FoundationCausalCollator,
     spectrum_collator: &FoundationSpectrumCollator,
     _normalization: &FoundationTargetNormalizationConfig,
+    open_ptm_mass_loss_weight: f64,
     alignment_weight: f64,
     alignment_temperature: f64,
     conditioning_margin_weight: f64,
@@ -1260,7 +1312,10 @@ fn causal_loss(
         alignment_temperature,
     )?;
     let alignment_loss = f64::from(alignment.to_scalar::<f32>()?);
-    let total = ((causal_ce + conditioning_penalty.affine(conditioning_margin_weight, 0.0)?)?
+    let open_ptm_mass = model.causal().open_ptm_mass_loss(&output, &causal)?;
+    let total = (((causal_ce
+        + conditioning_penalty.affine(conditioning_margin_weight, 0.0)?)?
+        + open_ptm_mass.affine(open_ptm_mass_loss_weight, 0.0)?)?
         + alignment.affine(alignment_weight, 0.0)?)?;
     Ok(CausalTrainObjective {
         total,
@@ -1927,6 +1982,53 @@ impl Ms2ShapeAccumulator {
     fn mean_target_intensity(&self) -> Option<f64> {
         (self.fragment_count > 0).then(|| self.target_intensity_sum / self.fragment_count as f64)
     }
+}
+
+#[derive(Debug, Default)]
+struct OpenPtmAudit {
+    records: usize,
+    modifications: usize,
+    known_unimod: usize,
+    open_mass: usize,
+    min_mass: Option<f64>,
+    max_mass: Option<f64>,
+}
+
+fn audit_open_ptm_encoding<'a>(
+    records: &[FoundationTrainingRecord],
+    index_sets: impl IntoIterator<Item = &'a [usize]>,
+    max_tokens: usize,
+    mass_scale_da: f64,
+) -> Result<OpenPtmAudit> {
+    let vocabulary = FoundationDiffusionVocabulary;
+    let mut audit = OpenPtmAudit::default();
+    // TRAIN-core, TRAIN-dev, and TRAIN-holdout are disjoint by construction, so
+    // no large deduplication set is needed for this full-corpus preflight.
+    for indices in index_sets {
+        for &index in indices {
+            let record = &records[index];
+            vocabulary
+                .encode_open_ptm(&record.peptidoform, max_tokens, mass_scale_da)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("open-PTM preflight failed for record index {index}"))?;
+            audit.records += 1;
+            for modification in &record.peptidoform.modifications {
+                let mass = f64::from(modification.mass_delta);
+                if !mass.is_finite() {
+                    anyhow::bail!("non-finite PTM mass in record index {index}");
+                }
+                audit.modifications += 1;
+                if modification.unimod_id.is_some() {
+                    audit.known_unimod += 1;
+                } else {
+                    audit.open_mass += 1;
+                }
+                audit.min_mass = Some(audit.min_mass.map_or(mass, |v| v.min(mass)));
+                audit.max_mass = Some(audit.max_mass.map_or(mass, |v| v.max(mass)));
+            }
+        }
+    }
+    Ok(audit)
 }
 
 fn pearson_correlation(first: &[f64], second: &[f64]) -> Option<f64> {

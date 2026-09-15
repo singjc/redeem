@@ -9,7 +9,7 @@
 use super::diffusion::{
     FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationSpectrumEncoder,
     SpectrumConditionedDiffusionBlock, FOUNDATION_DIFFUSION_EOS, FOUNDATION_DIFFUSION_MASK,
-    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_VOCAB_SIZE,
+    FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIFFUSION_VOCAB_SIZE, FOUNDATION_OPEN_PTM_VOCAB_SIZE,
 };
 use super::featurize::PeptidoformInput;
 use super::layers::FoundationLayerNorm;
@@ -54,6 +54,10 @@ pub struct FoundationCausalInputBatch {
     pub input_tokens: Tensor,
     /// Active prediction-position mask `[batch, max_tokens]`.
     pub token_mask: Tensor,
+    /// Shifted open-PTM sidecar `[batch, max_tokens, 2]` containing the signed
+    /// normalized modification mass and a presence bit for model-visible prefix
+    /// modification tokens.
+    pub modification_features: Tensor,
 }
 
 /// Teacher-forced batch for causal next-token training.
@@ -67,6 +71,10 @@ pub struct FoundationCausalBatch {
     pub active_indices: Tensor,
     /// Target classes aligned with `active_indices`.
     pub target_classes: Tensor,
+    /// Clean normalized PTM mass targets `[batch, max_tokens]`.
+    pub target_modification_mass_scaled: Tensor,
+    /// 1 at generic open-PTM target positions, else 0.
+    pub target_modification_mask: Tensor,
 }
 
 /// Deterministic causal teacher-forcing collator.
@@ -74,6 +82,7 @@ pub struct FoundationCausalBatch {
 pub struct FoundationCausalCollator {
     config: FoundationDiffusionConfig,
     vocabulary: FoundationDiffusionVocabulary,
+    open_ptm: bool,
 }
 
 impl FoundationCausalCollator {
@@ -83,6 +92,17 @@ impl FoundationCausalCollator {
         Ok(Self {
             config,
             vocabulary: FoundationDiffusionVocabulary,
+            open_ptm: false,
+        })
+    }
+
+    /// Construct the open-PTM causal collator used by v0.26.1.
+    pub fn new_open_ptm(config: FoundationDiffusionConfig) -> Result<Self> {
+        config.validate().map_err(candle_core::Error::Msg)?;
+        Ok(Self {
+            config,
+            vocabulary: FoundationDiffusionVocabulary,
+            open_ptm: true,
         })
     }
 
@@ -95,15 +115,108 @@ impl FoundationCausalCollator {
         if peptides.is_empty() {
             candle_core::bail!("causal collation requires at least one peptide");
         }
-        let rows: Vec<Vec<u32>> = peptides
-            .iter()
-            .map(|peptide| {
-                self.vocabulary
-                    .encode(peptide, self.config.max_tokens)
-                    .map_err(candle_core::Error::Msg)
-            })
-            .collect::<Result<_>>()?;
-        self.collate_token_rows(&rows, device)
+        if self.open_ptm {
+            let rows = peptides
+                .iter()
+                .map(|peptide| {
+                    self.vocabulary
+                        .encode_open_ptm(
+                            peptide,
+                            self.config.max_tokens,
+                            super::diffusion::FOUNDATION_OPEN_PTM_MASS_SCALE_DA,
+                        )
+                        .map_err(candle_core::Error::Msg)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.collate_open_ptm_rows(&rows, device)
+        } else {
+            let rows: Vec<Vec<u32>> = peptides
+                .iter()
+                .map(|peptide| {
+                    self.vocabulary
+                        .encode(peptide, self.config.max_tokens)
+                        .map_err(candle_core::Error::Msg)
+                })
+                .collect::<Result<_>>()?;
+            self.collate_token_rows(&rows, device)
+        }
+    }
+
+    fn collate_open_ptm_rows(
+        &self,
+        rows: &[super::diffusion::FoundationOpenPtmTokenRow],
+        device: &Device,
+    ) -> Result<FoundationCausalBatch> {
+        if rows.is_empty() {
+            candle_core::bail!("causal open-PTM collation requires at least one row");
+        }
+        let batch = rows.len();
+        let width = self.config.max_tokens;
+        let mut shifted = vec![FOUNDATION_DIFFUSION_PAD; batch * width];
+        let mut targets = vec![FOUNDATION_DIFFUSION_PAD; batch * width];
+        let mut mask = vec![0.0f32; batch * width];
+        let mut shifted_mod_features = vec![0.0f32; batch * width * 2];
+        let mut target_mod_mass = vec![0.0f32; batch * width];
+        let mut target_mod_mask = vec![0.0f32; batch * width];
+        let mut active_indices = Vec::<u32>::new();
+        let mut target_classes = Vec::<u32>::new();
+
+        for (row_index, row) in rows.iter().enumerate() {
+            if row.tokens.len() != width
+                || row.modification_mass_scaled.len() != width
+                || row.modification_mask.len() != width
+            {
+                candle_core::bail!("causal open-PTM row width does not match configured {width}");
+            }
+            let active_length = row
+                .tokens
+                .iter()
+                .position(|&t| t == FOUNDATION_DIFFUSION_PAD)
+                .unwrap_or(width);
+            if active_length == 0 || row.tokens[active_length - 1] != FOUNDATION_DIFFUSION_EOS {
+                candle_core::bail!("causal open-PTM target must terminate with EOS");
+            }
+            for position in 0..active_length {
+                let flat = row_index * width + position;
+                let token = row.tokens[position];
+                targets[flat] = token;
+                mask[flat] = 1.0;
+                active_indices.push(flat as u32);
+                target_classes.push(token);
+                target_mod_mass[flat] = row.modification_mass_scaled[position];
+                target_mod_mask[flat] = row.modification_mask[position];
+                if position > 0 {
+                    shifted[flat] = row.tokens[position - 1];
+                    shifted_mod_features[flat * 2] = row.modification_mass_scaled[position - 1];
+                    shifted_mod_features[flat * 2 + 1] = row.modification_mask[position - 1];
+                }
+            }
+        }
+        let active_count = active_indices.len();
+        Ok(FoundationCausalBatch {
+            input: FoundationCausalInputBatch {
+                input_tokens: Tensor::from_vec(shifted, (batch, width), device)?
+                    .to_dtype(DType::U32)?,
+                token_mask: Tensor::from_vec(mask, (batch, width), device)?,
+                modification_features: Tensor::from_vec(
+                    shifted_mod_features,
+                    (batch, width, 2),
+                    device,
+                )?,
+            },
+            target_tokens: Tensor::from_vec(targets, (batch, width), device)?
+                .to_dtype(DType::U32)?,
+            active_indices: Tensor::from_vec(active_indices, active_count, device)?
+                .to_dtype(DType::U32)?,
+            target_classes: Tensor::from_vec(target_classes, active_count, device)?
+                .to_dtype(DType::U32)?,
+            target_modification_mass_scaled: Tensor::from_vec(
+                target_mod_mass,
+                (batch, width),
+                device,
+            )?,
+            target_modification_mask: Tensor::from_vec(target_mod_mask, (batch, width), device)?,
+        })
     }
 
     /// Create a causal batch from already encoded clean candidate rows.
@@ -151,7 +264,12 @@ impl FoundationCausalCollator {
                             "causal clean target position {position} contains PAD/MASK"
                         );
                     }
-                    if token as usize >= FOUNDATION_DIFFUSION_VOCAB_SIZE {
+                    let vocab_size = if self.open_ptm {
+                        FOUNDATION_OPEN_PTM_VOCAB_SIZE
+                    } else {
+                        FOUNDATION_DIFFUSION_VOCAB_SIZE
+                    };
+                    if token as usize >= vocab_size {
                         candle_core::bail!("causal clean target token {token} exceeds vocabulary");
                     }
                     if token == FOUNDATION_DIFFUSION_EOS && position + 1 != active_length {
@@ -179,6 +297,7 @@ impl FoundationCausalCollator {
                 input_tokens: Tensor::from_vec(shifted, (batch, width), device)?
                     .to_dtype(DType::U32)?,
                 token_mask: Tensor::from_vec(mask, (batch, width), device)?,
+                modification_features: Tensor::zeros((batch, width, 2), DType::F32, device)?,
             },
             target_tokens: Tensor::from_vec(targets, (batch, width), device)?
                 .to_dtype(DType::U32)?,
@@ -186,6 +305,8 @@ impl FoundationCausalCollator {
                 .to_dtype(DType::U32)?,
             target_classes: Tensor::from_vec(target_classes, active_count, device)?
                 .to_dtype(DType::U32)?,
+            target_modification_mass_scaled: Tensor::zeros((batch, width), DType::F32, device)?,
+            target_modification_mask: Tensor::zeros((batch, width), DType::F32, device)?,
         })
     }
 
@@ -224,7 +345,12 @@ impl FoundationCausalCollator {
                 {
                     candle_core::bail!("causal prefix position {position} contains PAD/MASK/EOS");
                 }
-                if token as usize >= FOUNDATION_DIFFUSION_VOCAB_SIZE {
+                let vocab_size = if self.open_ptm {
+                    FOUNDATION_OPEN_PTM_VOCAB_SIZE
+                } else {
+                    FOUNDATION_DIFFUSION_VOCAB_SIZE
+                };
+                if token as usize >= vocab_size {
                     candle_core::bail!("causal prefix token {token} exceeds vocabulary");
                 }
                 shifted[row_index * width + position + 1] = token;
@@ -238,6 +364,7 @@ impl FoundationCausalCollator {
             input_tokens: Tensor::from_vec(shifted, (batch, width), device)?
                 .to_dtype(DType::U32)?,
             token_mask: Tensor::from_vec(mask, (batch, width), device)?,
+            modification_features: Tensor::zeros((batch, width, 2), DType::F32, device)?,
         })
     }
 
@@ -278,7 +405,12 @@ impl FoundationCausalCollator {
                 {
                     candle_core::bail!("causal prefix position {position} contains PAD/MASK/EOS");
                 }
-                if token as usize >= FOUNDATION_DIFFUSION_VOCAB_SIZE {
+                let vocab_size = if self.open_ptm {
+                    FOUNDATION_OPEN_PTM_VOCAB_SIZE
+                } else {
+                    FOUNDATION_DIFFUSION_VOCAB_SIZE
+                };
+                if token as usize >= vocab_size {
                     candle_core::bail!("causal prefix token {token} exceeds vocabulary");
                 }
                 shifted[row_index * width + position + 1] = token;
@@ -289,6 +421,7 @@ impl FoundationCausalCollator {
             input_tokens: Tensor::from_vec(shifted, (batch, width), device)?
                 .to_dtype(DType::U32)?,
             token_mask: Tensor::from_vec(mask, (batch, width), device)?,
+            modification_features: Tensor::zeros((batch, width, 2), DType::F32, device)?,
         })
     }
 }
@@ -340,18 +473,38 @@ pub struct PeptideSpectrumCausalModel {
     causal_start_embedding: Embedding,
     position_embedding: Embedding,
     precursor_projection: Linear,
+    modification_projection: Option<Linear>,
     layers: Vec<SpectrumConditionedDiffusionBlock>,
     output_norm: FoundationLayerNorm,
     token_head: Linear,
+    modification_mass_head: Option<Linear>,
 }
 
 impl PeptideSpectrumCausalModel {
     /// Construct the causal model with checkpoint-compatible shared namespaces.
     pub fn new(config: FoundationDiffusionConfig, vb: VarBuilder<'_>) -> Result<Self> {
+        Self::new_with_open_ptm(config, vb, false)
+    }
+
+    /// Construct the v0.26.1 open-PTM causal model.
+    pub fn new_open_ptm(config: FoundationDiffusionConfig, vb: VarBuilder<'_>) -> Result<Self> {
+        Self::new_with_open_ptm(config, vb, true)
+    }
+
+    fn new_with_open_ptm(
+        config: FoundationDiffusionConfig,
+        vb: VarBuilder<'_>,
+        open_ptm: bool,
+    ) -> Result<Self> {
         config.validate().map_err(candle_core::Error::Msg)?;
+        let vocab_size = if open_ptm {
+            FOUNDATION_OPEN_PTM_VOCAB_SIZE
+        } else {
+            FOUNDATION_DIFFUSION_VOCAB_SIZE
+        };
         let spectrum_encoder = FoundationSpectrumEncoder::new(&config, vb.pp("spectrum_encoder"))?;
         let token_embedding = nn::embedding(
-            FOUNDATION_DIFFUSION_VOCAB_SIZE,
+            vocab_size,
             config.model_dim,
             vb.pp("decoder.token_embedding"),
         )?;
@@ -367,6 +520,15 @@ impl PeptideSpectrumCausalModel {
             vb.pp("decoder.position_embedding"),
         )?;
         let precursor_projection = nn::linear(6, config.model_dim, vb.pp("decoder.precursor"))?;
+        let modification_projection = if open_ptm {
+            Some(nn::linear(
+                2,
+                config.model_dim,
+                vb.pp("decoder.open_ptm_input"),
+            )?)
+        } else {
+            None
+        };
         let mut layers = Vec::with_capacity(config.decoder_layers);
         for index in 0..config.decoder_layers {
             layers.push(SpectrumConditionedDiffusionBlock::new(
@@ -376,11 +538,16 @@ impl PeptideSpectrumCausalModel {
         }
         let output_norm =
             FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("decoder.output_norm"))?;
-        let token_head = nn::linear(
-            config.model_dim,
-            FOUNDATION_DIFFUSION_VOCAB_SIZE,
-            vb.pp("decoder.token_head"),
-        )?;
+        let token_head = nn::linear(config.model_dim, vocab_size, vb.pp("decoder.token_head"))?;
+        let modification_mass_head = if open_ptm {
+            Some(nn::linear(
+                config.model_dim,
+                1,
+                vb.pp("decoder.open_ptm_mass_head"),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
             spectrum_encoder,
@@ -388,9 +555,11 @@ impl PeptideSpectrumCausalModel {
             causal_start_embedding,
             position_embedding,
             precursor_projection,
+            modification_projection,
             layers,
             output_norm,
             token_head,
+            modification_mass_head,
         })
     }
 
@@ -552,6 +721,10 @@ impl PeptideSpectrumCausalModel {
             self.config.model_dim,
         ))?;
         let mut hidden = ((token_embedding + position_embedding)? + precursor_embedding)?;
+        if let Some(projection) = &self.modification_projection {
+            let modification_embedding = projection.forward(&input.modification_features)?;
+            hidden = (hidden + modification_embedding)?;
+        }
         let token_mask = input.token_mask.unsqueeze(2)?.broadcast_as((
             batch,
             token_len,
@@ -625,15 +798,52 @@ impl PeptideSpectrumCausalModel {
 }
 
 /// Cross-entropy next-token objective over all active targets, including EOS.
+impl PeptideSpectrumCausalModel {
+    /// Predict normalized signed modification masses from decoder states.
+    pub fn open_ptm_mass_prediction(
+        &self,
+        output: &FoundationCausalOutput,
+    ) -> Result<Option<Tensor>> {
+        self.modification_mass_head
+            .as_ref()
+            .map(|head| {
+                head.forward(&output.decoder_hidden)
+                    .and_then(|value| value.squeeze(2))
+            })
+            .transpose()
+    }
+
+    /// Masked MSE for open-PTM signed mass prediction in normalized units.
+    pub fn open_ptm_mass_loss(
+        &self,
+        output: &FoundationCausalOutput,
+        batch: &FoundationCausalBatch,
+    ) -> Result<Tensor> {
+        let Some(prediction) = self.open_ptm_mass_prediction(output)? else {
+            return Tensor::new(0.0f32, batch.target_modification_mask.device());
+        };
+        let squared = (&prediction - &batch.target_modification_mass_scaled)?
+            .sqr()?
+            .broadcast_mul(&batch.target_modification_mask)?;
+        let numerator = squared.sum_all()?;
+        let denominator = batch
+            .target_modification_mask
+            .sum_all()?
+            .clamp(1.0, f64::INFINITY)?;
+        numerator.broadcast_div(&denominator)
+    }
+}
+
 pub fn foundation_causal_next_token_loss(
     output: &FoundationCausalOutput,
     batch: &FoundationCausalBatch,
 ) -> Result<Tensor> {
     let (b, l, classes) = output.token_logits.dims3()?;
-    if classes != FOUNDATION_DIFFUSION_VOCAB_SIZE {
+    if classes != FOUNDATION_DIFFUSION_VOCAB_SIZE && classes != FOUNDATION_OPEN_PTM_VOCAB_SIZE {
         candle_core::bail!(
-            "causal logits expose {classes} classes, expected {}",
-            FOUNDATION_DIFFUSION_VOCAB_SIZE
+            "causal logits expose {classes} classes, expected legacy {} or open-PTM {}",
+            FOUNDATION_DIFFUSION_VOCAB_SIZE,
+            FOUNDATION_OPEN_PTM_VOCAB_SIZE
         );
     }
     let flat_logits = output.token_logits.reshape((b * l, classes))?;

@@ -43,10 +43,24 @@ pub const FOUNDATION_DIFFUSION_CARBAMIDOMETHYL: u32 = 25;
 pub const FOUNDATION_DIFFUSION_DEAMIDATED: u32 = 26;
 /// Residue-local UniMod:35 oxidation marker.
 pub const FOUNDATION_DIFFUSION_OXIDATION: u32 = 27;
-/// Residue-local UniMod:21 phosphorylation marker.
+/// Legacy dedicated UniMod:21 phosphorylation marker. Retained only for
+/// backwards-compatible closed-lane checkpoints; v0.26.1 open-PTM training
+/// does not emit this token.
 pub const FOUNDATION_DIFFUSION_PHOSPHO: u32 = 28;
-/// Size of the residue/PTM vocabulary.
+/// Generic peptide N-terminal modification marker used by the open-PTM lane.
+pub const FOUNDATION_DIFFUSION_OPEN_NTERM_MOD: u32 = 29;
+/// Generic residue-local modification marker used by the open-PTM lane.
+pub const FOUNDATION_DIFFUSION_OPEN_RESIDUE_MOD: u32 = 30;
+/// Generic peptide C-terminal modification marker used by the open-PTM lane.
+pub const FOUNDATION_DIFFUSION_OPEN_CTERM_MOD: u32 = 31;
+/// Legacy fixed-PTM vocabulary size, retained for closed-lane checkpoint compatibility.
 pub const FOUNDATION_DIFFUSION_VOCAB_SIZE: usize = 29;
+/// v0.26.1 open-PTM vocabulary size. The three additional classes encode only
+/// modification attachment scope; signed mass identity is continuous.
+pub const FOUNDATION_OPEN_PTM_VOCAB_SIZE: usize = 32;
+/// Scale used to normalize signed modification masses for neural regression.
+/// This is a scale, not a bound: arbitrary finite mass shifts remain encodable.
+pub const FOUNDATION_OPEN_PTM_MASS_SCALE_DA: f64 = 500.0;
 
 const PROTON_MASS_DA: f64 = 1.007_276_466_77;
 pub const FOUNDATION_PEPTIDE_WATER_MASS_DA: f64 = 18.010_564_684;
@@ -180,9 +194,22 @@ impl FoundationDiffusionConfig {
 ///
 /// PTM markers are separate sequence tokens rather than atom-graph states. A
 /// residue-local PTM marker follows the residue it modifies. N-terminal acetyl
-/// precedes the first residue. The vocabulary covers the canonical modification
-/// families used by the foundation inverse lanes, including phosphorylation on
-/// S/T/Y. Unsupported PTMs fail explicitly rather than being silently dropped.
+/// precedes the first residue. The current vocabulary exactly covers the four
+/// canonical modification families observed in the validated OpenSWATH/IP2
+/// corpus; unsupported PTMs fail explicitly rather than being silently dropped.
+/// One open-PTM encoded peptide row. Generic modification tokens preserve the
+/// attachment site while `modification_mass_scaled` preserves arbitrary signed
+/// mass shifts without expanding the discrete vocabulary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundationOpenPtmTokenRow {
+    /// Padded token row.
+    pub tokens: Vec<u32>,
+    /// Signed mass delta / `mass_scale_da` at generic modification positions.
+    pub modification_mass_scaled: Vec<f32>,
+    /// 1 at generic modification positions, else 0.
+    pub modification_mask: Vec<f32>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FoundationDiffusionVocabulary;
 
@@ -190,6 +217,11 @@ impl FoundationDiffusionVocabulary {
     /// Vocabulary size.
     pub const fn size(self) -> usize {
         FOUNDATION_DIFFUSION_VOCAB_SIZE
+    }
+
+    /// Vocabulary size for the open-PTM representation.
+    pub const fn open_ptm_size(self) -> usize {
+        FOUNDATION_OPEN_PTM_VOCAB_SIZE
     }
 
     /// Encode one peptidoform and append EOS/padding to `max_tokens`.
@@ -235,15 +267,17 @@ impl FoundationDiffusionVocabulary {
                 .collect();
             modifications.sort_by_key(|modification| modification.unimod_id.unwrap_or(u32::MAX));
             for modification in modifications {
-                let token = residue_modification_token(modification)?;
-                if !foundation_diffusion_residue_ptm_valid(token, residue) {
+                let phospho_site_ok =
+                    modification.unimod_id == Some(21) && matches!(residue, 'S' | 'T' | 'Y');
+                if exact_graph_modification_for(residue, modification).is_none() && !phospho_site_ok
+                {
                     return Err(format!(
                         "diffusion vocabulary cannot encode {} on residue {}",
                         modification.identity_label(),
                         residue
                     ));
                 }
-                tokens.push(token);
+                tokens.push(residue_modification_token(modification)?);
             }
         }
 
@@ -269,6 +303,182 @@ impl FoundationDiffusionVocabulary {
         }
         tokens.resize(max_tokens, FOUNDATION_DIFFUSION_PAD);
         Ok(tokens)
+    }
+
+    /// Encode any finite mass-shift modification with a generic site token plus
+    /// continuous signed mass sidecar. No UniMod allow-list is consulted.
+    pub fn encode_open_ptm(
+        self,
+        peptide: &PeptidoformInput,
+        max_tokens: usize,
+        mass_scale_da: f64,
+    ) -> std::result::Result<FoundationOpenPtmTokenRow, String> {
+        if !(mass_scale_da > 0.0 && mass_scale_da.is_finite()) {
+            return Err("open-PTM mass scale must be positive and finite".into());
+        }
+        let residues: Vec<char> = peptide.sequence.chars().collect();
+        if residues.is_empty() {
+            return Err("diffusion vocabulary cannot encode an empty peptide".into());
+        }
+        let mut tokens = Vec::with_capacity(max_tokens);
+        let mut masses = Vec::with_capacity(max_tokens);
+        let mut masks = Vec::with_capacity(max_tokens);
+        let mut push = |token: u32, mass: Option<f32>| -> std::result::Result<(), String> {
+            tokens.push(token);
+            if let Some(mass) = mass {
+                if !mass.is_finite() {
+                    return Err("open-PTM encoder received a non-finite modification mass".into());
+                }
+                masses.push((f64::from(mass) / mass_scale_da) as f32);
+                masks.push(1.0);
+            } else {
+                masses.push(0.0);
+                masks.push(0.0);
+            }
+            Ok(())
+        };
+
+        let mut nterm: Vec<&FoundationModification> = peptide
+            .modifications
+            .iter()
+            .filter(|m| m.site == FoundationModificationSite::NTerm)
+            .collect();
+        sort_open_modifications(&mut nterm);
+        for modification in nterm {
+            push(
+                FOUNDATION_DIFFUSION_OPEN_NTERM_MOD,
+                Some(modification.mass_delta),
+            )?;
+        }
+
+        for (residue_index, residue) in residues.iter().copied().enumerate() {
+            push(
+                residue_diffusion_token(residue).ok_or_else(|| {
+                    format!("diffusion vocabulary does not support residue '{residue}'")
+                })?,
+                None,
+            )?;
+            let mut modifications: Vec<&FoundationModification> = peptide
+                .modifications
+                .iter()
+                .filter(|m| m.site == FoundationModificationSite::Residue(residue_index))
+                .collect();
+            sort_open_modifications(&mut modifications);
+            for modification in modifications {
+                push(
+                    FOUNDATION_DIFFUSION_OPEN_RESIDUE_MOD,
+                    Some(modification.mass_delta),
+                )?;
+            }
+        }
+
+        let mut cterm: Vec<&FoundationModification> = peptide
+            .modifications
+            .iter()
+            .filter(|m| m.site == FoundationModificationSite::CTerm)
+            .collect();
+        sort_open_modifications(&mut cterm);
+        for modification in cterm {
+            push(
+                FOUNDATION_DIFFUSION_OPEN_CTERM_MOD,
+                Some(modification.mass_delta),
+            )?;
+        }
+        push(FOUNDATION_DIFFUSION_EOS, None)?;
+        if tokens.len() > max_tokens {
+            return Err(format!(
+                "open-PTM diffusion token length {} exceeds configured maximum {} for {}",
+                tokens.len(),
+                max_tokens,
+                peptide.sequence
+            ));
+        }
+        tokens.resize(max_tokens, FOUNDATION_DIFFUSION_PAD);
+        masses.resize(max_tokens, 0.0);
+        masks.resize(max_tokens, 0.0);
+        Ok(FoundationOpenPtmTokenRow {
+            tokens,
+            modification_mass_scaled: masses,
+            modification_mask: masks,
+        })
+    }
+
+    /// Decode an open-PTM row. Generic modifications are reconstructed as
+    /// explicit site-local mass shifts; exact UniMod identity is intentionally
+    /// not required for the open representation.
+    pub fn decode_open_ptm(
+        self,
+        tokens: &[u32],
+        modification_mass_scaled: &[f32],
+        mass_scale_da: f64,
+    ) -> std::result::Result<PeptidoformInput, String> {
+        if tokens.len() != modification_mass_scaled.len() {
+            return Err("open-PTM decode token/mass lengths differ".into());
+        }
+        let mut sequence = String::new();
+        let mut modifications = Vec::new();
+        let mut saw_eos = false;
+        for (position, (&token, &scaled_mass)) in
+            tokens.iter().zip(modification_mass_scaled).enumerate()
+        {
+            match token {
+                FOUNDATION_DIFFUSION_PAD => break,
+                FOUNDATION_DIFFUSION_MASK => {
+                    return Err("cannot decode MASK in open-PTM row".into())
+                }
+                FOUNDATION_DIFFUSION_EOS => {
+                    saw_eos = true;
+                    break;
+                }
+                FOUNDATION_DIFFUSION_OPEN_NTERM_MOD => {
+                    if !sequence.is_empty() {
+                        return Err("open N-terminal modification must precede residues".into());
+                    }
+                    modifications.push(FoundationModification::mass_delta_at_site(
+                        FoundationModificationSite::NTerm,
+                        0,
+                        (f64::from(scaled_mass) * mass_scale_da) as f32,
+                    ));
+                }
+                FOUNDATION_DIFFUSION_OPEN_RESIDUE_MOD => {
+                    let residue_index =
+                        sequence.chars().count().checked_sub(1).ok_or_else(|| {
+                            "open residue modification appeared before a residue".to_string()
+                        })?;
+                    modifications.push(FoundationModification::mass_delta(
+                        residue_index,
+                        (f64::from(scaled_mass) * mass_scale_da) as f32,
+                    ));
+                }
+                FOUNDATION_DIFFUSION_OPEN_CTERM_MOD => {
+                    let residue_index =
+                        sequence.chars().count().checked_sub(1).ok_or_else(|| {
+                            "open C-terminal modification appeared before a residue".to_string()
+                        })?;
+                    modifications.push(FoundationModification::mass_delta_at_site(
+                        FoundationModificationSite::CTerm,
+                        residue_index,
+                        (f64::from(scaled_mass) * mass_scale_da) as f32,
+                    ));
+                }
+                _ => {
+                    let residue = diffusion_token_residue(token).ok_or_else(|| {
+                        format!("unsupported token {token} at open-PTM position {position}")
+                    })?;
+                    sequence.push(residue);
+                }
+            }
+        }
+        if !saw_eos {
+            return Err("open-PTM token row did not contain EOS".into());
+        }
+        if sequence.is_empty() {
+            return Err("open-PTM row decoded to an empty peptide".into());
+        }
+        Ok(PeptidoformInput {
+            sequence,
+            modifications,
+        })
     }
 
     /// Decode one token row into a chemistry-aware peptidoform.
@@ -329,7 +539,9 @@ impl FoundationDiffusionVocabulary {
                         unimod_id,
                         definition.mass_delta,
                     );
-                    if !foundation_diffusion_residue_ptm_valid(token, residue) {
+                    let valid = exact_graph_modification_for(residue, &modification).is_some()
+                        || (unimod_id == 21 && matches!(residue, 'S' | 'T' | 'Y'));
+                    if !valid {
                         return Err(format!(
                             "diffusion token {} is not valid on residue {}",
                             self.token_label(token),
@@ -370,6 +582,9 @@ impl FoundationDiffusionVocabulary {
             FOUNDATION_DIFFUSION_DEAMIDATED => "[UniMod:7]",
             FOUNDATION_DIFFUSION_OXIDATION => "[UniMod:35]",
             FOUNDATION_DIFFUSION_PHOSPHO => "[UniMod:21]",
+            FOUNDATION_DIFFUSION_OPEN_NTERM_MOD => "[OPEN_NTERM_MOD]",
+            FOUNDATION_DIFFUSION_OPEN_RESIDUE_MOD => "[OPEN_RESIDUE_MOD]",
+            FOUNDATION_DIFFUSION_OPEN_CTERM_MOD => "[OPEN_CTERM_MOD]",
             3 => "A",
             4 => "C",
             5 => "D",
@@ -468,9 +683,6 @@ pub fn foundation_diffusion_residue_ptm_valid(token: u32, residue: char) -> bool
         FOUNDATION_DIFFUSION_PHOSPHO => 21,
         _ => return false,
     };
-    if unimod_id == 21 {
-        return matches!(residue, 'S' | 'T' | 'Y');
-    }
     let Some(definition) = common_unimod_definition(unimod_id) else {
         return false;
     };
@@ -481,6 +693,26 @@ pub fn foundation_diffusion_residue_ptm_valid(token: u32, residue: char) -> bool
         definition.mass_delta,
     );
     exact_graph_modification_for(residue, &modification).is_some()
+        || (unimod_id == 21 && matches!(residue, 'S' | 'T' | 'Y'))
+}
+
+/// Whether a token is one of the generic open-modification site markers.
+pub fn foundation_diffusion_is_open_modification_token(token: u32) -> bool {
+    matches!(
+        token,
+        FOUNDATION_DIFFUSION_OPEN_NTERM_MOD
+            | FOUNDATION_DIFFUSION_OPEN_RESIDUE_MOD
+            | FOUNDATION_DIFFUSION_OPEN_CTERM_MOD
+    )
+}
+
+fn sort_open_modifications(modifications: &mut Vec<&FoundationModification>) {
+    modifications.sort_by(|left, right| {
+        left.unimod_id
+            .unwrap_or(u32::MAX)
+            .cmp(&right.unimod_id.unwrap_or(u32::MAX))
+            .then_with(|| left.mass_delta.total_cmp(&right.mass_delta))
+    });
 }
 
 fn residue_modification_token(
@@ -490,8 +722,8 @@ fn residue_modification_token(
         Some(1) => Ok(FOUNDATION_DIFFUSION_RESIDUE_ACETYL),
         Some(4) => Ok(FOUNDATION_DIFFUSION_CARBAMIDOMETHYL),
         Some(7) => Ok(FOUNDATION_DIFFUSION_DEAMIDATED),
-        Some(21) => Ok(FOUNDATION_DIFFUSION_PHOSPHO),
         Some(35) => Ok(FOUNDATION_DIFFUSION_OXIDATION),
+        Some(21) => Ok(FOUNDATION_DIFFUSION_PHOSPHO),
         _ => Err(format!(
             "diffusion vocabulary does not yet support residue {}",
             modification.identity_label()
@@ -524,6 +756,14 @@ pub struct FoundationDiffusionBatch {
     pub target_classes: Tensor,
     /// Zero-based active-token length classes `[batch]`, where class `k` means `k + 1` active tokens.
     pub length_targets: Tensor,
+    /// Model-visible open-PTM sidecar `[batch, max_tokens, 2]`: normalized
+    /// signed mass and a presence bit. Values are zero when the modification
+    /// token itself is noised/masked, preventing target leakage.
+    pub noisy_modification_features: Tensor,
+    /// Clean normalized signed mass target `[batch, max_tokens]`.
+    pub target_modification_mass_scaled: Tensor,
+    /// 1 at clean generic modification positions, else 0.
+    pub target_modification_mask: Tensor,
 }
 
 /// Deterministic multinomial forward-process collator.
@@ -531,6 +771,7 @@ pub struct FoundationDiffusionBatch {
 pub struct FoundationDiffusionCollator {
     config: FoundationDiffusionConfig,
     vocabulary: FoundationDiffusionVocabulary,
+    open_ptm: bool,
 }
 
 impl FoundationDiffusionCollator {
@@ -540,6 +781,17 @@ impl FoundationDiffusionCollator {
         Ok(Self {
             config,
             vocabulary: FoundationDiffusionVocabulary,
+            open_ptm: false,
+        })
+    }
+
+    /// Construct the open-PTM collator used by v0.26.1.
+    pub fn new_open_ptm(config: FoundationDiffusionConfig) -> Result<Self> {
+        config.validate().map_err(candle_core::Error::Msg)?;
+        Ok(Self {
+            config,
+            vocabulary: FoundationDiffusionVocabulary,
+            open_ptm: true,
         })
     }
 
@@ -674,6 +926,9 @@ impl FoundationDiffusionCollator {
                 .to_dtype(DType::U32)?,
             length_targets: Tensor::from_vec(length_targets, batch, device)?
                 .to_dtype(DType::U32)?,
+            noisy_modification_features: Tensor::zeros((batch, width, 2), DType::F32, device)?,
+            target_modification_mass_scaled: Tensor::zeros((batch, width), DType::F32, device)?,
+            target_modification_mask: Tensor::zeros((batch, width), DType::F32, device)?,
         })
     }
 
@@ -700,13 +955,31 @@ impl FoundationDiffusionCollator {
         let mut length_targets = Vec::<u32>::with_capacity(b);
         let mut timestep_ids = Vec::<u32>::with_capacity(b);
         let mut timestep_features = Vec::<f32>::with_capacity(b * 4);
+        let mut clean_mod_mass = vec![0.0f32; b * l];
+        let mut clean_mod_mask = vec![0.0f32; b * l];
+        let mut noisy_mod_features = vec![0.0f32; b * l * 2];
         let mut rng = DiffusionRng::new(seed);
 
         for (batch_idx, (peptide, &timestep)) in peptides.iter().zip(timesteps).enumerate() {
-            let tokens = self
-                .vocabulary
-                .encode(peptide, l)
-                .map_err(candle_core::Error::Msg)?;
+            let (tokens, modification_mass_scaled, modification_mask) = if self.open_ptm {
+                let row = self
+                    .vocabulary
+                    .encode_open_ptm(peptide, l, FOUNDATION_OPEN_PTM_MASS_SCALE_DA)
+                    .map_err(candle_core::Error::Msg)?;
+                (
+                    row.tokens,
+                    row.modification_mass_scaled,
+                    row.modification_mask,
+                )
+            } else {
+                (
+                    self.vocabulary
+                        .encode(peptide, l)
+                        .map_err(candle_core::Error::Msg)?,
+                    vec![0.0; l],
+                    vec![0.0; l],
+                )
+            };
             let alpha_bar = self
                 .config
                 .alpha_bar(timestep)
@@ -730,15 +1003,32 @@ impl FoundationDiffusionCollator {
                 mask[flat] = 1.0;
                 active_indices.push(flat as u32);
                 target_classes.push(token);
-                noisy[flat] = if force_all_masked {
+                clean_mod_mass[flat] = modification_mass_scaled[position];
+                clean_mod_mask[flat] = modification_mask[position];
+                let noisy_token = if force_all_masked {
                     FOUNDATION_DIFFUSION_MASK
                 } else if rng.next_f64() < alpha_bar {
                     token
                 } else {
                     // Multinomial replacement over all non-padding categories,
                     // including MASK and EOS. Padding is structural and remains fixed.
-                    1 + (rng.next_u64() % (FOUNDATION_DIFFUSION_VOCAB_SIZE as u64 - 1)) as u32
+                    {
+                        let vocab_size = if self.open_ptm {
+                            FOUNDATION_OPEN_PTM_VOCAB_SIZE
+                        } else {
+                            FOUNDATION_DIFFUSION_VOCAB_SIZE
+                        };
+                        1 + (rng.next_u64() % (vocab_size as u64 - 1)) as u32
+                    }
                 };
+                noisy[flat] = noisy_token;
+                // Expose modification mass only when the clean generic modification
+                // token itself survives corruption. This prevents the sidecar from
+                // leaking a masked/noised PTM target.
+                if modification_mask[position] > 0.0 && noisy_token == token {
+                    noisy_mod_features[flat * 2] = modification_mass_scaled[position];
+                    noisy_mod_features[flat * 2 + 1] = 1.0;
+                }
             }
             debug_assert!(active_length > 0 && active_length <= l);
             length_targets.push((active_length - 1) as u32);
@@ -765,6 +1055,9 @@ impl FoundationDiffusionCollator {
             target_classes: Tensor::from_vec(target_classes, active_count, device)?
                 .to_dtype(DType::U32)?,
             length_targets: Tensor::from_vec(length_targets, b, device)?.to_dtype(DType::U32)?,
+            noisy_modification_features: Tensor::from_vec(noisy_mod_features, (b, l, 2), device)?,
+            target_modification_mass_scaled: Tensor::from_vec(clean_mod_mass, (b, l), device)?,
+            target_modification_mask: Tensor::from_vec(clean_mod_mask, (b, l), device)?,
         })
     }
 }
@@ -1065,6 +1358,9 @@ pub struct FoundationDiffusionOutput {
     pub spectrum_embedding: Tensor,
     /// Active-token length logits `[batch, max_tokens]`; class `k` means `k + 1` active tokens.
     pub length_logits: Tensor,
+    /// Predicted normalized signed mass at each token position when the open-PTM
+    /// sidecar is enabled.
+    pub modification_mass_prediction: Option<Tensor>,
 }
 
 /// Bidirectional foundation-model inverse scaffold.
@@ -1076,19 +1372,40 @@ pub struct PeptideSpectrumDiffusionModel {
     position_embedding: Embedding,
     precursor_projection: Linear,
     timestep_projection: Linear,
+    modification_projection: Option<Linear>,
     layers: Vec<SpectrumConditionedDiffusionBlock>,
     output_norm: FoundationLayerNorm,
     token_head: Linear,
     length_head: Linear,
+    modification_mass_head: Option<Linear>,
 }
 
 impl PeptideSpectrumDiffusionModel {
-    /// Construct the observed-spectrum encoder and peptide diffusion decoder.
+    /// Construct the legacy fixed-PTM observed-spectrum diffusion model.
     pub fn new(config: FoundationDiffusionConfig, vb: VarBuilder<'_>) -> Result<Self> {
+        Self::new_with_open_ptm(config, vb, false)
+    }
+
+    /// Construct the v0.26.1 open-PTM model with generic site tokens and a
+    /// continuous modification-mass sidecar/head.
+    pub fn new_open_ptm(config: FoundationDiffusionConfig, vb: VarBuilder<'_>) -> Result<Self> {
+        Self::new_with_open_ptm(config, vb, true)
+    }
+
+    fn new_with_open_ptm(
+        config: FoundationDiffusionConfig,
+        vb: VarBuilder<'_>,
+        open_ptm: bool,
+    ) -> Result<Self> {
         config.validate().map_err(candle_core::Error::Msg)?;
+        let vocab_size = if open_ptm {
+            FOUNDATION_OPEN_PTM_VOCAB_SIZE
+        } else {
+            FOUNDATION_DIFFUSION_VOCAB_SIZE
+        };
         let spectrum_encoder = FoundationSpectrumEncoder::new(&config, vb.pp("spectrum_encoder"))?;
         let token_embedding = nn::embedding(
-            FOUNDATION_DIFFUSION_VOCAB_SIZE,
+            vocab_size,
             config.model_dim,
             vb.pp("decoder.token_embedding"),
         )?;
@@ -1099,6 +1416,15 @@ impl PeptideSpectrumDiffusionModel {
         )?;
         let precursor_projection = nn::linear(6, config.model_dim, vb.pp("decoder.precursor"))?;
         let timestep_projection = nn::linear(4, config.model_dim, vb.pp("decoder.timestep"))?;
+        let modification_projection = if open_ptm {
+            Some(nn::linear(
+                2,
+                config.model_dim,
+                vb.pp("decoder.open_ptm_input"),
+            )?)
+        } else {
+            None
+        };
         let mut layers = Vec::with_capacity(config.decoder_layers);
         for index in 0..config.decoder_layers {
             layers.push(SpectrumConditionedDiffusionBlock::new(
@@ -1108,16 +1434,21 @@ impl PeptideSpectrumDiffusionModel {
         }
         let output_norm =
             FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("decoder.output_norm"))?;
-        let token_head = nn::linear(
-            config.model_dim,
-            FOUNDATION_DIFFUSION_VOCAB_SIZE,
-            vb.pp("decoder.token_head"),
-        )?;
+        let token_head = nn::linear(config.model_dim, vocab_size, vb.pp("decoder.token_head"))?;
         let length_head = nn::linear(
             config.model_dim,
             config.max_tokens,
             vb.pp("decoder.length_head"),
         )?;
+        let modification_mass_head = if open_ptm {
+            Some(nn::linear(
+                config.model_dim,
+                1,
+                vb.pp("decoder.open_ptm_mass_head"),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
             spectrum_encoder,
@@ -1125,10 +1456,12 @@ impl PeptideSpectrumDiffusionModel {
             position_embedding,
             precursor_projection,
             timestep_projection,
+            modification_projection,
             layers,
             output_norm,
             token_head,
             length_head,
+            modification_mass_head,
         })
     }
 
@@ -1226,6 +1559,11 @@ impl PeptideSpectrumDiffusionModel {
 
         let mut hidden = (((token_embedding + position_embedding)? + precursor_embedding)?
             + timestep_embedding)?;
+        if let Some(projection) = &self.modification_projection {
+            let modification_embedding =
+                projection.forward(&diffusion.noisy_modification_features)?;
+            hidden = (hidden + modification_embedding)?;
+        }
         let token_mask = diffusion.token_mask.unsqueeze(2)?.broadcast_as((
             batch,
             token_len,
@@ -1246,12 +1584,18 @@ impl PeptideSpectrumDiffusionModel {
             .forward(&hidden)?
             .broadcast_mul(&token_mask)?;
         let token_logits = self.token_head.forward(&hidden)?;
+        let modification_mass_prediction = self
+            .modification_mass_head
+            .as_ref()
+            .map(|head| head.forward(&hidden).and_then(|value| value.squeeze(2)))
+            .transpose()?;
         Ok(FoundationDiffusionOutput {
             token_logits,
             decoder_hidden: hidden,
             spectrum_memory,
             spectrum_embedding: spectrum_encoding.spectrum_embedding,
             length_logits,
+            modification_mass_prediction,
         })
     }
 
@@ -1262,15 +1606,59 @@ impl PeptideSpectrumDiffusionModel {
 }
 
 /// Cross-entropy x0 reconstruction objective over all non-padding clean tokens.
+/// Masked MSE for open-PTM signed mass prediction in normalized mass units.
+pub fn foundation_diffusion_open_ptm_mass_loss(
+    output: &FoundationDiffusionOutput,
+    batch: &FoundationDiffusionBatch,
+) -> Result<Tensor> {
+    let Some(prediction) = &output.modification_mass_prediction else {
+        return Tensor::new(0.0f32, batch.target_modification_mask.device());
+    };
+    let squared = (prediction - &batch.target_modification_mass_scaled)?
+        .sqr()?
+        .broadcast_mul(&batch.target_modification_mask)?;
+    let numerator = squared.sum_all()?;
+    let denominator = batch
+        .target_modification_mask
+        .sum_all()?
+        .clamp(1.0, f64::INFINITY)?;
+    numerator.broadcast_div(&denominator)
+}
+
+/// Mean absolute open-PTM mass error in Daltons.
+pub fn foundation_diffusion_open_ptm_mass_mae_da(
+    output: &FoundationDiffusionOutput,
+    batch: &FoundationDiffusionBatch,
+    mass_scale_da: f64,
+) -> Result<Option<f64>> {
+    let Some(prediction) = &output.modification_mass_prediction else {
+        return Ok(None);
+    };
+    let count = batch
+        .target_modification_mask
+        .sum_all()?
+        .to_scalar::<f32>()? as f64;
+    if count <= 0.0 {
+        return Ok(None);
+    }
+    let absolute = (prediction - &batch.target_modification_mass_scaled)?
+        .abs()?
+        .broadcast_mul(&batch.target_modification_mask)?
+        .sum_all()?
+        .to_scalar::<f32>()? as f64;
+    Ok(Some(absolute / count * mass_scale_da))
+}
+
 pub fn foundation_diffusion_x0_loss(
     output: &FoundationDiffusionOutput,
     batch: &FoundationDiffusionBatch,
 ) -> Result<Tensor> {
     let (b, l, classes) = output.token_logits.dims3()?;
-    if classes != FOUNDATION_DIFFUSION_VOCAB_SIZE {
+    if classes != FOUNDATION_DIFFUSION_VOCAB_SIZE && classes != FOUNDATION_OPEN_PTM_VOCAB_SIZE {
         candle_core::bail!(
-            "diffusion logits expose {classes} classes, expected {}",
-            FOUNDATION_DIFFUSION_VOCAB_SIZE
+            "diffusion logits expose {classes} classes, expected legacy {} or open-PTM {}",
+            FOUNDATION_DIFFUSION_VOCAB_SIZE,
+            FOUNDATION_OPEN_PTM_VOCAB_SIZE
         );
     }
     let flat_logits = output.token_logits.reshape((b * l, classes))?;
@@ -1456,39 +1844,6 @@ mod tests {
     }
 
     #[test]
-    fn phosphorylation_round_trips_on_sty_and_uses_canonical_mass() {
-        let vocabulary = FoundationDiffusionVocabulary;
-        let phospho = common_unimod_definition(21).unwrap();
-        for (sequence, residue_index) in [
-            ("ASPEPTIDE", 1usize),
-            ("ATPEPTIDE", 1usize),
-            ("AYPEPTIDE", 1usize),
-        ] {
-            let peptide = PeptidoformInput {
-                sequence: sequence.into(),
-                modifications: vec![FoundationModification::unimod(
-                    FoundationModificationSite::Residue(residue_index),
-                    residue_index,
-                    21,
-                    phospho.mass_delta,
-                )],
-            };
-            let tokens = vocabulary.encode(&peptide, 32).unwrap();
-            assert!(tokens.contains(&FOUNDATION_DIFFUSION_PHOSPHO));
-            assert_eq!(vocabulary.decode(&tokens).unwrap(), peptide);
-        }
-        assert!(
-            (foundation_diffusion_token_mass_da(FOUNDATION_DIFFUSION_PHOSPHO).unwrap() - 79.966_33)
-                .abs()
-                < 1e-6
-        );
-        assert!(!foundation_diffusion_residue_ptm_valid(
-            FOUNDATION_DIFFUSION_PHOSPHO,
-            'A'
-        ));
-    }
-
-    #[test]
     fn multinomial_corruption_is_deterministic_and_schedule_adds_noise() {
         let device = Device::Cpu;
         let config = FoundationDiffusionConfig {
@@ -1656,5 +2011,58 @@ mod tests {
             .unwrap();
         assert!(value.is_finite());
         assert!(value >= 0.0);
+    }
+}
+
+#[cfg(test)]
+mod open_ptm_tests {
+    use super::*;
+
+    #[test]
+    fn open_ptm_encoding_accepts_unimod_and_arbitrary_mass_shifts_without_new_classes() {
+        let peptide = PeptidoformInput {
+            sequence: "ASK".into(),
+            modifications: vec![
+                FoundationModification::unimod(
+                    FoundationModificationSite::Residue(1),
+                    1,
+                    21,
+                    79.96633,
+                ),
+                FoundationModification::mass_delta(2, 299.1667),
+                FoundationModification::mass_delta_at_site(
+                    FoundationModificationSite::NTerm,
+                    0,
+                    -17.0265,
+                ),
+            ],
+        };
+        let vocabulary = FoundationDiffusionVocabulary;
+        let encoded = vocabulary
+            .encode_open_ptm(&peptide, 32, FOUNDATION_OPEN_PTM_MASS_SCALE_DA)
+            .unwrap();
+        assert!(encoded
+            .tokens
+            .contains(&FOUNDATION_DIFFUSION_OPEN_NTERM_MOD));
+        assert_eq!(
+            encoded
+                .tokens
+                .iter()
+                .filter(|&&t| t == FOUNDATION_DIFFUSION_OPEN_RESIDUE_MOD)
+                .count(),
+            2
+        );
+        let decoded = vocabulary
+            .decode_open_ptm(
+                &encoded.tokens,
+                &encoded.modification_mass_scaled,
+                FOUNDATION_OPEN_PTM_MASS_SCALE_DA,
+            )
+            .unwrap();
+        assert_eq!(decoded.sequence, peptide.sequence);
+        let masses: Vec<f32> = decoded.modifications.iter().map(|m| m.mass_delta).collect();
+        assert!(masses.iter().any(|m| (*m - 79.96633).abs() < 1.0e-3));
+        assert!(masses.iter().any(|m| (*m - 299.1667).abs() < 1.0e-3));
+        assert!(masses.iter().any(|m| (*m + 17.0265).abs() < 1.0e-3));
     }
 }
