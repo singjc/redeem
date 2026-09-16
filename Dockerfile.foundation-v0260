@@ -46,13 +46,16 @@ COPY redeem-properties-py ./redeem-properties-py
 RUN set -eux; \
     test -f redeem-properties/examples/foundation_prepare_multimodal_v0260.rs; \
     test -f redeem-properties/examples/foundation_train_multimodal_v0260.rs; \
+    test -f redeem-properties/examples/foundation_export_alphapeptdeep_comparison_v0261.rs; \
     cargo build --release --locked \
       -p redeem-properties --features cuda \
       --example foundation_prepare_multimodal_v0260 \
-      --example foundation_train_multimodal_v0260; \
+      --example foundation_train_multimodal_v0260 \
+      --example foundation_export_alphapeptdeep_comparison_v0261; \
     mkdir -p /opt/redeem/bin; \
     cp target/release/examples/foundation_prepare_multimodal_v0260 /opt/redeem/bin/; \
-    cp target/release/examples/foundation_train_multimodal_v0260 /opt/redeem/bin/
+    cp target/release/examples/foundation_train_multimodal_v0260 /opt/redeem/bin/; \
+    cp target/release/examples/foundation_export_alphapeptdeep_comparison_v0261 /opt/redeem/bin/
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
 
@@ -73,6 +76,7 @@ COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
 RUN chmod 0755 /usr/local/bin/redeem-container-info /opt/redeem/bin/* && \
     command -v foundation_prepare_multimodal_v0260 && \
     command -v foundation_train_multimodal_v0260 && \
+    command -v foundation_export_alphapeptdeep_comparison_v0261 && \
     /usr/local/bin/redeem-container-info --build-check
 
 WORKDIR /work
