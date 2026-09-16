@@ -39,6 +39,7 @@ pub mod metadata;
 pub mod model;
 pub mod msp;
 pub mod multimodal_v0260;
+pub mod multimodal_v0270;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -205,10 +206,11 @@ pub use fragment_likelihood::{
     FOUNDATION_FRAGMENT_LIKELIHOOD_PRIMARY_SCORE_V0230,
 };
 pub use fragment_relation::{
-    foundation_fragment_relation_features, foundation_fragment_relation_legacy_log_prior,
-    foundation_fragment_relation_validate_mass_geometry, FoundationFragmentRelationBatch,
-    FoundationFragmentRelationFeatureRows, PeptideSpectrumFragmentRelationEnergy,
-    FOUNDATION_FRAGMENT_RELATION_ABS_TOLERANCE_DA_V0240,
+    foundation_fragment_cleavage_geometry, foundation_fragment_relation_features,
+    foundation_fragment_relation_legacy_log_prior,
+    foundation_fragment_relation_validate_mass_geometry, FoundationFragmentCleavageGeometry,
+    FoundationFragmentRelationBatch, FoundationFragmentRelationFeatureRows,
+    PeptideSpectrumFragmentRelationEnergy, FOUNDATION_FRAGMENT_RELATION_ABS_TOLERANCE_DA_V0240,
     FOUNDATION_FRAGMENT_RELATION_ARCHITECTURE_V0240,
     FOUNDATION_FRAGMENT_RELATION_CANDIDATE_HIDDEN_V0240,
     FOUNDATION_FRAGMENT_RELATION_CORE_CHANNELS_V0240,
@@ -252,6 +254,20 @@ pub use multimodal_v0260::{
     FOUNDATION_MULTIMODAL_MS2_INTENSITY_WEIGHT_V0260,
     FOUNDATION_MULTIMODAL_MS2_PRESENCE_WEIGHT_V0260, FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0260,
     FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0260,
+};
+pub use multimodal_v0270::{
+    foundation_multimodal_ms2_loss_v0270, foundation_multimodal_relation_margin_loss_v0270,
+    FoundationFragmentContextBatchV0270, FoundationMultimodalForwardOutputV0270,
+    FoundationMultimodalMs2LossesV0270, PeptideFoundationMultimodalForwardV0270,
+    PeptideFoundationMultimodalV0270Config, PeptideFoundationMultimodalV0270Model,
+    FOUNDATION_FRAGMENT_CHANNELS_V0270, FOUNDATION_FRAGMENT_CONTINUOUS_FEATURES_V0270,
+    FOUNDATION_FRAGMENT_TRANSFORMER_FF_DIM_V0270, FOUNDATION_FRAGMENT_TRANSFORMER_HEADS_V0270,
+    FOUNDATION_FRAGMENT_TRANSFORMER_LAYERS_V0270, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0270,
+    FOUNDATION_MULTIMODAL_MS2_COSINE_WEIGHT_V0270,
+    FOUNDATION_MULTIMODAL_MS2_INTENSITY_WEIGHT_V0270,
+    FOUNDATION_MULTIMODAL_MS2_PRESENCE_WEIGHT_V0270, FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0270,
+    FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0270, FOUNDATION_RT_SPECIALIST_FF_DIM_V0270,
+    FOUNDATION_RT_SPECIALIST_HEADS_V0270, FOUNDATION_RT_SPECIALIST_LAYERS_V0270,
 };
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,

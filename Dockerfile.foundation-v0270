@@ -1,0 +1,76 @@
+ARG CUDA_VERSION=12.2.2
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
+
+ARG RUST_TOOLCHAIN=stable
+ARG CUDA_COMPUTE_CAP=80
+ARG CARGO_BUILD_JOBS=1
+ARG CARGO_RELEASE_LTO=off
+ARG CARGO_RELEASE_CODEGEN_UNITS=8
+ARG CARGO_RELEASE_DEBUG=0
+ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        build-essential ca-certificates clang cmake curl git libssl-dev \
+        libstdc++-12-dev pkg-config && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf \
+        --retry 6 --retry-all-errors --retry-delay 5 \
+        --connect-timeout 30 --max-time 300 \
+        https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}"
+
+ENV PATH=/root/.cargo/bin:${PATH}
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_RELEASE_LTO}
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_RELEASE_CODEGEN_UNITS}
+ENV CARGO_PROFILE_RELEASE_DEBUG=${CARGO_RELEASE_DEBUG}
+
+# Build redeem-properties as a standalone crate. This deliberately excludes
+# redeem-classifiers, redeem-openms-ffi, Python bindings, and the CLI because
+# neither v0.27 executable depends on them.
+WORKDIR /app/redeem-properties
+COPY redeem-properties/ ./
+COPY Cargo.lock ./Cargo.lock
+
+RUN test -f examples/foundation_train_multimodal_v0270.rs && \
+    test -f examples/foundation_export_alphapeptdeep_comparison_v0270.rs && \
+    cargo build --release --locked --no-default-features --features cuda \
+      --example foundation_train_multimodal_v0270 \
+      --example foundation_export_alphapeptdeep_comparison_v0270 && \
+    mkdir -p /opt/redeem/bin && \
+    cp target/release/examples/foundation_train_multimodal_v0270 /opt/redeem/bin/ && \
+    cp target/release/examples/foundation_export_alphapeptdeep_comparison_v0270 /opt/redeem/bin/
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        bash ca-certificates libgomp1 libssl3 libstdc++6 time zstd && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+ENV PATH=/opt/redeem/bin:/usr/local/bin:${PATH}
+ENV REDEEM_FOUNDATION_IMAGE_PROFILE=v0270-multimodal
+
+COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
+COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
+
+RUN chmod 0755 /usr/local/bin/redeem-container-info /opt/redeem/bin/* && \
+    command -v foundation_train_multimodal_v0270 && \
+    command -v foundation_export_alphapeptdeep_comparison_v0270 && \
+    /usr/local/bin/redeem-container-info --build-check
+
+WORKDIR /work
+CMD ["foundation_train_multimodal_v0270"]

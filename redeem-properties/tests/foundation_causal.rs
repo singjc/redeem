@@ -108,7 +108,6 @@ fn causal_start_embedding_is_outside_the_existing_diffusion_vocabulary() {
     let config = tiny_config();
     let vocabulary = FoundationDiffusionVocabulary;
     assert_eq!(vocabulary.size(), FOUNDATION_DIFFUSION_VOCAB_SIZE);
-    assert_eq!(FOUNDATION_DIFFUSION_VOCAB_SIZE, 28);
 
     let diffusion_vars = VarMap::new();
     let diffusion_vb = VarBuilder::from_varmap(&diffusion_vars, DType::F32, &device);

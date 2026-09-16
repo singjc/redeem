@@ -632,6 +632,48 @@ fn core_fragment_mz(prefix_mass: f64, suffix_with_water: f64) -> [f64; 4] {
     ]
 }
 
+/// Exact open-PTM-aware mass geometry for one peptide cleavage.
+///
+/// This is the shared deterministic geometry used by fragment-relation scoring
+/// and the v0.27 contextual fragment decoder. Prefix mass excludes water and
+/// includes all N-terminal/residue modifications on the N-terminal side; the
+/// complementary suffix mass includes water and all C-terminal/residue
+/// modifications on the C-terminal side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FoundationFragmentCleavageGeometry {
+    /// Zero-based cleavage index.
+    pub cleavage_index: usize,
+    /// Neutral N-terminal residue-prefix mass before adding proton(s).
+    pub prefix_mass_da: f64,
+    /// Neutral complementary C-terminal mass including peptide water.
+    pub suffix_with_water_mass_da: f64,
+    /// Core b1+, b2+, y1+, y2+ theoretical m/z values.
+    pub core_mz: [f64; 4],
+}
+
+/// Build exact continuous fragment geometry for every cleavage in a peptidoform.
+///
+/// No PTM vocabulary lookup is involved: every finite signed mass delta already
+/// accepted by the open-PTM representation contributes directly to the masses.
+pub fn foundation_fragment_cleavage_geometry(
+    peptide: &PeptidoformInput,
+) -> std::result::Result<Vec<FoundationFragmentCleavageGeometry>, String> {
+    let prefixes = cleavage_prefix_masses(peptide)?;
+    let total_residue_mass = peptide_residue_mass(peptide)?;
+    let mut geometry = Vec::with_capacity(prefixes.len());
+    for (cleavage_index, prefix_mass_da) in prefixes.into_iter().enumerate() {
+        let suffix_with_water_mass_da =
+            total_residue_mass - prefix_mass_da + FOUNDATION_PEPTIDE_WATER_MASS_DA;
+        geometry.push(FoundationFragmentCleavageGeometry {
+            cleavage_index,
+            prefix_mass_da,
+            suffix_with_water_mass_da,
+            core_mz: core_fragment_mz(prefix_mass_da, suffix_with_water_mass_da),
+        });
+    }
+    Ok(geometry)
+}
+
 /// Validate the exact continuous-mass geometry used by v0.24/v0.26 fragment relations.
 ///
 /// This path is intentionally independent of the closed diffusion PTM token
