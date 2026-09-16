@@ -1,5 +1,15 @@
 ARG CUDA_VERSION=12.2.2
 
+# -----------------------------------------------------------------------------
+# ReDeeM v0.27 RT-specialist + contextual-fragment Rust/CUDA builder.
+#
+# Keep the repository workspace/lockfile relationship intact. Cargo resolves
+# workspace metadata before selecting -p redeem-properties, so placing the root
+# Cargo.lock beside a standalone redeem-properties manifest is not a valid
+# --locked build. Non-selected workspace crates are copied only into this
+# disposable builder stage for workspace metadata/lock resolution; they are not
+# selected as build targets and are not copied into the runtime image.
+# -----------------------------------------------------------------------------
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
 
 ARG RUST_TOOLCHAIN=stable
@@ -35,28 +45,44 @@ ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_RELEASE_LTO}
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_RELEASE_CODEGEN_UNITS}
 ENV CARGO_PROFILE_RELEASE_DEBUG=${CARGO_RELEASE_DEBUG}
 
-# Build redeem-properties as a standalone crate. This deliberately excludes
-# redeem-classifiers, redeem-openms-ffi, Python bindings, and the CLI because
-# neither v0.27 executable depends on them.
-WORKDIR /app/redeem-properties
-COPY redeem-properties/ ./
-COPY Cargo.lock ./Cargo.lock
+WORKDIR /app
 
-RUN test -f examples/foundation_train_multimodal_v0270.rs && \
-    test -f examples/foundation_export_alphapeptdeep_comparison_v0270.rs && \
-    cargo build --release --locked --no-default-features --features cuda \
+# Preserve the root workspace and authoritative lockfile exactly as used by the
+# repository. Only redeem-properties is selected below, so redeem-classifiers,
+# redeem-cli, redeem-openms-ffi, and redeem-properties-py are metadata-only here.
+COPY Cargo.toml Cargo.lock ./
+COPY redeem-openms-ffi ./redeem-openms-ffi
+COPY redeem-classifiers ./redeem-classifiers
+COPY redeem-cli ./redeem-cli
+COPY redeem-properties ./redeem-properties
+COPY redeem-properties-py ./redeem-properties-py
+
+RUN set -eux; \
+    echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"; \
+    test -f redeem-properties/examples/foundation_train_multimodal_v0270.rs; \
+    test -f redeem-properties/examples/foundation_export_alphapeptdeep_comparison_v0270.rs; \
+    cargo build --release --locked \
+      -p redeem-properties \
+      --no-default-features \
+      --features cuda \
       --example foundation_train_multimodal_v0270 \
-      --example foundation_export_alphapeptdeep_comparison_v0270 && \
-    mkdir -p /opt/redeem/bin && \
-    cp target/release/examples/foundation_train_multimodal_v0270 /opt/redeem/bin/ && \
+      --example foundation_export_alphapeptdeep_comparison_v0270; \
+    mkdir -p /opt/redeem/bin; \
+    cp target/release/examples/foundation_train_multimodal_v0270 /opt/redeem/bin/; \
     cp target/release/examples/foundation_export_alphapeptdeep_comparison_v0270 /opt/redeem/bin/
 
+# -----------------------------------------------------------------------------
+# Lean runtime. No compiler toolchain, Python/PyTorch/APD, classifier, OpenMS
+# FFI, or production CLI binary is copied into the final image.
+# -----------------------------------------------------------------------------
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
 
 RUN apt-get -o Acquire::Retries=5 update && \
     apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-        bash ca-certificates libgomp1 libssl3 libstdc++6 time zstd && \
+        bash ca-certificates gzip libgomp1 libssl3 libstdc++6 time zstd && \
     update-ca-certificates && \
+    command -v gzip && \
+    command -v zstd && \
     rm -rf /var/lib/apt/lists/*
 
 ENV CUDA_HOME=/usr/local/cuda
