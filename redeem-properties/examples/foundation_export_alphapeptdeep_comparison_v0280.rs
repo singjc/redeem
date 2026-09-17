@@ -1,0 +1,493 @@
+//! Export the frozen all-eligible VALIDATION comparison set for ReDeeM vs AlphaPeptDeep 1.5.1.
+//!
+//! Only TRAIN and VALIDATION benchmark partitions are accessed.  VALIDATION supplies the
+//! descriptive held-out RT/CCS/MS2 comparison peptides; a separate TRAIN-only RT calibration
+//! sample is exported so AlphaPeptDeep's model-native RT coordinate can be mapped to the
+//! ReDeeM target coordinate without fitting on validation.  TEST is never opened.
+
+use anyhow::{Context, Result};
+use candle_core::{DType, Device};
+use candle_nn::{VarBuilder, VarMap};
+use redeem_properties::foundation::{
+    load_foundation_corpus, read_foundation_training_run_config, FoundationBenchmarkManifest,
+    FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig,
+    FoundationFragmentContextBatchV0280, FoundationPartition, FoundationTargetNormalizationConfig,
+    FoundationTrainingRecord, PeptideFoundationMultimodalV0280Config,
+    PeptideFoundationMultimodalV0280Model, RetentionTimeObjective,
+    FOUNDATION_MULTIMODAL_ARCHITECTURE_V0280,
+};
+use serde::Deserialize;
+use std::collections::{BTreeSet, HashMap};
+use std::env;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+
+const VERSION: &str = "v0.28-alphapeptdeep-comparison-export";
+const DEFAULT_PER_TASK: usize = usize::MAX;
+const DEFAULT_RT_CALIBRATION: usize = 256;
+const DEFAULT_SEED: u64 = 20_260_916;
+const CPU_BATCH_SIZE: usize = 32;
+const CUDA_BATCH_SIZE: usize = 128;
+
+#[derive(Debug, Deserialize)]
+struct UnifiedMetadata {
+    version: u32,
+    completed_steps: usize,
+    property_adapter_hidden: usize,
+    forward_config: redeem_properties::foundation::FoundationConfig,
+    inverse_config: redeem_properties::foundation::FoundationDiffusionConfig,
+    v0280_config: PeptideFoundationMultimodalV0280Config,
+    rt_objective: RetentionTimeObjective,
+    target_normalization: FoundationTargetNormalizationConfig,
+}
+
+#[derive(Debug, Clone)]
+struct Predictions {
+    rt: f32,
+    ccs: f32,
+    ms2: Vec<Vec<f32>>,
+}
+
+fn main() -> Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if !(3..=6).contains(&args.len()) {
+        anyhow::bail!(
+            "usage: foundation_export_alphapeptdeep_comparison_v0280 RUN.yaml V0280_CHECKPOINT OUTPUT_DIR [validation_per_task=all_if_omitted] [rt_train_calibration=256] [seed=20260916]"
+        );
+    }
+    let training_yaml = PathBuf::from(&args[0]);
+    let checkpoint = PathBuf::from(&args[1]);
+    let output_dir = PathBuf::from(&args[2]);
+    let per_task = parse_or(&args, 3, DEFAULT_PER_TASK)?;
+    let rt_calibration_n = parse_or(&args, 4, DEFAULT_RT_CALIBRATION)?;
+    let seed = parse_or(&args, 5, DEFAULT_SEED)?;
+    if per_task == 0 || rt_calibration_n == 0 {
+        anyhow::bail!("comparison sample sizes must be positive");
+    }
+
+    let run = read_foundation_training_run_config(&training_yaml)?;
+    let corpus = load_foundation_corpus(&run.corpus)?;
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&run.benchmark_manifest)?;
+    benchmark.validate_against_records(&corpus.records)?;
+
+    let metadata_path = checkpoint.join("metadata.yaml");
+    let metadata: UnifiedMetadata = serde_yaml::from_str(
+        &fs::read_to_string(&metadata_path)
+            .with_context(|| format!("read unified metadata {metadata_path:?}"))?,
+    )?;
+
+    let validation_allowed = benchmark.partition_indices(FoundationPartition::Validation);
+    let train_allowed = benchmark.partition_indices(FoundationPartition::Train);
+
+    let rt_validation = select_records(
+        &validation_allowed,
+        &corpus.records,
+        per_task,
+        seed ^ 0x5254,
+        |record| rt_target(record, metadata.rt_objective).is_some(),
+    );
+    let ccs_validation = select_records(
+        &validation_allowed,
+        &corpus.records,
+        per_task,
+        seed ^ 0x4343_53,
+        |record| record.ccs.is_some() && record.context.charge.is_some(),
+    );
+    let ms2_validation = select_records(
+        &validation_allowed,
+        &corpus.records,
+        per_task,
+        seed ^ 0x4d53_32,
+        |record| {
+            record.context.charge.is_some()
+                && record
+                    .fragments
+                    .iter()
+                    .filter(|fragment| fragment.channel < 4 && fragment.intensity.is_finite())
+                    .count()
+                    >= 8
+        },
+    );
+    let rt_train = select_records(
+        &train_allowed,
+        &corpus.records,
+        rt_calibration_n,
+        seed ^ 0x4341_4c52_54,
+        |record| rt_target(record, metadata.rt_objective).is_some(),
+    );
+
+    if rt_validation.is_empty() || ccs_validation.is_empty() || ms2_validation.is_empty() {
+        anyhow::bail!(
+            "no eligible unmodified VALIDATION records for at least one comparison task: RT {} CCS {} MS2 {}",
+            rt_validation.len(), ccs_validation.len(), ms2_validation.len()
+        );
+    }
+    if rt_train.len() < rt_calibration_n {
+        anyhow::bail!(
+            "insufficient eligible unmodified TRAIN RT calibration records: {} requested {}",
+            rt_train.len(),
+            rt_calibration_n
+        );
+    }
+
+    let mut validation_union = BTreeSet::new();
+    validation_union.extend(rt_validation.iter().copied());
+    validation_union.extend(ccs_validation.iter().copied());
+    validation_union.extend(ms2_validation.iter().copied());
+    let validation_union = validation_union.into_iter().collect::<Vec<_>>();
+
+    if metadata.version != 280 {
+        anyhow::bail!(
+            "expected v0.28 checkpoint metadata version 280, observed {}",
+            metadata.version
+        );
+    }
+    let device = comparison_device()?;
+    let batch_size = if matches!(device, Device::Cpu) {
+        CPU_BATCH_SIZE
+    } else {
+        CUDA_BATCH_SIZE
+    };
+    let mut varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = PeptideFoundationMultimodalV0280Model::new(metadata.v0280_config.clone(), vb)?;
+    varmap
+        .load(checkpoint.join("model.safetensors"))
+        .with_context(|| format!("load v0.28 multimodal checkpoint {checkpoint:?}"))?;
+    let collator = FoundationCollator::new(
+        metadata.forward_config.clone(),
+        FoundationCollatorConfig {
+            retention_time_objective: metadata.rt_objective,
+            corruption: FoundationCorruptionConfig {
+                residue_mask_probability: 0.0,
+                chemistry_mask_probability: 0.0,
+            },
+        },
+    )?;
+
+    let predictions = predict_records(
+        &validation_union,
+        &corpus.records,
+        &model,
+        &collator,
+        &metadata.target_normalization,
+        seed,
+        batch_size,
+        &device,
+    )?;
+
+    fs::create_dir_all(&output_dir)?;
+    let precursor_path = output_dir.join("foundation_comparison_precursors.tsv");
+    let fragment_path = output_dir.join("foundation_comparison_fragments.tsv");
+    let calibration_path = output_dir.join("foundation_comparison_rt_train_calibration.tsv");
+
+    let rt_set: BTreeSet<usize> = rt_validation.iter().copied().collect();
+    let ccs_set: BTreeSet<usize> = ccs_validation.iter().copied().collect();
+    let ms2_set: BTreeSet<usize> = ms2_validation.iter().copied().collect();
+
+    let mut precursor = BufWriter::new(File::create(&precursor_path)?);
+    writeln!(
+        precursor,
+        "record_index\tpartition\tsource_id\tsequence\tmods\tmod_sites\tcharge\tnce\tinstrument\tselected_rt\tselected_ccs\tselected_ms2\ttarget_rt\tfoundation_rt\ttarget_ccs\tfoundation_ccs"
+    )?;
+    for &index in &validation_union {
+        let record = &corpus.records[index];
+        let pred = predictions
+            .get(&index)
+            .context("missing foundation prediction")?;
+        writeln!(
+            precursor,
+            "{}\tVALIDATION\t{}\t{}\t\t\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{}\t{:.8}",
+            index,
+            escape_tsv(&corpus.provenance[index].source_id),
+            record.peptidoform.sequence,
+            option_i32(record.context.charge),
+            option_f32(record.context.nce),
+            escape_tsv(record.context.instrument_name.as_deref().unwrap_or("")),
+            yes_no(rt_set.contains(&index)),
+            yes_no(ccs_set.contains(&index)),
+            yes_no(ms2_set.contains(&index)),
+            option_f32(rt_target(record, metadata.rt_objective)),
+            pred.rt,
+            option_f32(record.ccs),
+            pred.ccs,
+        )?;
+    }
+    precursor.flush()?;
+
+    let mut fragments = BufWriter::new(File::create(&fragment_path)?);
+    writeln!(
+        fragments,
+        "record_index\tsequence\tcleavage_index\tchannel\tcharged_frag_type\tfragment_number\tproduct_mz\ttarget_intensity\tfoundation_intensity"
+    )?;
+    for &index in &ms2_validation {
+        let record = &corpus.records[index];
+        let pred = predictions
+            .get(&index)
+            .context("missing foundation MS2 prediction")?;
+        for fragment in &record.fragments {
+            if fragment.channel >= 4 || !fragment.intensity.is_finite() {
+                continue;
+            }
+            let Some(predicted) = pred
+                .ms2
+                .get(fragment.cleavage_index)
+                .and_then(|row| row.get(fragment.channel))
+                .copied()
+            else {
+                continue;
+            };
+            let (frag_type, number) = fragment_identity(
+                fragment.channel,
+                fragment.cleavage_index,
+                record.peptidoform.sequence.len(),
+            )?;
+            writeln!(
+                fragments,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}",
+                index,
+                record.peptidoform.sequence,
+                fragment.cleavage_index,
+                fragment.channel,
+                frag_type,
+                number,
+                option_f32(fragment.product_mz),
+                fragment.intensity,
+                predicted,
+            )?;
+        }
+    }
+    fragments.flush()?;
+
+    let mut calibration = BufWriter::new(File::create(&calibration_path)?);
+    writeln!(
+        calibration,
+        "record_index\tpartition\tsource_id\tsequence\tmods\tmod_sites\tcharge\tnce\tinstrument\ttarget_rt"
+    )?;
+    for &index in &rt_train {
+        let record = &corpus.records[index];
+        writeln!(
+            calibration,
+            "{}\tTRAIN\t{}\t{}\t\t\t{}\t{}\t{}\t{}",
+            index,
+            escape_tsv(&corpus.provenance[index].source_id),
+            record.peptidoform.sequence,
+            option_i32(record.context.charge),
+            option_f32(record.context.nce),
+            escape_tsv(record.context.instrument_name.as_deref().unwrap_or("")),
+            option_f32(rt_target(record, metadata.rt_objective)),
+        )?;
+    }
+    calibration.flush()?;
+
+    println!("comparison_export_version\t{VERSION}");
+    println!(
+        "model_architecture\t{}",
+        FOUNDATION_MULTIMODAL_ARCHITECTURE_V0280
+    );
+    println!("checkpoint_metadata_version\t{}", metadata.version);
+    println!("checkpoint_completed_steps\t{}", metadata.completed_steps);
+    println!("comparison_device\t{device:?}");
+    println!("comparison_batch_size\t{batch_size}");
+    println!("partition\tVALIDATION");
+    println!("validation_rt_records\t{}", rt_validation.len());
+    println!("validation_ccs_records\t{}", ccs_validation.len());
+    println!("validation_ms2_records\t{}", ms2_validation.len());
+    println!("validation_union_records\t{}", validation_union.len());
+    println!("rt_train_calibration_records\t{}", rt_train.len());
+    println!("test_partition_consumed\tNO");
+    println!("rt_objective\t{:?}", metadata.rt_objective);
+    println!("seed\t{seed}");
+    println!(
+        "foundation_comparison_precursors\t{}",
+        precursor_path.display()
+    );
+    println!(
+        "foundation_comparison_fragments\t{}",
+        fragment_path.display()
+    );
+    println!(
+        "foundation_comparison_rt_train_calibration\t{}",
+        calibration_path.display()
+    );
+    Ok(())
+}
+
+fn select_records<F>(
+    partition_indices: &[usize],
+    records: &[FoundationTrainingRecord],
+    n: usize,
+    seed: u64,
+    eligible: F,
+) -> Vec<usize>
+where
+    F: Fn(&FoundationTrainingRecord) -> bool,
+{
+    let mut candidates = partition_indices
+        .iter()
+        .copied()
+        .filter(|&index| {
+            records.get(index).is_some_and(|record| {
+                record.peptidoform.modifications.is_empty()
+                    && record.peptidoform.sequence.len() >= 7
+                    && record.peptidoform.sequence.len() <= 35
+                    && eligible(record)
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|&index| mix64(seed ^ index as u64));
+    candidates.truncate(n.min(candidates.len()));
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_records(
+    indices: &[usize],
+    records: &[FoundationTrainingRecord],
+    model: &PeptideFoundationMultimodalV0280Model,
+    collator: &FoundationCollator,
+    normalization: &FoundationTargetNormalizationConfig,
+    seed: u64,
+    batch_size: usize,
+    device: &Device,
+) -> Result<HashMap<usize, Predictions>> {
+    let mut out = HashMap::new();
+    for chunk in indices.chunks(batch_size) {
+        let batch_records = chunk
+            .iter()
+            .map(|&index| records[index].clone())
+            .collect::<Vec<_>>();
+        let batch = collator.collate(&batch_records, device, seed ^ chunk[0] as u64)?;
+        let fragment_context = FoundationFragmentContextBatchV0280::from_records(
+            &batch_records,
+            model.forward_config(),
+            device,
+        )?;
+        let mut prediction = model
+            .forward_v0280_t(&batch.input, &batch.context, &fragment_context, false)?
+            .base;
+        prediction.rt = normalization.rt.denormalize_tensor(&prediction.rt)?;
+        prediction.ccs = normalization.ccs.denormalize_tensor(&prediction.ccs)?;
+        let rt = prediction.rt.squeeze(1)?.to_vec1::<f32>()?;
+        let ccs = prediction.ccs.squeeze(1)?.to_vec1::<f32>()?;
+        let ms2 = prediction.ms2.to_vec3::<f32>()?;
+        for local in 0..chunk.len() {
+            out.insert(
+                chunk[local],
+                Predictions {
+                    rt: rt[local],
+                    ccs: ccs[local],
+                    ms2: ms2[local].clone(),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn rt_target(record: &FoundationTrainingRecord, objective: RetentionTimeObjective) -> Option<f32> {
+    match objective {
+        RetentionTimeObjective::Normalized => record.retention_time.normalized,
+        RetentionTimeObjective::Harmonized => record.retention_time.harmonized,
+        RetentionTimeObjective::Observed => record.retention_time.observed_seconds,
+        RetentionTimeObjective::IntrinsicAndObserved => record.retention_time.normalized,
+    }
+    .filter(|value| value.is_finite())
+}
+
+fn fragment_identity(
+    channel: usize,
+    cleavage_index: usize,
+    peptide_len: usize,
+) -> Result<(&'static str, usize)> {
+    let b_number = cleavage_index + 1;
+    let y_number = peptide_len.saturating_sub(cleavage_index + 1);
+    match channel {
+        0 => Ok(("b_z1", b_number)),
+        1 => Ok(("b_z2", b_number)),
+        2 => Ok(("y_z1", y_number)),
+        3 => Ok(("y_z2", y_number)),
+        _ => anyhow::bail!("unsupported AlphaPeptDeep comparison channel {channel}"),
+    }
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn escape_tsv(value: &str) -> String {
+    value.replace(['\t', '\n', '\r'], " ")
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "YES"
+    } else {
+        "NO"
+    }
+}
+
+fn option_i32(value: Option<i32>) -> String {
+    value.map(|x| x.to_string()).unwrap_or_else(|| "NA".into())
+}
+
+fn option_f32(value: Option<f32>) -> String {
+    value
+        .filter(|x| x.is_finite())
+        .map(|x| format!("{x:.8}"))
+        .unwrap_or_else(|| "NA".into())
+}
+
+fn comparison_device() -> Result<Device> {
+    match std::env::var("REDEEM_COMPARISON_DEVICE")
+        .unwrap_or_else(|_| "auto".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cpu" => Ok(Device::Cpu),
+        "auto" | "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                match Device::new_cuda(0) {
+                    Ok(device) => return Ok(device),
+                    Err(error)
+                        if std::env::var("REDEEM_COMPARISON_DEVICE")
+                            .unwrap_or_else(|_| "auto".to_string())
+                            .eq_ignore_ascii_case("cuda") =>
+                    {
+                        anyhow::bail!("CUDA comparison device requested but unavailable: {error}")
+                    }
+                    Err(_) => {}
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            if std::env::var("REDEEM_COMPARISON_DEVICE")
+                .unwrap_or_else(|_| "auto".to_string())
+                .eq_ignore_ascii_case("cuda")
+            {
+                anyhow::bail!(
+                    "CUDA comparison device requested but binary was built without cuda feature"
+                );
+            }
+            Ok(Device::Cpu)
+        }
+        other => {
+            anyhow::bail!("invalid REDEEM_COMPARISON_DEVICE={other:?}; expected auto, cuda, or cpu")
+        }
+    }
+}
+
+fn parse_or<T: std::str::FromStr>(args: &[String], index: usize, default: T) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    match args.get(index) {
+        Some(value) => value
+            .parse::<T>()
+            .map_err(|error| anyhow::anyhow!("invalid argument {index} '{value}': {error}")),
+        None => Ok(default),
+    }
+}

@@ -40,6 +40,7 @@ pub mod model;
 pub mod msp;
 pub mod multimodal_v0260;
 pub mod multimodal_v0270;
+pub mod multimodal_v0280;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -268,6 +269,15 @@ pub use multimodal_v0270::{
     FOUNDATION_MULTIMODAL_MS2_PRESENCE_WEIGHT_V0270, FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0270,
     FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0270, FOUNDATION_RT_SPECIALIST_FF_DIM_V0270,
     FOUNDATION_RT_SPECIALIST_HEADS_V0270, FOUNDATION_RT_SPECIALIST_LAYERS_V0270,
+};
+pub use multimodal_v0280::{
+    foundation_multimodal_ms2_loss_v0280, foundation_multimodal_relation_margin_loss_v0280,
+    FoundationFragmentContextBatchV0280, FoundationMultimodalForwardOutputV0280,
+    FoundationMultimodalMs2LossesV0280, PeptideFoundationMultimodalV0280Config,
+    PeptideFoundationMultimodalV0280Model, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0280,
+    FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0280, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0280,
+    FOUNDATION_TASK_CONDITION_BOTTLENECK_V0280, FOUNDATION_TASK_CONDITION_COUNT_V0280,
+    FOUNDATION_TASK_CONDITION_EMBED_DIM_V0280,
 };
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,

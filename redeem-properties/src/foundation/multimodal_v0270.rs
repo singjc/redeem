@@ -832,25 +832,39 @@ impl PeptideFoundationMultimodalForwardV0270 {
         })
     }
 
-    /// Full v0.27 forward pass.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_v0270_t_with_shared_gradient_scales(
+    /// Encode one peptide batch with the frozen shared v0.27 encoder.
+    ///
+    /// This crate-visible hook exists so later architectures can refine the
+    /// shared representation without duplicating the validated v0.27 heads.
+    pub(crate) fn encode_foundation_t(
         &self,
         batch: &super::featurize::FoundationBatch,
-        context: &PrecursorContextBatch,
-        fragment: &FoundationFragmentContextBatchV0270,
         train: bool,
-        rt_encoder_gradient_scale: f64,
-        ccs_encoder_gradient_scale: f64,
-    ) -> Result<FoundationMultimodalForwardOutputV0270> {
-        validate_gradient_scale("CCS", ccs_encoder_gradient_scale)?;
-        let foundation = self.encoder.forward_t(batch, train)?;
-        let rt = self
-            .rt_specialist
-            .forward_t(&foundation, train, rt_encoder_gradient_scale)?;
+    ) -> Result<FoundationOutput> {
+        self.encoder.forward_t(batch, train)
+    }
 
+    /// Evaluate the validated v0.27 RT specialist from a supplied representation.
+    pub(crate) fn rt_from_foundation_t(
+        &self,
+        foundation: &FoundationOutput,
+        train: bool,
+        shared_gradient_scale: f64,
+    ) -> Result<Tensor> {
+        self.rt_specialist
+            .forward_t(foundation, train, shared_gradient_scale)
+    }
+
+    /// Evaluate the validated v0.27 CCS path from a supplied representation.
+    pub(crate) fn ccs_from_foundation(
+        &self,
+        foundation: &FoundationOutput,
+        context: &PrecursorContextBatch,
+        shared_gradient_scale: f64,
+    ) -> Result<Tensor> {
+        validate_gradient_scale("CCS", shared_gradient_scale)?;
         let ccs_embedding =
-            gradient_scaled_identity(&foundation.peptide_embedding, ccs_encoder_gradient_scale)?;
+            gradient_scaled_identity(&foundation.peptide_embedding, shared_gradient_scale)?;
         let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
         let ccs_scalar_context = match self.config.forward.ccs_context_mode {
             FoundationCcsContextMode::ChargePresence => {
@@ -871,16 +885,31 @@ impl PeptideFoundationMultimodalForwardV0270 {
         };
         let ccs_features = Tensor::cat(&[&ccs_embedding, &ccs_scalar_context], 1)?;
         let ccs_residual = self.ccs_adapter.forward(&ccs_features)?;
-        let ccs = if let Some(baseline) = &self.config.forward.ccs_physics_baseline {
-            let baseline = standardized_ccs_physics_baseline_v0270(&foundation, context, baseline)?;
-            (&baseline + &ccs_residual)?
+        if let Some(baseline) = &self.config.forward.ccs_physics_baseline {
+            let baseline = standardized_ccs_physics_baseline_v0270(foundation, context, baseline)?;
+            Ok((&baseline + &ccs_residual)?)
         } else {
-            ccs_residual
-        };
+            Ok(ccs_residual)
+        }
+    }
 
-        let (ms2_presence_logits, ms2_positive_intensity, ms2) =
-            self.fragment_decoder
-                .forward_t(&foundation, context, fragment, train)?;
+    /// Evaluate the validated contextual fragment decoder from a supplied representation.
+    pub(crate) fn ms2_from_foundation_t(
+        &self,
+        foundation: &FoundationOutput,
+        context: &PrecursorContextBatch,
+        fragment: &FoundationFragmentContextBatchV0270,
+        train: bool,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.fragment_decoder
+            .forward_t(foundation, context, fragment, train)
+    }
+
+    /// Evaluate the unchanged shared auxiliary heads from a supplied representation.
+    pub(crate) fn auxiliaries_from_foundation(
+        &self,
+        foundation: &FoundationOutput,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let residue_logits = self.residue_head.forward(&foundation.residue_embeddings)?;
         let chemistry_reconstruction = self
             .chemistry_head
@@ -888,6 +917,31 @@ impl PeptideFoundationMultimodalForwardV0270 {
         let contrastive_projection = self
             .contrastive_head
             .forward(&foundation.peptide_embedding)?;
+        Ok((
+            residue_logits,
+            chemistry_reconstruction,
+            contrastive_projection,
+        ))
+    }
+
+    /// Full v0.27 forward pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_v0270_t_with_shared_gradient_scales(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+        fragment: &FoundationFragmentContextBatchV0270,
+        train: bool,
+        rt_encoder_gradient_scale: f64,
+        ccs_encoder_gradient_scale: f64,
+    ) -> Result<FoundationMultimodalForwardOutputV0270> {
+        let foundation = self.encode_foundation_t(batch, train)?;
+        let rt = self.rt_from_foundation_t(&foundation, train, rt_encoder_gradient_scale)?;
+        let ccs = self.ccs_from_foundation(&foundation, context, ccs_encoder_gradient_scale)?;
+        let (ms2_presence_logits, ms2_positive_intensity, ms2) =
+            self.ms2_from_foundation_t(&foundation, context, fragment, train)?;
+        let (residue_logits, chemistry_reconstruction, contrastive_projection) =
+            self.auxiliaries_from_foundation(&foundation)?;
 
         Ok(FoundationMultimodalForwardOutputV0270 {
             base: FoundationMultiTaskOutput {
