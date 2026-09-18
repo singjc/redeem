@@ -851,6 +851,56 @@ pub fn foundation_causal_next_token_loss(
     loss::cross_entropy(&selected_logits, &batch.target_classes)
 }
 
+/// Return one teacher-forced mean next-token NLL per candidate row.
+///
+/// Unlike [`foundation_causal_next_token_loss`], this preserves the candidate
+/// axis so sequence-level reward objectives can weight complete hypotheses.
+/// Active lengths are read from the binary token mask; slicing decisions are
+/// non-differentiable metadata, while every returned NLL remains connected to
+/// the causal logits.
+pub fn foundation_causal_sequence_mean_nlls(
+    output: &FoundationCausalOutput,
+    batch: &FoundationCausalBatch,
+) -> Result<Tensor> {
+    let (rows, width, classes) = output.token_logits.dims3()?;
+    if classes != FOUNDATION_DIFFUSION_VOCAB_SIZE && classes != FOUNDATION_OPEN_PTM_VOCAB_SIZE {
+        candle_core::bail!(
+            "causal logits expose {classes} classes, expected legacy {} or open-PTM {}",
+            FOUNDATION_DIFFUSION_VOCAB_SIZE,
+            FOUNDATION_OPEN_PTM_VOCAB_SIZE
+        );
+    }
+    let (target_rows, target_width) = batch.target_tokens.dims2()?;
+    let (mask_rows, mask_width) = batch.input.token_mask.dims2()?;
+    if (target_rows, target_width) != (rows, width) || (mask_rows, mask_width) != (rows, width) {
+        candle_core::bail!(
+            "causal sequence-NLL batch shape mismatch: logits=({rows},{width}) targets=({target_rows},{target_width}) mask=({mask_rows},{mask_width})"
+        );
+    }
+    let masks = batch.input.token_mask.to_vec2::<f32>()?;
+    let mut losses = Vec::with_capacity(rows);
+    for (row, mask) in masks.iter().enumerate() {
+        let active = mask.iter().take_while(|&&value| value > 0.5).count();
+        if active == 0 {
+            candle_core::bail!("causal sequence-NLL row {row} has no active targets");
+        }
+        let logits = output
+            .token_logits
+            .narrow(0, row, 1)?
+            .squeeze(0)?
+            .narrow(0, 0, active)?
+            .contiguous()?;
+        let targets = batch
+            .target_tokens
+            .narrow(0, row, 1)?
+            .squeeze(0)?
+            .narrow(0, 0, active)?;
+        losses.push(loss::cross_entropy(&logits, &targets)?);
+    }
+    let refs = losses.iter().collect::<Vec<_>>();
+    Tensor::stack(&refs, 0)
+}
+
 /// Hinge penalty that makes causal next-token likelihood spectrum-discriminative.
 ///
 /// `matched_loss` and `shuffled_loss` are the same teacher-forced target loss

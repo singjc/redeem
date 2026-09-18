@@ -32,6 +32,7 @@ pub mod featurize;
 pub mod fragment_likelihood;
 pub mod fragment_relation;
 pub mod interaction;
+pub mod inverse_reward_v0290;
 pub mod iterative_refinement;
 pub mod layers;
 pub mod loss;
@@ -41,12 +42,14 @@ pub mod msp;
 pub mod multimodal_v0260;
 pub mod multimodal_v0270;
 pub mod multimodal_v0280;
+pub mod multimodal_v0300;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
 pub mod rt_harmonization;
 pub mod run;
 pub mod sampling;
+pub mod sequence_reward;
 pub mod spectrum;
 pub mod split;
 pub mod structured_edit;
@@ -56,11 +59,11 @@ pub mod wrapper;
 
 pub use causal::{
     foundation_causal_conditioning_margin_loss, foundation_causal_next_token_loss,
-    foundation_fragment_causal_rerank_score, load_causal_from_diffusion_checkpoint,
-    FoundationCausalBatch, FoundationCausalCollator, FoundationCausalContext,
-    FoundationCausalInputBatch, FoundationCausalOutput, FoundationCausalWarmStartReport,
-    PeptideSpectrumCausalModel, FOUNDATION_CAUSAL_RERANK_POLICY_V0123,
-    FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123,
+    foundation_causal_sequence_mean_nlls, foundation_fragment_causal_rerank_score,
+    load_causal_from_diffusion_checkpoint, FoundationCausalBatch, FoundationCausalCollator,
+    FoundationCausalContext, FoundationCausalInputBatch, FoundationCausalOutput,
+    FoundationCausalWarmStartReport, PeptideSpectrumCausalModel,
+    FOUNDATION_CAUSAL_RERANK_POLICY_V0123, FOUNDATION_CAUSAL_RERANK_WEIGHT_V0123,
 };
 pub use ccs_physics::{
     evaluate_foundation_ccs_physics_baseline, fit_foundation_ccs_physics_baseline,
@@ -215,12 +218,24 @@ pub use fragment_relation::{
     FOUNDATION_FRAGMENT_RELATION_ARCHITECTURE_V0240,
     FOUNDATION_FRAGMENT_RELATION_CANDIDATE_HIDDEN_V0240,
     FOUNDATION_FRAGMENT_RELATION_CORE_CHANNELS_V0240,
+    FOUNDATION_FRAGMENT_RELATION_EXPLAINED_INTENSITY_V0240,
     FOUNDATION_FRAGMENT_RELATION_FEATURE_DIM_V0240, FOUNDATION_FRAGMENT_RELATION_HIDDEN_V0240,
     FOUNDATION_FRAGMENT_RELATION_MATCHED_OFFSET_V0240,
     FOUNDATION_FRAGMENT_RELATION_MAX_PEAKS_V0240, FOUNDATION_FRAGMENT_RELATION_OBJECTIVE_V0240,
-    FOUNDATION_FRAGMENT_RELATION_POOLED_V0240, FOUNDATION_FRAGMENT_RELATION_PPM_V0240,
+    FOUNDATION_FRAGMENT_RELATION_PEAK_COVERAGE_V0240, FOUNDATION_FRAGMENT_RELATION_POOLED_V0240,
+    FOUNDATION_FRAGMENT_RELATION_PPM_V0240,
 };
 pub use interaction::FoundationSpectrumCandidateInteractionAdapter;
+pub use inverse_reward_v0290::{
+    foundation_multimodal_ms2_loss_v0290, foundation_multimodal_relation_margin_loss_v0290,
+    FoundationFragmentContextBatchV0290, FoundationMultimodalMs2LossesV0290,
+    PeptideFoundationInverseRewardV0290Config, PeptideFoundationInverseRewardV0290Model,
+    FOUNDATION_INVERSE_REWARD_ARCHITECTURE_V0290, FOUNDATION_INVERSE_REWARD_BEAM_WIDTH_V0290,
+    FOUNDATION_INVERSE_REWARD_GROUPS_PER_STEP_V0290, FOUNDATION_INVERSE_REWARD_POLICY_WEIGHT_V0290,
+    FOUNDATION_INVERSE_REWARD_REFERENCE_WEIGHT_V0290,
+    FOUNDATION_INVERSE_REWARD_SUPERVISED_WEIGHT_V0290, FOUNDATION_INVERSE_REWARD_TOP_K_V0290,
+    FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0290, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0290,
+};
 pub use iterative_refinement::{
     foundation_iterative_refinement_collate, foundation_iterative_refinement_mask_positions,
     load_iterative_refinement_from_unified_checkpoint, validate_iterative_refinement_namespace,
@@ -270,6 +285,7 @@ pub use multimodal_v0270::{
     FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0270, FOUNDATION_RT_SPECIALIST_FF_DIM_V0270,
     FOUNDATION_RT_SPECIALIST_HEADS_V0270, FOUNDATION_RT_SPECIALIST_LAYERS_V0270,
 };
+
 pub use multimodal_v0280::{
     foundation_multimodal_ms2_loss_v0280, foundation_multimodal_relation_margin_loss_v0280,
     FoundationFragmentContextBatchV0280, FoundationMultimodalForwardOutputV0280,
@@ -278,6 +294,17 @@ pub use multimodal_v0280::{
     FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0280, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0280,
     FOUNDATION_TASK_CONDITION_BOTTLENECK_V0280, FOUNDATION_TASK_CONDITION_COUNT_V0280,
     FOUNDATION_TASK_CONDITION_EMBED_DIM_V0280,
+};
+
+pub use multimodal_v0300::{
+    foundation_fragment_representation_aux_loss_v0300, foundation_multimodal_ms2_loss_v0300,
+    foundation_multimodal_relation_margin_loss_v0300, FoundationFragmentContextBatchV0300,
+    FoundationMultimodalForwardOutputV0300, FoundationMultimodalMs2LossesV0300,
+    PeptideFoundationMultimodalV0300Config, PeptideFoundationMultimodalV0300Model,
+    FOUNDATION_FRAGMENT_REPRESENTATION_AUX_CONTEXT_V0300,
+    FOUNDATION_FRAGMENT_REPRESENTATION_AUX_HIDDEN_V0300,
+    FOUNDATION_FRAGMENT_REPRESENTATION_AUX_WEIGHT_V0300, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0300,
+    FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0300, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0300,
 };
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
@@ -305,6 +332,13 @@ pub use sampling::{
     sample_foundation_training_indices, sample_foundation_validation_indices,
     FoundationSampleCoverage, FoundationSamplePlan, FoundationSamplingConfig,
     FoundationSamplingStrategy,
+};
+pub use sequence_reward::{
+    foundation_group_relative_advantages_v0290, foundation_group_relative_policy_loss_v0290,
+    foundation_reference_nll_anchor_v0290, foundation_sequence_reward_v0290,
+    FoundationSequenceRewardV0290, FOUNDATION_SEQUENCE_REWARD_EPS_V0290,
+    FOUNDATION_SEQUENCE_REWARD_FRAGMENT_WEIGHT_V0290, FOUNDATION_SEQUENCE_REWARD_MASS_WEIGHT_V0290,
+    FOUNDATION_SEQUENCE_REWARD_OBJECTIVE_V0290, FOUNDATION_SEQUENCE_REWARD_SEQUENCE_WEIGHT_V0290,
 };
 pub use spectrum::{
     foundation_diffusion_dataset_fingerprint, foundation_diffusion_record_fingerprint,
