@@ -919,38 +919,50 @@ fn precursor_context(
     records: &[&FoundationTrainingRecord],
     device: &Device,
 ) -> Result<PrecursorContextBatch> {
-    let charge = records
+    let charge: Vec<f32> = records
         .iter()
         .map(|r| r.context.charge.unwrap_or(0) as f32)
-        .collect::<Vec<_>>();
-    let charge_present = records
+        .collect();
+    let charge_present: Vec<f32> = records
         .iter()
-        .map(|r| if r.context.charge.is_some() { 1.0 } else { 0.0 })
-        .collect::<Vec<_>>();
-    let precursor_mz = records
+        .map(|r| {
+            if r.context.charge.is_some() {
+                1.0f32
+            } else {
+                0.0f32
+            }
+        })
+        .collect();
+    let precursor_mz: Vec<f32> = records
         .iter()
         .map(|r| r.context.precursor_mz.unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let precursor_mz_present = records
+        .collect();
+    let precursor_mz_present: Vec<f32> = records
         .iter()
         .map(|r| {
             if r.context.precursor_mz.is_some() {
-                1.0
+                1.0f32
             } else {
-                0.0
+                0.0f32
             }
         })
-        .collect::<Vec<_>>();
-    let nce = records
+        .collect();
+    let nce: Vec<f32> = records
         .iter()
         .map(|r| r.context.nce.unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let nce_present = records
+        .collect();
+    let nce_present: Vec<f32> = records
         .iter()
-        .map(|r| if r.context.nce.is_some() { 1.0 } else { 0.0 })
-        .collect::<Vec<_>>();
+        .map(|r| {
+            if r.context.nce.is_some() {
+                1.0f32
+            } else {
+                0.0f32
+            }
+        })
+        .collect();
     let b = records.len();
-    Ok(PrecursorContextBatch {
+    let context = PrecursorContextBatch {
         charge: Tensor::from_vec(charge, b, device)?,
         charge_present: Tensor::from_vec(charge_present, b, device)?,
         precursor_mz: Tensor::from_vec(precursor_mz, b, device)?,
@@ -959,7 +971,24 @@ fn precursor_context(
         nce_present: Tensor::from_vec(nce_present, b, device)?,
         instrument_ids: Tensor::zeros(b, DType::U32, device)?,
         instrument_present: Tensor::zeros(b, DType::F32, device)?,
-    })
+    };
+    for (name, tensor) in [
+        ("charge", &context.charge),
+        ("charge_present", &context.charge_present),
+        ("precursor_mz", &context.precursor_mz),
+        ("precursor_mz_present", &context.precursor_mz_present),
+        ("nce", &context.nce),
+        ("nce_present", &context.nce_present),
+        ("instrument_present", &context.instrument_present),
+    ] {
+        if tensor.dtype() != DType::F32 {
+            anyhow::bail!(
+                "v0.29 precursor context tensor {name} must be F32, observed {:?}",
+                tensor.dtype()
+            );
+        }
+    }
+    Ok(context)
 }
 
 fn active_row(row: &[u32]) -> Vec<u32> {
