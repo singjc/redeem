@@ -168,8 +168,14 @@ impl SharedTaskConditionerV0280 {
             .forward(&task_ids)?
             .unsqueeze(1)?
             .broadcast_as((batch, sequence, self.task_embedding_dim))?;
-        let features = Tensor::cat(&[&normalized, &task_embedding], 2)?;
-        let residual = self.up.forward(&self.down.forward(&features)?.relu()?)?;
+        // The shared encoder can return a logically [B, S, D] tensor with a
+        // non-contiguous CUDA layout. Concatenating the broadcast task embedding
+        // preserves that layout, while Candle's CUDA Linear/matmul requires a
+        // contiguous left operand. Materialize the two Linear inputs explicitly;
+        // this is layout-only and does not change v0.28 numerics or gradients.
+        let features = Tensor::cat(&[&normalized, &task_embedding], 2)?.contiguous()?;
+        let hidden = self.down.forward(&features)?.relu()?.contiguous()?;
+        let residual = self.up.forward(&hidden)?;
         let expanded_mask = foundation
             .residue_mask
             .unsqueeze(2)?
