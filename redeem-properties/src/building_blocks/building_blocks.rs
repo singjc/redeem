@@ -620,7 +620,7 @@ impl ModEmbeddingFixFirstK {
 
     fn from_varstore(
         varstore: &nn::VarBuilder,
-        mod_feature_size: usize,
+        _mod_feature_size: usize,
         out_features: usize,
         name: &str,
     ) -> Result<Self> {
@@ -633,7 +633,7 @@ impl ModEmbeddingFixFirstK {
 
 impl Module for ModEmbeddingFixFirstK {
     fn forward(&self, mod_x: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len, _) = mod_x.dims3()?;
+        let (_batch_size, _seq_len, _) = mod_x.dims3()?;
 
         // Split the input tensor
         let first_k = mod_x.narrow(D::Minus1, 0, self.k)?;
@@ -876,7 +876,7 @@ impl ModLossNN {
         nheads: usize,
         nlayers: usize,
         dropout: f64,
-        output_attentions: bool,
+        _output_attentions: bool,
         decoder_linear_output_dim: usize,
         bert_name: &str,
         decoder_linear_names: Vec<&str>,
@@ -1275,11 +1275,11 @@ impl Encoder26aaModCnnLstmAttnSum {
         // log::trace!("[Encoder26aaModCnnLstmAttnSum] one-hot output stats - min: {min}, max: {max}, mean: {mean}");
 
         let x = self.input_cnn.forward(&x)?;
-        let (b, s, d) = x.dims3()?;
+        let (_b, _s, _d) = x.dims3()?;
         // println!("x (post input_cnn): batch size: {b}, seq len: {s}, embedding dim: {d}");
 
         let x = self.input_lstm.forward(&x)?;
-        let (b, s, d) = x.dims3()?;
+        let (_b, _s, _d) = x.dims3()?;
         // println!("x (post input_lstm): batch size: {b}, seq len: {s}, embedding dim: {d}");
 
         let x = self.attn_sum.forward(&x)?;

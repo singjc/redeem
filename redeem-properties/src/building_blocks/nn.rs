@@ -85,7 +85,7 @@ pub struct TransformerEncoder {
 impl TransformerEncoder {
     pub fn new(
         varbuilder: &VarBuilder,
-        input_dim: usize,
+        _input_dim: usize,
         model_dim: usize,
         ff_dim: usize,
         num_heads: usize,

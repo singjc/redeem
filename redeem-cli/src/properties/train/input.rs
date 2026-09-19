@@ -1,10 +1,8 @@
-use anyhow::{Context, Result};
 use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::properties::util::validate_tsv_or_csv_file;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PropertyTrainConfig {

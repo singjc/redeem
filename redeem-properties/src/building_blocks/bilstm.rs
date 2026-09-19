@@ -1,4 +1,4 @@
-use candle_core::{DType, IndexOp, Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 use candle_nn::{rnn, Module, VarBuilder, RNN};
 
 #[derive(Debug, Clone)]
@@ -80,7 +80,7 @@ impl BidirectionalLSTM {
         lstm_backward: &rnn::LSTM,
         h0: &Tensor,
         c0: &Tensor,
-        layer_idx: &i32,
+        _layer_idx: &i32,
     ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (batch_size, seq_len, input_size) = input.dims3()?;
 
@@ -152,7 +152,7 @@ impl BidirectionalLSTM {
             ],
             0,
         )?; // Shape: [2, 1, 128]
-        let hn_concat = Tensor::cat(&[last_forward_state, last_backward_state], 1)?; // Shape: [1, 256]
+        let _hn_concat = Tensor::cat(&[last_forward_state, last_backward_state], 1)?; // Shape: [1, 256]
 
         // Combine the forward and backwards cell states for cn
         let cn = Tensor::cat(
@@ -171,7 +171,7 @@ impl BidirectionalLSTM {
 
     // New method that returns output and states
     pub fn forward_with_state(&self, xs: &Tensor) -> Result<(Tensor, (Tensor, Tensor))> {
-        let (batch_size, seq_len, input_size) = xs.dims3()?;
+        let (batch_size, _seq_len, _input_size) = xs.dims3()?;
 
         let h0 = &self
             .h0

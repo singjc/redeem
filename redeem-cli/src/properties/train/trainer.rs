@@ -518,7 +518,7 @@ pub fn run_training(config: &PropertyTrainConfig) -> Result<()> {
         if top_n > 0 {
             let mut table_rows = Vec::new();
             for i in 0..top_n {
-                let (err, true_p, pred_p) = examples[i];
+                let (_err, true_p, pred_p) = examples[i];
                 let (t, p) =
                     if config.model_arch == "ccs_cnn_lstm" || config.model_arch == "ccs_cnn_tf" {
                         (true_p.ccs.unwrap() as f64, pred_p.ccs.unwrap() as f64)

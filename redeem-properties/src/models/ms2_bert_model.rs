@@ -3,10 +3,8 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Dropout, Module, VarBuilder, VarMap};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, sync::Arc};
 
-use crate::utils::utils::get_tensor_stats;
 
 use crate::{
     building_blocks::building_blocks::{

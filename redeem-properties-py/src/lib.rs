@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use redeem_properties::models::{
     ccs_model::CCSModelWrapper,
-    model_interface::{ModelInterface, PredictionResult},
+    model_interface::PredictionResult,
     ms2_model::MS2ModelWrapper,
     rt_model::RTModelWrapper,
 };

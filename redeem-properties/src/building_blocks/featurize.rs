@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 use rayon::prelude::*;
-use std::sync::atomic::Ordering;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::building_blocks::building_blocks::AA_EMBEDDING_SIZE;

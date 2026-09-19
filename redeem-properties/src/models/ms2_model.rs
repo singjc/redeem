@@ -3,7 +3,7 @@ use crate::models::ms2_bert_model::MS2BertModel;
 use crate::utils::data_handling::{PeptideData, TargetNormalization};
 use crate::utils::peptdeep_utils::ModificationMap;
 use anyhow::{anyhow, Result};
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
