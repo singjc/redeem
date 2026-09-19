@@ -51,6 +51,7 @@ const HOLDOUT_GENERATION_RECORDS_V0290: usize = 64;
 const DEV_BEAM_WIDTH_V0290: usize = 32;
 const DEV_TOP_K_V0290: usize = 10;
 const MAX_GRADIENT_NORM_V0290: f64 = 1.0;
+const MAX_REWARD_GROUP_ATTEMPTS_V0290: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct V0270ParentMetadata {
@@ -440,19 +441,69 @@ fn main() -> Result<()> {
             )?;
 
             let mut group_losses = Vec::<RewardGroupLoss>::new();
-            for &record_index in batch_indices
-                .iter()
-                .take(FOUNDATION_INVERSE_REWARD_GROUPS_PER_STEP_V0290)
-            {
-                group_losses.push(reward_group_loss(
+            let mut reward_group_attempts = 0usize;
+            let mut reward_group_skipped = 0usize;
+            let mut attempted_reward_records = BTreeSet::<usize>::new();
+            let reward_refill_seed = seed
+                ^ (epoch as u64).wrapping_mul(0xd1b5_4a32_d192_ed03)
+                ^ (local_step as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+
+            for &record_index in &batch_indices {
+                if group_losses.len() >= FOUNDATION_INVERSE_REWARD_GROUPS_PER_STEP_V0290 {
+                    break;
+                }
+                if !attempted_reward_records.insert(record_index) {
+                    continue;
+                }
+                reward_group_attempts += 1;
+                match reward_group_loss(
                     &model,
                     &reference_model,
                     &corpus.records[record_index],
                     &causal_collator,
                     &spectrum_collator,
                     &device,
-                )?);
+                )? {
+                    Some(group) => group_losses.push(group),
+                    None => reward_group_skipped += 1,
+                }
             }
+
+            for refill_slot in 0..MAX_REWARD_GROUP_ATTEMPTS_V0290 {
+                if group_losses.len() >= FOUNDATION_INVERSE_REWARD_GROUPS_PER_STEP_V0290 {
+                    break;
+                }
+                let key = mix64(
+                    reward_refill_seed ^ (refill_slot as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                );
+                let record_index = train_indices[(key as usize) % train_indices.len()];
+                if !attempted_reward_records.insert(record_index) {
+                    continue;
+                }
+                reward_group_attempts += 1;
+                match reward_group_loss(
+                    &model,
+                    &reference_model,
+                    &corpus.records[record_index],
+                    &causal_collator,
+                    &spectrum_collator,
+                    &device,
+                )? {
+                    Some(group) => group_losses.push(group),
+                    None => reward_group_skipped += 1,
+                }
+            }
+
+            if group_losses.len() < FOUNDATION_INVERSE_REWARD_GROUPS_PER_STEP_V0290 {
+                anyhow::bail!(
+                    "v0.29 could construct only {} of {} reward groups after {} unique TRAIN-record attempts ({} skipped for <2 candidates)",
+                    group_losses.len(),
+                    FOUNDATION_INVERSE_REWARD_GROUPS_PER_STEP_V0290,
+                    reward_group_attempts,
+                    reward_group_skipped,
+                );
+            }
+
             let policy_tensors = group_losses.iter().map(|g| &g.total).collect::<Vec<_>>();
             let reward_objective = Tensor::stack(&policy_tensors, 0)?.mean_all()?;
             let total = (supervised
@@ -466,7 +517,7 @@ fn main() -> Result<()> {
             {
                 let groups = group_losses.len().max(1) as f64;
                 println!(
-                    "v0290_train\tepoch={epoch}\tstep={global_step}\tepoch_step={}\tlr={lr:.8}\ttotal={:.6}\tpolicy={:.6}\treference={:.6}\treward_mean={:.6}\treward_max={:.6}\tcandidates={}\tliteral_group_fraction={:.3}\til_group_fraction={:.3}\tgradient_norm={:.6}\tgradient_scale={:.6}",
+                    "v0290_train\tepoch={epoch}\tstep={global_step}\tepoch_step={}\tlr={lr:.8}\ttotal={:.6}\tpolicy={:.6}\treference={:.6}\treward_mean={:.6}\treward_max={:.6}\tcandidates={}\treward_group_attempts={}\treward_group_skipped_lt2={}\tliteral_group_fraction={:.3}\til_group_fraction={:.3}\tgradient_norm={:.6}\tgradient_scale={:.6}",
                     local_step + 1,
                     total_value,
                     group_losses.iter().map(|g| g.policy).sum::<f64>() / groups,
@@ -474,6 +525,8 @@ fn main() -> Result<()> {
                     group_losses.iter().map(|g| g.reward_mean).sum::<f64>() / groups,
                     group_losses.iter().map(|g| g.reward_max).sum::<f64>() / groups,
                     group_losses.iter().map(|g| g.candidates).sum::<usize>(),
+                    reward_group_attempts,
+                    reward_group_skipped,
                     group_losses.iter().filter(|g| g.literal_present).count() as f64 / groups,
                     group_losses.iter().filter(|g| g.il_present).count() as f64 / groups,
                     update.gradient_norm,
@@ -575,7 +628,7 @@ fn reward_group_loss(
     causal_collator: &FoundationCausalCollator,
     spectrum_collator: &FoundationSpectrumCollator,
     device: &Device,
-) -> Result<RewardGroupLoss> {
+) -> Result<Option<RewardGroupLoss>> {
     let spectrum = FoundationSpectrum::from_training_record(record)
         .ok_or_else(|| anyhow::anyhow!("v0.29 reward record lacks spectrum"))?;
     let spectrum_batch = spectrum_collator.collate(&[spectrum.clone()], device)?;
@@ -621,7 +674,7 @@ fn reward_group_loss(
     candidates.sort_by(|a, b| b.log_probability.total_cmp(&a.log_probability));
     candidates.truncate(FOUNDATION_INVERSE_REWARD_TOP_K_V0290 + 1);
     if candidates.len() < 2 {
-        anyhow::bail!("v0.29 reward group requires at least two candidates");
+        return Ok(None);
     }
 
     let decoded = candidates
@@ -683,7 +736,7 @@ fn reward_group_loss(
     let reference_value = reference_anchor.to_scalar::<f32>()? as f64;
     let total = (policy.affine(FOUNDATION_INVERSE_REWARD_POLICY_WEIGHT_V0290, 0.0)?
         + reference_anchor.affine(FOUNDATION_INVERSE_REWARD_REFERENCE_WEIGHT_V0290, 0.0)?)?;
-    Ok(RewardGroupLoss {
+    Ok(Some(RewardGroupLoss {
         total,
         policy: policy_value,
         reference: reference_value,
@@ -695,7 +748,7 @@ fn reward_group_loss(
         candidates: candidates.len(),
         literal_present: rewards.iter().any(|reward| reward.literal_match),
         il_present: rewards.iter().any(|reward| reward.il_match),
-    })
+    }))
 }
 
 fn legacy_next_logits(
@@ -1174,6 +1227,11 @@ fn print_header(
     println!("beam_width\t{}", config.beam_width);
     println!("reward_top_k\t{}", config.top_k);
     println!("reward_groups_per_step\t{}", config.groups_per_step);
+    println!("reward_group_sparse_candidate_policy\tskip_lt2_then_deterministic_train_refill_v1");
+    println!(
+        "reward_group_max_refill_attempts\t{}",
+        MAX_REWARD_GROUP_ATTEMPTS_V0290
+    );
     println!("supervised_weight\t{}", config.supervised_weight);
     println!("policy_weight\t{}", config.policy_weight);
     println!("reference_anchor_weight\t{}", config.reference_weight);
