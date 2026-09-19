@@ -43,6 +43,7 @@ pub mod multimodal_v0260;
 pub mod multimodal_v0270;
 pub mod multimodal_v0280;
 pub mod multimodal_v0300;
+pub mod multimodal_v0310;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -187,11 +188,12 @@ pub use diffusion::{
 pub use direct_decoder::{
     foundation_direct_beam_search, foundation_direct_conditioning_loss,
     foundation_direct_prefix_competitive_loss, foundation_direct_shuffled_order,
-    load_direct_decoder_from_unified_checkpoint, DirectDecoderBeamCandidate,
-    DirectDecoderBeamConfig, DirectDecoderWarmStartReport, DirectPrefixCompetition,
-    PeptideSpectrumDirectDecoder, FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
-    FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190, FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190,
-    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0191, FOUNDATION_DIRECT_PREFIX_MARGIN_V0191,
+    foundation_mass_stratified_beam_search, load_direct_decoder_from_unified_checkpoint,
+    DirectDecoderBeamCandidate, DirectDecoderBeamConfig, DirectDecoderWarmStartReport,
+    DirectPrefixCompetition, MassStratifiedBeamConfig, PeptideSpectrumDirectDecoder,
+    FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190, FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
+    FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0190, FOUNDATION_DIRECT_DECODER_OBJECTIVE_V0191,
+    FOUNDATION_DIRECT_PREFIX_MARGIN_V0191,
 };
 pub use experiment::{
     build_foundation_benchmark_manifest, foundation_dataset_fingerprint,
@@ -305,6 +307,19 @@ pub use multimodal_v0300::{
     FOUNDATION_FRAGMENT_REPRESENTATION_AUX_HIDDEN_V0300,
     FOUNDATION_FRAGMENT_REPRESENTATION_AUX_WEIGHT_V0300, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0300,
     FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0300, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0300,
+};
+
+pub use multimodal_v0310::{
+    foundation_fragment_representation_aux_loss_v0310, foundation_multimodal_ms2_loss_v0310,
+    foundation_multimodal_relation_margin_loss_v0310, FoundationFragmentContextBatchV0310,
+    FoundationMultimodalForwardOutputV0310, FoundationMultimodalMs2LossesV0310,
+    PeptideFoundationMultimodalV0310Config, PeptideFoundationMultimodalV0310Model,
+    FOUNDATION_FRAGMENT_REPRESENTATION_AUX_CONTEXT_V0310,
+    FOUNDATION_FRAGMENT_REPRESENTATION_AUX_HIDDEN_V0310,
+    FOUNDATION_FRAGMENT_REPRESENTATION_AUX_WEIGHT_V0310, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0310,
+    FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0310, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0310,
+    FOUNDATION_PROPERTY_REFINEMENT_FF_DIM_V0310, FOUNDATION_PROPERTY_REFINEMENT_HEADS_V0310,
+    FOUNDATION_PROPERTY_REFINEMENT_LAYERS_V0310,
 };
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,

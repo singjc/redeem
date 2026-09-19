@@ -359,6 +359,42 @@ pub struct DirectDecoderBeamCandidate {
     pub mass_error_da: f64,
 }
 
+/// Coverage-oriented v0.32 search policy.
+///
+/// The live beam is partitioned by normalized remaining precursor mass after a
+/// small global elite is retained. This prevents all hypotheses from collapsing
+/// onto one high-probability mass trajectory while preserving the strongest
+/// ordinary autoregressive prefixes. The policy is deterministic and introduces
+/// no trainable parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MassStratifiedBeamConfig {
+    pub beam_width: usize,
+    pub top_k: usize,
+    pub mass_tolerance_da: f64,
+    pub max_tokens: usize,
+    pub mass_strata: usize,
+    pub global_elite: usize,
+}
+
+impl MassStratifiedBeamConfig {
+    pub fn validate(self) -> std::result::Result<(), String> {
+        DirectDecoderBeamConfig {
+            beam_width: self.beam_width,
+            top_k: self.top_k,
+            mass_tolerance_da: self.mass_tolerance_da,
+            max_tokens: self.max_tokens,
+        }
+        .validate()?;
+        if self.mass_strata < 2 {
+            return Err("mass-stratified beam requires at least two mass strata".into());
+        }
+        if self.global_elite >= self.beam_width {
+            return Err("mass-stratified global_elite must be smaller than beam_width".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BeamState {
     tokens: Vec<u32>,
@@ -503,6 +539,214 @@ where
     Ok(completed)
 }
 
+/// Run a deterministic mass-stratified beam search for candidate-coverage diagnostics.
+///
+/// Search legality, neural scoring, and hard precursor-mass closure are identical
+/// to [`foundation_direct_beam_search`]. Only the live-beam retention policy is
+/// changed: a fixed global elite is followed by round-robin selection across
+/// normalized remaining-mass strata, then any unused capacity is filled by
+/// ordinary global score order.
+pub fn foundation_mass_stratified_beam_search<F>(
+    precursor_neutral_mass: f64,
+    config: MassStratifiedBeamConfig,
+    mut next_logits: F,
+) -> std::result::Result<Vec<DirectDecoderBeamCandidate>, String>
+where
+    F: FnMut(&[Vec<u32>]) -> std::result::Result<Vec<Vec<f32>>, String>,
+{
+    config.validate()?;
+    if !(precursor_neutral_mass > FOUNDATION_PEPTIDE_WATER_MASS_DA
+        && precursor_neutral_mass.is_finite())
+    {
+        return Err(
+            "mass-stratified decoder requires a finite positive precursor neutral mass".into(),
+        );
+    }
+    let residue_masses: Vec<f64> = (0..FOUNDATION_DIFFUSION_VOCAB_SIZE as u32)
+        .filter(|&token| foundation_diffusion_token_residue(token).is_some())
+        .filter_map(foundation_diffusion_token_mass_da)
+        .collect();
+    let min_residue_mass = residue_masses.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_token_mass = (0..FOUNDATION_DIFFUSION_VOCAB_SIZE as u32)
+        .filter_map(foundation_diffusion_token_mass_da)
+        .fold(0.0f64, f64::max);
+    let mut live = vec![BeamState {
+        tokens: Vec::new(),
+        neutral_mass: FOUNDATION_PEPTIDE_WATER_MASS_DA,
+        log_probability: 0.0,
+        residues: 0,
+    }];
+    let mut completed = HashMap::<Vec<u32>, DirectDecoderBeamCandidate>::new();
+
+    for depth in 0..config.max_tokens {
+        if live.is_empty() {
+            break;
+        }
+        let prefixes: Vec<Vec<u32>> = live.iter().map(|state| state.tokens.clone()).collect();
+        let logits = next_logits(&prefixes)?;
+        if logits.len() != live.len()
+            || logits
+                .iter()
+                .any(|row| row.len() != FOUNDATION_DIFFUSION_VOCAB_SIZE)
+        {
+            return Err("mass-stratified decoder logit callback returned an invalid shape".into());
+        }
+        let mut expanded = Vec::<BeamState>::new();
+        for (state, row) in live.iter().zip(logits.iter()) {
+            if state.residues > 0 {
+                let error = state.neutral_mass - precursor_neutral_mass;
+                if error.abs() <= config.mass_tolerance_da {
+                    let mut tokens = state.tokens.clone();
+                    tokens.push(FOUNDATION_DIFFUSION_EOS);
+                    let candidate = DirectDecoderBeamCandidate {
+                        tokens: tokens.clone(),
+                        log_probability: state.log_probability
+                            + selected_log_softmax(row, FOUNDATION_DIFFUSION_EOS as usize)?,
+                        mass_error_da: error,
+                    };
+                    completed
+                        .entry(tokens)
+                        .and_modify(|old| {
+                            if candidate.log_probability > old.log_probability {
+                                *old = candidate.clone();
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+            }
+            if depth + 1 >= config.max_tokens {
+                continue;
+            }
+            for token in FOUNDATION_DIFFUSION_EOS + 1..FOUNDATION_DIFFUSION_VOCAB_SIZE as u32 {
+                if !token_allowed(&state.tokens, token) || !row[token as usize].is_finite() {
+                    continue;
+                }
+                let Some(token_mass) = foundation_diffusion_token_mass_da(token) else {
+                    continue;
+                };
+                let neutral_mass = state.neutral_mass + token_mass;
+                if neutral_mass > precursor_neutral_mass + config.mass_tolerance_da {
+                    continue;
+                }
+                let remaining = config.max_tokens - depth - 2;
+                if neutral_mass + remaining as f64 * max_token_mass + config.mass_tolerance_da
+                    < precursor_neutral_mass
+                {
+                    continue;
+                }
+                if state.residues == 0
+                    && foundation_diffusion_token_residue(token).is_none()
+                    && neutral_mass + min_residue_mass
+                        > precursor_neutral_mass + config.mass_tolerance_da
+                {
+                    continue;
+                }
+                let mut tokens = state.tokens.clone();
+                tokens.push(token);
+                expanded.push(BeamState {
+                    tokens,
+                    neutral_mass,
+                    log_probability: state.log_probability
+                        + selected_log_softmax(row, token as usize)?,
+                    residues: state.residues
+                        + usize::from(foundation_diffusion_token_residue(token).is_some()),
+                });
+            }
+        }
+        expanded.sort_by(|a, b| b.log_probability.total_cmp(&a.log_probability));
+        live = select_mass_stratified_live(
+            expanded,
+            precursor_neutral_mass,
+            config.beam_width,
+            config.mass_strata,
+            config.global_elite,
+            depth,
+        );
+    }
+    let mut completed: Vec<_> = completed.into_values().collect();
+    completed.sort_by(|a, b| {
+        b.log_probability
+            .total_cmp(&a.log_probability)
+            .then_with(|| a.mass_error_da.abs().total_cmp(&b.mass_error_da.abs()))
+    });
+    completed.truncate(config.top_k);
+    Ok(completed)
+}
+
+fn select_mass_stratified_live(
+    expanded: Vec<BeamState>,
+    precursor_neutral_mass: f64,
+    beam_width: usize,
+    mass_strata: usize,
+    global_elite: usize,
+    depth: usize,
+) -> Vec<BeamState> {
+    if expanded.len() <= beam_width {
+        return expanded;
+    }
+    let elite = global_elite.min(expanded.len()).min(beam_width);
+    let mut selected_indices = HashSet::<usize>::new();
+    let mut selected = Vec::with_capacity(beam_width);
+    for index in 0..elite {
+        selected_indices.insert(index);
+        selected.push(expanded[index].clone());
+    }
+
+    // Use the *observed* remaining-mass span at this depth rather than the
+    // whole precursor mass. Early causal prefixes often occupy a narrow slice
+    // of the theoretical 0..precursor range; absolute bins would then collapse
+    // back to ordinary beam search. Depth-local residual strata deliberately
+    // preserve distinct feasible mass trajectories within the actual frontier.
+    let residuals = expanded
+        .iter()
+        .skip(elite)
+        .map(|state| (precursor_neutral_mass - state.neutral_mass).max(0.0))
+        .collect::<Vec<_>>();
+    let min_remaining = residuals.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_remaining = residuals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let residual_span = (max_remaining - min_remaining).max(f64::EPSILON);
+    let mut strata = vec![Vec::<usize>::new(); mass_strata];
+    for (offset, (index, state)) in expanded.iter().enumerate().skip(elite).enumerate() {
+        let remaining = (precursor_neutral_mass - state.neutral_mass).max(0.0);
+        let fraction = ((remaining - min_remaining) / residual_span).clamp(0.0, 1.0);
+        let stratum = ((fraction * mass_strata as f64).floor() as usize).min(mass_strata - 1);
+        debug_assert_eq!(remaining, residuals[offset]);
+        strata[stratum].push(index);
+    }
+    let mut positions = vec![0usize; mass_strata];
+    let start = depth % mass_strata;
+    while selected.len() < beam_width {
+        let before = selected.len();
+        for offset in 0..mass_strata {
+            if selected.len() >= beam_width {
+                break;
+            }
+            let stratum = (start + offset) % mass_strata;
+            let position = positions[stratum];
+            if let Some(&index) = strata[stratum].get(position) {
+                positions[stratum] += 1;
+                if selected_indices.insert(index) {
+                    selected.push(expanded[index].clone());
+                }
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    if selected.len() < beam_width {
+        for (index, state) in expanded.iter().enumerate() {
+            if selected.len() >= beam_width {
+                break;
+            }
+            if selected_indices.insert(index) {
+                selected.push(state.clone());
+            }
+        }
+    }
+    selected
+}
+
 fn token_allowed(prefix: &[u32], token: u32) -> bool {
     if token == FOUNDATION_DIFFUSION_PAD
         || token == FOUNDATION_DIFFUSION_MASK
@@ -587,6 +831,58 @@ mod tests {
         assert_eq!(top1, 0.0);
         assert_eq!(top5, 1.0);
         assert_eq!(top10, 1.0);
+    }
+
+    #[test]
+    fn mass_stratified_retention_keeps_multiple_remaining_mass_trajectories() {
+        let target = 1000.0;
+        let expanded = vec![
+            BeamState {
+                tokens: vec![3],
+                neutral_mass: 900.0,
+                log_probability: 10.0,
+                residues: 1,
+            },
+            BeamState {
+                tokens: vec![4],
+                neutral_mass: 890.0,
+                log_probability: 9.0,
+                residues: 1,
+            },
+            BeamState {
+                tokens: vec![5],
+                neutral_mass: 880.0,
+                log_probability: 8.0,
+                residues: 1,
+            },
+            BeamState {
+                tokens: vec![6],
+                neutral_mass: 700.0,
+                log_probability: 7.0,
+                residues: 1,
+            },
+            BeamState {
+                tokens: vec![7],
+                neutral_mass: 500.0,
+                log_probability: 6.0,
+                residues: 1,
+            },
+            BeamState {
+                tokens: vec![8],
+                neutral_mass: 300.0,
+                log_probability: 5.0,
+                residues: 1,
+            },
+        ];
+        let selected = select_mass_stratified_live(expanded, target, 4, 4, 1, 0);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(selected[0].tokens, vec![3]);
+        let masses = selected
+            .iter()
+            .map(|state| state.neutral_mass)
+            .collect::<Vec<_>>();
+        assert!(masses.iter().any(|&mass| mass <= 500.0));
+        assert!(masses.iter().any(|&mass| mass >= 880.0));
     }
 
     #[test]
