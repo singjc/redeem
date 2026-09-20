@@ -3,9 +3,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use redeem_properties::models::{
-    ccs_model::CCSModelWrapper,
-    model_interface::PredictionResult,
-    ms2_model::MS2ModelWrapper,
+    ccs_model::CCSModelWrapper, model_interface::PredictionResult, ms2_model::MS2ModelWrapper,
     rt_model::RTModelWrapper,
 };
 use redeem_properties::pretrained::{locate_pretrained_model, PretrainedModel};

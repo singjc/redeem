@@ -1,8 +1,5 @@
 use crate::{
-    building_blocks::featurize::{
-        aa_indices_tensor_from_arc,
-        get_mod_features_from_parsed_arc,
-    },
+    building_blocks::featurize::{aa_indices_tensor_from_arc, get_mod_features_from_parsed_arc},
     models::{ccs_model::CCSModelWrapper, ms2_model::MS2ModelWrapper, rt_model::RTModelWrapper},
     utils::{
         data_handling::{PeptideBatchData, PeptideData, TargetNormalization},
@@ -19,10 +16,7 @@ use log::info;
 use rayon::prelude::*;
 use std::path::Path;
 use std::{collections::HashMap, path::PathBuf};
-use std::{
-    ops::Index,
-    sync::Arc,
-};
+use std::{ops::Index, sync::Arc};
 
 // Constants
 const CHARGE_FACTOR: f64 = 0.1;

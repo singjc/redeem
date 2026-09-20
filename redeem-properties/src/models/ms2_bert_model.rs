@@ -5,7 +5,6 @@ use std::fmt;
 use std::path::Path;
 use std::{collections::HashMap, sync::Arc};
 
-
 use crate::{
     building_blocks::building_blocks::{
         DecoderLinear, HiddenHfaceTransformer, Input26aaModPositionalEncoding, MetaEmbedding,
