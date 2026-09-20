@@ -29,6 +29,7 @@ pub mod diffusion;
 pub mod direct_decoder;
 pub mod experiment;
 pub mod featurize;
+mod fragment_grounded_v0330;
 pub mod fragment_likelihood;
 pub mod fragment_relation;
 pub mod interaction;
@@ -203,6 +204,12 @@ pub use experiment::{
 pub use featurize::{
     exact_graph_modification_for, FoundationBatch, FoundationModification,
     FoundationModificationSite, PeptideGraphFeaturizer, PeptidoformInput,
+};
+
+pub use fragment_grounded_v0330::{
+    FragmentGroundedTransitionHeadV0330, FOUNDATION_FRAGMENT_GROUNDED_ARCHITECTURE_V0330,
+    FOUNDATION_FRAGMENT_GROUNDED_FEATURE_DIM_V0330, FOUNDATION_FRAGMENT_GROUNDED_HIDDEN_V0330,
+    FOUNDATION_FRAGMENT_GROUNDED_JOINT_V0330, FOUNDATION_FRAGMENT_GROUNDED_OBJECTIVE_V0330,
 };
 pub use fragment_likelihood::{
     foundation_fragment_likelihood_score, FoundationFragmentLikelihoodScore,
