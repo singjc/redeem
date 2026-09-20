@@ -45,6 +45,7 @@ pub mod multimodal_v0270;
 pub mod multimodal_v0280;
 pub mod multimodal_v0300;
 pub mod multimodal_v0310;
+pub mod multimodal_v0340;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -327,6 +328,19 @@ pub use multimodal_v0310::{
     FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0310, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0310,
     FOUNDATION_PROPERTY_REFINEMENT_FF_DIM_V0310, FOUNDATION_PROPERTY_REFINEMENT_HEADS_V0310,
     FOUNDATION_PROPERTY_REFINEMENT_LAYERS_V0310,
+};
+
+pub use multimodal_v0340::{
+    foundation_multimodal_ms2_loss_v0340, foundation_multimodal_relation_margin_loss_v0340,
+    FoundationFragmentContextBatchV0340, FoundationMultimodalForwardOutputV0340,
+    FoundationMultimodalMs2LossesV0340, PeptideFoundationMultimodalV0340Config,
+    PeptideFoundationMultimodalV0340Model, FOUNDATION_MS2_ATTENTION_HEADS_V0340,
+    FOUNDATION_MS2_DECODER_HIDDEN_V0340, FOUNDATION_MS2_FF_DIM_V0340,
+    FOUNDATION_MS2_TRANSFORMER_LAYERS_V0340, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0340,
+    FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0340, FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0340,
+    FOUNDATION_RT_ATTENTION_HEADS_V0340, FOUNDATION_RT_FF_DIM_V0340,
+    FOUNDATION_RT_LOCAL_CHANNELS_V0340, FOUNDATION_RT_TRANSFORMER_LAYERS_V0340,
+    FOUNDATION_SPECIALIST_DIM_V0340,
 };
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
