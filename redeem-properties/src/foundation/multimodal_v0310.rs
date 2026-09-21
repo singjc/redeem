@@ -360,6 +360,25 @@ impl PeptideFoundationMultimodalV0310Model {
         self.forward_v0310_t_with_shared_gradient_scales(batch, context, fragment, train, 1.0, 0.0)
     }
 
+    /// Evaluate only the immutable protected CCS path. Later forward-only
+    /// architecture experiments use this hook to preserve exact v0.31/v0.27
+    /// CCS without paying for the frozen RT/MS2 decoders on every train step.
+    pub fn protected_ccs_t(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+    ) -> Result<Tensor> {
+        let base_foundation = self
+            .base_v0270
+            .forward()
+            .encode_foundation_t(batch, false)?;
+        Ok(self
+            .base_v0270
+            .forward()
+            .ccs_from_foundation(&base_foundation, context, 0.0)?
+            .detach())
+    }
+
     pub fn peptide_projection_t(
         &self,
         batch: &super::featurize::FoundationBatch,

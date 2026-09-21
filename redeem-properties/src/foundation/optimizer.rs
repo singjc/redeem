@@ -90,6 +90,37 @@ pub struct FoundationAdamW {
 impl FoundationAdamW {
     /// Create zero-initialized AdamW moment state for all floating-point model variables.
     pub fn new(varmap: &VarMap, config: FoundationAdamWConfig) -> Result<Self> {
+        Self::new_matching(varmap, config, |_| true)
+    }
+
+    /// Create AdamW state only for floating-point variables whose names start
+    /// with one of `prefixes`.
+    ///
+    /// This is used by protected-branch continuation experiments where the
+    /// checkpoint deliberately contains an immutable anchor model alongside a
+    /// trainable child namespace. Optimizer scoping prevents zero-gradient
+    /// anchor tensors from being changed by decoupled weight decay.
+    pub fn new_for_prefixes(
+        varmap: &VarMap,
+        config: FoundationAdamWConfig,
+        prefixes: &[&str],
+    ) -> Result<Self> {
+        if prefixes.is_empty() {
+            candle_core::bail!("foundation AdamW prefix filter requires at least one prefix");
+        }
+        Self::new_matching(varmap, config, |name| {
+            prefixes.iter().any(|prefix| name.starts_with(prefix))
+        })
+    }
+
+    fn new_matching<F>(
+        varmap: &VarMap,
+        config: FoundationAdamWConfig,
+        mut matches: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str) -> bool,
+    {
         let config = config.validate()?;
         let data = varmap
             .data()
@@ -97,11 +128,16 @@ impl FoundationAdamW {
             .map_err(|_| candle_core::Error::Msg("foundation VarMap lock poisoned".to_string()))?;
         let mut named: Vec<(String, Var)> = data
             .iter()
-            .filter(|(_, variable)| variable.dtype().is_float())
+            .filter(|(name, variable)| variable.dtype().is_float() && matches(name))
             .map(|(name, variable)| (name.clone(), variable.clone()))
             .collect();
         drop(data);
         named.sort_by(|left, right| left.0.cmp(&right.0));
+        if named.is_empty() {
+            candle_core::bail!(
+                "foundation AdamW variable filter selected no floating-point variables"
+            );
+        }
 
         let mut variables = Vec::with_capacity(named.len());
         for (name, variable) in named {

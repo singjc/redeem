@@ -46,6 +46,7 @@ pub mod multimodal_v0280;
 pub mod multimodal_v0300;
 pub mod multimodal_v0310;
 pub mod multimodal_v0340;
+pub mod multimodal_v0350;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -342,6 +343,25 @@ pub use multimodal_v0340::{
     FOUNDATION_RT_LOCAL_CHANNELS_V0340, FOUNDATION_RT_TRANSFORMER_LAYERS_V0340,
     FOUNDATION_SPECIALIST_DIM_V0340,
 };
+
+pub use multimodal_v0350::{
+    foundation_fragment_representation_aux_loss_v0350, foundation_multimodal_ms2_loss_v0350,
+    foundation_multimodal_relation_margin_loss_v0350, FoundationFragmentContextBatchV0350,
+    FoundationMultimodalForwardOutputV0350, FoundationMultimodalMs2LossesV0350,
+    FoundationRepresentationAuxOutputV0350, PeptideFoundationMultimodalV0350Config,
+    PeptideFoundationMultimodalV0350Model, FOUNDATION_FRAGMENT_AUX_HIDDEN_V0350,
+    FOUNDATION_FRAGMENT_AUX_WEIGHT_V0350, FOUNDATION_MS2_CONTEXT_FF_DIM_V0350,
+    FOUNDATION_MS2_CONTEXT_HEADS_V0350, FOUNDATION_MS2_CONTEXT_INSTRUMENT_DIM_V0350,
+    FOUNDATION_MS2_CONTEXT_LAYERS_V0350, FOUNDATION_MS2_PEARSON_WEIGHT_V0350,
+    FOUNDATION_MULTIMODAL_ARCHITECTURE_V0350, FOUNDATION_MULTIMODAL_PROPERTY_HIDDEN_V0350,
+    FOUNDATION_MULTIMODAL_RELATION_MARGIN_V0350, FOUNDATION_PROPERTY_REFINEMENT_FF_DIM_V0350,
+    FOUNDATION_PROPERTY_REFINEMENT_HEADS_V0350, FOUNDATION_PROPERTY_REFINEMENT_LAYERS_V0350,
+    FOUNDATION_REPRESENTATION_CHEMISTRY_WEIGHT_V0350,
+    FOUNDATION_REPRESENTATION_CONTRASTIVE_WEIGHT_V0350,
+    FOUNDATION_REPRESENTATION_MASKED_WEIGHT_V0350, FOUNDATION_RT_ROBUST_DELTA_V0350,
+    FOUNDATION_RT_ROBUST_WEIGHT_V0350,
+};
+
 pub use normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
     FoundationTargetNormalizationConfig,
