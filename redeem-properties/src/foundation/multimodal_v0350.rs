@@ -418,6 +418,18 @@ impl PeptideFoundationMultimodalV0350Model {
         self.property_refinement_v0350.forward_t(&encoded, train)
     }
 
+    /// Fast protected CCS-only path for diagnostics/calibration stages.
+    ///
+    /// This delegates directly to the accepted v0.31 CCS path embedded in
+    /// v0.35 and does not evaluate the trainable v0.35 RT/MS2 representation.
+    pub fn protected_ccs_v0350_t(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+    ) -> Result<Tensor> {
+        self.base_v0310.protected_ccs_t(batch, context)
+    }
+
     /// Frozen scalar anchor used by later protected specialist stages.
     ///
     /// This evaluates only the v0.35 trainable-forward representation, RT head,
