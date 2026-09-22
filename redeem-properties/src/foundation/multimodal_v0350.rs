@@ -418,6 +418,34 @@ impl PeptideFoundationMultimodalV0350Model {
         self.property_refinement_v0350.forward_t(&encoded, train)
     }
 
+    /// Frozen scalar anchor used by later protected specialist stages.
+    ///
+    /// This evaluates only the v0.35 trainable-forward representation, RT head,
+    /// and protected v0.31 CCS path. Returned tensors are detached so downstream
+    /// specialist optimizers cannot backpropagate into the accepted v0.35 model.
+    pub fn detached_scalar_anchor_v0350_t(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+    ) -> Result<(FoundationOutput, Tensor, Tensor)> {
+        let foundation = self.trainable_property_foundation_t(batch, false)?;
+        let rt = self
+            .forward_v0350
+            .rt_from_foundation_t(&foundation, false, 0.0)?
+            .detach();
+        let ccs = self.base_v0310.protected_ccs_t(batch, context)?.detach();
+        Ok((
+            FoundationOutput {
+                residue_embeddings: foundation.residue_embeddings.detach(),
+                peptide_embedding: foundation.peptide_embedding.detach(),
+                residue_mask: foundation.residue_mask.clone(),
+                chemistry_targets: foundation.chemistry_targets.clone(),
+            },
+            rt,
+            ccs,
+        ))
+    }
+
     pub fn forward_representation_aux_t(
         &self,
         batch: &super::featurize::FoundationBatch,
