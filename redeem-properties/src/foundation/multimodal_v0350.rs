@@ -128,7 +128,7 @@ impl PeptideFoundationMultimodalV0350Config {
 }
 
 #[derive(Clone)]
-struct PropertyResidueRefinementV0350 {
+pub(crate) struct PropertyResidueRefinementV0350 {
     input_norm: FoundationLayerNorm,
     transformer: PeptideTransformerBlock,
     delta_output: Linear,
@@ -136,7 +136,10 @@ struct PropertyResidueRefinementV0350 {
 }
 
 impl PropertyResidueRefinementV0350 {
-    fn new(config: &PeptideFoundationMultimodalV0350Config, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(crate) fn new(
+        config: &PeptideFoundationMultimodalV0350Config,
+        vb: VarBuilder<'_>,
+    ) -> Result<Self> {
         let model_dim = config.forward().model_dim;
         Ok(Self {
             input_norm: FoundationLayerNorm::new(model_dim, 1e-5, vb.pp("input_norm"))?,
@@ -156,7 +159,11 @@ impl PropertyResidueRefinementV0350 {
         })
     }
 
-    fn forward_t(&self, base: &FoundationOutput, train: bool) -> Result<FoundationOutput> {
+    pub(crate) fn forward_t(
+        &self,
+        base: &FoundationOutput,
+        train: bool,
+    ) -> Result<FoundationOutput> {
         let (batch, sequence, model_dim) = base.residue_embeddings.dims3()?;
         if model_dim != self.model_dim {
             candle_core::bail!(

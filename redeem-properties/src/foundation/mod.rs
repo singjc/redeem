@@ -48,6 +48,7 @@ pub mod multimodal_v0310;
 pub mod multimodal_v0340;
 pub mod multimodal_v0350;
 pub mod multimodal_v0360;
+pub mod multimodal_v0380;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -373,6 +374,13 @@ pub use multimodal_v0360::{
     FOUNDATION_MULTIMODAL_ARCHITECTURE_V0360, FOUNDATION_RT_SCALAR_CONTEXT_DIM_V0360,
     FOUNDATION_RT_SPECIALIST_HIDDEN_V0360, FOUNDATION_RT_STRETCH_TARGET_MAE_V0360,
     FOUNDATION_SCALAR_ROBUST_DELTA_V0360,
+};
+
+pub use multimodal_v0380::{
+    FoundationMobilityOutputV0380, PeptideFoundationMultimodalV0380Config,
+    PeptideFoundationMultimodalV0380Model, FOUNDATION_CCS_CONTEXT_FF_DIM_V0380,
+    FOUNDATION_CCS_CONTEXT_HEADS_V0380, FOUNDATION_CCS_CONTEXT_LAYERS_V0380,
+    FOUNDATION_CCS_MOBILITY_HIDDEN_V0380, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0380,
 };
 
 pub use normalization::{
