@@ -50,6 +50,7 @@ pub mod multimodal_v0350;
 pub mod multimodal_v0360;
 pub mod multimodal_v0380;
 pub mod multimodal_v0390;
+pub mod multimodal_v0500;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -389,6 +390,14 @@ pub use multimodal_v0390::{
     PeptideFoundationMultimodalV0390Model, FOUNDATION_CCS_CONFORMER_FF_DIM_V0390,
     FOUNDATION_CCS_CONFORMER_HEADS_V0390, FOUNDATION_CCS_CONFORMER_LAYERS_V0390,
     FOUNDATION_CCS_MOBILITY_HIDDEN_V0390, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0390,
+};
+
+pub use multimodal_v0500::{
+    FoundationMultimodalForwardOutputV0500, FoundationRepresentationV0500,
+    FoundationTeacherAnchorOutputV0500, FoundationV0350TeacherV0500, PeptideFoundationV0500Config,
+    PeptideFoundationV0500Model, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0500,
+    FOUNDATION_V0500_PAIR_CLASS_COUNT, FOUNDATION_V0500_STUDENT_NAMESPACE,
+    FOUNDATION_V0500_TASK_COUNT, FOUNDATION_V0500_TEACHER_SOURCE,
 };
 
 pub use normalization::{
