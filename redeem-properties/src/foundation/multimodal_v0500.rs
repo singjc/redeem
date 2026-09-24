@@ -27,6 +27,7 @@ pub const FOUNDATION_V0500_PAIR_CLASS_COUNT: usize = 6;
 pub const FOUNDATION_V0500_RELATIVE_FEATURE_DIM: usize = 6;
 pub const FOUNDATION_V0500_MOBILITY_CONTEXT_DIM: usize = 6;
 pub const FOUNDATION_V0500_MS2_CONTEXT_SCALAR_DIM: usize = 5;
+pub const FOUNDATION_V0500_CHEMISTRY_SUMMARY_DIM: usize = 8;
 
 const TASK_RT: usize = 0;
 const TASK_MOBILITY: usize = 1;
@@ -201,6 +202,8 @@ pub struct FoundationMultimodalForwardOutputV0500 {
     pub contrastive_projection: Tensor,
     /// Pair-class auxiliary logits over residue-residue pairs.
     pub pair_interaction_logits: Tensor,
+    /// Deterministic peptide-chemistry summary prediction `[batch, 8]`.
+    pub chemistry_summary: Tensor,
 }
 
 #[derive(Clone)]
@@ -517,6 +520,7 @@ pub struct PeptideFoundationV0500Model {
     chemistry_head: Linear,
     contrastive_head: Linear,
     pair_interaction_head: Linear,
+    chemistry_summary_head: Linear,
 }
 
 impl PeptideFoundationV0500Model {
@@ -654,6 +658,11 @@ impl PeptideFoundationV0500Model {
                 FOUNDATION_V0500_PAIR_CLASS_COUNT,
                 vb.pp("heads.pair_interaction"),
             )?,
+            chemistry_summary_head: nn::linear(
+                config.residue_dim,
+                FOUNDATION_V0500_CHEMISTRY_SUMMARY_DIM,
+                vb.pp("heads.chemistry_summary"),
+            )?,
             config,
             atom_input,
             graph_layers,
@@ -757,6 +766,7 @@ impl PeptideFoundationV0500Model {
         let residue_logits = self.residue_head.forward(&residue_embeddings)?;
         let chemistry_reconstruction = self.chemistry_head.forward(&residue_embeddings)?;
         let contrastive_projection = self.contrastive_head.forward(&global_embedding)?;
+        let chemistry_summary = self.chemistry_summary_head.forward(&global_embedding)?;
 
         let residue_pair =
             pair.narrow(1, FOUNDATION_V0500_TASK_COUNT, self.config.max_sequence_len)?;
@@ -807,6 +817,7 @@ impl PeptideFoundationV0500Model {
             chemistry_reconstruction,
             contrastive_projection,
             pair_interaction_logits,
+            chemistry_summary,
         })
     }
 
@@ -1219,6 +1230,10 @@ mod tests {
             (2, tokens, tokens)
         );
         assert_eq!(
+            output.chemistry_summary.dims2()?,
+            (2, FOUNDATION_V0500_CHEMISTRY_SUMMARY_DIM)
+        );
+        assert_eq!(
             output.pair_interaction_logits.dims4()?,
             (
                 2,
@@ -1255,9 +1270,10 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let model = PeptideFoundationV0500Model::new(config, vb)?;
         let output = model.forward_t(&batch, &context, true)?;
-        let loss = (((output.rt.sum_all()? + output.mobility_native.sum_all()?)?
+        let loss = ((((output.rt.sum_all()? + output.mobility_native.sum_all()?)?
             + output.ms2.sum_all()?)?
-            + output.pair_interaction_logits.sum_all()?)?;
+            + output.pair_interaction_logits.sum_all()?)?
+            + output.chemistry_summary.sum_all()?)?;
         let gradients = loss.backward()?;
         let data = varmap.data().lock().unwrap();
         for name in [
@@ -1268,6 +1284,7 @@ mod tests {
             "student_v050.heads.rt.output.weight",
             "student_v050.heads.mobility.output.weight",
             "student_v050.heads.ms2.output.weight",
+            "student_v050.heads.chemistry_summary.weight",
         ] {
             let variable = data.get(name).unwrap_or_else(|| panic!("missing {name}"));
             let gradient = gradients

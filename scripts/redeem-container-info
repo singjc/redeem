@@ -9,6 +9,11 @@ fi
 profile="${REDEEM_FOUNDATION_IMAGE_PROFILE:-full-research}"
 
 case "$profile" in
+  v0500)
+    required=(
+      foundation_train_multimodal_v0500
+    )
+    ;;
   v0500-smoke)
     required=(
       foundation_v0500_smoke
@@ -203,6 +208,12 @@ else
 fi
 
 
+
+if command -v foundation_train_multimodal_v0500 >/dev/null 2>&1; then
+  echo -e "v0500_deep_pair_joint_trainer\t$(command -v foundation_train_multimodal_v0500)"
+else
+  echo -e "v0500_deep_pair_joint_trainer\tNOT_INSTALLED"
+fi
 
 if command -v foundation_v0500_smoke >/dev/null 2>&1; then
   echo -e "v0500_deep_pair_architecture_smoke\t$(command -v foundation_v0500_smoke)"
