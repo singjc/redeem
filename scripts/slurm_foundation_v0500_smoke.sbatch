@@ -35,6 +35,22 @@ else
   exit 127
 fi
 
+SMOKE_MODE="${SMOKE_MODE:-a100-full}"
+PROFILE_BATCH_SIZE="${PROFILE_BATCH_SIZE:-32}"
+PROFILE_STEPS="${PROFILE_STEPS:-12}"
+case "$SMOKE_MODE" in
+  a100)
+    EXPECTED_BLOCKS=2
+    ;;
+  a100-full)
+    EXPECTED_BLOCKS=8
+    ;;
+  *)
+    echo "Codon v0.50 smoke mode must be a100 or a100-full; observed $SMOKE_MODE" >&2
+    exit 2
+    ;;
+esac
+
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 | xargs)"
 GPU_CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
 echo "job_id=${SLURM_JOB_ID:-NA}"
@@ -43,7 +59,10 @@ echo "gpu_name=$GPU_NAME"
 echo "cuda_compute_capability=$GPU_CC"
 echo "sif=$SIF"
 echo "out=$OUT"
-echo "v0500_smoke_blocks=2"
+echo "v0500_smoke_mode=$SMOKE_MODE"
+echo "v0500_smoke_blocks=$EXPECTED_BLOCKS"
+echo "profile_batch_size=$PROFILE_BATCH_SIZE"
+echo "profile_steps=$PROFILE_STEPS"
 echo "train_holdout_consumed=NO"
 echo "historical_validation_consumed=NO"
 echo "historical_test_consumed=NO"
@@ -62,7 +81,7 @@ GPU_USAGE_SUMMARY="$OUT/gpu_usage_smoke_summary.tsv"
 printf '%s\n' 'timestamp,index,gpu_util_percent,gpu_memory_util_percent,gpu_memory_used_mib,gpu_memory_total_mib' > "$GPU_USAGE_CSV"
 nvidia-smi \
   --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total \
-  --format=csv,noheader,nounits -l 2 >> "$GPU_USAGE_CSV" 2> "$OUT/gpu_usage_smoke.stderr" &
+  --format=csv,noheader,nounits -l 1 >> "$GPU_USAGE_CSV" 2> "$OUT/gpu_usage_smoke.stderr" &
 GPU_MONITOR_PID=$!
 
 cleanup() {
@@ -96,7 +115,7 @@ LOG="$OUT/smoke.log"
 TIME_FILE="$OUT/smoke.time.txt"
 srun "$ENGINE" exec --nv --bind "$OUT" "$SIF" \
   /usr/bin/time -v -o "$TIME_FILE" \
-  foundation_v0500_smoke a100 \
+  foundation_v0500_smoke "$SMOKE_MODE" "$PROFILE_BATCH_SIZE" "$PROFILE_STEPS" \
   2>&1 | tee "$LOG"
 run_rc=${PIPESTATUS[0]}
 exit "$run_rc"
