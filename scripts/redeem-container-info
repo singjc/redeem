@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+build_check=0
+if [ "${1:-}" = "--build-check" ]; then
+  build_check=1
+fi
+
+profile="${REDEEM_FOUNDATION_IMAGE_PROFILE:-full-research}"
+
+case "$profile" in
+  v0500-smoke)
+    required=(
+      foundation_v0500_smoke
+    )
+    ;;
+  v0390)
+    required=(
+      foundation_train_multimodal_v0390
+    )
+    ;;
+  v0381)
+    required=(
+      foundation_train_multimodal_v0381
+    )
+    ;;
+  v0380)
+    required=(
+      foundation_train_multimodal_v0380
+    )
+    ;;
+  v0370)
+    required=(
+      foundation_train_multimodal_v0370
+    )
+    ;;
+  v0364)
+    required=(
+      foundation_audit_ccs_mobility_provenance_v0364
+    )
+    ;;
+  v0363)
+    required=(
+      foundation_audit_ccs_target_consistency_v0363
+    )
+    ;;
+  v0362)
+    required=(
+      foundation_audit_ccs_domains_v0362
+    )
+    ;;
+  v0361)
+    required=(
+      foundation_train_multimodal_v0361
+    )
+    ;;
+  v0360)
+    required=(
+      foundation_train_multimodal_v0360
+    )
+    ;;
+  v0350)
+    required=(
+      foundation_train_multimodal_v0350
+    )
+    ;;
+  v0340)
+    required=(
+      foundation_train_multimodal_v0340
+    )
+    ;;
+  v0310-apd-export)
+    required=(
+      foundation_export_alphapeptdeep_comparison_v0310
+      foundation_export_alphapeptdeep_comparison_v0270
+    )
+    ;;
+  v0330)
+    required=(
+      foundation_train_fragment_grounded_v0330
+    )
+    ;;
+  v0310-v0320)
+    required=(
+      foundation_train_multimodal_v0310
+      foundation_search_coverage_v0320
+    )
+    ;;
+  v0290-v0300-parallel)
+    required=(
+      foundation_train_inverse_reward_v0290
+      foundation_train_multimodal_v0300
+    )
+    ;;
+  v0270-multimodal)
+    required=(
+      foundation_train_multimodal_v0270
+      foundation_export_alphapeptdeep_comparison_v0270
+    )
+    ;;
+  v0260-multimodal)
+    required=(
+      foundation_prepare_multimodal_v0260
+      foundation_train_multimodal_v0260
+      foundation_export_alphapeptdeep_comparison_v0261
+    )
+    ;;
+  v0250-refoundation)
+    required=(
+      foundation_prepare_refoundation_v0250
+      foundation_train_unified_v0250
+    )
+    ;;
+  v0240-test-eval)
+    required=(
+      redeem-foundation
+      foundation_generate_unified
+      foundation_score_fragment_relation_v0240
+    )
+    ;;
+  v0240-fragment-relation)
+    required=(
+      redeem-foundation
+      foundation_train_fragment_relation_v0240
+    )
+    ;;
+  v0230-fragment-likelihood)
+    required=(
+      redeem-foundation
+      foundation_score_fragment_likelihood_v0230
+    )
+    ;;
+  v0220-structured-edit)
+    required=(
+      redeem-foundation
+      foundation_train_structured_edit_v0220
+    )
+    ;;
+  v0210-chemistry-diffusion)
+    required=(
+      redeem-foundation
+      foundation_train_chemistry_diffusion_v0210
+    )
+    ;;
+  v0200-chemistry-structured)
+    required=(
+      redeem-foundation
+      foundation_train_chemistry_decoder_v0200
+    )
+    ;;
+  v0191-prefix-competitive)
+    required=(
+      redeem-foundation
+      foundation_train_direct_decoder_v0191
+    )
+    ;;
+  v0190-direct-decoder)
+    required=(
+      redeem-foundation
+      foundation_train_direct_decoder_v0190
+    )
+    ;;
+  full-research)
+    # Historical broad research image contract retained for Dockerfile.
+    required=(
+      redeem
+      redeem-foundation
+      uv
+      foundation_train_unified
+      foundation_generate_unified
+      foundation_train_trainable_interaction_reranker
+      foundation_train_compatibility_pretraining
+      foundation_train_compatibility_pretraining_v0171
+      foundation_train_compatibility_pretraining_v0180
+      foundation_train_direct_decoder_v0190
+      foundation_export_alphapeptdeep_comparison
+      foundation_export_alphapeptdeep_comparison_v0240
+    )
+    ;;
+  *)
+    echo "unknown ReDeeM foundation image profile: $profile" >&2
+    exit 2
+    ;;
+esac
+
+for executable in "${required[@]}"; do
+  command -v "$executable" >/dev/null 2>&1 || {
+    echo "missing required executable for profile $profile: $executable" >&2
+    exit 1
+  }
+done
+
+if [ "$build_check" -eq 1 ]; then
+  exit 0
+fi
+
+echo -e "redeem_container\tYES"
+echo -e "foundation_image_profile\t$profile"
+if command -v redeem-foundation >/dev/null 2>&1; then
+  echo -e "foundation_launcher\t$(command -v redeem-foundation)"
+else
+  echo -e "foundation_launcher\tNOT_INSTALLED_BY_PROFILE"
+fi
+
+
+
+if command -v foundation_v0500_smoke >/dev/null 2>&1; then
+  echo -e "v0500_deep_pair_architecture_smoke\t$(command -v foundation_v0500_smoke)"
+else
+  echo -e "v0500_deep_pair_architecture_smoke\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0390 >/dev/null 2>&1; then
+  echo -e "v0390_conformer_token_ccs\t$(command -v foundation_train_multimodal_v0390)"
+else
+  echo -e "v0390_conformer_token_ccs\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0381 >/dev/null 2>&1; then
+  echo -e "v0381_standardized_mobility_residual\t$(command -v foundation_train_multimodal_v0381)"
+else
+  echo -e "v0381_standardized_mobility_residual\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0380 >/dev/null 2>&1; then
+  echo -e "v0380_mobility_native_ccs\t$(command -v foundation_train_multimodal_v0380)"
+else
+  echo -e "v0380_mobility_native_ccs\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0370 >/dev/null 2>&1; then
+  echo -e "v0370_consensus_reliability_ccs	$(command -v foundation_train_multimodal_v0370)"
+else
+  echo -e "v0370_consensus_reliability_ccs	NOT_INSTALLED"
+fi
+
+if command -v foundation_audit_ccs_target_consistency_v0363 >/dev/null 2>&1; then
+  echo -e "v0363_ccs_target_consistency_audit\t$(command -v foundation_audit_ccs_target_consistency_v0363)"
+else
+  echo -e "v0363_ccs_target_consistency_audit\tNOT_INSTALLED"
+fi
+
+
+if command -v foundation_audit_ccs_domains_v0362 >/dev/null 2>&1; then
+  echo -e "v0362_ccs_domain_residual_diagnostic\t$(command -v foundation_audit_ccs_domains_v0362)"
+else
+  echo -e "v0362_ccs_domain_residual_diagnostic\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0361 >/dev/null 2>&1; then
+  echo -e "v0361_ccs_only_loss_conditioned_specialist\t$(command -v foundation_train_multimodal_v0361)"
+else
+  echo -e "v0361_ccs_only_loss_conditioned_specialist\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0360 >/dev/null 2>&1; then
+  echo -e "v0360_protected_scalar_specialists\t$(command -v foundation_train_multimodal_v0360)"
+else
+  echo -e "v0360_protected_scalar_specialists\tNOT_INSTALLED"
+fi
+
+
+if command -v foundation_train_multimodal_v0350 >/dev/null 2>&1; then
+  echo -e "v0350_trainable_forward_representation\t$(command -v foundation_train_multimodal_v0350)"
+else
+  echo -e "v0350_trainable_forward_representation\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0340 >/dev/null 2>&1; then
+  echo -e "v0340_deep_forward_specialists\t$(command -v foundation_train_multimodal_v0340)"
+else
+  echo -e "v0340_deep_forward_specialists\tNOT_INSTALLED"
+fi
+
+if command -v foundation_export_alphapeptdeep_comparison_v0310 >/dev/null 2>&1; then
+  echo -e "v0310_apd_exporter\t$(command -v foundation_export_alphapeptdeep_comparison_v0310)"
+else
+  echo -e "v0310_apd_exporter\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_fragment_grounded_v0330 >/dev/null 2>&1; then
+  echo -e "v0330_fragment_grounded_decoder\t$(command -v foundation_train_fragment_grounded_v0330)"
+else
+  echo -e "v0330_fragment_grounded_decoder\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0310 >/dev/null 2>&1; then
+  echo -e "v0310_protected_ccs_property_view\t$(command -v foundation_train_multimodal_v0310)"
+else
+  echo -e "v0310_protected_ccs_property_view\tNOT_INSTALLED"
+fi
+
+if command -v foundation_search_coverage_v0320 >/dev/null 2>&1; then
+  echo -e "v0320_search_coverage\t$(command -v foundation_search_coverage_v0320)"
+else
+  echo -e "v0320_search_coverage\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_inverse_reward_v0290 >/dev/null 2>&1; then
+  echo -e "v0290_inverse_reward\t$(command -v foundation_train_inverse_reward_v0290)"
+else
+  echo -e "v0290_inverse_reward\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0300 >/dev/null 2>&1; then
+  echo -e "v0300_fragment_aware\t$(command -v foundation_train_multimodal_v0300)"
+else
+  echo -e "v0300_fragment_aware\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0270 >/dev/null 2>&1; then
+  echo -e "v0270_train_multimodal\t$(command -v foundation_train_multimodal_v0270)"
+else
+  echo -e "v0270_train_multimodal\tNOT_INSTALLED"
+fi
+
+if command -v foundation_export_alphapeptdeep_comparison_v0270 >/dev/null 2>&1; then
+  echo -e "v0270_apd_exporter\t$(command -v foundation_export_alphapeptdeep_comparison_v0270)"
+else
+  echo -e "v0270_apd_exporter\tNOT_INSTALLED"
+fi
+
+if command -v foundation_prepare_multimodal_v0260 >/dev/null 2>&1; then
+  echo -e "v0260_prepare_multimodal\t$(command -v foundation_prepare_multimodal_v0260)"
+else
+  echo -e "v0260_prepare_multimodal\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_multimodal_v0260 >/dev/null 2>&1; then
+  echo -e "v0260_train_multimodal\t$(command -v foundation_train_multimodal_v0260)"
+else
+  echo -e "v0260_train_multimodal\tNOT_INSTALLED"
+fi
+
+if command -v foundation_export_alphapeptdeep_comparison_v0261 >/dev/null 2>&1; then
+  echo -e "v0261_apd_exporter\t$(command -v foundation_export_alphapeptdeep_comparison_v0261)"
+else
+  echo -e "v0261_apd_exporter\tNOT_INSTALLED"
+fi
+
+if command -v foundation_prepare_refoundation_v0250 >/dev/null 2>&1; then
+  echo -e "v0250_prepare_refoundation\t$(command -v foundation_prepare_refoundation_v0250)"
+else
+  echo -e "v0250_prepare_refoundation\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_unified_v0250 >/dev/null 2>&1; then
+  echo -e "v0250_train_unified\t$(command -v foundation_train_unified_v0250)"
+else
+  echo -e "v0250_train_unified\tNOT_INSTALLED"
+fi
+
+if command -v foundation_score_fragment_relation_v0240 >/dev/null 2>&1; then
+  echo -e "v0240_test_relation_scorer\t$(command -v foundation_score_fragment_relation_v0240)"
+else
+  echo -e "v0240_test_relation_scorer\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_fragment_relation_v0240 >/dev/null 2>&1; then
+  echo -e "v0240_fragment_relation\t$(command -v foundation_train_fragment_relation_v0240)"
+else
+  echo -e "v0240_fragment_relation\tNOT_INSTALLED"
+fi
+
+if command -v foundation_score_fragment_likelihood_v0230 >/dev/null 2>&1; then
+  echo -e "v0230_fragment_likelihood\t$(command -v foundation_score_fragment_likelihood_v0230)"
+else
+  echo -e "v0230_fragment_likelihood\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_structured_edit_v0220 >/dev/null 2>&1; then
+  echo -e "v0220_structured_edit\t$(command -v foundation_train_structured_edit_v0220)"
+else
+  echo -e "v0220_structured_edit\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_chemistry_diffusion_v0210 >/dev/null 2>&1; then
+  echo -e "v0210_chemistry_diffusion\t$(command -v foundation_train_chemistry_diffusion_v0210)"
+else
+  echo -e "v0210_chemistry_diffusion\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_chemistry_decoder_v0200 >/dev/null 2>&1; then
+  echo -e "v0200_chemistry_decoder	$(command -v foundation_train_chemistry_decoder_v0200)"
+else
+  echo -e "v0200_chemistry_decoder	NOT_INSTALLED"
+fi
+
+if command -v foundation_train_direct_decoder_v0191 >/dev/null 2>&1; then
+  echo -e "v0191_direct_decoder\t$(command -v foundation_train_direct_decoder_v0191)"
+else
+  echo -e "v0191_direct_decoder\tNOT_INSTALLED"
+fi
+
+if command -v foundation_train_direct_decoder_v0190 >/dev/null 2>&1; then
+  echo -e "v0190_direct_decoder\t$(command -v foundation_train_direct_decoder_v0190)"
+else
+  echo -e "v0190_direct_decoder\tNOT_INSTALLED"
+fi
+
+if command -v redeem >/dev/null 2>&1; then
+  echo -e "redeem_binary\t$(command -v redeem)"
+else
+  echo -e "redeem_binary\tNOT_INSTALLED_BY_PROFILE"
+fi
+
+if command -v python >/dev/null 2>&1; then
+  echo -e "python\t$(python --version 2>&1 || true)"
+else
+  echo -e "python\tNOT_INSTALLED_BY_PROFILE"
+fi
+
+if command -v uv >/dev/null 2>&1; then
+  echo -e "uv\t$(uv --version 2>&1 || true)"
+else
+  echo -e "uv\tNOT_INSTALLED_BY_PROFILE"
+fi
+
+if command -v python >/dev/null 2>&1 && \
+   python -c 'import importlib.metadata; print(importlib.metadata.version("peptdeep"))' \
+     >/tmp/redeem-peptdeep-version 2>/dev/null; then
+  echo -e "alphapeptdeep\t$(cat /tmp/redeem-peptdeep-version)"
+  rm -f /tmp/redeem-peptdeep-version
+else
+  rm -f /tmp/redeem-peptdeep-version
+  echo -e "alphapeptdeep\tNOT_INSTALLED_BY_PROFILE"
+fi
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  echo -e "nvidia_runtime\tVISIBLE"
+  nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null || nvidia-smi -L || true
+else
+  echo -e "nvidia_runtime\tNOT_VISIBLE (expected during image build / CPU launch)"
+fi

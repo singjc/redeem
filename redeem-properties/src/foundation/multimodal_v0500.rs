@@ -243,21 +243,26 @@ impl PairConditionedSelfAttentionV0500 {
             candle_core::bail!("v0.50 pair-conditioned attention shape mismatch");
         }
 
+        // Candle's CUDA batched Linear/matmul path requires contiguous inputs.
+        // Task-token concatenation, narrow views, and layer-norm elementwise ops can preserve
+        // strided layouts that the CPU backend accepts but CUDA rejects. Materialize once at
+        // every projection boundary that can receive such a view.
+        let hidden = hidden.contiguous()?;
         let q = self
             .query
-            .forward(hidden)?
+            .forward(&hidden)?
             .reshape((batch, tokens, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
         let k = self
             .key
-            .forward(hidden)?
+            .forward(&hidden)?
             .reshape((batch, tokens, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
         let v = self
             .value
-            .forward(hidden)?
+            .forward(&hidden)?
             .reshape((batch, tokens, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -288,11 +293,11 @@ impl PairConditionedSelfAttentionV0500 {
             .unsqueeze(1)?
             .broadcast_as((batch, self.num_heads, tokens, tokens))?;
         let probabilities = ops::softmax(&(scores + key_mask)?, D::Minus1)?;
-        let context =
-            probabilities
-                .matmul(&v)?
-                .transpose(1, 2)?
-                .reshape((batch, tokens, residue_dim))?;
+        let context = probabilities
+            .matmul(&v)?
+            .transpose(1, 2)?
+            .reshape((batch, tokens, residue_dim))?
+            .contiguous()?;
         let output = self.output.forward(&context)?;
         let query_mask = token_mask
             .unsqueeze(2)?
@@ -424,7 +429,7 @@ impl ResiduePairInteractionBlockV0500 {
 
         // 2. Residue-to-pair update.  Left/right projections plus a multiplicative
         // interaction give the pair state an explicit place to encode compatibility.
-        let normalized_hidden = self.residue_to_pair_norm.forward(&hidden)?;
+        let normalized_hidden = self.residue_to_pair_norm.forward(&hidden)?.contiguous()?;
         let left = self
             .pair_update_left
             .forward(&normalized_hidden)?
@@ -462,7 +467,10 @@ impl ResiduePairInteractionBlockV0500 {
         pair = mask_pair_state(&pair, pair_mask)?;
 
         // 4. Residue transition / MLP.
-        let normalized_hidden = self.residue_transition_norm.forward(&hidden)?;
+        let normalized_hidden = self
+            .residue_transition_norm
+            .forward(&hidden)?
+            .contiguous()?;
         let residue_transition = self
             .residue_transition_in
             .forward(&normalized_hidden)?
@@ -701,7 +709,9 @@ impl PeptideFoundationV0500Model {
         residues = mask_token_state(&residues, &batch.residue_mask)?;
 
         let task_tokens = self.contextual_task_tokens(batch_size, context)?;
-        let mut hidden = Tensor::cat(&[&task_tokens, &residues], 1)?;
+        // `Tensor::cat` may retain a strided layout when one input originates from a broadcast.
+        // CUDA Linear requires the combined task+residue state to be contiguous.
+        let mut hidden = Tensor::cat(&[&task_tokens, &residues], 1)?.contiguous()?;
         let task_mask = Tensor::ones(
             (batch_size, FOUNDATION_V0500_TASK_COUNT),
             DType::F32,
@@ -721,12 +731,18 @@ impl PeptideFoundationV0500Model {
         pair = self.pair_output_norm.forward(&pair)?;
         pair = mask_pair_state(&pair, &pair_mask)?;
 
-        let rt_embedding = hidden.narrow(1, TASK_RT, 1)?.squeeze(1)?;
-        let mobility_embedding = hidden.narrow(1, TASK_MOBILITY, 1)?.squeeze(1)?;
-        let ms2_embedding = hidden.narrow(1, TASK_MS2, 1)?.squeeze(1)?;
-        let global_embedding = hidden.narrow(1, TASK_GLOBAL, 1)?.squeeze(1)?;
-        let residue_embeddings =
-            hidden.narrow(1, FOUNDATION_V0500_TASK_COUNT, self.config.max_sequence_len)?;
+        // Narrow/squeeze produces views. Materialize task and residue slices before the
+        // property/reconstruction heads so GPU Linear never receives a strided matrix.
+        let rt_embedding = hidden.narrow(1, TASK_RT, 1)?.squeeze(1)?.contiguous()?;
+        let mobility_embedding = hidden
+            .narrow(1, TASK_MOBILITY, 1)?
+            .squeeze(1)?
+            .contiguous()?;
+        let ms2_embedding = hidden.narrow(1, TASK_MS2, 1)?.squeeze(1)?.contiguous()?;
+        let global_embedding = hidden.narrow(1, TASK_GLOBAL, 1)?.squeeze(1)?.contiguous()?;
+        let residue_embeddings = hidden
+            .narrow(1, FOUNDATION_V0500_TASK_COUNT, self.config.max_sequence_len)?
+            .contiguous()?;
 
         let rt = self
             .rt_head_output
@@ -922,15 +938,16 @@ impl PeptideFoundationV0500Model {
         let (batch, tokens, _) = hidden.dims3()?;
         let sequence = self.config.max_sequence_len;
         let pair_dim = self.config.pair_dim;
+        let hidden = hidden.contiguous()?;
 
         let left = self
             .pair_left
-            .forward(hidden)?
+            .forward(&hidden)?
             .unsqueeze(2)?
             .broadcast_as((batch, tokens, tokens, pair_dim))?;
         let right = self
             .pair_right
-            .forward(hidden)?
+            .forward(&hidden)?
             .unsqueeze(1)?
             .broadcast_as((batch, tokens, tokens, pair_dim))?;
 
@@ -983,7 +1000,11 @@ impl PeptideFoundationV0500Model {
         let features = Tensor::cat(&[&left, &right, &task], 2)?.contiguous()?;
         let hidden = self
             .ms2_head_hidden
-            .forward(&features.reshape((batch_size * cleavages, 3 * residue_dim))?)?
+            .forward(
+                &features
+                    .reshape((batch_size * cleavages, 3 * residue_dim))?
+                    .contiguous()?,
+            )?
             .relu()?;
         let prediction = self.ms2_head_output.forward(&hidden)?.relu()?.reshape((
             batch_size,
