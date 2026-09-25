@@ -51,6 +51,7 @@ pub mod multimodal_v0360;
 pub mod multimodal_v0380;
 pub mod multimodal_v0390;
 pub mod multimodal_v0500;
+pub mod multimodal_v0510;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -399,6 +400,14 @@ pub use multimodal_v0500::{
     FOUNDATION_V0500_CHEMISTRY_SUMMARY_DIM, FOUNDATION_V0500_PAIR_CLASS_COUNT,
     FOUNDATION_V0500_STUDENT_NAMESPACE, FOUNDATION_V0500_TASK_COUNT,
     FOUNDATION_V0500_TEACHER_SOURCE,
+};
+
+pub use multimodal_v0510::{
+    FoundationMultimodalForwardOutputV0510, FoundationTeacherAnchorOutputV0510,
+    FoundationTeacherBridgeOutputV0510, FoundationV0350TeacherV0510, PeptideFoundationV0510Config,
+    PeptideFoundationV0510Model, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0510,
+    FOUNDATION_V0510_STUDENT_NAMESPACE, FOUNDATION_V0510_TEACHER_DIM,
+    FOUNDATION_V0510_TEACHER_SOURCE,
 };
 
 pub use normalization::{

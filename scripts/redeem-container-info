@@ -9,6 +9,11 @@ fi
 profile="${REDEEM_FOUNDATION_IMAGE_PROFILE:-full-research}"
 
 case "$profile" in
+  v0510)
+    required=(
+      foundation_train_multimodal_v0510
+    )
+    ;;
   v0500)
     required=(
       foundation_train_multimodal_v0500
@@ -208,6 +213,12 @@ else
 fi
 
 
+
+if command -v foundation_train_multimodal_v0510 >/dev/null 2>&1; then
+  echo -e "v0510_teacher_bridged_deep_pair_specialists\t$(command -v foundation_train_multimodal_v0510)"
+else
+  echo -e "v0510_teacher_bridged_deep_pair_specialists\tNOT_INSTALLED"
+fi
 
 if command -v foundation_train_multimodal_v0500 >/dev/null 2>&1; then
   echo -e "v0500_deep_pair_joint_trainer\t$(command -v foundation_train_multimodal_v0500)"
