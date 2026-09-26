@@ -673,7 +673,22 @@ impl PeptideFoundationV0510Model {
         self.base_v0500.forward_t(batch, context, train)
     }
 
-    /// Compute only the mobility residual specialist on top of the v0.50 backbone.
+    /// Compute the warm-started v0.50 mobility representation and the v0.51 residual
+    /// in one pass. v0.52 uses this hook to add a pair-aware mobility refinement
+    /// without duplicating the expensive deep backbone forward.
+    pub fn mobility_components_t(
+        &self,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        physics: &FoundationScalarPhysicsBatchV0360,
+        train: bool,
+    ) -> Result<(FoundationMultimodalForwardOutputV0500, Tensor)> {
+        let base = self.base_v0500.forward_t(batch, context, train)?;
+        let residual = self.mobility_residual.forward_t(&base, physics, train)?;
+        Ok((base, residual))
+    }
+
+    /// Compute only the v0.51 mobility residual specialist on top of the v0.50 backbone.
     pub fn mobility_residual_t(
         &self,
         batch: &FoundationBatch,
@@ -681,8 +696,8 @@ impl PeptideFoundationV0510Model {
         physics: &FoundationScalarPhysicsBatchV0360,
         train: bool,
     ) -> Result<Tensor> {
-        let base = self.base_v0500.forward_t(batch, context, train)?;
-        self.mobility_residual.forward_t(&base, physics, train)
+        let (_, residual) = self.mobility_components_t(batch, context, physics, train)?;
+        Ok(residual)
     }
 
     pub fn property_forward_t(
