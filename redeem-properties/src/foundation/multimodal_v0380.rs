@@ -127,12 +127,12 @@ impl MobilityContextHeadV0380 {
         })
     }
 
-    fn forward_t(
+    fn contextual_features_t(
         &self,
         foundation: &FoundationOutput,
         physics: &FoundationScalarPhysicsBatchV0360,
         train: bool,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let (batch, sequence, model_dim) = foundation.residue_embeddings.dims3()?;
         if model_dim != self.model_dim {
             candle_core::bail!("v0.38 mobility head received incompatible residue width");
@@ -152,13 +152,32 @@ impl MobilityContextHeadV0380 {
             hidden = block.forward_t(&hidden, &foundation.residue_mask, train)?;
         }
         let pooled = masked_mean_v0380(&hidden, &foundation.residue_mask)?;
+        Ok((hidden, pooled))
+    }
+
+    fn residual_from_pooled(
+        &self,
+        foundation: &FoundationOutput,
+        physics: &FoundationScalarPhysicsBatchV0360,
+        pooled: &Tensor,
+    ) -> Result<Tensor> {
         let features = Tensor::cat(
-            &[&foundation.peptide_embedding, &pooled, &physics.ccs_physics],
+            &[&foundation.peptide_embedding, pooled, &physics.ccs_physics],
             1,
         )?;
         let hidden = self.hidden.forward(&features)?.relu()?;
         let hidden = self.bottleneck.forward(&hidden)?.relu()?;
         self.output.forward(&hidden)
+    }
+
+    fn forward_t(
+        &self,
+        foundation: &FoundationOutput,
+        physics: &FoundationScalarPhysicsBatchV0360,
+        train: bool,
+    ) -> Result<Tensor> {
+        let (_, pooled) = self.contextual_features_t(foundation, physics, train)?;
+        self.residual_from_pooled(foundation, physics, &pooled)
     }
 }
 
@@ -168,6 +187,22 @@ pub struct FoundationMobilityOutputV0380 {
     pub base_ccs_model: Tensor,
     /// Native raw ion-mobility residual. Step 0 is exactly zero.
     pub mobility_residual_native: Tensor,
+}
+
+/// Frozen v0.38 mobility features exposed for later representation distillation.
+///
+/// This does not alter the v0.38 training contract.  It only exposes the representation
+/// that already drives the accepted v0.38 mobility head so later students can learn the
+/// same mobility geometry without using DEV/HOLDOUT labels as representation targets.
+#[derive(Debug, Clone)]
+pub struct FoundationMobilityTeacherFeaturesV0380 {
+    pub base_ccs_model: Tensor,
+    pub mobility_residual_native: Tensor,
+    pub peptide_embedding: Tensor,
+    pub residue_embeddings: Tensor,
+    pub residue_mask: Tensor,
+    pub context_residue_embeddings: Tensor,
+    pub context_pooled_embedding: Tensor,
 }
 
 #[derive(Clone)]
@@ -210,17 +245,44 @@ impl PeptideFoundationMultimodalV0380Model {
         physics: &FoundationScalarPhysicsBatchV0360,
         train: bool,
     ) -> Result<FoundationMobilityOutputV0380> {
+        let output = self.mobility_teacher_features_v0380_t(batch, context, physics, train)?;
+        Ok(FoundationMobilityOutputV0380 {
+            base_ccs_model: output.base_ccs_model,
+            mobility_residual_native: output.mobility_residual_native,
+        })
+    }
+
+    /// Expose the accepted v0.38 mobility representation for frozen teacher distillation.
+    /// The returned tensors are not detached here so the method remains generally useful;
+    /// callers that use v0.38 as a frozen teacher must detach them explicitly.
+    pub fn mobility_teacher_features_v0380_t(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+        physics: &FoundationScalarPhysicsBatchV0360,
+        train: bool,
+    ) -> Result<FoundationMobilityTeacherFeaturesV0380> {
         let (_, _, base_ccs_model) = self
             .base_v0350
             .detached_scalar_anchor_v0350_t(batch, context)?;
         let base = self.ccs_forward_v0380.encode_foundation_t(batch, train)?;
         let foundation = self.ccs_property_refinement_v0380.forward_t(&base, train)?;
-        let mobility_residual_native =
-            self.ccs_context_v0380
-                .forward_t(&foundation, physics, train)?;
-        Ok(FoundationMobilityOutputV0380 {
+        let (context_residue_embeddings, context_pooled_embedding) = self
+            .ccs_context_v0380
+            .contextual_features_t(&foundation, physics, train)?;
+        let mobility_residual_native = self.ccs_context_v0380.residual_from_pooled(
+            &foundation,
+            physics,
+            &context_pooled_embedding,
+        )?;
+        Ok(FoundationMobilityTeacherFeaturesV0380 {
             base_ccs_model,
             mobility_residual_native,
+            peptide_embedding: foundation.peptide_embedding,
+            residue_embeddings: foundation.residue_embeddings,
+            residue_mask: foundation.residue_mask,
+            context_residue_embeddings,
+            context_pooled_embedding,
         })
     }
 
