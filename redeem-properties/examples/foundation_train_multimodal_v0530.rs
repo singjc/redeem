@@ -965,12 +965,13 @@ fn main() -> Result<()> {
                 seed ^ (global_step as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
                 &device,
             )?;
-            let update = backward_step_v0530(
-                &loss,
-                &mut optimizer,
-                &student_varmap,
-                smoke_mode && global_step == 1,
-            )?;
+            let gradient_audit_step = if smoke_mode && global_step <= 2 {
+                Some(global_step)
+            } else {
+                None
+            };
+            let update =
+                backward_step_v0530(&loss, &mut optimizer, &student_varmap, gradient_audit_step)?;
             if global_step == 1 || global_step % 100 == 0 || local_step + 1 == steps_per_epoch {
                 println!(
                     "v0530_train\tepoch={epoch}\tstep={global_step}\tepoch_step={}\tlr={:.8}\ttotal={:.6}\tprimary={:.6}\tauxiliary={:.6}\tteacher_prediction={:.6}\tteacher_features={:.6}\tgradient_norm={:.6}\tgradient_scale={:.6}",
@@ -2309,33 +2310,54 @@ fn backward_step_v0530(
     loss: &Tensor,
     optimizer: &mut FoundationAdamW,
     varmap: &VarMap,
-    audit_gradients: bool,
+    gradient_audit_step: Option<usize>,
 ) -> Result<FoundationOptimizerStep> {
     let gradients = loss.backward()?;
-    if audit_gradients {
-        audit_gradients_v0530(varmap, &gradients)?;
+    if let Some(audit_step) = gradient_audit_step {
+        audit_gradients_v0530(varmap, &gradients, audit_step)?;
     }
     Ok(optimizer.step(&gradients, Some(V053_MAX_GRADIENT_NORM))?)
+}
+
+fn required_gradient_parameters_v0530(audit_step: usize) -> &'static [&'static str] {
+    // The scalar mobility output is exactly zero-initialized to preserve the frozen-parent
+    // prediction at step 0.  On the first backward pass that zero matrix necessarily blocks
+    // scalar-loss gradients from reaching hidden/bottleneck/pair-only parameters.  Direct
+    // feature-distillation losses still reach the residue/context/transformer path immediately.
+    // After optimizer step 1, output.weight is non-zero; step 2 can then verify the scalar-only
+    // branch all the way through pair_projection without weakening the zero-init contract.
+    match audit_step {
+        1 => &[
+            "student_v053.mobility_teacher_bridge.output.weight",
+            "student_v053.mobility_teacher_bridge.residue_projection.weight",
+            "student_v053.mobility_teacher_bridge.context_projection.weight",
+            "student_v053.mobility_teacher_bridge.transformer.0.attention.query.weight",
+        ],
+        2 => &[
+            "student_v053.mobility_teacher_bridge.output.weight",
+            "student_v053.mobility_teacher_bridge.hidden.weight",
+            "student_v053.mobility_teacher_bridge.bottleneck.weight",
+            "student_v053.mobility_teacher_bridge.pair_projection.weight",
+        ],
+        _ => &[],
+    }
 }
 
 fn audit_gradients_v0530(
     varmap: &VarMap,
     gradients: &candle_core::backprop::GradStore,
+    audit_step: usize,
 ) -> Result<()> {
-    // Feature-level teacher losses intentionally bypass the zero-initialized scalar output, so
-    // the first smoke update must already reach the representation adapter and transformer.
-    let required = [
-        "student_v053.mobility_teacher_bridge.output.weight",
-        "student_v053.mobility_teacher_bridge.residue_projection.weight",
-        "student_v053.mobility_teacher_bridge.pair_projection.weight",
-        "student_v053.mobility_teacher_bridge.context_projection.weight",
-        "student_v053.mobility_teacher_bridge.transformer.0.attention.query.weight",
-    ];
+    let required = required_gradient_parameters_v0530(audit_step);
+    println!(
+        "v0530_gradient_audit_stage\tstep={audit_step}\trequired_parameters={}",
+        required.len()
+    );
     let data = varmap
         .data()
         .lock()
         .map_err(|_| anyhow::anyhow!("v0.53 VarMap lock poisoned during gradient audit"))?;
-    for name in required {
+    for &name in required {
         let variable = data
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("v0.53 gradient audit missing parameter {name}"))?;
@@ -2936,6 +2958,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v0530_gradient_audit_respects_zero_initialized_output_unlock() {
+        let first = required_gradient_parameters_v0530(1);
+        assert!(first.contains(&"student_v053.mobility_teacher_bridge.output.weight"));
+        assert!(first.contains(&"student_v053.mobility_teacher_bridge.residue_projection.weight"));
+        assert!(!first.contains(&"student_v053.mobility_teacher_bridge.pair_projection.weight"));
+        assert!(!first.contains(&"student_v053.mobility_teacher_bridge.hidden.weight"));
+        assert!(!first.contains(&"student_v053.mobility_teacher_bridge.bottleneck.weight"));
+
+        let second = required_gradient_parameters_v0530(2);
+        assert!(second.contains(&"student_v053.mobility_teacher_bridge.output.weight"));
+        assert!(second.contains(&"student_v053.mobility_teacher_bridge.hidden.weight"));
+        assert!(second.contains(&"student_v053.mobility_teacher_bridge.bottleneck.weight"));
+        assert!(second.contains(&"student_v053.mobility_teacher_bridge.pair_projection.weight"));
+        assert!(!second.contains(&"student_v053.mobility_teacher_bridge.residue_projection.weight"));
+
+        assert!(required_gradient_parameters_v0530(3).is_empty());
+    }
 
     #[test]
     fn v0530_affine_fit_recovers_linear_map() {
