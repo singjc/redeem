@@ -691,6 +691,89 @@ impl PeptideFoundationV0500Model {
         &self.config
     }
 
+    /// Encode only the reusable deep chemistry/residue-pair representation.
+    ///
+    /// This is an additive entry point for downstream representation-learning experiments that
+    /// do not need the historical v0.50 RT/MS2/reconstruction heads. `forward_t` remains
+    /// unchanged, preserving all historical v0.50/v0.51/v0.52 behavior.
+    pub fn representation_t(
+        &self,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+    ) -> Result<FoundationRepresentationV0500> {
+        let (batch_size, sequence_len, _atom_count, feature_dim) = batch.atom_features.dims4()?;
+        if sequence_len != self.config.max_sequence_len {
+            candle_core::bail!(
+                "v0.50 expected sequence width {}, got {}",
+                self.config.max_sequence_len,
+                sequence_len
+            );
+        }
+        if feature_dim != ATOM_FEATURE_DIM {
+            candle_core::bail!(
+                "v0.50 atom feature mismatch: expected {}, got {}",
+                ATOM_FEATURE_DIM,
+                feature_dim
+            );
+        }
+
+        let chemistry_targets = mean_raw_chemistry(batch)?;
+        let mut residues = self.encode_residues(batch, &chemistry_targets)?;
+        residues = mask_token_state(&residues, &batch.residue_mask)?;
+        let task_tokens = self.contextual_task_tokens(batch_size, context)?;
+        let mut hidden = Tensor::cat(&[&task_tokens, &residues], 1)?.contiguous()?;
+        // Representation-only consumers do not need RT/MS2 acquisition task tokens. Keep only
+        // the mobility and global tokens active so unrelated RT/NCE/instrument context cannot
+        // leak into a mobility-specific latent through self-attention. Historical `forward_t`
+        // below still uses all four task tokens exactly as before.
+        let mut task_mask_values = Vec::with_capacity(batch_size * FOUNDATION_V0500_TASK_COUNT);
+        for _ in 0..batch_size {
+            task_mask_values.extend_from_slice(&[0.0f32, 1.0, 0.0, 1.0]);
+        }
+        let task_mask = Tensor::from_vec(
+            task_mask_values,
+            (batch_size, FOUNDATION_V0500_TASK_COUNT),
+            batch.residue_mask.device(),
+        )?;
+        let token_mask = Tensor::cat(&[&task_mask, &batch.residue_mask], 1)?;
+        let pair_mask = token_mask
+            .unsqueeze(2)?
+            .broadcast_mul(&token_mask.unsqueeze(1)?)?;
+        let mut pair = self.initialize_pair_state(&hidden, &chemistry_targets, &pair_mask)?;
+        for block in &self.interaction_blocks {
+            (hidden, pair) = block.forward_t(&hidden, &pair, &token_mask, &pair_mask, train)?;
+        }
+        hidden = self.residue_output_norm.forward(&hidden)?;
+        hidden = mask_token_state(&hidden, &token_mask)?;
+        pair = self.pair_output_norm.forward(&pair)?;
+        pair = mask_pair_state(&pair, &pair_mask)?;
+
+        let rt_embedding = hidden.narrow(1, TASK_RT, 1)?.squeeze(1)?.contiguous()?;
+        let mobility_embedding = hidden
+            .narrow(1, TASK_MOBILITY, 1)?
+            .squeeze(1)?
+            .contiguous()?;
+        let ms2_embedding = hidden.narrow(1, TASK_MS2, 1)?.squeeze(1)?.contiguous()?;
+        let global_embedding = hidden.narrow(1, TASK_GLOBAL, 1)?.squeeze(1)?.contiguous()?;
+        let residue_embeddings = hidden
+            .narrow(1, FOUNDATION_V0500_TASK_COUNT, self.config.max_sequence_len)?
+            .contiguous()?;
+
+        Ok(FoundationRepresentationV0500 {
+            residue_embeddings,
+            pair_embeddings: pair,
+            residue_mask: batch.residue_mask.clone(),
+            token_mask,
+            pair_mask,
+            global_embedding,
+            rt_embedding,
+            mobility_embedding,
+            ms2_embedding,
+            chemistry_targets,
+        })
+    }
+
     pub fn forward_t(
         &self,
         batch: &FoundationBatch,

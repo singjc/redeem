@@ -54,6 +54,7 @@ pub mod multimodal_v0500;
 pub mod multimodal_v0510;
 pub mod multimodal_v0520;
 pub mod multimodal_v0530;
+pub mod multimodal_v0600;
 pub mod normalization;
 pub mod optimizer;
 pub mod reverse_causal;
@@ -426,6 +427,15 @@ pub use multimodal_v0530::{
     FOUNDATION_V0530_MOBILITY_HEADS, FOUNDATION_V0530_MOBILITY_HIDDEN,
     FOUNDATION_V0530_MOBILITY_LAYERS, FOUNDATION_V0530_STUDENT_NAMESPACE,
     FOUNDATION_V0530_TEACHER_DIM, FOUNDATION_V0530_TEACHER_SOURCE,
+};
+
+pub use multimodal_v0600::{
+    FoundationMobilityRepresentationV0600, PeptideFoundationV0600Config,
+    PeptideFoundationV0600Model, FOUNDATION_MULTIMODAL_ARCHITECTURE_V0600,
+    FOUNDATION_V0600_CHARGE_LAYERS, FOUNDATION_V0600_CHARGE_SLOTS,
+    FOUNDATION_V0600_CONFORMER_LAYERS, FOUNDATION_V0600_CONFORMER_SLOTS,
+    FOUNDATION_V0600_HEAD_BOTTLENECK, FOUNDATION_V0600_HEAD_HIDDEN,
+    FOUNDATION_V0600_STUDENT_NAMESPACE,
 };
 
 pub use normalization::{

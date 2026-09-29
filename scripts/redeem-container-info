@@ -9,6 +9,11 @@ fi
 profile="${REDEEM_FOUNDATION_IMAGE_PROFILE:-full-research}"
 
 case "$profile" in
+  v0600)
+    required=(
+      foundation_train_multimodal_v0600
+    )
+    ;;
   v0530)
     required=(
       foundation_train_multimodal_v0530
@@ -216,6 +221,12 @@ fi
 
 echo -e "redeem_container\tYES"
 echo -e "foundation_image_profile\t$profile"
+
+if command -v foundation_train_multimodal_v0600 >/dev/null 2>&1; then
+  echo -e "v0600_mobility_first_charge_conformer_representation\t$(command -v foundation_train_multimodal_v0600)"
+else
+  echo -e "v0600_mobility_first_charge_conformer_representation\tNOT_INSTALLED"
+fi
 if command -v redeem-foundation >/dev/null 2>&1; then
   echo -e "foundation_launcher\t$(command -v redeem-foundation)"
 else
