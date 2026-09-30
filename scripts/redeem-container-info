@@ -9,6 +9,12 @@ fi
 profile="${REDEEM_FOUNDATION_IMAGE_PROFILE:-full-research}"
 
 case "$profile" in
+  v0600-ccs-audit-v1)
+    required=(
+      foundation_train_multimodal_v0380
+      foundation_train_multimodal_v0600
+    )
+    ;;
   v0600)
     required=(
       foundation_train_multimodal_v0600

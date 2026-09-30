@@ -196,7 +196,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 13 {
         anyhow::bail!(
-            "usage: foundation_train_multimodal_v0600 RUN_V0260.yaml OUTPUT_DIR PARENT_V0350_FINAL [representation_epochs=6] [consensus_epochs=4] [representation_batch_size=8] [consensus_batch_size=32] [patience=3] [min_delta=0.002] [seed=20261060] [learning_rate=2e-5] [mode=smoke|train|resume]"
+            "usage: foundation_train_multimodal_v0600 RUN_V0260.yaml OUTPUT_DIR PARENT_V0350_FINAL [representation_epochs=6] [consensus_epochs=4] [representation_batch_size=8] [consensus_batch_size=32] [patience=3] [min_delta=0.002] [seed=20261060] [learning_rate=2e-5] [mode=smoke|train|resume|audit-export]"
         );
     }
     let training_yaml = &args[1];
@@ -211,11 +211,14 @@ fn main() -> Result<()> {
     let seed = parse_or(&args, 10, 20_261_060u64)?;
     let learning_rate = parse_or(&args, 11, 2.0e-5f64)?;
     let mode = args.get(12).map(String::as_str).unwrap_or("train");
+    let audit_export_only = mode == "audit-export";
     let smoke_mode = match mode {
         "smoke" => true,
-        "train" | "resume" => false,
+        "train" | "resume" | "audit-export" => false,
         other => {
-            anyhow::bail!("unsupported v0.60 mode {other:?}; expected smoke, train, or resume")
+            anyhow::bail!(
+                "unsupported v0.60 mode {other:?}; expected smoke, train, resume, or audit-export"
+            )
         }
     };
     let resume_mode = mode == "resume";
@@ -236,7 +239,14 @@ fn main() -> Result<()> {
         anyhow::bail!("v0.60 learning_rate must be positive and finite");
     }
 
-    if resume_mode {
+    if audit_export_only {
+        let best = output_root.join("best");
+        for file in ["model.safetensors", "metadata.yaml"] {
+            if !best.join(file).is_file() {
+                anyhow::bail!("v0.60 audit export is missing {:?}", best.join(file));
+            }
+        }
+    } else if resume_mode {
         for checkpoint in ["latest", "best"] {
             let dir = output_root.join(checkpoint);
             for file in [
@@ -321,6 +331,56 @@ fn main() -> Result<()> {
         if length > v0600_config.backbone.max_sequence_len {
             anyhow::bail!("v0.60 record {index} length {length} exceeds configured maximum");
         }
+    }
+
+    if audit_export_only {
+        let export_path = PathBuf::from(
+            env::var("REDEEM_CCS_AUDIT_EXPORT_TSV")
+                .context("set REDEEM_CCS_AUDIT_EXPORT_TSV for v0.60 audit-export mode")?,
+        );
+        let best_dir = output_root.join("best");
+        let best_metadata = read_v060_metadata(&best_dir)?;
+        validate_v060_audit_metadata(
+            &best_metadata,
+            &current_corpus_fingerprint,
+            &current_benchmark_fingerprint,
+            &parent_v0350_checkpoint,
+            &v0600_config,
+        )?;
+        if best_metadata.completed_updates == 0 {
+            anyhow::bail!("v0.60 audit export refuses an unselected checkpoint");
+        }
+        let audit_collator = FoundationCollator::new(
+            featurizer_config.clone(),
+            FoundationCollatorConfig {
+                retention_time_objective: parent_metadata.rt_objective,
+                corruption: FoundationCorruptionConfig {
+                    residue_mask_probability: 0.0,
+                    chemistry_mask_probability: 0.0,
+                },
+            },
+        )?;
+        let mut audit_varmap = VarMap::new();
+        let audit_vb = VarBuilder::from_varmap(&audit_varmap, DType::F32, &device);
+        let audit_model = PeptideFoundationV0600Model::new(v0600_config.clone(), audit_vb)?;
+        audit_varmap.load(best_dir.join("model.safetensors"))?;
+        let (exported, mae) = export_raw_ccs_predictions_v0600(
+            &audit_model,
+            &audit_collator,
+            &corpus.records,
+            &corpus.provenance,
+            &ccs_dev_indices_full,
+            best_metadata.consensus_batch_size,
+            &device,
+            &export_path,
+        )?;
+        println!("v0600_audit_export_records\t{exported}");
+        println!("v0600_audit_export_raw_ccs_mae\t{mae:.8}");
+        println!("v0600_audit_export_path\t{}", export_path.display());
+        println!("train_holdout_consumed\tNO");
+        println!("historical_validation_consumed\tNO");
+        println!("historical_test_consumed\tNO");
+        return Ok(());
     }
 
     let train_supervision = build_train_consensus_supervision(
@@ -1990,6 +2050,102 @@ fn audit_gradients_v0600(
     Ok(())
 }
 
+fn audit_peptidoform_label_v0600(record: &FoundationTrainingRecord) -> String {
+    let mut modifications = record
+        .peptidoform
+        .modifications
+        .iter()
+        .map(|modification| {
+            let site = match modification.site {
+                FoundationModificationSite::Residue(index) => format!("R{index}"),
+                FoundationModificationSite::NTerm => "N".to_string(),
+                FoundationModificationSite::CTerm => "C".to_string(),
+            };
+            format!(
+                "{site}:{}:{:+.4}",
+                modification.identity_label(),
+                modification.mass_delta
+            )
+        })
+        .collect::<Vec<_>>();
+    modifications.sort();
+    if modifications.is_empty() {
+        record.peptidoform.sequence.clone()
+    } else {
+        let annotated = modifications
+            .iter()
+            .map(|modification| format!("[{modification}]"))
+            .collect::<String>();
+        format!("{}{annotated}", record.peptidoform.sequence)
+    }
+}
+
+fn audit_tsv_field_v0600(value: &str) -> String {
+    value
+        .replace('\t', " ")
+        .replace('\n', " ")
+        .replace('\r', " ")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_raw_ccs_predictions_v0600(
+    model: &PeptideFoundationV0600Model,
+    collator: &FoundationCollator,
+    records: &[FoundationTrainingRecord],
+    provenance: &[FoundationRecordProvenance],
+    indices: &[usize],
+    batch_size: usize,
+    device: &Device,
+    output: &Path,
+) -> Result<(usize, f64)> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut text = String::from(
+        "record_index\tsource_id\tsequence\tpeptidoform\tcharge\tprecursor_mz\ttarget_ccs\tpredicted_ccs\n",
+    );
+    let mut absolute_error = 0.0f64;
+    let mut count = 0usize;
+    for chunk in indices.chunks(batch_size.max(1)) {
+        let owned = chunk
+            .iter()
+            .map(|&idx| records[idx].clone())
+            .collect::<Vec<_>>();
+        let batch = collator.collate(&owned, device, 0)?;
+        let (_, ccs, _) = predicted_mobility_and_ccs_v0600(model, &batch, &owned, false)?;
+        let predicted = ccs.to_vec2::<f32>()?;
+        for (row, (&record_index, record)) in chunk.iter().zip(owned.iter()).enumerate() {
+            let Some(target) = record.ccs.filter(|value| value.is_finite()) else {
+                continue;
+            };
+            let source = provenance
+                .get(record_index)
+                .ok_or_else(|| anyhow::anyhow!("v0.60 audit export missing provenance"))?;
+            let charge = record.context.charge.unwrap_or_default();
+            let mz = record.context.precursor_mz.unwrap_or_default();
+            let prediction = predicted[row][0];
+            absolute_error += f64::from((prediction - target).abs());
+            count += 1;
+            text.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}\t{:.8}\n",
+                record_index,
+                audit_tsv_field_v0600(&source.source_id),
+                audit_tsv_field_v0600(&record.peptidoform.sequence),
+                audit_tsv_field_v0600(&audit_peptidoform_label_v0600(record)),
+                charge,
+                mz,
+                target,
+                prediction,
+            ));
+        }
+    }
+    if count == 0 {
+        anyhow::bail!("v0.60 audit export contains no finite DEV CCS rows");
+    }
+    fs::write(output, text)?;
+    Ok((count, absolute_error / count as f64))
+}
+
 fn evaluate_raw_ccs_v0600(
     model: &PeptideFoundationV0600Model,
     collator: &FoundationCollator,
@@ -2115,6 +2271,26 @@ fn read_v060_metadata(checkpoint: &Path) -> Result<V060Metadata> {
         &fs::read_to_string(&path).with_context(|| format!("failed to read {path:?}"))?,
     )
     .with_context(|| format!("failed to parse v0.60 metadata {path:?}"))
+}
+
+fn validate_v060_audit_metadata(
+    metadata: &V060Metadata,
+    corpus_fingerprint: &str,
+    benchmark_fingerprint: &str,
+    parent_v0350: &Path,
+    config: &PeptideFoundationV0600Config,
+) -> Result<()> {
+    if metadata.version != V060_VERSION
+        || metadata.objective != V060_OBJECTIVE
+        || metadata.architecture != FOUNDATION_MULTIMODAL_ARCHITECTURE_V0600
+        || metadata.corpus_fingerprint != corpus_fingerprint
+        || metadata.benchmark_manifest_fingerprint != benchmark_fingerprint
+        || metadata.parent_v0350_metadata_checkpoint != parent_v0350.display().to_string()
+        || metadata.v0600_config != *config
+    {
+        anyhow::bail!("v0.60 audit-export checkpoint provenance mismatch");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

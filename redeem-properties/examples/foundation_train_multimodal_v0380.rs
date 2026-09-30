@@ -169,7 +169,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 11 {
         anyhow::bail!(
-            "usage: foundation_train_multimodal_v0380 RUN_V0260.yaml OUTPUT_DIR PARENT_V0350_CHECKPOINT [max_epochs=10] [batch_size=96] [patience=3] [min_delta=0.002] [seed=20261038] [learning_rate=3e-5] [mode=train|finalize]"
+            "usage: foundation_train_multimodal_v0380 RUN_V0260.yaml OUTPUT_DIR PARENT_V0350_CHECKPOINT [max_epochs=10] [batch_size=96] [patience=3] [min_delta=0.002] [seed=20261038] [learning_rate=3e-5] [mode=train|finalize|audit-export]"
         );
     }
 
@@ -183,10 +183,13 @@ fn main() -> Result<()> {
     let seed = parse_or(&args, 8, 20_261_038u64)?;
     let learning_rate = parse_or(&args, 9, 3.0e-5f64)?;
     let run_mode = args.get(10).map(String::as_str).unwrap_or("train");
+    let audit_export_only = run_mode == "audit-export";
     let finalize_only = match run_mode {
-        "train" => false,
+        "train" | "audit-export" => false,
         "finalize" => true,
-        other => anyhow::bail!("unsupported v0.38 run mode {other:?}; expected train or finalize"),
+        other => anyhow::bail!(
+            "unsupported v0.38 run mode {other:?}; expected train, finalize, or audit-export"
+        ),
     };
 
     if max_epochs == 0 || batch_size < 2 || patience == 0 {
@@ -199,7 +202,14 @@ fn main() -> Result<()> {
         anyhow::bail!("v0.38 learning_rate must be positive and finite");
     }
 
-    if finalize_only {
+    if audit_export_only {
+        let best = output_root.join("best");
+        for file in ["model.safetensors", "metadata.yaml"] {
+            if !best.join(file).is_file() {
+                anyhow::bail!("v0.38 audit export is missing {:?}", best.join(file));
+            }
+        }
+    } else if finalize_only {
         for name in ["initial", "best"] {
             let directory = output_root.join(name);
             for file in [
@@ -335,6 +345,60 @@ fn main() -> Result<()> {
         .min(V038_MAX_STEPS_PER_EPOCH)
         .max(1);
     let max_total_steps = max_epochs.saturating_mul(steps_per_epoch);
+    if audit_export_only {
+        let export_path = PathBuf::from(
+            env::var("REDEEM_CCS_AUDIT_EXPORT_TSV")
+                .context("set REDEEM_CCS_AUDIT_EXPORT_TSV for v0.38 audit-export mode")?,
+        );
+        let best_dir = output_root.join("best");
+        let best_metadata = read_v038_metadata(&best_dir)?;
+        validate_v038_audit_metadata(
+            &best_metadata,
+            &current_corpus_fingerprint,
+            &current_benchmark_fingerprint,
+            &format!("fnv1a64:{:016x}", train_supervision.fingerprint),
+            &v0380_config,
+            &parent_checkpoint,
+        )?;
+        if best_metadata.completed_steps == 0 {
+            anyhow::bail!("v0.38 audit export refuses an unselected checkpoint");
+        }
+
+        let mut audit_varmap = VarMap::new();
+        let audit_vb = VarBuilder::from_varmap(&audit_varmap, DType::F32, &device);
+        let audit_model =
+            PeptideFoundationMultimodalV0380Model::new(v0380_config.clone(), audit_vb)?;
+        audit_varmap.load(best_dir.join("model.safetensors"))?;
+        let audit_collator = FoundationCollator::new(
+            forward_config.clone(),
+            FoundationCollatorConfig {
+                retention_time_objective: parent_metadata.rt_objective,
+                corruption: FoundationCorruptionConfig {
+                    residue_mask_probability: 0.0,
+                    chemistry_mask_probability: 0.0,
+                },
+            },
+        )?;
+        let (exported, mae) = export_raw_ccs_predictions_v0380(
+            &audit_model,
+            &audit_collator,
+            &corpus.records,
+            &corpus.provenance,
+            &ccs_dev_indices,
+            best_metadata.batch_size,
+            &parent_metadata.target_normalization,
+            &device,
+            &export_path,
+        )?;
+        println!("v0380_audit_export_records\t{exported}");
+        println!("v0380_audit_export_raw_ccs_mae\t{mae:.8}");
+        println!("v0380_audit_export_path\t{}", export_path.display());
+        println!("train_holdout_consumed\tNO");
+        println!("historical_validation_consumed\tNO");
+        println!("historical_test_consumed\tNO");
+        return Ok(());
+    }
+
     let requested_dev_batches = (dev_indices.len() / batch_size)
         .min(V038_MAX_DEV_BATCHES)
         .max(1);
@@ -1749,6 +1813,109 @@ fn weighted_scaled_pseudo_huber(
     Ok(numerator.broadcast_div(&denominator)?)
 }
 
+fn audit_peptidoform_label_v0380(record: &FoundationTrainingRecord) -> String {
+    let mut modifications = record
+        .peptidoform
+        .modifications
+        .iter()
+        .map(|modification| {
+            let site = match modification.site {
+                FoundationModificationSite::Residue(index) => format!("R{index}"),
+                FoundationModificationSite::NTerm => "N".to_string(),
+                FoundationModificationSite::CTerm => "C".to_string(),
+            };
+            format!(
+                "{site}:{}:{:+.4}",
+                modification.identity_label(),
+                modification.mass_delta
+            )
+        })
+        .collect::<Vec<_>>();
+    modifications.sort();
+    if modifications.is_empty() {
+        record.peptidoform.sequence.clone()
+    } else {
+        let annotated = modifications
+            .iter()
+            .map(|modification| format!("[{modification}]"))
+            .collect::<String>();
+        format!("{}{annotated}", record.peptidoform.sequence)
+    }
+}
+
+fn audit_tsv_field_v0380(value: &str) -> String {
+    value
+        .replace('\t', " ")
+        .replace('\n', " ")
+        .replace('\r', " ")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_raw_ccs_predictions_v0380(
+    model: &PeptideFoundationMultimodalV0380Model,
+    collator: &FoundationCollator,
+    records: &[FoundationTrainingRecord],
+    provenance: &[FoundationRecordProvenance],
+    indices: &[usize],
+    batch_size: usize,
+    normalization: &FoundationTargetNormalizationConfig,
+    device: &Device,
+    output: &Path,
+) -> Result<(usize, f64)> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut text = String::from(
+        "record_index\tsource_id\tsequence\tpeptidoform\tcharge\tprecursor_mz\ttarget_ccs\tpredicted_ccs\n",
+    );
+    let mut absolute_error = 0.0f64;
+    let mut count = 0usize;
+    for chunk in indices.chunks(batch_size.max(1)) {
+        let owned = chunk
+            .iter()
+            .map(|&index| records[index].clone())
+            .collect::<Vec<_>>();
+        let batch = collator.collate(&owned, device, 0)?;
+        let physics = FoundationScalarPhysicsBatchV0360::from_records(
+            &owned,
+            model.forward_config().max_sequence_len,
+            device,
+        )?;
+        let (_, predicted_ccs) =
+            predicted_native_mobility_and_ccs(model, &batch, &physics, normalization, false)?;
+        let predicted = predicted_ccs.to_vec2::<f32>()?;
+        for (row, (&record_index, record)) in chunk.iter().zip(owned.iter()).enumerate() {
+            let Some(target) = record.ccs.filter(|value| value.is_finite()) else {
+                continue;
+            };
+            let source = provenance
+                .get(record_index)
+                .ok_or_else(|| anyhow::anyhow!("v0.38 audit export missing provenance"))?;
+            let charge = record.context.charge.unwrap_or_default();
+            let mz = record.context.precursor_mz.unwrap_or_default();
+            let prediction = predicted[row][0];
+            absolute_error += f64::from((prediction - target).abs());
+            count += 1;
+            text.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}\t{:.8}\n",
+                record_index,
+                audit_tsv_field_v0380(&source.source_id),
+                audit_tsv_field_v0380(&record.peptidoform.sequence),
+                audit_tsv_field_v0380(&audit_peptidoform_label_v0380(record)),
+                charge,
+                mz,
+                target,
+                prediction,
+            ));
+        }
+    }
+    if count == 0 {
+        anyhow::bail!("v0.38 audit export contains no finite DEV CCS rows");
+    }
+    fs::write(output, text)?;
+    Ok((count, absolute_error / count as f64))
+}
+
 fn evaluate_raw_ccs_indices(
     model: &PeptideFoundationMultimodalV0380Model,
     collator: &FoundationCollator,
@@ -2263,6 +2430,28 @@ fn read_v038_metadata(checkpoint: &Path) -> Result<V038Metadata> {
         &fs::read_to_string(&path).with_context(|| format!("failed to read {path:?}"))?,
     )
     .with_context(|| format!("failed to parse v0.38 metadata {path:?}"))
+}
+
+fn validate_v038_audit_metadata(
+    metadata: &V038Metadata,
+    corpus_fingerprint: &str,
+    benchmark_fingerprint: &str,
+    supervision_fingerprint: &str,
+    config: &PeptideFoundationMultimodalV0380Config,
+    parent_v0350: &Path,
+) -> Result<()> {
+    if metadata.version != V038_VERSION
+        || metadata.objective != V038_OBJECTIVE
+        || metadata.architecture != V038_ARCHITECTURE
+        || metadata.corpus_fingerprint != corpus_fingerprint
+        || metadata.benchmark_manifest_fingerprint != benchmark_fingerprint
+        || metadata.supervision_fingerprint != supervision_fingerprint
+        || metadata.parent_v0350_checkpoint != parent_v0350.display().to_string()
+        || metadata.v0380_config != *config
+    {
+        anyhow::bail!("v0.38 audit-export checkpoint provenance mismatch");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
