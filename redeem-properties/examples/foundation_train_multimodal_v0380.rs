@@ -169,7 +169,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 11 {
         anyhow::bail!(
-            "usage: foundation_train_multimodal_v0380 RUN_V0260.yaml OUTPUT_DIR PARENT_V0350_CHECKPOINT [max_epochs=10] [batch_size=96] [patience=3] [min_delta=0.002] [seed=20261038] [learning_rate=3e-5] [mode=train|finalize|audit-export]"
+            "usage: foundation_train_multimodal_v0380 RUN_V0260.yaml OUTPUT_DIR PARENT_V0350_CHECKPOINT [max_epochs=10] [batch_size=96] [patience=3] [min_delta=0.002] [seed=20261038] [learning_rate=3e-5] [mode=train|finalize|audit-export|audit-export-train-selected]"
         );
     }
 
@@ -183,12 +183,13 @@ fn main() -> Result<()> {
     let seed = parse_or(&args, 8, 20_261_038u64)?;
     let learning_rate = parse_or(&args, 9, 3.0e-5f64)?;
     let run_mode = args.get(10).map(String::as_str).unwrap_or("train");
-    let audit_export_only = run_mode == "audit-export";
+    let audit_export_train_selected = run_mode == "audit-export-train-selected";
+    let audit_export_only = run_mode == "audit-export" || audit_export_train_selected;
     let finalize_only = match run_mode {
-        "train" | "audit-export" => false,
+        "train" | "audit-export" | "audit-export-train-selected" => false,
         "finalize" => true,
         other => anyhow::bail!(
-            "unsupported v0.38 run mode {other:?}; expected train, finalize, or audit-export"
+            "unsupported v0.38 run mode {other:?}; expected train, finalize, audit-export, or audit-export-train-selected"
         ),
     };
 
@@ -251,23 +252,37 @@ fn main() -> Result<()> {
         .filter(|entry| entry.partition == FoundationPartition::Train)
         .map(|entry| entry.record_index)
         .collect();
-    let dev_indices: Vec<usize> = benchmark
-        .entries
-        .iter()
-        .filter(|entry| entry.partition == FoundationPartition::Validation)
-        .map(|entry| entry.record_index)
-        .collect();
-    let holdout_indices: Vec<usize> = benchmark
-        .entries
-        .iter()
-        .filter(|entry| entry.partition == FoundationPartition::Test)
-        .map(|entry| entry.record_index)
-        .collect();
+    let dev_indices: Vec<usize> = if audit_export_train_selected {
+        Vec::new()
+    } else {
+        benchmark
+            .entries
+            .iter()
+            .filter(|entry| entry.partition == FoundationPartition::Validation)
+            .map(|entry| entry.record_index)
+            .collect()
+    };
+    let holdout_indices: Vec<usize> = if audit_export_train_selected {
+        Vec::new()
+    } else {
+        benchmark
+            .entries
+            .iter()
+            .filter(|entry| entry.partition == FoundationPartition::Test)
+            .map(|entry| entry.record_index)
+            .collect()
+    };
     let mobility_train_indices = finite_mobility_ccs_indices(&corpus.records, &train_indices);
-    let ccs_dev_indices = finite_mobility_ccs_indices(&corpus.records, &dev_indices);
-    if mobility_train_indices.len() < batch_size || ccs_dev_indices.len() < batch_size {
+    let ccs_dev_indices = if audit_export_train_selected {
+        Vec::new()
+    } else {
+        finite_mobility_ccs_indices(&corpus.records, &dev_indices)
+    };
+    if mobility_train_indices.len() < batch_size
+        || (!audit_export_train_selected && ccs_dev_indices.len() < batch_size)
+    {
         anyhow::bail!(
-            "v0.38 requires at least one batch of CCS labels in TRAIN and DEV; observed train={} dev={} batch_size={batch_size}",
+            "v0.38 requires at least one batch of requested CCS labels; observed train={} dev={} batch_size={batch_size}",
             mobility_train_indices.len(),
             ccs_dev_indices.len()
         );
@@ -331,13 +346,17 @@ fn main() -> Result<()> {
     if train_supervision.examples.len() < batch_size {
         anyhow::bail!("v0.38 consensus TRAIN has fewer examples than batch_size");
     }
-    let dev_consensus = build_partition_consensus_examples(
-        &corpus.records,
-        &corpus.provenance,
-        &ccs_dev_indices,
-        &train_supervision.source_supervision,
-    )?;
-    if dev_consensus.is_empty() {
+    let dev_consensus = if audit_export_train_selected {
+        Vec::new()
+    } else {
+        build_partition_consensus_examples(
+            &corpus.records,
+            &corpus.provenance,
+            &ccs_dev_indices,
+            &train_supervision.source_supervision,
+        )?
+    };
+    if !audit_export_train_selected && dev_consensus.is_empty() {
         anyhow::bail!("v0.38 DEV consensus set is empty");
     }
 
@@ -379,23 +398,65 @@ fn main() -> Result<()> {
                 },
             },
         )?;
-        let (exported, mae) = export_raw_ccs_predictions_v0380(
-            &audit_model,
-            &audit_collator,
-            &corpus.records,
-            &corpus.provenance,
-            &ccs_dev_indices,
-            best_metadata.batch_size,
-            &parent_metadata.target_normalization,
-            &device,
-            &export_path,
-        )?;
-        println!("v0380_audit_export_records\t{exported}");
-        println!("v0380_audit_export_raw_ccs_mae\t{mae:.8}");
-        println!("v0380_audit_export_path\t{}", export_path.display());
-        println!("train_holdout_consumed\tNO");
-        println!("historical_validation_consumed\tNO");
-        println!("historical_test_consumed\tNO");
+        if audit_export_train_selected {
+            let selected_path = PathBuf::from(
+                env::var("REDEEM_CCS_AUDIT_SELECTED_IDENTITIES_TSV").context(
+                    "set REDEEM_CCS_AUDIT_SELECTED_IDENTITIES_TSV for v0.38 audit-export-train-selected mode",
+                )?,
+            );
+            let selected = read_selected_identity_keys_v0380(&selected_path)?;
+            let selected_rows = select_train_ccs_rows_v0380(
+                &corpus.records,
+                &benchmark,
+                &mobility_train_indices,
+                &selected,
+            )?;
+            let (exported, identities, mae) = export_selected_train_raw_ccs_predictions_v0380(
+                &audit_model,
+                &audit_collator,
+                &corpus.records,
+                &corpus.provenance,
+                &selected_rows,
+                best_metadata.batch_size,
+                &parent_metadata.target_normalization,
+                &device,
+                &export_path,
+            )?;
+            println!(
+                "v0380_train_selected_manifest_identities\t{}",
+                selected.len()
+            );
+            println!("v0380_train_selected_export_records\t{exported}");
+            println!("v0380_train_selected_export_identities\t{identities}");
+            println!("v0380_train_selected_raw_ccs_mae\t{mae:.8}");
+            println!(
+                "v0380_train_selected_export_path\t{}",
+                export_path.display()
+            );
+            println!("partition_scope\tTRAIN_selected_only");
+            println!("dev_labels_used\tNO");
+            println!("train_holdout_consumed\tNO");
+            println!("historical_validation_consumed\tNO");
+            println!("historical_test_consumed\tNO");
+        } else {
+            let (exported, mae) = export_raw_ccs_predictions_v0380(
+                &audit_model,
+                &audit_collator,
+                &corpus.records,
+                &corpus.provenance,
+                &ccs_dev_indices,
+                best_metadata.batch_size,
+                &parent_metadata.target_normalization,
+                &device,
+                &export_path,
+            )?;
+            println!("v0380_audit_export_records\t{exported}");
+            println!("v0380_audit_export_raw_ccs_mae\t{mae:.8}");
+            println!("v0380_audit_export_path\t{}", export_path.display());
+            println!("train_holdout_consumed\tNO");
+            println!("historical_validation_consumed\tNO");
+            println!("historical_test_consumed\tNO");
+        }
         return Ok(());
     }
 
@@ -1850,6 +1911,158 @@ fn audit_tsv_field_v0380(value: &str) -> String {
         .replace('\r', " ")
 }
 
+fn read_selected_identity_keys_v0380(path: &Path) -> Result<BTreeSet<String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read selected identity manifest {path:?}"))?;
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("selected identity manifest is empty"))?;
+    let headers = header.split('\t').collect::<Vec<_>>();
+    let identity_index = headers
+        .iter()
+        .position(|value| *value == "identity_key")
+        .ok_or_else(|| anyhow::anyhow!("selected identity manifest lacks identity_key column"))?;
+    let mut identities = BTreeSet::<String>::new();
+    for (line_number, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let identity = fields
+            .get(identity_index)
+            .copied()
+            .unwrap_or_default()
+            .trim();
+        if identity.is_empty() {
+            anyhow::bail!(
+                "selected identity manifest has empty identity_key at line {}",
+                line_number + 2
+            );
+        }
+        if !identities.insert(identity.to_string()) {
+            anyhow::bail!("duplicate selected identity_key {identity:?}");
+        }
+    }
+    if identities.is_empty() {
+        anyhow::bail!("selected identity manifest contains no identities");
+    }
+    Ok(identities)
+}
+
+fn select_train_ccs_rows_v0380(
+    records: &[FoundationTrainingRecord],
+    benchmark: &FoundationBenchmarkManifest,
+    mobility_train_indices: &[usize],
+    selected: &BTreeSet<String>,
+) -> Result<Vec<(usize, String, String)>> {
+    let train_peptidoforms = benchmark
+        .entries
+        .iter()
+        .filter(|entry| entry.partition == FoundationPartition::Train)
+        .map(|entry| (entry.record_index, entry.peptidoform.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::<(usize, String, String)>::new();
+    for &record_index in mobility_train_indices {
+        let record = records
+            .get(record_index)
+            .ok_or_else(|| anyhow::anyhow!("selected TRAIN CCS record index is out of bounds"))?;
+        let peptidoform = train_peptidoforms.get(&record_index).ok_or_else(|| {
+            anyhow::anyhow!("selected TRAIN CCS record lacks benchmark peptidoform")
+        })?;
+        let charge = record
+            .context
+            .charge
+            .ok_or_else(|| anyhow::anyhow!("selected TRAIN CCS record lacks charge"))?;
+        let identity_key = format!("{peptidoform}|z{charge}");
+        if selected.contains(&identity_key) {
+            rows.push((record_index, identity_key, peptidoform.clone()));
+        }
+    }
+    if rows.is_empty() {
+        anyhow::bail!("no selected Stage B identities have finite TRAIN CCS/mobility labels");
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_selected_train_raw_ccs_predictions_v0380(
+    model: &PeptideFoundationMultimodalV0380Model,
+    collator: &FoundationCollator,
+    records: &[FoundationTrainingRecord],
+    provenance: &[FoundationRecordProvenance],
+    selected_rows: &[(usize, String, String)],
+    batch_size: usize,
+    normalization: &FoundationTargetNormalizationConfig,
+    device: &Device,
+    output: &Path,
+) -> Result<(usize, usize, f64)> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut text = String::from(
+        "record_index\tsource_id\tidentity_key\tsequence\tpeptidoform\tcharge\tprecursor_mz\ttarget_ccs\tpredicted_ccs\n",
+    );
+    let mut absolute_error = 0.0f64;
+    let mut count = 0usize;
+    let mut identities = BTreeSet::<String>::new();
+    for chunk in selected_rows.chunks(batch_size.max(1)) {
+        let owned = chunk
+            .iter()
+            .map(|(record_index, _, _)| records[*record_index].clone())
+            .collect::<Vec<_>>();
+        let batch = collator.collate(&owned, device, 0)?;
+        let physics = FoundationScalarPhysicsBatchV0360::from_records(
+            &owned,
+            model.forward_config().max_sequence_len,
+            device,
+        )?;
+        let (_, predicted_ccs) =
+            predicted_native_mobility_and_ccs(model, &batch, &physics, normalization, false)?;
+        let predicted = predicted_ccs.to_vec2::<f32>()?;
+        for (row, ((record_index, identity_key, peptidoform), record)) in
+            chunk.iter().zip(owned.iter()).enumerate()
+        {
+            let target = record
+                .ccs
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| anyhow::anyhow!("selected TRAIN CCS export lost finite target"))?;
+            let source = provenance
+                .get(*record_index)
+                .ok_or_else(|| anyhow::anyhow!("v0.38 TRAIN export missing provenance"))?;
+            let charge = record
+                .context
+                .charge
+                .ok_or_else(|| anyhow::anyhow!("v0.38 TRAIN export missing charge"))?;
+            let mz = record
+                .context
+                .precursor_mz
+                .ok_or_else(|| anyhow::anyhow!("v0.38 TRAIN export missing precursor m/z"))?;
+            let prediction = predicted[row][0];
+            absolute_error += f64::from((prediction - target).abs());
+            count += 1;
+            identities.insert(identity_key.clone());
+            text.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{:.8}\t{:.8}\t{:.8}\n",
+                record_index,
+                audit_tsv_field_v0380(&source.source_id),
+                audit_tsv_field_v0380(identity_key),
+                audit_tsv_field_v0380(&record.peptidoform.sequence),
+                audit_tsv_field_v0380(peptidoform),
+                charge,
+                mz,
+                target,
+                prediction,
+            ));
+        }
+    }
+    if count == 0 {
+        anyhow::bail!("v0.38 selected TRAIN audit export contains no finite CCS rows");
+    }
+    fs::write(output, text)?;
+    Ok((count, identities.len(), absolute_error / count as f64))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn export_raw_ccs_predictions_v0380(
     model: &PeptideFoundationMultimodalV0380Model,
@@ -2748,6 +2961,31 @@ mod tests {
             "pxd058337"
         );
         assert_eq!(source_family("ip2_bruker_human"), "ip2_bruker_human");
+    }
+
+    #[test]
+    fn v0380_selected_identity_manifest_reader_is_fail_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "redeem-v0380-selected-identities-{}.tsv",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "stage_b_order\tidentity_key\n1\tPEPTIDEK|z2\n2\tPEPTIDEK|z3\n",
+        )
+        .unwrap();
+        let identities = read_selected_identity_keys_v0380(&path).unwrap();
+        assert_eq!(identities.len(), 2);
+        assert!(identities.contains("PEPTIDEK|z2"));
+        assert!(identities.contains("PEPTIDEK|z3"));
+
+        fs::write(
+            &path,
+            "stage_b_order\tidentity_key\n1\tPEPTIDEK|z2\n2\tPEPTIDEK|z2\n",
+        )
+        .unwrap();
+        assert!(read_selected_identity_keys_v0380(&path).is_err());
+        let _ = fs::remove_file(path);
     }
 
     #[test]
