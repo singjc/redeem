@@ -50,7 +50,7 @@ FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
 RUN apt-get -o Acquire::Retries=5 update && \
     apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-        bash ca-certificates libgomp1 libssl3 libstdc++6 time && \
+        bash ca-certificates gzip libgomp1 libssl3 libstdc++6 time zstd && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
