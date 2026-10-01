@@ -38,7 +38,9 @@ if [ "$GPU_CC" != "80" ]; then
   exit 2
 fi
 
-mkdir -p "$OUT/export" "$OUT/comparison"
+mkdir -p "$OUT"
+[ ! -e "$OUT/export" ] || { echo "export output must remain fresh before exporter: $OUT/export" >&2; exit 2; }
+[ ! -e "$OUT/comparison" ] || { echo "comparison output must remain fresh before comparator: $OUT/comparison" >&2; exit 2; }
 bind_dirs="$({ dirname "$RUN_YAML"; dirname "$V052_BEST"; dirname "$OUT"; dirname "$REPORT_SCRIPT"; } | sort -u | paste -sd, -)"
 if [ -n "${REDEEM_SINGULARITY_BINDS:-}" ]; then
   bind_dirs="${bind_dirs},${REDEEM_SINGULARITY_BINDS}"
