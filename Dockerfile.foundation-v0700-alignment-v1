@@ -71,7 +71,7 @@ ENV PATH=/opt/redeem/bin:/usr/local/bin:${PATH}
 ENV REDEEM_FOUNDATION_IMAGE_PROFILE=v0700-spectrum-peptide-alignment-v1
 
 COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
-COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
+COPY scripts/redeem-container-info-v0700 /usr/local/bin/redeem-container-info
 
 RUN chmod 0755 /usr/local/bin/redeem-container-info /opt/redeem/bin/* && \
     command -v foundation_train_spectrum_alignment_v0700 && \
