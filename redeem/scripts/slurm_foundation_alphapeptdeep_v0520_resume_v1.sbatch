@@ -84,8 +84,8 @@ TEST_CONSUMED="$(read_metric historical_test_consumed)"
   exit 2
 }
 
-PRECURSOR_ROWS="$(awk 'END { print NR > 0 ? NR - 1 : 0 }' "$PRECURSORS")"
-CALIBRATION_ROWS="$(awk 'END { print NR > 0 ? NR - 1 : 0 }' "$RT_CALIBRATION")"
+PRECURSOR_ROWS="$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$PRECURSORS")"
+CALIBRATION_ROWS="$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "$RT_CALIBRATION")"
 [ "$PRECURSOR_ROWS" = "$EXPECTED_UNION_RECORDS" ] || {
   echo "precursor TSV row mismatch: $PRECURSOR_ROWS != $EXPECTED_UNION_RECORDS" >&2
   exit 2
