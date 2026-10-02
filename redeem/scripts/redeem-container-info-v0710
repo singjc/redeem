@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+expected_profile="v0710-spectrum-causal-decoder-v1"
+profile="${REDEEM_FOUNDATION_IMAGE_PROFILE:-$expected_profile}"
+
+if [ "$profile" != "$expected_profile" ]; then
+  echo "unexpected ReDeeM v0.71 foundation image profile: $profile" >&2
+  exit 2
+fi
+
+required=(
+  foundation_train_spectrum_causal_v0710
+)
+
+for executable in "${required[@]}"; do
+  command -v "$executable" >/dev/null 2>&1 || {
+    echo "missing required executable for profile $profile: $executable" >&2
+    exit 1
+  }
+done
+
+if [ "${1:-}" = "--build-check" ]; then
+  exit 0
+fi
+
+echo -e "redeem_container\tYES"
+echo -e "foundation_image_profile\t$profile"
+echo -e "v0710_spectrum_causal_decoder\t$(command -v foundation_train_spectrum_causal_v0710)"
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  echo -e "nvidia_runtime\tVISIBLE"
+  nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null || nvidia-smi -L || true
+else
+  echo -e "nvidia_runtime\tNOT_VISIBLE (expected during image build / CPU launch)"
+fi
