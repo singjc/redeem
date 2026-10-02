@@ -38,7 +38,7 @@ esac
   exit 2
 }
 
-MODEL_OUT="$OUT/model"
+MODEL_OUT="$OUT"
 if [ "$MODE" = "resume" ]; then
   [ -f "$MODEL_OUT/latest/model.safetensors" ] || {
     echo "v0.71 resume requires latest/model.safetensors" >&2
