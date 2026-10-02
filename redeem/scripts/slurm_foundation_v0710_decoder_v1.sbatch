@@ -40,16 +40,16 @@ esac
 
 MODEL_OUT="$OUT"
 if [ "$MODE" = "resume" ]; then
-  [ -f "$MODEL_OUT/latest/model.safetensors" ] || {
-    echo "v0.71 resume requires latest/model.safetensors" >&2
+  [ -f "$MODEL_OUT/model/latest/model.safetensors" ] || {
+    echo "v0.71 resume requires model/latest/model.safetensors" >&2
     exit 2
   }
-  [ -f "$MODEL_OUT/latest/optimizer.safetensors" ] || {
-    echo "v0.71 resume requires latest/optimizer.safetensors" >&2
+  [ -f "$MODEL_OUT/model/latest/optimizer.safetensors" ] || {
+    echo "v0.71 resume requires model/latest/optimizer.safetensors" >&2
     exit 2
   }
-  [ -f "$MODEL_OUT/best/model.safetensors" ] || {
-    echo "v0.71 resume requires best/model.safetensors" >&2
+  [ -f "$MODEL_OUT/model/best/model.safetensors" ] || {
+    echo "v0.71 resume requires model/best/model.safetensors" >&2
     exit 2
   }
 else
@@ -57,8 +57,14 @@ else
     echo "v0.71 $MODE output must be fresh: $OUT" >&2
     exit 2
   fi
-  mkdir -p "$OUT"
 fi
+
+AUX_OUT="${OUT}.launcher-${SLURM_JOB_ID:-manual}"
+if [ -e "$AUX_OUT" ]; then
+  echo "v0.71 launcher sidecar must be fresh: $AUX_OUT" >&2
+  exit 2
+fi
+mkdir -p "$AUX_OUT"
 
 ENGINE="$(command -v singularity)"
 [ -n "$ENGINE" ] || { echo "singularity is unavailable after module load" >&2; exit 127; }
@@ -107,12 +113,12 @@ if [ "$MODE" = "resume" ]; then
   RUN_TAG="resume_${SLURM_JOB_ID:-manual}"
 fi
 
-GPU_USAGE_CSV="$OUT/gpu_usage_${RUN_TAG}.csv"
-GPU_USAGE_SUMMARY="$OUT/gpu_usage_${RUN_TAG}_summary.tsv"
+GPU_USAGE_CSV="$AUX_OUT/gpu_usage_${RUN_TAG}.csv"
+GPU_USAGE_SUMMARY="$AUX_OUT/gpu_usage_${RUN_TAG}_summary.tsv"
 printf '%s\n' 'timestamp,index,gpu_util_percent,gpu_memory_util_percent,gpu_memory_used_mib,gpu_memory_total_mib' > "$GPU_USAGE_CSV"
 nvidia-smi \
   --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total \
-  --format=csv,noheader,nounits -l 5 >> "$GPU_USAGE_CSV" 2> "$OUT/gpu_usage_${RUN_TAG}.stderr" &
+  --format=csv,noheader,nounits -l 5 >> "$GPU_USAGE_CSV" 2> "$AUX_OUT/gpu_usage_${RUN_TAG}.stderr" &
 GPU_MONITOR_PID=$!
 
 cleanup() {
@@ -142,8 +148,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-LOG="$OUT/${RUN_TAG}.log"
-TIME_FILE="$OUT/${RUN_TAG}.time.txt"
+LOG="$AUX_OUT/${RUN_TAG}.log"
+TIME_FILE="$AUX_OUT/${RUN_TAG}.time.txt"
 
 srun "$ENGINE" exec --nv --bind "$bind_dirs" "$SIF" \
   /usr/bin/time -v -o "$TIME_FILE" \
@@ -162,4 +168,15 @@ srun "$ENGINE" exec --nv --bind "$bind_dirs" "$SIF" \
   2>&1 | tee "$LOG"
 
 run_rc=${PIPESTATUS[0]}
+
+cleanup
+trap - EXIT
+
+if [ -d "$OUT" ]; then
+  find "$AUX_OUT" -mindepth 1 -maxdepth 1 -exec mv -t "$OUT" -- {} +
+  rmdir "$AUX_OUT"
+else
+  echo "v0.71 trainer did not create output root; launcher logs retained at $AUX_OUT" >&2
+fi
+
 exit "$run_rc"
