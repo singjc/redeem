@@ -18,14 +18,14 @@ use candle_nn::{VarBuilder, VarMap};
 use redeem_properties::foundation::{
     foundation_causal_next_token_loss, foundation_direct_beam_search,
     foundation_direct_conditioning_loss, foundation_direct_prefix_competitive_loss,
-    foundation_direct_shuffled_order, foundation_precursor_neutral_mass, load_foundation_corpus,
-    read_foundation_training_run_config, DirectDecoderBeamConfig, FoundationAdamW,
-    FoundationAdamWConfig, FoundationBenchmarkManifest, FoundationCausalCollator,
-    FoundationDiffusionConfig, FoundationDiffusionVocabulary, FoundationLearningRateSchedule,
-    FoundationPartition, FoundationSpectrum, FoundationSpectrumCollator, FoundationTrainingRecord,
-    PeptideSpectrumCausalModel, PrecursorContextBatch, FOUNDATION_DIFFUSION_PAD,
-    FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190, FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
-    FOUNDATION_DIRECT_PREFIX_MARGIN_V0191,
+    foundation_direct_shuffled_order, foundation_peptidoform_neutral_mass,
+    foundation_precursor_neutral_mass, load_foundation_corpus, read_foundation_training_run_config,
+    DirectDecoderBeamConfig, FoundationAdamW, FoundationAdamWConfig, FoundationBenchmarkManifest,
+    FoundationCausalCollator, FoundationDiffusionConfig, FoundationDiffusionVocabulary,
+    FoundationLearningRateSchedule, FoundationPartition, FoundationSpectrum,
+    FoundationSpectrumCollator, FoundationTrainingRecord, PeptideSpectrumCausalModel,
+    PrecursorContextBatch, FOUNDATION_DIFFUSION_PAD, FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+    FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190, FOUNDATION_DIRECT_PREFIX_MARGIN_V0191,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -193,6 +193,16 @@ struct PropertyAvailability {
     both: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct MassFeasibilityAudit {
+    basic_eligible_records: usize,
+    mass_feasible_records: usize,
+    mass_infeasible_records: usize,
+    mass_feasible_unique_identities: usize,
+    mean_abs_mass_error_da: f64,
+    max_abs_mass_error_da: f64,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || args.len() > 12 {
@@ -263,14 +273,14 @@ fn main() -> Result<()> {
     decoder_config.validate().map_err(anyhow::Error::msg)?;
 
     let vocabulary = FoundationDiffusionVocabulary;
-    let train_groups = build_groups(
+    let (train_groups, train_mass_audit) = build_groups(
         &corpus.records,
         &benchmark,
         FoundationPartition::Train,
         &decoder_config,
         vocabulary,
     )?;
-    let dev_groups = build_groups(
+    let (dev_groups, dev_mass_audit) = build_groups(
         &corpus.records,
         &benchmark,
         FoundationPartition::Validation,
@@ -394,6 +404,8 @@ fn main() -> Result<()> {
     println!("optional_property_reason\treserved_for_matched_post_v071_ablation");
     println!("train_eligible_unique_identities\t{}", train_groups.len());
     println!("dev_eligible_unique_identities\t{}", dev_groups.len());
+    print_mass_feasibility("train_mass_feasibility", train_mass_audit);
+    print_mass_feasibility("dev_mass_feasibility", dev_mass_audit);
     println!("dev_generation_identities\t{}", dev_indices.len());
     println!("dev_identity_fingerprint\t{dev_fingerprint}");
     print_property_availability("train_property_availability", train_availability);
@@ -858,8 +870,11 @@ fn build_groups(
     partition: FoundationPartition,
     config: &FoundationDiffusionConfig,
     vocabulary: FoundationDiffusionVocabulary,
-) -> Result<Vec<IdentityGroup>> {
+) -> Result<(Vec<IdentityGroup>, MassFeasibilityAudit)> {
     let mut groups = BTreeMap::<String, IdentityGroup>::new();
+    let mut audit = MassFeasibilityAudit::default();
+    let mut abs_mass_error_sum = 0.0f64;
+
     for entry in benchmark
         .entries
         .iter()
@@ -871,12 +886,14 @@ fn build_groups(
         let Some(charge) = record.context.charge else {
             continue;
         };
+        let Some(precursor_mz) = record
+            .context
+            .precursor_mz
+            .filter(|v| v.is_finite() && *v > 0.0)
+        else {
+            continue;
+        };
         if charge <= 0
-            || record
-                .context
-                .precursor_mz
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .is_none()
             || FoundationSpectrum::from_training_record(record).is_none()
             || vocabulary
                 .encode(&record.peptidoform, config.max_tokens)
@@ -884,6 +901,21 @@ fn build_groups(
         {
             continue;
         }
+
+        audit.basic_eligible_records += 1;
+        let target_mass =
+            foundation_peptidoform_neutral_mass(&record.peptidoform).map_err(anyhow::Error::msg)?;
+        let precursor_mass = foundation_precursor_neutral_mass(f64::from(precursor_mz), charge)
+            .map_err(anyhow::Error::msg)?;
+        let abs_error = (target_mass - precursor_mass).abs();
+        abs_mass_error_sum += abs_error;
+        audit.max_abs_mass_error_da = audit.max_abs_mass_error_da.max(abs_error);
+        if abs_error > V071_MASS_TOLERANCE_DA {
+            audit.mass_infeasible_records += 1;
+            continue;
+        }
+        audit.mass_feasible_records += 1;
+
         let key = format!("{}|z{charge}", entry.peptidoform);
         groups
             .entry(key.clone())
@@ -894,7 +926,31 @@ fn build_groups(
             .record_indices
             .push(entry.record_index);
     }
-    Ok(groups.into_values().collect())
+
+    audit.mass_feasible_unique_identities = groups.len();
+    audit.mean_abs_mass_error_da = if audit.basic_eligible_records > 0 {
+        abs_mass_error_sum / audit.basic_eligible_records as f64
+    } else {
+        0.0
+    };
+    Ok((groups.into_values().collect(), audit))
+}
+
+fn print_mass_feasibility(label: &str, audit: MassFeasibilityAudit) {
+    let feasible_fraction = if audit.basic_eligible_records > 0 {
+        audit.mass_feasible_records as f64 / audit.basic_eligible_records as f64
+    } else {
+        0.0
+    };
+    println!(
+        "{label}\tbasic_records={}\tmass_feasible_records={}\tmass_infeasible_records={}\tmass_feasible_fraction={feasible_fraction:.6}\tmass_feasible_unique_identities={}\tmean_abs_mass_error_da={:.6}\tmax_abs_mass_error_da={:.6}",
+        audit.basic_eligible_records,
+        audit.mass_feasible_records,
+        audit.mass_infeasible_records,
+        audit.mass_feasible_unique_identities,
+        audit.mean_abs_mass_error_da,
+        audit.max_abs_mass_error_da,
+    );
 }
 
 fn select_identity_records(
