@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=redeem-v0711
-#SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
