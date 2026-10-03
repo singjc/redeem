@@ -26,7 +26,8 @@ use redeem_properties::foundation::{
     FoundationSpectrumEncoder, FoundationTrainingRecord, PeptideSpectrumChemistryDecoder,
     PeptidoformInput, PrecursorContextBatch, FOUNDATION_CHEMISTRY_DECODER_ARCHITECTURE_V0200,
     FOUNDATION_CHEMISTRY_DECODER_OBJECTIVE_V0200, FOUNDATION_DIFFUSION_PAD,
-    FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190, FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
+    FOUNDATION_DIFFUSION_VOCAB_SIZE, FOUNDATION_DIRECT_CONDITIONING_MARGIN_V0190,
+    FOUNDATION_DIRECT_CONDITIONING_WEIGHT_V0190,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -54,6 +55,8 @@ const V0711_SEED: u64 = 20_261_071_1;
 const V0711_LEARNING_RATE: f64 = 1.0e-4;
 const V0711_WEIGHT_DECAY: f64 = 1.0e-4;
 const V0711_MAX_GRADIENT_NORM: f64 = 5.0;
+const V0200_LEGACY_VOCAB_SIZE: usize = 28;
+const V0711_DISABLED_APPENDED_TOKEN_BIAS: f32 = -1.0e9;
 
 #[derive(Debug, Clone, Deserialize)]
 struct V070Metadata {
@@ -154,6 +157,8 @@ struct PropertyAvailability {
 #[derive(Debug, Clone, Copy, Default)]
 struct MassFeasibilityAudit {
     basic_eligible_records: usize,
+    legacy_vocab_compatible_records: usize,
+    legacy_vocab_incompatible_records: usize,
     mass_feasible_records: usize,
     mass_infeasible_records: usize,
     mass_feasible_unique_identities: usize,
@@ -186,6 +191,119 @@ struct V0711Metadata {
     residual_gate: f32,
     teacher: TeacherMetrics,
     generation: GenerationMetrics,
+    v0200_checkpoint_vocab_size: usize,
+    current_vocab_size: usize,
+    v0200_exact_loaded_variables: usize,
+    v0200_vocab_expanded_variables: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V0200CompatibilityLoadReport {
+    checkpoint_vocab_size: usize,
+    current_vocab_size: usize,
+    exact_loaded_variables: usize,
+    vocab_expanded_variables: usize,
+}
+
+fn load_v0200_legacy_vocab_checkpoint(
+    varmap: &VarMap,
+    path: &Path,
+    device: &Device,
+    model_dim: usize,
+) -> Result<V0200CompatibilityLoadReport> {
+    if FOUNDATION_DIFFUSION_VOCAB_SIZE != V0200_LEGACY_VOCAB_SIZE + 1 {
+        anyhow::bail!(
+            "v0.71.1 compatibility loader expects exactly one appended token: legacy={} current={}",
+            V0200_LEGACY_VOCAB_SIZE,
+            FOUNDATION_DIFFUSION_VOCAB_SIZE
+        );
+    }
+    let checkpoint = candle_core::safetensors::load(path, device)
+        .with_context(|| format!("load v0.20 SafeTensors {path:?}"))?;
+    let data = varmap
+        .data()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("v0.71.1 v0.20 VarMap lock poisoned"))?;
+    let mut exact_loaded_variables = 0usize;
+    let mut vocab_expanded_variables = 0usize;
+
+    for (name, variable) in data.iter() {
+        let tensor = checkpoint
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("v0.20 checkpoint missing required tensor {name}"))?;
+        if variable.as_tensor().dims() == tensor.dims() {
+            variable.set(tensor)?;
+            exact_loaded_variables += 1;
+            continue;
+        }
+
+        match name.as_str() {
+            "decoder.token_embedding.weight" | "decoder.token_head.weight" => {
+                let current_shape = variable.as_tensor().dims2()?;
+                let checkpoint_shape = tensor.dims2()?;
+                if current_shape != (FOUNDATION_DIFFUSION_VOCAB_SIZE, model_dim)
+                    || checkpoint_shape != (V0200_LEGACY_VOCAB_SIZE, model_dim)
+                {
+                    anyhow::bail!(
+                        "unsupported v0.20 vocabulary expansion for {name}: current {:?}, checkpoint {:?}",
+                        current_shape,
+                        checkpoint_shape
+                    );
+                }
+                let appended = Tensor::zeros((1, model_dim), DType::F32, device)?;
+                let expanded = Tensor::cat(&[tensor, &appended], 0)?;
+                variable.set(&expanded)?;
+                vocab_expanded_variables += 1;
+            }
+            "decoder.token_head.bias" => {
+                let current_size = variable.as_tensor().dims1()?;
+                let checkpoint_size = tensor.dims1()?;
+                if current_size != FOUNDATION_DIFFUSION_VOCAB_SIZE
+                    || checkpoint_size != V0200_LEGACY_VOCAB_SIZE
+                {
+                    anyhow::bail!(
+                        "unsupported v0.20 token-head bias expansion: current {} checkpoint {}",
+                        current_size,
+                        checkpoint_size
+                    );
+                }
+                let appended = Tensor::new(&[V0711_DISABLED_APPENDED_TOKEN_BIAS], device)?;
+                let expanded = Tensor::cat(&[tensor, &appended], 0)?;
+                variable.set(&expanded)?;
+                vocab_expanded_variables += 1;
+            }
+            _ => {
+                anyhow::bail!(
+                    "v0.20 warm-start shape mismatch outside the known appended-vocabulary tensors for '{name}': current {:?}, checkpoint {:?}",
+                    variable.as_tensor().dims(),
+                    tensor.dims()
+                );
+            }
+        }
+    }
+
+    if vocab_expanded_variables != 3 {
+        anyhow::bail!(
+            "v0.71.1 expected exactly three 28->29 vocabulary tensors, expanded {}",
+            vocab_expanded_variables
+        );
+    }
+    if exact_loaded_variables == 0 {
+        anyhow::bail!("v0.71.1 v0.20 compatibility loader loaded zero exact tensors");
+    }
+
+    Ok(V0200CompatibilityLoadReport {
+        checkpoint_vocab_size: V0200_LEGACY_VOCAB_SIZE,
+        current_vocab_size: FOUNDATION_DIFFUSION_VOCAB_SIZE,
+        exact_loaded_variables,
+        vocab_expanded_variables,
+    })
+}
+
+fn v0200_legacy_vocab_compatible(tokens: &[u32]) -> bool {
+    tokens
+        .iter()
+        .all(|&token| token < V0200_LEGACY_VOCAB_SIZE as u32)
 }
 
 struct SpectrumResidualAdapter {
@@ -347,12 +465,12 @@ fn main() -> Result<()> {
         decoder_config.clone(),
         VarBuilder::from_varmap(&decoder_varmap, DType::F32, &device),
     )?;
-    decoder_varmap.load(&v0200_model_path).with_context(|| {
-        format!(
-            "load exact v0.20 decoder checkpoint {}",
-            v0200_model_path.display()
-        )
-    })?;
+    let v0200_load = load_v0200_legacy_vocab_checkpoint(
+        &decoder_varmap,
+        &v0200_model_path,
+        &device,
+        decoder_config.model_dim,
+    )?;
 
     let mut v070_varmap = VarMap::new();
     let v070_encoder = FoundationSpectrumEncoder::new(
@@ -430,7 +548,24 @@ fn main() -> Result<()> {
     println!("parent_v0200_global_step\t{}", v0200_meta.global_step);
     println!("parent_v0200_objective\t{}", v0200_meta.objective);
     println!("parent_v0200_architecture\t{}", v0200_meta.architecture);
-    println!("decoder_update_policy\tfrozen_exact_v0200_checkpoint");
+    println!(
+        "parent_v0200_checkpoint_vocab_size\t{}",
+        v0200_load.checkpoint_vocab_size
+    );
+    println!(
+        "current_decoder_vocab_size\t{}",
+        v0200_load.current_vocab_size
+    );
+    println!(
+        "v0200_exact_loaded_variables\t{}",
+        v0200_load.exact_loaded_variables
+    );
+    println!(
+        "v0200_vocab_expanded_variables\t{}",
+        v0200_load.vocab_expanded_variables
+    );
+    println!("v0200_appended_token_policy\tdisable_token_28_with_zero_embedding_zero_head_weight_bias_minus_1e9");
+    println!("decoder_update_policy\tfrozen_v0200_checkpoint_legacy28_to_current29_appended_token_disabled");
     println!("v070_update_policy\tfrozen_selected_v070_spectrum_encoder");
     println!("adapter_update_policy\tprojection_plus_scalar_gate_only");
     println!(
@@ -544,6 +679,10 @@ fn main() -> Result<()> {
             residual_gate: adapter.gate_value()?,
             teacher: initial_teacher,
             generation: initial_generation,
+            v0200_checkpoint_vocab_size: v0200_load.checkpoint_vocab_size,
+            current_vocab_size: v0200_load.current_vocab_size,
+            v0200_exact_loaded_variables: v0200_load.exact_loaded_variables,
+            v0200_vocab_expanded_variables: v0200_load.vocab_expanded_variables,
         },
         &initial_outcomes,
     )?;
@@ -727,6 +866,10 @@ fn main() -> Result<()> {
             residual_gate: adapter.gate_value()?,
             teacher: final_teacher,
             generation: final_generation,
+            v0200_checkpoint_vocab_size: v0200_load.checkpoint_vocab_size,
+            current_vocab_size: v0200_load.current_vocab_size,
+            v0200_exact_loaded_variables: v0200_load.exact_loaded_variables,
+            v0200_vocab_expanded_variables: v0200_load.vocab_expanded_variables,
         },
         &final_outcomes,
     )?;
@@ -1376,16 +1519,20 @@ fn build_groups(
         else {
             continue;
         };
-        if charge <= 0
-            || FoundationSpectrum::from_training_record(record).is_none()
-            || vocabulary
-                .encode(&record.peptidoform, config.max_tokens)
-                .is_err()
-        {
+        if charge <= 0 || FoundationSpectrum::from_training_record(record).is_none() {
             continue;
         }
+        let tokens = match vocabulary.encode(&record.peptidoform, config.max_tokens) {
+            Ok(tokens) => tokens,
+            Err(_) => continue,
+        };
 
         audit.basic_eligible_records += 1;
+        if !v0200_legacy_vocab_compatible(&tokens) {
+            audit.legacy_vocab_incompatible_records += 1;
+            continue;
+        }
+        audit.legacy_vocab_compatible_records += 1;
         let target_mass =
             foundation_peptidoform_neutral_mass(&record.peptidoform).map_err(anyhow::Error::msg)?;
         let precursor_mass = foundation_precursor_neutral_mass(f64::from(precursor_mz), charge)
@@ -1411,8 +1558,8 @@ fn build_groups(
     }
 
     audit.mass_feasible_unique_identities = groups.len();
-    audit.mean_abs_mass_error_da = if audit.basic_eligible_records > 0 {
-        abs_mass_error_sum / audit.basic_eligible_records as f64
+    audit.mean_abs_mass_error_da = if audit.legacy_vocab_compatible_records > 0 {
+        abs_mass_error_sum / audit.legacy_vocab_compatible_records as f64
     } else {
         0.0
     };
@@ -1420,14 +1567,16 @@ fn build_groups(
 }
 
 fn print_mass_feasibility(label: &str, audit: MassFeasibilityAudit) {
-    let feasible_fraction = if audit.basic_eligible_records > 0 {
-        audit.mass_feasible_records as f64 / audit.basic_eligible_records as f64
+    let feasible_fraction = if audit.legacy_vocab_compatible_records > 0 {
+        audit.mass_feasible_records as f64 / audit.legacy_vocab_compatible_records as f64
     } else {
         0.0
     };
     println!(
-        "{label}\tbasic_records={}\tmass_feasible_records={}\tmass_infeasible_records={}\tmass_feasible_fraction={feasible_fraction:.6}\tmass_feasible_unique_identities={}\tmean_abs_mass_error_da={:.6}\tmax_abs_mass_error_da={:.6}",
+        "{label}\tbasic_records={}\tlegacy_vocab_compatible_records={}\tlegacy_vocab_incompatible_records={}\tmass_feasible_records={}\tmass_infeasible_records={}\tmass_feasible_fraction={feasible_fraction:.6}\tmass_feasible_unique_identities={}\tmean_abs_mass_error_da={:.6}\tmax_abs_mass_error_da={:.6}",
         audit.basic_eligible_records,
+        audit.legacy_vocab_compatible_records,
+        audit.legacy_vocab_incompatible_records,
         audit.mass_feasible_records,
         audit.mass_infeasible_records,
         audit.mass_feasible_unique_identities,
@@ -1810,5 +1959,12 @@ mod tests {
     #[test]
     fn v0711_il_equivalence_collapses_isoleucine() {
         assert_eq!(il_sequence("PEPTIDE"), il_sequence("PEPTLDE"));
+    }
+
+    #[test]
+    fn v0711_legacy_v0200_vocab_excludes_appended_phospho_token() {
+        assert!(v0200_legacy_vocab_compatible(&[0, 2, 3, 27]));
+        assert!(!v0200_legacy_vocab_compatible(&[0, 2, 28]));
+        assert_eq!(V0200_LEGACY_VOCAB_SIZE + 1, FOUNDATION_DIFFUSION_VOCAB_SIZE);
     }
 }
