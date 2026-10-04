@@ -362,7 +362,7 @@ const V074_MASS_POOL: usize = 1024;
 const V074_MASS64: usize = 64;
 const V074_MASS256: usize = 256;
 const V074_RETRIEVAL_SHORTLIST: usize = 64;
-const V074_CANDIDATE_BATCH: usize = 256;
+const V074_CANDIDATE_BATCH: usize = 64;
 const V074_QUERY_BATCH: usize = 64;
 const V074_PRECURSOR_PPM: f64 = 20.0;
 const V074_PRECURSOR_ABS_DA: f64 = 0.02;
@@ -697,6 +697,7 @@ fn main() -> Result<()> {
     println!("target_forcing\tNO");
     println!("forward_ms2_intensity\tNO");
     println!("mass_pool\t{V074_MASS_POOL}");
+    println!("candidate_encoding_batch\t{V074_CANDIDATE_BATCH}");
     println!("retrieval_shortlist\t{V074_RETRIEVAL_SHORTLIST}");
     println!(
         "parent_v070_dev_identity_count\t{}",
@@ -3004,5 +3005,11 @@ mod v074_tests {
         assert_eq!(metrics.il_top1, 0.5);
         assert_eq!(metrics.exact_mrr, 0.5);
         assert_eq!(metrics.il_mrr, 0.5);
+    }
+
+    #[test]
+    fn v074_full_candidate_encoding_uses_v070_proven_batch_bound() {
+        assert!(V074_CANDIDATE_BATCH <= 64);
+        assert!(V074_CANDIDATE_BATCH > 0);
     }
 }
