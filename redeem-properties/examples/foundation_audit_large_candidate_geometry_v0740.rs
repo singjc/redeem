@@ -1,11 +1,11 @@
-//! v0.74 large-DEV candidate-universe retrieval + deterministic fragment-geometry audit.
+//! v0.74.2 charge-compatible large-DEV candidate-universe retrieval + deterministic fragment-geometry audit.
 //!
 //! Scientific contract:
 //! - reproduce the selected v0.70 2,048-identity DEV checkpoint exactly before interpretation;
 //! - keep the exact v0.73/v0.73.1 query cohort for controlled comparison;
 //! - expand candidates to every source-closed DEV-eligible unique peptidoform+charge identity;
 //! - never insert or force the true target into any mass pool or retrieval shortlist;
-//! - build a fixed nearest-neutral-mass 1,024-candidate pool per query;
+//! - constrain candidates to the observed precursor charge, then build a fixed nearest-neutral-mass 1,024-candidate pool per query;
 //! - compare frozen v0.70 retrieval, geometry-only ranking of all 1,024, and one fixed
 //!   two-stage policy (v0.70 top-64 -> deterministic geometry reranking);
 //! - report nearest-64/256/1024 target coverage and 20-ppm/0.02-Da candidate density;
@@ -349,11 +349,11 @@ struct V073AttributionScores {
     shuffled_core_cosine: f64,
 }
 
-const V074_VERSION: u32 = 740;
+const V074_VERSION: u32 = 742;
 const V074_OBJECTIVE: &str =
-    "v0740_large_dev_candidate_retrieval_plus_deterministic_fragment_geometry_reranking";
+    "v0742_charge_compatible_large_dev_candidate_retrieval_plus_deterministic_fragment_geometry_reranking";
 const V074_ARCHITECTURE: &str =
-    "frozen_v070_full_dev_candidate_retrieval_plus_mass1024_geometry_reranking";
+    "frozen_v070_full_dev_charge_compatible_candidate_retrieval_plus_mass1024_geometry_reranking";
 const V074_SCORE: &str = "open_ptm_core_b1_b2_y1_y2_uniform_sqrt_intensity_cosine_20ppm_abs0p02Da";
 const V074_SEED: u64 = 20_261_074;
 const V074_SMOKE_QUERIES: usize = 32;
@@ -676,7 +676,7 @@ fn main() -> Result<()> {
     let v052_checksum_initial = varmap_checksum(&v052_varmap)?;
     let v070_checksum_initial = varmap_checksum(&v070_varmap)?;
 
-    println!("v0740_version\tv0.74-large-dev-candidate-geometry-audit");
+    println!("v0742_version\tv0.74.2-charge-compatible-large-dev-candidate-geometry-audit");
     println!("objective\t{V074_OBJECTIVE}");
     println!("architecture\t{V074_ARCHITECTURE}");
     println!("score\t{V074_SCORE}");
@@ -692,7 +692,10 @@ fn main() -> Result<()> {
     );
     println!("parent_update_policy\tfrozen_v070_plus_frozen_v052_no_trainable_variables");
     println!("candidate_universe_policy\tall_source_closed_dev_eligible_unique_peptidoform_charge_identities");
-    println!("candidate_policy\tnearest_neutral_mass1024_no_target_forcing");
+    println!(
+        "candidate_policy\tobserved_charge_compatible_nearest_neutral_mass1024_no_target_forcing"
+    );
+    println!("precursor_charge_policy\tmatch_observed_query_charge");
     println!("two_stage_policy\tv070_top64_within_mass1024_then_geometry");
     println!("target_forcing\tNO");
     println!("forward_ms2_intensity\tNO");
@@ -724,7 +727,7 @@ fn main() -> Result<()> {
         64,
         &device,
     )?;
-    print_parent_retrieval("v0740_parent_v070_reproduction", parent_baseline);
+    print_parent_retrieval("v0742_parent_v070_reproduction", parent_baseline);
     let reproduction_delta =
         (parent_baseline.selection_score() - parent_v070_metadata.dev_selection_score).abs();
     if reproduction_delta > 1.0e-5 {
@@ -735,7 +738,7 @@ fn main() -> Result<()> {
             reproduction_delta
         );
     }
-    println!("v0740_parent_reproduction_gate\tPASS\tdelta={reproduction_delta:.8}");
+    println!("v0742_parent_reproduction_gate\tPASS\tdelta={reproduction_delta:.8}");
 
     fs::create_dir_all(&output_root)?;
     let encode_started = Instant::now();
@@ -762,7 +765,7 @@ fn main() -> Result<()> {
         .to_vec2::<f32>()?;
     let candidate_encoding_seconds = encode_started.elapsed().as_secs_f64();
 
-    let mass_sorted = mass_sorted_candidates_v074(&full_identities);
+    let mass_sorted_by_charge = mass_sorted_candidates_by_charge_v074(&full_identities);
     let candidate_geometry = precompute_candidate_geometry_v074(&corpus.records, &full_identities)?;
 
     let scoring_started = Instant::now();
@@ -772,7 +775,7 @@ fn main() -> Result<()> {
         &full_query_indices,
         &selected_query_indices,
         &similarities,
-        &mass_sorted,
+        &mass_sorted_by_charge,
         &candidate_geometry,
     )?;
     metrics.candidate_encoding_seconds = candidate_encoding_seconds;
@@ -800,33 +803,33 @@ fn main() -> Result<()> {
     let geometry_gain = metrics.geometry_mass1024.il_top1 - metrics.retrieval_mass1024.il_top1;
     let gate_gain = geometry_gain >= V074_MIN_TWO_STAGE_GAIN_OVER_RETRIEVAL;
 
-    println!("v0740_geometry_top1_gain_over_retrieval\t{geometry_gain:.8}");
+    println!("v0742_geometry_top1_gain_over_retrieval\t{geometry_gain:.8}");
     println!(
-        "v0740_gate_candidate_universe_ge_10x_parent\t{}",
+        "v0742_gate_candidate_universe_ge_10x_parent\t{}",
         pass_fail(gate_universe)
     );
     println!(
-        "v0740_gate_mass1024_il_coverage_ge_0_99\t{}",
+        "v0742_gate_mass1024_il_coverage_ge_0_99\t{}",
         pass_fail(gate_mass_coverage)
     );
     println!(
-        "v0740_gate_geometry_mass1024_il_top1_ge_0_85\t{}",
+        "v0742_gate_geometry_mass1024_il_top1_ge_0_85\t{}",
         pass_fail(gate_geometry_top1)
     );
     println!(
-        "v0740_gate_geometry_mass1024_il_top10_ge_0_97\t{}",
+        "v0742_gate_geometry_mass1024_il_top10_ge_0_97\t{}",
         pass_fail(gate_geometry_top10)
     );
     println!(
-        "v0740_gate_shortlist64_il_coverage_ge_0_90\t{}",
+        "v0742_gate_shortlist64_il_coverage_ge_0_90\t{}",
         pass_fail(gate_shortlist_coverage)
     );
     println!(
-        "v0740_gate_two_stage_il_top1_ge_0_85\t{}",
+        "v0742_gate_two_stage_il_top1_ge_0_85\t{}",
         pass_fail(gate_two_stage_top1)
     );
     println!(
-        "v0740_gate_geometry_top1_gain_over_retrieval_ge_0_10\t{}",
+        "v0742_gate_geometry_top1_gain_over_retrieval_ge_0_10\t{}",
         pass_fail(gate_gain)
     );
 
@@ -846,7 +849,7 @@ fn main() -> Result<()> {
     } else {
         "GEOMETRY_SCALABILITY_NOT_PROVEN"
     };
-    println!("v0740_audit_decision\t{decision}");
+    println!("v0742_audit_decision\t{decision}");
     println!("train_holdout_consumed\tNO");
     println!("historical_validation_consumed\tNO");
     println!("historical_test_consumed\tNO");
@@ -959,18 +962,23 @@ fn encode_query_alignment_v074(
     )?)
 }
 
-fn mass_sorted_candidates_v074(identities: &[RerankIdentity]) -> Vec<(f64, usize)> {
-    let mut out = identities
-        .iter()
-        .enumerate()
-        .map(|(index, identity)| (identity.candidate_neutral_mass, index))
-        .collect::<Vec<_>>();
-    out.sort_by(|left, right| {
-        left.0
-            .partial_cmp(&right.0)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.1.cmp(&right.1))
-    });
+fn mass_sorted_candidates_by_charge_v074(
+    identities: &[RerankIdentity],
+) -> BTreeMap<i32, Vec<(f64, usize)>> {
+    let mut out = BTreeMap::<i32, Vec<(f64, usize)>>::new();
+    for (index, identity) in identities.iter().enumerate() {
+        out.entry(identity.charge)
+            .or_default()
+            .push((identity.candidate_neutral_mass, index));
+    }
+    for rows in out.values_mut() {
+        rows.sort_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+    }
     out
 }
 
@@ -1128,7 +1136,7 @@ fn audit_large_candidate_geometry_v074(
     full_query_indices: &[usize],
     selected_query_indices: &[usize],
     similarities: &[Vec<f32>],
-    mass_sorted: &[(f64, usize)],
+    mass_sorted_by_charge: &BTreeMap<i32, Vec<(f64, usize)>>,
     candidate_geometry: &[Vec<f64>],
 ) -> Result<(V074Metrics, Vec<V074QueryDiagnostic>)> {
     if full_query_indices.len() != selected_query_indices.len()
@@ -1173,8 +1181,17 @@ fn audit_large_candidate_geometry_v074(
             .ok_or_else(|| anyhow::anyhow!("v0.74 query lacks observed spectrum"))?;
         let peaks = normalized_retained_peaks_v073(&spectrum);
 
-        let mass1024 =
-            nearest_mass_pool_v074(mass_sorted, query.observed_neutral_mass, V074_MASS_POOL);
+        let charge_mass_sorted = mass_sorted_by_charge.get(&query.charge).ok_or_else(|| {
+            anyhow::anyhow!(
+                "v0.74.2 no charge-compatible candidate universe for observed charge {}",
+                query.charge
+            )
+        })?;
+        let mass1024 = nearest_mass_pool_v074(
+            charge_mass_sorted,
+            query.observed_neutral_mass,
+            V074_MASS_POOL,
+        );
         let mass64 = mass1024
             .iter()
             .copied()
@@ -1185,7 +1202,15 @@ fn audit_large_candidate_geometry_v074(
             .copied()
             .take(V074_MASS256)
             .collect::<Vec<_>>();
-        let tolerance_pool = tolerance_candidates_v074(mass_sorted, query.observed_neutral_mass);
+        let tolerance_pool =
+            tolerance_candidates_v074(charge_mass_sorted, query.observed_neutral_mass);
+        if mass1024
+            .iter()
+            .chain(tolerance_pool.iter())
+            .any(|&index| identities[index].charge != query.charge)
+        {
+            anyhow::bail!("v0.74.2 charge-incompatible candidate escaped precursor-charge filter");
+        }
 
         let mass64_exact_covered = pool_exact_covered_v074(&mass64, identities, query);
         let mass64_il_covered = pool_il_covered_v074(&mass64, identities, query);
@@ -1387,14 +1412,14 @@ fn assert_frozen_checksum_v074(label: &str, initial: f64, current: f64) -> Resul
         );
     }
     println!(
-        "v0740_freeze_audit\tcomponent={label}\tstatus=PASS\tchecksum={current:.8}\tdelta={delta:.8}"
+        "v0742_freeze_audit\tcomponent={label}\tstatus=PASS\tchecksum={current:.8}\tdelta={delta:.8}"
     );
     Ok(())
 }
 
 fn print_v074_metrics(m: &V074Metrics) {
     println!(
-        "v0740_audit\tqueries={}\tcandidate_universe={}\tuniverse_multiple={:.3}\tmass64_il_coverage={:.6}\tmass256_il_coverage={:.6}\tmass1024_il_coverage={:.6}\tshortlist64_il_coverage={:.6}\ttolerance20ppm_mean_candidates={:.3}\ttolerance20ppm_median_candidates={:.3}\ttolerance20ppm_il_coverage={:.6}\tretrieval_il_top1={:.6}\tretrieval_il_top10={:.6}\tretrieval_il_mrr={:.6}\tgeometry_il_top1={:.6}\tgeometry_il_top10={:.6}\tgeometry_il_mrr={:.6}\ttwo_stage_il_top1={:.6}\ttwo_stage_il_top10={:.6}\ttwo_stage_il_mrr={:.6}\tgeometry_target_beats_negative={:.6}\tmean_retrieval_geometry_pearson={:.6}\tcandidate_encoding_seconds={:.3}\tscoring_seconds={:.3}\telapsed_seconds={:.3}",
+        "v0742_audit\tqueries={}\tcandidate_universe={}\tuniverse_multiple={:.3}\tmass64_il_coverage={:.6}\tmass256_il_coverage={:.6}\tmass1024_il_coverage={:.6}\tshortlist64_il_coverage={:.6}\ttolerance20ppm_mean_candidates={:.3}\ttolerance20ppm_median_candidates={:.3}\ttolerance20ppm_il_coverage={:.6}\tretrieval_il_top1={:.6}\tretrieval_il_top10={:.6}\tretrieval_il_mrr={:.6}\tgeometry_il_top1={:.6}\tgeometry_il_top10={:.6}\tgeometry_il_mrr={:.6}\ttwo_stage_il_top1={:.6}\ttwo_stage_il_top10={:.6}\ttwo_stage_il_mrr={:.6}\tgeometry_target_beats_negative={:.6}\tmean_retrieval_geometry_pearson={:.6}\tcandidate_encoding_seconds={:.3}\tscoring_seconds={:.3}\telapsed_seconds={:.3}",
         m.queries,
         m.candidate_universe,
         m.candidate_universe_multiple_vs_v070,
@@ -3005,6 +3030,42 @@ mod v074_tests {
         assert_eq!(metrics.il_top1, 0.5);
         assert_eq!(metrics.exact_mrr, 0.5);
         assert_eq!(metrics.il_mrr, 0.5);
+    }
+
+    #[test]
+    fn v074_charge_compatible_mass_index_excludes_other_precursor_charges() {
+        let identities = vec![
+            RerankIdentity {
+                record_index: 0,
+                exact_key: "PEPTIDE|z2".to_string(),
+                il_key: "PEPTIDE|z2".to_string(),
+                charge: 2,
+                observed_neutral_mass: 100.0,
+                candidate_neutral_mass: 100.0,
+            },
+            RerankIdentity {
+                record_index: 1,
+                exact_key: "PEPTIDE|z3".to_string(),
+                il_key: "PEPTIDE|z3".to_string(),
+                charge: 3,
+                observed_neutral_mass: 100.0,
+                candidate_neutral_mass: 100.0,
+            },
+            RerankIdentity {
+                record_index: 2,
+                exact_key: "OTHER|z2".to_string(),
+                il_key: "OTHER|z2".to_string(),
+                charge: 2,
+                observed_neutral_mass: 100.2,
+                candidate_neutral_mass: 100.2,
+            },
+        ];
+        let by_charge = mass_sorted_candidates_by_charge_v074(&identities);
+        let charge2 = by_charge.get(&2).expect("charge 2 candidates");
+        let pool = nearest_mass_pool_v074(charge2, 100.0, 8);
+        assert_eq!(pool, vec![0, 2]);
+        assert!(pool.iter().all(|&index| identities[index].charge == 2));
+        assert!(!pool.contains(&1));
     }
 
     #[test]
