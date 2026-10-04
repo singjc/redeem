@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+if [ "${1:-}" = "--build-check" ]; then
+  command -v foundation_audit_forward_ms2_attribution_v0731 >/dev/null || exit 1
+  exit 0
+fi
+printf 'redeem_container\tYES\n'
+printf 'foundation_image_profile\t%s\n' "${REDEEM_FOUNDATION_IMAGE_PROFILE:-UNKNOWN}"
+printf 'v0731_ms2_attribution_audit\t%s\n' "$(command -v foundation_audit_forward_ms2_attribution_v0731 2>/dev/null || echo MISSING)"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  printf 'nvidia_runtime\tVISIBLE\n'
+else
+  printf 'nvidia_runtime\tNOT_VISIBLE (expected during image build / CPU launch)\n'
+fi
