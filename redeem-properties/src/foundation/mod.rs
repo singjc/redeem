@@ -33,6 +33,7 @@ mod fragment_grounded_v0330;
 pub mod fragment_likelihood;
 pub mod fragment_relation;
 pub mod interaction;
+pub mod inverse_identifier_v0751;
 pub mod inverse_reward_v0290;
 pub mod iterative_refinement;
 pub mod layers;
@@ -245,6 +246,14 @@ pub use fragment_relation::{
     FOUNDATION_FRAGMENT_RELATION_PPM_V0240,
 };
 pub use interaction::FoundationSpectrumCandidateInteractionAdapter;
+pub use inverse_identifier_v0751::{
+    FoundationPracticalIdentifierBuildTimingsV0751, FoundationPracticalIdentifierCandidateV0751,
+    FoundationPracticalIdentifierHitV0751, FoundationPracticalIdentifierV0751,
+    FOUNDATION_PRACTICAL_IDENTIFIER_ARCHITECTURE_V0751,
+    FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POLICY_V0751,
+    FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POOL_V0751,
+    FOUNDATION_PRACTICAL_IDENTIFIER_SCORE_V0751, FOUNDATION_PRACTICAL_IDENTIFIER_VERSION_V0751,
+};
 pub use inverse_reward_v0290::{
     foundation_multimodal_ms2_loss_v0290, foundation_multimodal_relation_margin_loss_v0290,
     FoundationFragmentContextBatchV0290, FoundationMultimodalMs2LossesV0290,

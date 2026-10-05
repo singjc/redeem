@@ -15,11 +15,14 @@
 
 use anyhow::{Context, Result};
 use redeem_properties::foundation::{
-    foundation_fragment_cleavage_geometry, foundation_peptidoform_neutral_mass,
-    foundation_precursor_neutral_mass, load_foundation_corpus, read_foundation_training_run_config,
-    FoundationBenchmarkManifest, FoundationPartition, FoundationSpectrum, FoundationTrainingRecord,
-    FOUNDATION_FRAGMENT_LIKELIHOOD_ABS_TOLERANCE_DA_V0230,
-    FOUNDATION_FRAGMENT_LIKELIHOOD_MAX_PEAKS_V0230, FOUNDATION_FRAGMENT_LIKELIHOOD_PPM_V0230,
+    foundation_peptidoform_neutral_mass, foundation_precursor_neutral_mass, load_foundation_corpus,
+    read_foundation_training_run_config, FoundationBenchmarkManifest, FoundationPartition,
+    FoundationPracticalIdentifierCandidateV0751, FoundationPracticalIdentifierV0751,
+    FoundationSpectrum, FoundationTrainingRecord, PeptidoformInput,
+    FOUNDATION_PRACTICAL_IDENTIFIER_ARCHITECTURE_V0751,
+    FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POLICY_V0751,
+    FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POOL_V0751,
+    FOUNDATION_PRACTICAL_IDENTIFIER_SCORE_V0751,
 };
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -31,11 +34,9 @@ use std::time::Instant;
 
 const V075_VERSION: u32 = 750;
 const V075_OBJECTIVE: &str = "v0750_charge_mass_geometry_identifier";
-const V075_ARCHITECTURE: &str =
-    "observed_charge_neutral_mass256_plus_deterministic_open_ptm_fragment_geometry";
-const V075_SCORE: &str = "open_ptm_core_b1_b2_y1_y2_uniform_sqrt_intensity_cosine_20ppm_abs0p02Da";
-const V075_CANDIDATE_POLICY: &str =
-    "observed_charge_compatible_nearest_neutral_mass256_no_target_forcing";
+const V075_ARCHITECTURE: &str = FOUNDATION_PRACTICAL_IDENTIFIER_ARCHITECTURE_V0751;
+const V075_SCORE: &str = FOUNDATION_PRACTICAL_IDENTIFIER_SCORE_V0751;
+const V075_CANDIDATE_POLICY: &str = FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POLICY_V0751;
 
 // Frozen cohort-construction values used by v0.70-v0.74.2. These are provenance constants only;
 // v0.75 does not load or execute the v0.70 model.
@@ -49,7 +50,7 @@ const V075_HOLDOUT_QUERY_SEED: u64 = 20_261_075;
 const V075_HOLDOUT_RECORD_SEED: u64 = 20_261_075 ^ 0x7500_001d_3a7a_0001;
 const V075_HOLDOUT_CONFIRM_TOKEN: &str = "CONFIRM_TRAIN_HOLDOUT_ONCE";
 const V075_MAX_SEQUENCE_LEN: usize = 64;
-const V075_MASS_POOL: usize = 256;
+const V075_MASS_POOL: usize = FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POOL_V0751;
 const V075_TARGET_FORCING: bool = false;
 const V075_EXPECTED_PARENT_DEV_FINGERPRINT: &str = "fnv1a64:2aa9a31055c720a6";
 const V075_EXPECTED_CANDIDATE_UNIVERSE: usize = 63_332;
@@ -448,13 +449,23 @@ fn main() -> Result<()> {
     fs::create_dir_all(&output_root)?;
     write_candidate_catalog(&output_root.join("candidate_catalog.tsv"), &full_identities)?;
 
-    let index_started = Instant::now();
-    let mass_sorted_by_charge = mass_sorted_candidates_by_charge(&full_identities);
-    let index_build_seconds = index_started.elapsed().as_secs_f64();
-
-    let geometry_started = Instant::now();
-    let candidate_geometry = precompute_candidate_geometry(&corpus.records, &full_identities)?;
-    let geometry_precompute_seconds = geometry_started.elapsed().as_secs_f64();
+    let practical_candidates = full_identities
+        .iter()
+        .map(|identity| {
+            FoundationPracticalIdentifierCandidateV0751::new(
+                identity.exact_key.clone(),
+                corpus.records[identity.record_index].peptidoform.clone(),
+                identity.charge,
+            )
+        })
+        .collect::<Vec<_>>();
+    let practical_identifier = FoundationPracticalIdentifierV0751::new(practical_candidates)?;
+    if practical_identifier.candidate_count() != full_identities.len() {
+        anyhow::bail!("v0.75.1 practical identifier candidate-count drift");
+    }
+    let practical_build_timings = practical_identifier.build_timings();
+    let index_build_seconds = practical_build_timings.index_build_seconds;
+    let geometry_precompute_seconds = practical_build_timings.geometry_precompute_seconds;
 
     println!("v0750_version\tv0.75-charge-mass-geometry-identifier");
     println!("objective\t{V075_OBJECTIVE}");
@@ -518,8 +529,7 @@ fn main() -> Result<()> {
         &full_identities,
         &full_query_indices,
         &selected_query_indices,
-        &mass_sorted_by_charge,
-        &candidate_geometry,
+        &practical_identifier,
     )?;
     metrics.catalog_build_seconds = catalog_build_seconds;
     metrics.index_build_seconds = index_build_seconds;
@@ -800,157 +810,6 @@ fn identity_fingerprint(identities: &[CandidateIdentity]) -> u64 {
     hash
 }
 
-fn mass_sorted_candidates_by_charge(
-    identities: &[CandidateIdentity],
-) -> BTreeMap<i32, Vec<(f64, usize)>> {
-    let mut out = BTreeMap::<i32, Vec<(f64, usize)>>::new();
-    for (index, identity) in identities.iter().enumerate() {
-        out.entry(identity.charge)
-            .or_default()
-            .push((identity.candidate_neutral_mass, index));
-    }
-    for rows in out.values_mut() {
-        rows.sort_by(|left, right| {
-            left.0
-                .partial_cmp(&right.0)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.1.cmp(&right.1))
-        });
-    }
-    out
-}
-
-fn nearest_mass_pool(mass_sorted: &[(f64, usize)], observed_mass: f64, count: usize) -> Vec<usize> {
-    if mass_sorted.is_empty() || count == 0 {
-        return Vec::new();
-    }
-    let split = mass_sorted.partition_point(|row| row.0 < observed_mass);
-    let mut left = split;
-    let mut right = split;
-    let mut out = Vec::with_capacity(count.min(mass_sorted.len()));
-    while out.len() < count.min(mass_sorted.len()) {
-        let left_item = if left > 0 {
-            Some(mass_sorted[left - 1])
-        } else {
-            None
-        };
-        let right_item = mass_sorted.get(right).copied();
-        let take_left = match (left_item, right_item) {
-            (Some(l), Some(r)) => {
-                let ld = (l.0 - observed_mass).abs();
-                let rd = (r.0 - observed_mass).abs();
-                ld < rd || (ld == rd && l.1 < r.1)
-            }
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => break,
-        };
-        if take_left {
-            left -= 1;
-            out.push(mass_sorted[left].1);
-        } else {
-            out.push(mass_sorted[right].1);
-            right += 1;
-        }
-    }
-    out
-}
-
-fn precompute_candidate_geometry(
-    records: &[FoundationTrainingRecord],
-    identities: &[CandidateIdentity],
-) -> Result<Vec<Vec<f64>>> {
-    let mut all = Vec::with_capacity(identities.len());
-    for identity in identities {
-        let record = &records[identity.record_index];
-        let geometry = foundation_fragment_cleavage_geometry(&record.peptidoform)
-            .map_err(anyhow::Error::msg)?;
-        let mut mz = Vec::with_capacity(geometry.len() * 4);
-        for cleavage in geometry {
-            mz.extend_from_slice(&cleavage.core_mz);
-        }
-        all.push(mz);
-    }
-    Ok(all)
-}
-
-fn normalized_retained_peaks(spectrum: &FoundationSpectrum) -> Vec<(f64, f64)> {
-    let mut peaks = spectrum
-        .peaks
-        .iter()
-        .copied()
-        .filter(|peak| {
-            peak.mz.is_finite()
-                && peak.mz > 0.0
-                && peak.intensity.is_finite()
-                && peak.intensity > 0.0
-        })
-        .collect::<Vec<_>>();
-    peaks.sort_by(|left, right| {
-        right
-            .intensity
-            .total_cmp(&left.intensity)
-            .then_with(|| left.mz.total_cmp(&right.mz))
-    });
-    peaks.truncate(FOUNDATION_FRAGMENT_LIKELIHOOD_MAX_PEAKS_V0230);
-    let max_intensity = peaks
-        .iter()
-        .map(|peak| f64::from(peak.intensity))
-        .fold(0.0f64, f64::max)
-        .max(f64::EPSILON);
-    let mut normalized = peaks
-        .into_iter()
-        .map(|peak| {
-            (
-                f64::from(peak.mz),
-                (f64::from(peak.intensity) / max_intensity).clamp(0.0, 1.0),
-            )
-        })
-        .collect::<Vec<_>>();
-    normalized.sort_by(|left, right| left.0.total_cmp(&right.0));
-    normalized
-}
-
-fn best_peak_support_fast(theoretical_mz: f64, peaks: &[(f64, f64)]) -> f64 {
-    if !(theoretical_mz > 0.0 && theoretical_mz.is_finite()) {
-        return 0.0;
-    }
-    let sigma = (theoretical_mz * FOUNDATION_FRAGMENT_LIKELIHOOD_PPM_V0230 * 1e-6)
-        .max(FOUNDATION_FRAGMENT_LIKELIHOOD_ABS_TOLERANCE_DA_V0230 / 3.0);
-    let cutoff = (3.0 * sigma).max(FOUNDATION_FRAGMENT_LIKELIHOOD_ABS_TOLERANCE_DA_V0230);
-    let low = theoretical_mz - cutoff;
-    let high = theoretical_mz + cutoff;
-    let start = peaks.partition_point(|row| row.0 < low);
-    let mut best = 0.0f64;
-    for &(observed_mz, normalized_intensity) in &peaks[start..] {
-        if observed_mz > high {
-            break;
-        }
-        let error = (observed_mz - theoretical_mz).abs();
-        let mass_weight = (-0.5 * (error / sigma).powi(2)).exp();
-        best = best.max(normalized_intensity * mass_weight);
-    }
-    best
-}
-
-fn geometry_uniform_score(theoretical_mz: &[f64], peaks: &[(f64, f64)]) -> f64 {
-    if theoretical_mz.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0f64;
-    let mut obs_norm = 0.0f64;
-    for &mz in theoretical_mz {
-        let observed = best_peak_support_fast(mz, peaks).max(0.0);
-        dot += observed.sqrt();
-        obs_norm += observed;
-    }
-    if obs_norm > 0.0 {
-        (dot / ((theoretical_mz.len() as f64).sqrt() * obs_norm.sqrt())).clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
-}
-
 fn optional_exact_rank(
     ranked: &[usize],
     identities: &[CandidateIdentity],
@@ -996,11 +855,10 @@ fn identify_queries(
     identities: &[CandidateIdentity],
     full_query_indices: &[usize],
     selected_query_indices: &[usize],
-    mass_sorted_by_charge: &BTreeMap<i32, Vec<(f64, usize)>>,
-    candidate_geometry: &[Vec<f64>],
+    practical_identifier: &FoundationPracticalIdentifierV0751,
 ) -> Result<(V075Metrics, Vec<QueryDiagnostic>, Vec<RankedCandidateRow>)> {
     if full_query_indices.len() != selected_query_indices.len()
-        || candidate_geometry.len() != identities.len()
+        || practical_identifier.candidate_count() != identities.len()
     {
         anyhow::bail!("v0.75 identifier input shape mismatch");
     }
@@ -1030,27 +888,17 @@ fn identify_queries(
         let query_record = &records[query.record_index];
         let spectrum = FoundationSpectrum::from_training_record(query_record)
             .ok_or_else(|| anyhow::anyhow!("v0.75 query lacks observed spectrum"))?;
-        let peaks = normalized_retained_peaks(&spectrum);
-
-        let charge_mass_sorted = mass_sorted_by_charge.get(&query.charge).ok_or_else(|| {
-            anyhow::anyhow!(
-                "v0.75 no candidate universe for observed precursor charge {}",
-                query.charge
-            )
-        })?;
-        let mass256 = nearest_mass_pool(
-            charge_mass_sorted,
+        let hits = practical_identifier.identify_neutral_mass(
+            query.charge,
             query.observed_neutral_mass,
-            V075_MASS_POOL,
-        );
+            &spectrum,
+        )?;
+        let mass256 = hits
+            .iter()
+            .map(|hit| hit.candidate_index)
+            .collect::<Vec<_>>();
         if mass256.is_empty() {
             anyhow::bail!("v0.75 same-charge mass candidate pool is empty");
-        }
-        if mass256
-            .iter()
-            .any(|&index| identities[index].charge != query.charge)
-        {
-            anyhow::bail!("v0.75 charge-incompatible candidate escaped per-charge mass index");
         }
 
         let exact_covered = pool_exact_covered(&mass256, identities, query);
@@ -1059,19 +907,10 @@ fn identify_queries(
         il_covered_count += usize::from(il_covered);
         candidate_counts.push(mass256.len());
 
-        let mut scored = Vec::<(usize, f64)>::with_capacity(mass256.len());
-        for &candidate_index in &mass256 {
-            let score = geometry_uniform_score(&candidate_geometry[candidate_index], &peaks);
-            if !score.is_finite() {
-                anyhow::bail!("v0.75 geometry score is not finite");
-            }
-            scored.push((candidate_index, score));
-        }
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        let scored = hits
+            .iter()
+            .map(|hit| (hit.candidate_index, hit.geometry_score))
+            .collect::<Vec<_>>();
         let ranked = scored.iter().map(|row| row.0).collect::<Vec<_>>();
         let exact_rank = optional_exact_rank(&ranked, identities, query);
         let il_rank = optional_il_rank(&ranked, identities, query);
@@ -1571,16 +1410,20 @@ fn hash64_str(value: &str) -> u64 {
 }
 
 fn self_test() -> Result<()> {
-    let mass_sorted = vec![(99.0, 0), (100.0, 1), (100.3, 2), (101.0, 3), (103.0, 4)];
-    let pool = nearest_mass_pool(&mass_sorted, 100.2, 3);
-    if pool != vec![2, 1, 3] {
-        anyhow::bail!("v0.75 self-test nearest-mass ordering failed: {pool:?}");
-    }
-    let peaks = vec![(100.0, 1.0), (200.0, 0.64), (300.0, 0.36)];
-    let aligned = geometry_uniform_score(&[100.0, 200.0, 300.0], &peaks);
-    let shifted = geometry_uniform_score(&[110.0, 210.0, 310.0], &peaks);
-    if !(aligned > 0.9 && shifted == 0.0 && aligned > shifted) {
-        anyhow::bail!("v0.75 self-test geometry score failed: aligned={aligned} shifted={shifted}");
+    let target = PeptidoformInput::unmodified("PEPTIDE");
+    let practical_identifier = FoundationPracticalIdentifierV0751::new(vec![
+        FoundationPracticalIdentifierCandidateV0751::new("PEPTIDE|z2", target.clone(), 2),
+        FoundationPracticalIdentifierCandidateV0751::new(
+            "PEPTIDK|z2",
+            PeptidoformInput::unmodified("PEPTIDK"),
+            2,
+        ),
+    ])?;
+    let target_mass = foundation_peptidoform_neutral_mass(&target).map_err(anyhow::Error::msg)?;
+    let spectrum = FoundationSpectrum::from_pairs([(100.0f32, 1.0f32)]);
+    let hits = practical_identifier.identify_neutral_mass(2, target_mass, &spectrum)?;
+    if hits.len() != 2 || hits.iter().any(|hit| hit.charge != 2) {
+        anyhow::bail!("v0.75 self-test reusable practical identifier integration failed");
     }
     if v075_decision("holdout", false) != "HOLDOUT_CONFIRMATION_FAIL_DO_NOT_TUNE"
         || v075_decision("holdout", true) != "HOLDOUT_CONFIRMATION_PASS"
@@ -1614,36 +1457,12 @@ mod tests {
     }
 
     #[test]
-    fn nearest_mass_pool_is_distance_ordered_without_target_forcing() {
-        let mass_sorted = vec![(99.0, 0), (100.0, 1), (100.3, 2), (101.0, 3), (103.0, 4)];
-        let pool = nearest_mass_pool(&mass_sorted, 100.2, 3);
-        assert_eq!(pool, vec![2, 1, 3]);
-        assert!(!pool.contains(&0));
-    }
-
-    #[test]
-    fn per_charge_index_excludes_other_precursor_charges() {
-        let identities = vec![
-            identity(0, "PEPTIDE|z2", 2, 100.0),
-            identity(1, "PEPTIDE|z3", 3, 100.0),
-            identity(2, "OTHER|z2", 2, 100.2),
-        ];
-        let by_charge = mass_sorted_candidates_by_charge(&identities);
-        let charge2 = by_charge.get(&2).expect("charge 2 candidates");
-        let pool = nearest_mass_pool(charge2, 100.0, 8);
-        assert_eq!(pool, vec![0, 2]);
-        assert!(pool.iter().all(|&index| identities[index].charge == 2));
-        assert!(!pool.contains(&1));
-    }
-
-    #[test]
-    fn geometry_score_rewards_mass_aligned_fragment_support() {
-        let peaks = vec![(100.0, 1.0), (200.0, 0.64), (300.0, 0.36)];
-        let aligned = geometry_uniform_score(&[100.0, 200.0, 300.0], &peaks);
-        let shifted = geometry_uniform_score(&[110.0, 210.0, 310.0], &peaks);
-        assert!(aligned > 0.9);
-        assert_eq!(shifted, 0.0);
-        assert!(aligned > shifted);
+    fn reusable_practical_identifier_api_is_wired_to_frozen_pool() {
+        assert_eq!(
+            V075_MASS_POOL,
+            FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POOL_V0751
+        );
+        self_test().expect("v0.75 reusable practical identifier self-test");
     }
 
     #[test]
