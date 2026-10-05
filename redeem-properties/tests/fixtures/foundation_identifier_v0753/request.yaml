@@ -1,0 +1,8 @@
+schema: redeem.foundation.practical_identifier.v0752
+query_id: codon-smoke-query
+observed_precursor_mz: 400.0
+observed_charge: 2
+peaks:
+  - mz: 1.0
+    intensity: 1.0
+top_k: 1
