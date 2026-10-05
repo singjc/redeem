@@ -289,9 +289,10 @@ awk -F '\t' 'BEGIN { OFS="\t"; print "query_id","rank","candidate_index","key","
 NR > 1 { printf "%s\t%s\t%s\t%s\t%s\t%.8f\t%.8f\t%.8f\n", $1,$2,$3,$4,$5,$6,$7,$8 }' \
   "$HITS" > "$PROD_NORMALIZED"
 
-if grep -Eq 'TRAIN_HOLDOUT|historical_test|model\.safetensors|target_forcing=YES' \
+if grep -Eiq \
+  'train_holdout_(accessed|consumed)(=|[[:space:]])YES|historical_(validation|test)_(accessed|consumed)(=|[[:space:]])YES|target_forcing(=|[[:space:]])YES|v0(70|52)_checkpoint_required(=|[[:space:]])YES|model\.safetensors|CONFIRM_TRAIN_HOLDOUT' \
   "$EXPORT_LOG" "$MATERIALIZE_LOG" "$BATCH_LOG"; then
-  echo "v0.76.1 unexpectedly references protected/model-selection state" >&2
+  echo "v0.76.1 unexpectedly uses protected/model-selection state" >&2
   exit 2
 fi
 
