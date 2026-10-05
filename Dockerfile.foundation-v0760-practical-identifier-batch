@@ -1,0 +1,112 @@
+ARG UBUNTU_VERSION=22.04
+
+# ReDeeM v0.76.0 CPU-only production search-space materialization + batch identifier runtime.
+# Scientific behavior remains frozen in v0.75.1/v0.75.2.
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+
+ARG RUST_TOOLCHAIN=stable
+ARG CARGO_BUILD_JOBS=2
+ARG CARGO_RELEASE_LTO=off
+ARG CARGO_RELEASE_CODEGEN_UNITS=8
+ARG CARGO_RELEASE_DEBUG=0
+
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        build-essential ca-certificates clang cmake curl git libssl-dev \
+        libstdc++-12-dev pkg-config && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf \
+        --retry 6 --retry-all-errors --retry-delay 5 \
+        --connect-timeout 30 --max-time 300 \
+        https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}"
+
+ENV PATH=/root/.cargo/bin:${PATH}
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_RELEASE_LTO}
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_RELEASE_CODEGEN_UNITS}
+ENV CARGO_PROFILE_RELEASE_DEBUG=${CARGO_RELEASE_DEBUG}
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY redeem-openms-ffi ./redeem-openms-ffi
+COPY redeem-classifiers ./redeem-classifiers
+COPY redeem-cli ./redeem-cli
+COPY redeem-properties ./redeem-properties
+COPY redeem-properties-py ./redeem-properties-py
+
+RUN test -f redeem-properties/src/foundation/inverse_identifier_batch_v0760.rs && \
+    test -f redeem-properties/examples/foundation_identify_batch_v0760.rs && \
+    test -f redeem-properties/tests/fixtures/foundation_identifier_v0760/search_space.yaml && \
+    test -f redeem-properties/tests/fixtures/foundation_identifier_v0760/batch.yaml && \
+    cargo test --locked \
+      -p redeem-properties \
+      --no-default-features \
+      --lib \
+      inverse_identifier_batch_v0760 && \
+    cargo test --locked \
+      -p redeem-properties \
+      --no-default-features \
+      --example foundation_identify_batch_v0760 && \
+    cargo build --release --locked \
+      -p redeem-properties \
+      --no-default-features \
+      --example foundation_identify_batch_v0760 && \
+    mkdir -p /opt/redeem/bin /opt/redeem/share/v0760 /tmp/redeem-v0760-build-smoke && \
+    cp target/release/examples/foundation_identify_batch_v0760 /opt/redeem/bin/ && \
+    cp redeem-properties/tests/fixtures/foundation_identifier_v0760/search_space.yaml /opt/redeem/share/v0760/search_space.yaml && \
+    cp redeem-properties/tests/fixtures/foundation_identifier_v0760/batch.yaml /opt/redeem/share/v0760/batch.yaml && \
+    /opt/redeem/bin/foundation_identify_batch_v0760 --self-test && \
+    /opt/redeem/bin/foundation_identify_batch_v0760 materialize-catalog \
+      --search-space /opt/redeem/share/v0760/search_space.yaml \
+      --output-catalog /tmp/redeem-v0760-build-smoke/catalog.yaml && \
+    /opt/redeem/bin/foundation_identify_batch_v0760 identify-batch \
+      --catalog /tmp/redeem-v0760-build-smoke/catalog.yaml \
+      --batch /opt/redeem/share/v0760/batch.yaml \
+      --output-yaml /tmp/redeem-v0760-build-smoke/response.yaml \
+      --output-tsv /tmp/redeem-v0760-build-smoke/hits.tsv && \
+    grep -q '^schema: redeem.foundation.practical_identifier.v0752$' /tmp/redeem-v0760-build-smoke/catalog.yaml && \
+    grep -q '^schema: redeem.foundation.practical_identifier.batch_response.v0760$' /tmp/redeem-v0760-build-smoke/response.yaml && \
+    grep -q '^catalog_size: 3$' /tmp/redeem-v0760-build-smoke/response.yaml && \
+    grep -q '^request_count: 2$' /tmp/redeem-v0760-build-smoke/response.yaml && \
+    grep -q '^total_candidates_scored: 3$' /tmp/redeem-v0760-build-smoke/response.yaml && \
+    grep -q 'batch-q2' /tmp/redeem-v0760-build-smoke/hits.tsv && \
+    grep -q 'batch-q3' /tmp/redeem-v0760-build-smoke/hits.tsv
+
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        bash ca-certificates libgomp1 libssl3 libstdc++6 && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/opt/redeem/bin:${PATH}
+ENV REDEEM_FOUNDATION_IMAGE_PROFILE=v0760-practical-identifier-batch
+
+COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
+COPY --from=builder /opt/redeem/share/ /opt/redeem/share/
+
+RUN chmod 0755 /opt/redeem/bin/* && \
+    command -v foundation_identify_batch_v0760 && \
+    foundation_identify_batch_v0760 --self-test && \
+    mkdir -p /tmp/redeem-v0760-runtime-smoke && \
+    foundation_identify_batch_v0760 materialize-catalog \
+      --search-space /opt/redeem/share/v0760/search_space.yaml \
+      --output-catalog /tmp/redeem-v0760-runtime-smoke/catalog.yaml && \
+    foundation_identify_batch_v0760 identify-batch \
+      --catalog /tmp/redeem-v0760-runtime-smoke/catalog.yaml \
+      --batch /opt/redeem/share/v0760/batch.yaml \
+      --output-yaml /tmp/redeem-v0760-runtime-smoke/response.yaml \
+      --output-tsv /tmp/redeem-v0760-runtime-smoke/hits.tsv && \
+    grep -q '^schema: redeem.foundation.practical_identifier.batch_response.v0760$' /tmp/redeem-v0760-runtime-smoke/response.yaml && \
+    grep -q '^request_count: 2$' /tmp/redeem-v0760-runtime-smoke/response.yaml && \
+    grep -q '^total_candidates_scored: 3$' /tmp/redeem-v0760-runtime-smoke/response.yaml && \
+    grep -q 'batch-q2' /tmp/redeem-v0760-runtime-smoke/hits.tsv && \
+    grep -q 'batch-q3' /tmp/redeem-v0760-runtime-smoke/hits.tsv
+
+WORKDIR /work
+CMD ["foundation_identify_batch_v0760", "--self-test"]

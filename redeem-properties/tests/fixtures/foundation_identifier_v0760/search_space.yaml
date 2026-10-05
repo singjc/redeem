@@ -1,0 +1,11 @@
+schema: redeem.foundation.practical_identifier.search_space.v0760
+peptidoforms:
+  - id: pep-a
+    sequence: PEPTIDE
+    charges:
+      - 2
+      - 3
+  - id: pep-b
+    sequence: PEPTIDK
+    charges:
+      - 2

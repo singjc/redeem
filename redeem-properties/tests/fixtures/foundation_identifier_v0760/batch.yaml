@@ -1,0 +1,18 @@
+schema: redeem.foundation.practical_identifier.batch.v0760
+requests:
+  - schema: redeem.foundation.practical_identifier.v0752
+    query_id: batch-q2
+    observed_precursor_mz: 400.0
+    observed_charge: 2
+    peaks:
+      - mz: 100.0
+        intensity: 1.0
+    top_k: 2
+  - schema: redeem.foundation.practical_identifier.v0752
+    query_id: batch-q3
+    observed_precursor_mz: 300.0
+    observed_charge: 3
+    peaks:
+      - mz: 100.0
+        intensity: 1.0
+    top_k: 1

@@ -34,6 +34,7 @@ pub mod fragment_likelihood;
 pub mod fragment_relation;
 pub mod interaction;
 pub mod inverse_identifier_api_v0752;
+pub mod inverse_identifier_batch_v0760;
 pub mod inverse_identifier_v0751;
 pub mod inverse_reward_v0290;
 pub mod iterative_refinement;
@@ -256,6 +257,17 @@ pub use inverse_identifier_api_v0752::{
     FOUNDATION_PRACTICAL_IDENTIFIER_API_SCHEMA_V0752,
     FOUNDATION_PRACTICAL_IDENTIFIER_API_VERSION_V0752,
     FOUNDATION_PRACTICAL_IDENTIFIER_DEFAULT_TOP_K_V0752,
+};
+pub use inverse_identifier_batch_v0760::{
+    materialize_catalog_v0760, FoundationPracticalIdentifierBatchRequestV0760,
+    FoundationPracticalIdentifierBatchResponseV0760,
+    FoundationPracticalIdentifierBatchServiceV0760,
+    FoundationPracticalIdentifierSearchSpaceEntryV0760,
+    FoundationPracticalIdentifierSearchSpaceV0760,
+    FOUNDATION_PRACTICAL_IDENTIFIER_BATCH_RESPONSE_SCHEMA_V0760,
+    FOUNDATION_PRACTICAL_IDENTIFIER_BATCH_SCHEMA_V0760,
+    FOUNDATION_PRACTICAL_IDENTIFIER_BATCH_VERSION_V0760,
+    FOUNDATION_PRACTICAL_IDENTIFIER_SEARCH_SPACE_SCHEMA_V0760,
 };
 pub use inverse_identifier_v0751::{
     FoundationPracticalIdentifierBuildTimingsV0751, FoundationPracticalIdentifierCandidateV0751,
