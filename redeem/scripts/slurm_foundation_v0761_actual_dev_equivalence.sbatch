@@ -50,6 +50,9 @@ BATCH_TIME="$OUT/batch.time.txt"
 REF_QUERY_MANIFEST="$OUT/reference_query_manifest.tsv"
 REF_NORMALIZED="$OUT/reference_ranked_normalized.tsv"
 PROD_NORMALIZED="$OUT/production_ranked_normalized.tsv"
+REF_IDENTITY="$OUT/reference_rank_identity.tsv"
+PROD_IDENTITY="$OUT/production_rank_identity.tsv"
+NUMERIC_EQUIV="$OUT/numeric_equivalence.tsv"
 
 BIND="$ROOT:$ROOT"
 if [ -n "${REDEEM_SINGULARITY_BINDS:-}" ]; then
@@ -190,6 +193,94 @@ if [ "$candidate_pool_lines" -ne 512 ]; then
   exit 2
 fi
 
+# Preserve the complete discrete ranking identity as a byte-exact gate.
+# The historical v0.75 TSV stores floating-point values at 8 decimals, whereas
+# the production v0.76 TSV stores them at 12 decimals. Re-rounding both text
+# representations to 8 decimals can flip the final displayed digit at a
+# half-way boundary even when the underlying scores differ far below the
+# reference artifact's resolution. Therefore compare ranking identity exactly
+# and floating fields numerically at the frozen reference resolution.
+awk -F '\t' 'BEGIN { OFS="\t"; print "query_id","rank","candidate_index","key","charge" }
+NR > 1 { print $1,$2,$3,$4,$6 }' \
+  "$REF/ranked_candidates.tsv" > "$REF_IDENTITY"
+
+awk -F '\t' 'BEGIN { OFS="\t"; print "query_id","rank","candidate_index","key","charge" }
+NR > 1 { print $1,$2,$3,$4,$5 }' \
+  "$HITS" > "$PROD_IDENTITY"
+
+if ! cmp -s "$REF_IDENTITY" "$PROD_IDENTITY"; then
+  echo "v0.76.1 discrete rank identity differs from frozen actual DEV reference" >&2
+  diff -u "$REF_IDENTITY" "$PROD_IDENTITY" | head -120 >&2
+  exit 2
+fi
+
+python3 - "$REF/ranked_candidates.tsv" "$HITS" "$NUMERIC_EQUIV" <<'PY_EQUIV'
+import csv
+import math
+import sys
+from itertools import zip_longest
+
+ref_path, prod_path, report_path = sys.argv[1:4]
+tolerance = 1.0e-8
+fields = (
+    ("theoretical_neutral_mass", "theoretical_neutral_mass"),
+    ("absolute_neutral_mass_error", "absolute_neutral_mass_error"),
+    ("geometry_score", "geometry_score"),
+)
+max_delta = {name: 0.0 for name, _ in fields}
+rows = 0
+first_failure = None
+
+with open(ref_path, newline="") as ref_handle, open(prod_path, newline="") as prod_handle:
+    ref_rows = csv.DictReader(ref_handle, delimiter="\t")
+    prod_rows = csv.DictReader(prod_handle, delimiter="\t")
+    for row_number, pair in enumerate(zip_longest(ref_rows, prod_rows), start=1):
+        ref_row, prod_row = pair
+        if ref_row is None or prod_row is None:
+            first_failure = f"row-count mismatch at data row {row_number}"
+            break
+        rows += 1
+        for ref_name, prod_name in fields:
+            ref_value = float(ref_row[ref_name])
+            prod_value = float(prod_row[prod_name])
+            if not (math.isfinite(ref_value) and math.isfinite(prod_value)):
+                first_failure = (
+                    f"non-finite value at row {row_number} field {ref_name}: "
+                    f"reference={ref_value!r} production={prod_value!r}"
+                )
+                break
+            delta = abs(ref_value - prod_value)
+            max_delta[ref_name] = max(max_delta[ref_name], delta)
+            if delta > tolerance:
+                first_failure = (
+                    f"numeric mismatch at row {row_number} field {ref_name}: "
+                    f"reference={ref_value:.12g} production={prod_value:.12g} "
+                    f"abs_delta={delta:.12g} tolerance={tolerance:.12g}"
+                )
+                break
+        if first_failure is not None:
+            break
+
+with open(report_path, "w") as handle:
+    handle.write("key\tvalue\n")
+    handle.write(f"rows_compared\t{rows}\n")
+    handle.write(f"absolute_tolerance\t{tolerance:.12g}\n")
+    for name, _ in fields:
+        handle.write(f"max_abs_delta_{name}\t{max_delta[name]:.12g}\n")
+    handle.write(f"status\t{'FAIL' if first_failure else 'PASS'}\n")
+
+if first_failure is not None:
+    print(first_failure, file=sys.stderr)
+    sys.exit(2)
+PY_EQUIV
+numeric_rc=$?
+if [ "$numeric_rc" -ne 0 ]; then
+  echo "v0.76.1 floating-field equivalence exceeds frozen 1e-8 reference resolution" >&2
+  cat "$NUMERIC_EQUIV" >&2
+  exit "$numeric_rc"
+fi
+
+# Keep normalized artifacts for human inspection only; they are not the gate.
 awk -F '\t' 'BEGIN { OFS="\t"; print "query_id","rank","candidate_index","key","charge","theoretical_neutral_mass","absolute_neutral_mass_error","geometry_score" }
 NR > 1 { printf "%s\t%s\t%s\t%s\t%s\t%.8f\t%.8f\t%.8f\n", $1,$2,$3,$4,$6,$7,$8,$9 }' \
   "$REF/ranked_candidates.tsv" > "$REF_NORMALIZED"
@@ -198,20 +289,14 @@ awk -F '\t' 'BEGIN { OFS="\t"; print "query_id","rank","candidate_index","key","
 NR > 1 { printf "%s\t%s\t%s\t%s\t%s\t%.8f\t%.8f\t%.8f\n", $1,$2,$3,$4,$5,$6,$7,$8 }' \
   "$HITS" > "$PROD_NORMALIZED"
 
-if ! cmp -s "$REF_NORMALIZED" "$PROD_NORMALIZED"; then
-  echo "v0.76.1 production rankings differ from frozen actual DEV reference" >&2
-  diff -u "$REF_NORMALIZED" "$PROD_NORMALIZED" | head -120 >&2
-  exit 2
-fi
-
 if grep -Eq 'TRAIN_HOLDOUT|historical_test|model\.safetensors|target_forcing=YES' \
   "$EXPORT_LOG" "$MATERIALIZE_LOG" "$BATCH_LOG"; then
   echo "v0.76.1 unexpectedly references protected/model-selection state" >&2
   exit 2
 fi
 
-reference_rows=$(($(wc -l < "$REF_NORMALIZED") - 1))
-production_rows=$(($(wc -l < "$PROD_NORMALIZED") - 1))
+reference_rows=$(($(wc -l < "$REF_IDENTITY") - 1))
+production_rows=$(($(wc -l < "$PROD_IDENTITY") - 1))
 if [ "$reference_rows" -ne "$production_rows" ]; then
   echo "v0.76.1 ranked-row count mismatch: reference=$reference_rows production=$production_rows" >&2
   exit 2
@@ -231,7 +316,8 @@ fi
   printf 'candidate_pool\t256\n'
   printf 'candidate_catalog_byte_identical\tYES\n'
   printf 'query_manifest_byte_identical\tYES\n'
-  printf 'normalized_rankings_byte_identical\tYES\n'
+  printf 'rank_identity_byte_identical\tYES\n'
+  printf 'floating_fields_within_1e-8\tYES\n'
   printf 'ranked_rows\t%s\n' "$production_rows"
   printf 'target_forcing\tNO\n'
   printf 'train_holdout_accessed\tNO\n'
@@ -241,7 +327,8 @@ fi
 echo "v0761_actual_dev_production_equivalence=PASS"
 echo "candidate_catalog_byte_identical=YES"
 echo "query_manifest_byte_identical=YES"
-echo "normalized_rankings_byte_identical=YES"
+echo "rank_identity_byte_identical=YES"
+echo "floating_fields_within_1e-8=YES"
 echo "train_holdout_accessed=NO"
 echo "historical_test_accessed=NO"
 echo "v0761_out=$OUT"
