@@ -9,8 +9,9 @@
 //! - rank candidates only by the validated v0.74.2 deterministic b1/b2/y1/y2 geometry score;
 //! - use the exact v0.74.2 observed-peak normalization/capping and fragment support semantics;
 //! - require no v0.70 checkpoint, no v0.52 checkpoint, no optimizer, and no training;
-//! - use DEV only for the bounded implementation-reproduction audit; never consume HOLDOUT,
-//!   historical VALIDATION/APD, or TEST.
+//! - use DEV only for the bounded implementation-reproduction audit;
+//! - expose one explicitly confirmed TRAIN-HOLDOUT evaluation mode after the DEV implementation is frozen;
+//! - never use TRAIN-HOLDOUT for selection and never consume historical VALIDATION/APD or TEST.
 
 use anyhow::{Context, Result};
 use redeem_properties::foundation::{
@@ -43,18 +44,28 @@ const V070_DEV_IDENTITIES: usize = 2048;
 const V073_QUERY_SEED: u64 = 20_261_073;
 const V075_SMOKE_QUERIES: usize = 32;
 const V075_AUDIT_QUERIES: usize = 512;
+const V075_HOLDOUT_QUERIES: usize = V070_DEV_IDENTITIES;
+const V075_HOLDOUT_QUERY_SEED: u64 = 20_261_075;
+const V075_HOLDOUT_RECORD_SEED: u64 = 20_261_075 ^ 0x7500_001d_3a7a_0001;
+const V075_HOLDOUT_CONFIRM_TOKEN: &str = "CONFIRM_TRAIN_HOLDOUT_ONCE";
 const V075_MAX_SEQUENCE_LEN: usize = 64;
 const V075_MASS_POOL: usize = 256;
 const V075_TARGET_FORCING: bool = false;
 const V075_EXPECTED_PARENT_DEV_FINGERPRINT: &str = "fnv1a64:2aa9a31055c720a6";
 const V075_EXPECTED_CANDIDATE_UNIVERSE: usize = 63_332;
 const V075_EXPECTED_CANDIDATE_FINGERPRINT: &str = "fnv1a64:a5699533553116e8";
+const V075_EXPECTED_CORPUS_FINGERPRINT: &str = "fnv1a64:a2a6f57d31064ba6";
+const V075_EXPECTED_BENCHMARK_FINGERPRINT: &str = "fnv1a64:2133c039625f77df";
 
 // Reuse the already-declared v0.74 geometry promotion floors. These are reproduction guards,
 // not a new architecture-selection sweep.
 const V075_MIN_IL_COVERAGE: f64 = 1.0;
 const V075_MIN_GEOMETRY_IL_TOP1: f64 = 0.85;
 const V075_MIN_GEOMETRY_IL_TOP10: f64 = 0.97;
+// The one-time protected confirmation reuses the already-declared v0.74/v0.75 floors rather than
+// introducing a HOLDOUT-tuned criterion. Candidate coverage may fall below 1.0 on an unseen
+// partition, so its confirmatory floor is fixed at 0.99 before looking at HOLDOUT results.
+const V075_HOLDOUT_MIN_IL_COVERAGE: f64 = 0.99;
 
 #[derive(Debug, Clone)]
 struct AlignmentGroup {
@@ -158,11 +169,14 @@ struct V075Metadata {
     score: String,
     candidate_policy: String,
     mode: String,
+    evaluation_partition: String,
+    protected_evaluation: bool,
     corpus_fingerprint: String,
     benchmark_manifest_fingerprint: String,
     parent_dev_identity_fingerprint: String,
     candidate_universe_fingerprint: String,
     expected_candidate_universe_fingerprint: String,
+    query_cohort_fingerprint: String,
     audit_queries: usize,
     candidate_pool: usize,
     max_sequence_len: usize,
@@ -175,6 +189,7 @@ struct V075Metadata {
     candidate_pool_sweep_performed: bool,
     metrics: V075Metrics,
     train_holdout_consumed: bool,
+    train_holdout_consumed_for_selection: bool,
     historical_validation_consumed: bool,
     historical_test_consumed: bool,
 }
@@ -222,26 +237,42 @@ fn main() -> Result<()> {
         println!("v0750_charge_mass_geometry_identifier_self_test=PASS");
         return Ok(());
     }
-    if args.len() != 4 {
+    if !(args.len() == 4 || args.len() == 5) {
         anyhow::bail!(
-            "usage: foundation_identify_charge_mass_geometry_v0750 RUN_V0260.yaml OUTPUT_DIR mode=smoke|audit"
+            "usage: foundation_identify_charge_mass_geometry_v0750 RUN_V0260.yaml OUTPUT_DIR mode=smoke|audit|holdout [CONFIRM_TRAIN_HOLDOUT_ONCE]"
         );
     }
 
     let training_yaml = PathBuf::from(&args[1]);
     let output_root = PathBuf::from(&args[2]);
     let mode = args[3].as_str();
-    if !matches!(mode, "smoke" | "audit") {
-        anyhow::bail!("v0.75 mode must be smoke or audit");
+    if !matches!(mode, "smoke" | "audit" | "holdout") {
+        anyhow::bail!("v0.75 mode must be smoke, audit, or holdout");
+    }
+    let holdout_mode = mode == "holdout";
+    if holdout_mode {
+        if args.len() != 5 || args[4] != V075_HOLDOUT_CONFIRM_TOKEN {
+            anyhow::bail!(
+                "v0.75 HOLDOUT is protected and requires the explicit token {V075_HOLDOUT_CONFIRM_TOKEN}"
+            );
+        }
+    } else if args.len() != 4 {
+        anyhow::bail!("v0.75 smoke/audit modes do not accept a HOLDOUT confirmation token");
     }
     if output_root.exists() {
         anyhow::bail!("v0.75 output directory must be fresh: {output_root:?}");
     }
 
-    let audit_queries = if mode == "smoke" {
-        V075_SMOKE_QUERIES
+    let evaluation_queries = match mode {
+        "smoke" => V075_SMOKE_QUERIES,
+        "audit" => V075_AUDIT_QUERIES,
+        "holdout" => V075_HOLDOUT_QUERIES,
+        _ => unreachable!(),
+    };
+    let evaluation_partition = if holdout_mode {
+        "TRAIN_HOLDOUT_ONCE"
     } else {
-        V075_AUDIT_QUERIES
+        "DEV_IMPLEMENTATION_REPRODUCTION_ONLY"
     };
     let total_started = Instant::now();
 
@@ -254,82 +285,164 @@ fn main() -> Result<()> {
     let current_corpus_fingerprint = format!("fnv1a64:{:016x}", corpus.corpus_fingerprint);
     let current_benchmark_fingerprint =
         format!("fnv1a64:{:016x}", benchmark.manifest_fingerprint());
-
-    let catalog_started = Instant::now();
-    let dev_groups = build_alignment_groups(
-        &corpus.records,
-        &benchmark,
-        FoundationPartition::Validation,
-        V075_MAX_SEQUENCE_LEN,
-    )?;
-    let identity_seed = V070_SELECTION_SEED ^ 0x7000_d3f0_a11e_0001;
-    let selected_identities = select_dev_identities(
-        &corpus.records,
-        &dev_groups,
-        V070_DEV_IDENTITIES,
-        identity_seed,
-    )?;
-    if selected_identities.len() != V070_DEV_IDENTITIES {
-        anyhow::bail!(
-            "v0.75 expected {V070_DEV_IDENTITIES} frozen parent DEV identities, observed {}",
-            selected_identities.len()
-        );
-    }
-    let selected_fingerprint = format!(
-        "fnv1a64:{:016x}",
-        identity_fingerprint(&selected_identities)
-    );
-    if selected_fingerprint != V075_EXPECTED_PARENT_DEV_FINGERPRINT {
-        anyhow::bail!(
-            "v0.75 frozen query-cohort parent fingerprint mismatch: current={} expected={}",
-            selected_fingerprint,
-            V075_EXPECTED_PARENT_DEV_FINGERPRINT
-        );
-    }
-
-    let full_identities =
-        build_all_dev_identities(&corpus.records, &dev_groups, identity_seed.rotate_left(17))?;
-    let full_fingerprint = format!("fnv1a64:{:016x}", identity_fingerprint(&full_identities));
-    if full_identities.len() != V075_EXPECTED_CANDIDATE_UNIVERSE {
-        anyhow::bail!(
-            "v0.75 candidate-universe size mismatch: current={} expected={}",
-            full_identities.len(),
-            V075_EXPECTED_CANDIDATE_UNIVERSE
-        );
-    }
-    if full_fingerprint != V075_EXPECTED_CANDIDATE_FINGERPRINT {
-        anyhow::bail!(
-            "v0.75 candidate-universe fingerprint mismatch: current={} expected={}",
-            full_fingerprint,
-            V075_EXPECTED_CANDIDATE_FINGERPRINT
-        );
-    }
-
-    let full_index = full_identity_index(&full_identities)?;
-    let selected_query_indices = deterministic_eval_queries(
-        &selected_identities,
-        audit_queries,
-        V073_QUERY_SEED ^ 0x7300_d3f0_0000_0001,
-    );
-    let mut full_query_indices = Vec::with_capacity(selected_query_indices.len());
-    for &selected_index in &selected_query_indices {
-        let selected = &selected_identities[selected_index];
-        let full_index_value = *full_index.get(&selected.exact_key).with_context(|| {
-            format!(
-                "v0.75 frozen query {} absent from direct candidate catalog",
-                selected.exact_key
-            )
-        })?;
-        if full_identities[full_index_value].record_index != selected.record_index {
+    if holdout_mode {
+        if current_corpus_fingerprint != V075_EXPECTED_CORPUS_FINGERPRINT {
             anyhow::bail!(
-                "v0.75 frozen query record drift for {}: selected={} full={}",
-                selected.exact_key,
-                selected.record_index,
-                full_identities[full_index_value].record_index
+                "v0.75 HOLDOUT corpus fingerprint mismatch: current={} expected={}",
+                current_corpus_fingerprint,
+                V075_EXPECTED_CORPUS_FINGERPRINT
             );
         }
-        full_query_indices.push(full_index_value);
+        if current_benchmark_fingerprint != V075_EXPECTED_BENCHMARK_FINGERPRINT {
+            anyhow::bail!(
+                "v0.75 HOLDOUT benchmark fingerprint mismatch: current={} expected={}",
+                current_benchmark_fingerprint,
+                V075_EXPECTED_BENCHMARK_FINGERPRINT
+            );
+        }
     }
+
+    let catalog_started = Instant::now();
+    let (
+        selected_fingerprint,
+        full_identities,
+        full_fingerprint,
+        selected_query_indices,
+        full_query_indices,
+        query_cohort_fingerprint,
+    ) = if holdout_mode {
+        // In the prepared benchmark, FoundationPartition::Test is the reserved TRAIN-HOLDOUT.
+        // Historical TEST is a separate external evaluation resource and is not accessed here.
+        let holdout_groups = build_alignment_groups(
+            &corpus.records,
+            &benchmark,
+            FoundationPartition::Test,
+            V075_MAX_SEQUENCE_LEN,
+        )?;
+        let holdout_identities = build_all_partition_identities(
+            &corpus.records,
+            &holdout_groups,
+            V075_HOLDOUT_RECORD_SEED,
+        )?;
+        if holdout_identities.len() < V075_HOLDOUT_QUERIES {
+            anyhow::bail!(
+                "v0.75 HOLDOUT expected at least {V075_HOLDOUT_QUERIES} eligible identities, observed {}",
+                holdout_identities.len()
+            );
+        }
+        let query_indices = deterministic_eval_queries(
+            &holdout_identities,
+            V075_HOLDOUT_QUERIES,
+            V075_HOLDOUT_QUERY_SEED,
+        );
+        let query_identities = query_indices
+            .iter()
+            .map(|&index| holdout_identities[index].clone())
+            .collect::<Vec<_>>();
+        let query_fingerprint = format!("fnv1a64:{:016x}", identity_fingerprint(&query_identities));
+        let universe_fingerprint =
+            format!("fnv1a64:{:016x}", identity_fingerprint(&holdout_identities));
+        (
+            "NOT_APPLICABLE_HOLDOUT".to_string(),
+            holdout_identities,
+            universe_fingerprint,
+            query_indices.clone(),
+            query_indices,
+            query_fingerprint,
+        )
+    } else {
+        let dev_groups = build_alignment_groups(
+            &corpus.records,
+            &benchmark,
+            FoundationPartition::Validation,
+            V075_MAX_SEQUENCE_LEN,
+        )?;
+        let identity_seed = V070_SELECTION_SEED ^ 0x7000_d3f0_a11e_0001;
+        let selected_identities = select_dev_identities(
+            &corpus.records,
+            &dev_groups,
+            V070_DEV_IDENTITIES,
+            identity_seed,
+        )?;
+        if selected_identities.len() != V070_DEV_IDENTITIES {
+            anyhow::bail!(
+                "v0.75 expected {V070_DEV_IDENTITIES} frozen parent DEV identities, observed {}",
+                selected_identities.len()
+            );
+        }
+        let parent_fingerprint = format!(
+            "fnv1a64:{:016x}",
+            identity_fingerprint(&selected_identities)
+        );
+        if parent_fingerprint != V075_EXPECTED_PARENT_DEV_FINGERPRINT {
+            anyhow::bail!(
+                "v0.75 frozen query-cohort parent fingerprint mismatch: current={} expected={}",
+                parent_fingerprint,
+                V075_EXPECTED_PARENT_DEV_FINGERPRINT
+            );
+        }
+
+        let all_dev_identities = build_all_partition_identities(
+            &corpus.records,
+            &dev_groups,
+            identity_seed.rotate_left(17),
+        )?;
+        let universe_fingerprint =
+            format!("fnv1a64:{:016x}", identity_fingerprint(&all_dev_identities));
+        if all_dev_identities.len() != V075_EXPECTED_CANDIDATE_UNIVERSE {
+            anyhow::bail!(
+                "v0.75 candidate-universe size mismatch: current={} expected={}",
+                all_dev_identities.len(),
+                V075_EXPECTED_CANDIDATE_UNIVERSE
+            );
+        }
+        if universe_fingerprint != V075_EXPECTED_CANDIDATE_FINGERPRINT {
+            anyhow::bail!(
+                "v0.75 candidate-universe fingerprint mismatch: current={} expected={}",
+                universe_fingerprint,
+                V075_EXPECTED_CANDIDATE_FINGERPRINT
+            );
+        }
+
+        let full_index = full_identity_index(&all_dev_identities)?;
+        let query_indices = deterministic_eval_queries(
+            &selected_identities,
+            evaluation_queries,
+            V073_QUERY_SEED ^ 0x7300_d3f0_0000_0001,
+        );
+        let query_identities = query_indices
+            .iter()
+            .map(|&index| selected_identities[index].clone())
+            .collect::<Vec<_>>();
+        let query_fingerprint = format!("fnv1a64:{:016x}", identity_fingerprint(&query_identities));
+        let mut mapped_query_indices = Vec::with_capacity(query_indices.len());
+        for &selected_index in &query_indices {
+            let selected = &selected_identities[selected_index];
+            let full_index_value = *full_index.get(&selected.exact_key).with_context(|| {
+                format!(
+                    "v0.75 frozen query {} absent from direct candidate catalog",
+                    selected.exact_key
+                )
+            })?;
+            if all_dev_identities[full_index_value].record_index != selected.record_index {
+                anyhow::bail!(
+                    "v0.75 frozen query record drift for {}: selected={} full={}",
+                    selected.exact_key,
+                    selected.record_index,
+                    all_dev_identities[full_index_value].record_index
+                );
+            }
+            mapped_query_indices.push(full_index_value);
+        }
+        (
+            parent_fingerprint,
+            all_dev_identities,
+            universe_fingerprint,
+            query_indices,
+            mapped_query_indices,
+            query_fingerprint,
+        )
+    };
     let catalog_build_seconds = catalog_started.elapsed().as_secs_f64();
 
     fs::create_dir_all(&output_root)?;
@@ -348,10 +461,26 @@ fn main() -> Result<()> {
     println!("architecture\t{V075_ARCHITECTURE}");
     println!("score\t{V075_SCORE}");
     println!("mode\t{mode}");
+    println!("evaluation_partition\t{evaluation_partition}");
+    println!("protected_evaluation\t{}", yes_no(holdout_mode));
     println!("execution_device\tCPU");
     println!("training_scope\tNONE");
-    println!("selection_scope\tDEV_IMPLEMENTATION_REPRODUCTION_ONLY");
-    println!("candidate_universe_policy\tall_source_closed_dev_eligible_unique_peptidoform_charge_identities");
+    println!(
+        "selection_scope\t{}",
+        if holdout_mode {
+            "FROZEN_IMPLEMENTATION_CONFIRMATION_ONLY"
+        } else {
+            "DEV_IMPLEMENTATION_REPRODUCTION_ONLY"
+        }
+    );
+    println!(
+        "candidate_universe_policy\t{}",
+        if holdout_mode {
+            "all_source_closed_train_holdout_eligible_unique_peptidoform_charge_identities"
+        } else {
+            "all_source_closed_dev_eligible_unique_peptidoform_charge_identities"
+        }
+    );
     println!("candidate_policy\t{V075_CANDIDATE_POLICY}");
     println!("precursor_charge_policy\tobserved_positive_charge_required");
     println!("target_forcing\tNO");
@@ -365,10 +494,21 @@ fn main() -> Result<()> {
     println!("candidate_pool_sweep_performed\tNO");
     println!("candidate_pool\t{V075_MASS_POOL}");
     println!("parent_dev_identity_fingerprint\t{selected_fingerprint}");
-    println!("full_dev_candidate_universe\t{}", full_identities.len());
-    println!("full_dev_identity_fingerprint\t{full_fingerprint}");
-    println!("audit_queries\t{audit_queries}");
-    println!("train_holdout_consumed\tNO");
+    println!("candidate_universe\t{}", full_identities.len());
+    println!("candidate_universe_fingerprint\t{full_fingerprint}");
+    println!("query_cohort_fingerprint\t{query_cohort_fingerprint}");
+    println!("evaluation_queries\t{evaluation_queries}");
+    println!(
+        "dev_labels_used_for_analysis\t{}",
+        if holdout_mode {
+            "NO"
+        } else {
+            "YES_DEV_REPRODUCTION"
+        }
+    );
+    println!("dev_partition_used_for_selection\tNO");
+    println!("train_holdout_consumed\t{}", yes_no(holdout_mode));
+    println!("train_holdout_consumed_for_selection\tNO");
     println!("historical_validation_consumed\tNO");
     println!("historical_test_consumed\tNO");
 
@@ -390,31 +530,40 @@ fn main() -> Result<()> {
 
     print_metrics(&metrics);
 
-    let gate_fingerprint = full_fingerprint == V075_EXPECTED_CANDIDATE_FINGERPRINT;
+    let gate_candidate_provenance = if holdout_mode {
+        current_corpus_fingerprint == V075_EXPECTED_CORPUS_FINGERPRINT
+            && current_benchmark_fingerprint == V075_EXPECTED_BENCHMARK_FINGERPRINT
+    } else {
+        full_fingerprint == V075_EXPECTED_CANDIDATE_FINGERPRINT
+    };
     let gate_target_forcing = !V075_TARGET_FORCING;
-    let gate_coverage = (metrics.il_candidate_coverage - V075_MIN_IL_COVERAGE).abs() <= 1.0e-12;
+    let gate_coverage = if holdout_mode {
+        metrics.il_candidate_coverage >= V075_HOLDOUT_MIN_IL_COVERAGE
+    } else {
+        (metrics.il_candidate_coverage - V075_MIN_IL_COVERAGE).abs() <= 1.0e-12
+    };
     let gate_top1 = metrics.geometry.il_top1 >= V075_MIN_GEOMETRY_IL_TOP1;
     let gate_top10 = metrics.geometry.il_top10 >= V075_MIN_GEOMETRY_IL_TOP10;
     let gate_no_learned_dependency = metrics.learned_candidate_embedding_seconds == 0.0;
 
     println!(
-        "v0750_gate_candidate_universe_fingerprint_exact\t{}",
-        pass_fail(gate_fingerprint)
+        "v0750_gate_candidate_provenance\t{}",
+        pass_fail(gate_candidate_provenance)
     );
     println!(
         "v0750_gate_target_forcing_no\t{}",
         pass_fail(gate_target_forcing)
     );
     println!(
-        "v0750_gate_mass256_il_coverage_eq_1\t{}",
+        "v0750_gate_mass256_il_coverage\t{}",
         pass_fail(gate_coverage)
     );
     println!(
-        "v0750_gate_geometry_il_top1_ge_v074_floor\t{}",
+        "v0750_gate_geometry_il_top1_ge_frozen_floor\t{}",
         pass_fail(gate_top1)
     );
     println!(
-        "v0750_gate_geometry_il_top10_ge_v074_floor\t{}",
+        "v0750_gate_geometry_il_top10_ge_frozen_floor\t{}",
         pass_fail(gate_top10)
     );
     println!(
@@ -422,21 +571,16 @@ fn main() -> Result<()> {
         pass_fail(gate_no_learned_dependency)
     );
 
-    let decision = if mode == "smoke" {
-        "SMOKE_MECHANICAL_ONLY"
-    } else if gate_fingerprint
+    let all_confirmation_gates = gate_candidate_provenance
         && gate_target_forcing
         && gate_coverage
         && gate_top1
         && gate_top10
-        && gate_no_learned_dependency
-    {
-        "IMPLEMENTATION_REPRODUCTION_PASS"
-    } else {
-        "IMPLEMENTATION_REPRODUCTION_FAIL"
-    };
+        && gate_no_learned_dependency;
+    let decision = v075_decision(mode, all_confirmation_gates);
     println!("v0750_audit_decision\t{decision}");
-    println!("train_holdout_consumed\tNO");
+    println!("train_holdout_consumed\t{}", yes_no(holdout_mode));
+    println!("train_holdout_consumed_for_selection\tNO");
     println!("historical_validation_consumed\tNO");
     println!("historical_test_consumed\tNO");
 
@@ -444,11 +588,14 @@ fn main() -> Result<()> {
     write_summary(
         &output_root.join("summary.tsv"),
         mode,
+        evaluation_partition,
         &current_corpus_fingerprint,
         &current_benchmark_fingerprint,
         &selected_fingerprint,
         &full_fingerprint,
+        &query_cohort_fingerprint,
         decision,
+        holdout_mode,
         &metrics,
     )?;
     write_query_diagnostics(&output_root.join("query_diagnostics.tsv"), &diagnostics)?;
@@ -461,12 +608,19 @@ fn main() -> Result<()> {
         score: V075_SCORE.to_string(),
         candidate_policy: V075_CANDIDATE_POLICY.to_string(),
         mode: mode.to_string(),
+        evaluation_partition: evaluation_partition.to_string(),
+        protected_evaluation: holdout_mode,
         corpus_fingerprint: current_corpus_fingerprint,
         benchmark_manifest_fingerprint: current_benchmark_fingerprint,
         parent_dev_identity_fingerprint: selected_fingerprint,
         candidate_universe_fingerprint: full_fingerprint,
-        expected_candidate_universe_fingerprint: V075_EXPECTED_CANDIDATE_FINGERPRINT.to_string(),
-        audit_queries,
+        expected_candidate_universe_fingerprint: if holdout_mode {
+            "NOT_PREINSPECTED_PROTECTED_PARTITION".to_string()
+        } else {
+            V075_EXPECTED_CANDIDATE_FINGERPRINT.to_string()
+        },
+        query_cohort_fingerprint,
+        audit_queries: evaluation_queries,
         candidate_pool: V075_MASS_POOL,
         max_sequence_len: V075_MAX_SEQUENCE_LEN,
         target_forcing: V075_TARGET_FORCING,
@@ -477,7 +631,8 @@ fn main() -> Result<()> {
         threshold_tuning_performed: false,
         candidate_pool_sweep_performed: false,
         metrics,
-        train_holdout_consumed: false,
+        train_holdout_consumed: holdout_mode,
+        train_holdout_consumed_for_selection: false,
         historical_validation_consumed: false,
         historical_test_consumed: false,
     };
@@ -555,7 +710,7 @@ fn select_dev_identities(
     Ok(selected)
 }
 
-fn build_all_dev_identities(
+fn build_all_partition_identities(
     records: &[FoundationTrainingRecord],
     groups: &[AlignmentGroup],
     record_seed: u64,
@@ -982,7 +1137,6 @@ fn identify_queries(
         });
     }
 
-    let denom = full_query_indices.len() as f64;
     let candidate_count_min = candidate_counts.iter().copied().min().unwrap_or(0);
     let candidate_count_max = candidate_counts.iter().copied().max().unwrap_or(0);
     let candidate_count_mean = if candidate_counts.is_empty() {
@@ -1144,11 +1298,14 @@ fn write_metrics(path: &Path, metrics: &V075Metrics) -> Result<()> {
 fn write_summary(
     path: &Path,
     mode: &str,
+    evaluation_partition: &str,
     corpus_fingerprint: &str,
     benchmark_fingerprint: &str,
     parent_dev_fingerprint: &str,
     candidate_fingerprint: &str,
+    query_cohort_fingerprint: &str,
     decision: &str,
+    train_holdout_consumed: bool,
     metrics: &V075Metrics,
 ) -> Result<()> {
     let mut text = String::from("key\tvalue\n");
@@ -1158,6 +1315,11 @@ fn write_summary(
         ("architecture", V075_ARCHITECTURE.to_string()),
         ("score", V075_SCORE.to_string()),
         ("mode", mode.to_string()),
+        ("evaluation_partition", evaluation_partition.to_string()),
+        (
+            "protected_evaluation",
+            yes_no(train_holdout_consumed).to_string(),
+        ),
         ("corpus_fingerprint", corpus_fingerprint.to_string()),
         (
             "benchmark_manifest_fingerprint",
@@ -1171,7 +1333,12 @@ fn write_summary(
             "candidate_universe_fingerprint",
             candidate_fingerprint.to_string(),
         ),
+        (
+            "query_cohort_fingerprint",
+            query_cohort_fingerprint.to_string(),
+        ),
         ("candidate_universe", metrics.candidate_universe.to_string()),
+        ("evaluation_queries", metrics.queries.to_string()),
         ("candidate_pool", V075_MASS_POOL.to_string()),
         ("target_forcing", "NO".to_string()),
         ("v070_checkpoint_required", "NO".to_string()),
@@ -1223,7 +1390,20 @@ fn write_summary(
         ),
         ("elapsed_seconds", format!("{:.6}", metrics.elapsed_seconds)),
         ("audit_decision", decision.to_string()),
-        ("train_holdout_consumed", "NO".to_string()),
+        (
+            "train_holdout_consumed",
+            yes_no(train_holdout_consumed).to_string(),
+        ),
+        ("train_holdout_consumed_for_selection", "NO".to_string()),
+        (
+            "dev_labels_used_for_analysis",
+            if train_holdout_consumed {
+                "NO".to_string()
+            } else {
+                "YES_DEV_REPRODUCTION".to_string()
+            },
+        ),
+        ("dev_partition_used_for_selection", "NO".to_string()),
         ("historical_validation_consumed", "NO".to_string()),
         ("historical_test_consumed", "NO".to_string()),
     ];
@@ -1355,6 +1535,17 @@ fn pass_fail(value: bool) -> &'static str {
     }
 }
 
+fn v075_decision(mode: &str, all_confirmation_gates: bool) -> &'static str {
+    match mode {
+        "smoke" => "SMOKE_MECHANICAL_ONLY",
+        "audit" if all_confirmation_gates => "IMPLEMENTATION_REPRODUCTION_PASS",
+        "audit" => "IMPLEMENTATION_REPRODUCTION_FAIL",
+        "holdout" if all_confirmation_gates => "HOLDOUT_CONFIRMATION_PASS",
+        "holdout" => "HOLDOUT_CONFIRMATION_FAIL_DO_NOT_TUNE",
+        _ => "INVALID_MODE",
+    }
+}
+
 fn il_label(label: &str) -> String {
     label
         .chars()
@@ -1391,7 +1582,17 @@ fn self_test() -> Result<()> {
     if !(aligned > 0.9 && shifted == 0.0 && aligned > shifted) {
         anyhow::bail!("v0.75 self-test geometry score failed: aligned={aligned} shifted={shifted}");
     }
-    if V075_MASS_POOL != 256 || V075_EXPECTED_CANDIDATE_UNIVERSE != 63_332 {
+    if v075_decision("holdout", false) != "HOLDOUT_CONFIRMATION_FAIL_DO_NOT_TUNE"
+        || v075_decision("holdout", true) != "HOLDOUT_CONFIRMATION_PASS"
+    {
+        anyhow::bail!("v0.75 self-test protected HOLDOUT decision is not fail-closed");
+    }
+    if V075_MASS_POOL != 256
+        || V075_EXPECTED_CANDIDATE_UNIVERSE != 63_332
+        || V075_HOLDOUT_QUERIES != 2048
+        || V075_HOLDOUT_CONFIRM_TOKEN != "CONFIRM_TRAIN_HOLDOUT_ONCE"
+        || V075_HOLDOUT_MIN_IL_COVERAGE != 0.99
+    {
         anyhow::bail!("v0.75 self-test frozen implementation constants drifted");
     }
     Ok(())
@@ -1458,9 +1659,27 @@ mod tests {
     }
 
     #[test]
+    fn holdout_confirmation_is_fail_closed_without_tuning() {
+        assert_eq!(
+            v075_decision("holdout", false),
+            "HOLDOUT_CONFIRMATION_FAIL_DO_NOT_TUNE"
+        );
+        assert_eq!(v075_decision("holdout", true), "HOLDOUT_CONFIRMATION_PASS");
+    }
+
+    #[test]
     fn implementation_constants_are_frozen() {
         assert_eq!(V075_MASS_POOL, 256);
         assert_eq!(V075_MAX_SEQUENCE_LEN, 64);
+        assert_eq!(V075_HOLDOUT_QUERIES, 2048);
+        assert_eq!(V075_HOLDOUT_QUERY_SEED, 20_261_075);
+        assert_eq!(V075_HOLDOUT_CONFIRM_TOKEN, "CONFIRM_TRAIN_HOLDOUT_ONCE");
+        assert_eq!(V075_HOLDOUT_MIN_IL_COVERAGE, 0.99);
+        assert_eq!(V075_EXPECTED_CORPUS_FINGERPRINT, "fnv1a64:a2a6f57d31064ba6");
+        assert_eq!(
+            V075_EXPECTED_BENCHMARK_FINGERPRINT,
+            "fnv1a64:2133c039625f77df"
+        );
         assert_eq!(
             V075_EXPECTED_PARENT_DEV_FINGERPRINT,
             "fnv1a64:2aa9a31055c720a6"
