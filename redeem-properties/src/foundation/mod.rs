@@ -33,6 +33,7 @@ mod fragment_grounded_v0330;
 pub mod fragment_likelihood;
 pub mod fragment_relation;
 pub mod interaction;
+pub mod inverse_identifier_api_v0752;
 pub mod inverse_identifier_v0751;
 pub mod inverse_reward_v0290;
 pub mod iterative_refinement;
@@ -246,6 +247,16 @@ pub use fragment_relation::{
     FOUNDATION_FRAGMENT_RELATION_PPM_V0240,
 };
 pub use interaction::FoundationSpectrumCandidateInteractionAdapter;
+pub use inverse_identifier_api_v0752::{
+    FoundationPracticalIdentifierCatalogCandidateV0752, FoundationPracticalIdentifierCatalogV0752,
+    FoundationPracticalIdentifierModificationSiteV0752,
+    FoundationPracticalIdentifierModificationV0752, FoundationPracticalIdentifierPeakV0752,
+    FoundationPracticalIdentifierRequestV0752, FoundationPracticalIdentifierResponseV0752,
+    FoundationPracticalIdentifierResultHitV0752, FoundationPracticalIdentifierServiceV0752,
+    FOUNDATION_PRACTICAL_IDENTIFIER_API_SCHEMA_V0752,
+    FOUNDATION_PRACTICAL_IDENTIFIER_API_VERSION_V0752,
+    FOUNDATION_PRACTICAL_IDENTIFIER_DEFAULT_TOP_K_V0752,
+};
 pub use inverse_identifier_v0751::{
     FoundationPracticalIdentifierBuildTimingsV0751, FoundationPracticalIdentifierCandidateV0751,
     FoundationPracticalIdentifierHitV0751, FoundationPracticalIdentifierV0751,
