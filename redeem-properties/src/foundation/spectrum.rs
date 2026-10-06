@@ -413,11 +413,11 @@ mod tests {
     #[test]
     fn spectrum_collator_filters_truncates_and_normalizes() {
         let device = Device::Cpu;
-        let collator = FoundationSpectrumCollator::new(FoundationSpectrumConfig {
+        let config = FoundationSpectrumConfig {
             max_peaks: 2,
             ..FoundationSpectrumConfig::default()
-        })
-        .unwrap();
+        };
+        let collator = FoundationSpectrumCollator::new(config.clone()).unwrap();
         let spectrum = FoundationSpectrum::from_pairs([
             (500.0, 10.0),
             (100.0, 30.0),
@@ -425,7 +425,7 @@ mod tests {
             (-1.0, 99.0),
         ]);
         let batch = collator.collate(&[spectrum], &device).unwrap();
-        assert_eq!(batch.peak_features.dims(), &[1, 2, 8]);
+        assert_eq!(batch.peak_features.dims(), &[1, 2, config.peak_feature_dim]);
         assert_eq!(
             batch.peak_mask.to_vec2::<f32>().unwrap(),
             vec![vec![1.0, 1.0]]

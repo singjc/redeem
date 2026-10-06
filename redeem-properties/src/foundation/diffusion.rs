@@ -2011,7 +2011,7 @@ mod tests {
         );
         assert_eq!(
             output.spectrum_memory.dims(),
-            &[2, config.spectrum.max_peaks, config.model_dim]
+            &[2, config.spectrum.max_peaks + 1, config.model_dim]
         );
         assert_eq!(output.spectrum_embedding.dims(), &[2, config.model_dim]);
         let value = foundation_diffusion_x0_loss(&output, &diffusion_batch)

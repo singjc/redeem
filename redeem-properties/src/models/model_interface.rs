@@ -69,6 +69,70 @@ pub fn load_tensors_from_model<P: AsRef<Path>>(
     }
 }
 
+/// Canonical modification site used by the production prediction API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredictionModificationSite {
+    Residue(usize),
+    NTerm,
+    CTerm,
+}
+
+/// One site-specific peptide modification used by the production prediction API.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredictionModification {
+    pub site: PredictionModificationSite,
+    pub mass_delta: f32,
+    pub unimod_id: Option<u32>,
+}
+
+/// Model-agnostic peptide request used by production predictors.
+///
+/// Acquisition context is optional so RT-only callers do not need to fabricate
+/// charge/NCE/instrument values. Models that need a field treat `None` as unknown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredictionInput {
+    pub sequence: String,
+    pub modifications: Vec<PredictionModification>,
+    pub charge: Option<i32>,
+    pub precursor_mz: Option<f32>,
+    pub nce: Option<f32>,
+    pub instrument_id: Option<u32>,
+    pub instrument_name: Option<String>,
+}
+
+impl PredictionInput {
+    pub fn unmodified(sequence: impl Into<String>) -> Self {
+        Self {
+            sequence: sequence.into(),
+            modifications: Vec::new(),
+            charge: None,
+            precursor_mz: None,
+            nce: None,
+            instrument_id: None,
+            instrument_name: None,
+        }
+    }
+}
+
+/// Multi-property prediction for one peptide request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PredictionOutput {
+    pub rt: Option<f32>,
+    pub ccs: Option<f32>,
+    /// Fragment intensities indexed as `[cleavage][channel]`.
+    pub ms2: Option<Vec<Vec<f32>>>,
+}
+
+/// Small production inference contract shared by prediction backends.
+///
+/// This is intentionally separate from [`ModelInterface`], which also owns the
+/// legacy single-property training/fine-tuning lifecycle. Multi-task foundation
+/// inference should not pretend to be one RT/CCS/MS2 model merely to satisfy
+/// that older trait.
+pub trait PredictionModel {
+    fn predict_batch(&self, inputs: &[PredictionInput]) -> Result<Vec<PredictionOutput>>;
+}
+
 /// Represents the type of property to predict.
 #[derive(Clone)]
 pub enum PropertyType {
