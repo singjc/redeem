@@ -168,13 +168,47 @@ struct FoundationTrainingSource {
 pub fn load_foundation_records_from_run(
     run_yaml: impl AsRef<Path>,
 ) -> Result<Vec<FoundationTrainingRecord>> {
+    let (_, records) = load_foundation_run(run_yaml)?;
+    Ok(records)
+}
+
+/// Load only one benchmark partition from a prepared run.
+///
+/// This keeps engineering inference/evaluation from silently consuming protected
+/// partitions simply because they share the same materialized corpus.
+pub fn load_foundation_records_from_run_partition(
+    run_yaml: impl AsRef<Path>,
+    partition: FoundationPartition,
+) -> Result<Vec<FoundationTrainingRecord>> {
+    let (benchmark, records) = load_foundation_run(run_yaml)?;
+    let indices = benchmark.partition_indices(partition);
+    if indices.is_empty() {
+        anyhow::bail!("foundation requested partition contains no records");
+    }
+    indices
+        .into_iter()
+        .map(|index| {
+            records.get(index).cloned().ok_or_else(|| {
+                anyhow::anyhow!("foundation benchmark record index {index} is out of range")
+            })
+        })
+        .collect()
+}
+
+fn load_foundation_run(
+    run_yaml: impl AsRef<Path>,
+) -> Result<(FoundationBenchmarkManifest, Vec<FoundationTrainingRecord>)> {
     let run_yaml = run_yaml.as_ref();
     let source: FoundationTrainingSource = serde_yaml::from_str(
         &fs::read_to_string(run_yaml)
             .with_context(|| format!("read foundation run YAML {}", run_yaml.display()))?,
     )
     .with_context(|| format!("parse foundation run YAML {}", run_yaml.display()))?;
-    Ok(load_foundation_corpus(&source.corpus)?.records)
+    let corpus = load_foundation_corpus(&source.corpus)?;
+    let benchmark = FoundationBenchmarkManifest::read_tsv(&source.benchmark_manifest)
+        .with_context(|| format!("read benchmark {}", source.benchmark_manifest.display()))?;
+    benchmark.validate_against_records(&corpus.records)?;
+    Ok((benchmark, corpus.records))
 }
 
 /// One epoch's aggregate optimization/evaluation losses.

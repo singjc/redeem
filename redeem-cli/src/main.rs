@@ -152,6 +152,12 @@ fn main() -> Result<()> {
                             .value_parser(clap::value_parser!(PathBuf))
                             .value_hint(ValueHint::FilePath),
                     )
+                    .arg(
+                        Arg::new("foundation_partition")
+                            .long("partition")
+                            .help("Foundation benchmark partition to infer: train or validation. Test stays closed.")
+                            .value_parser(["train", "validation"]),
+                    )
                 ),
         )
         .subcommand(

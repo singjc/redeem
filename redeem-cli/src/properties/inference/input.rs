@@ -17,6 +17,9 @@ pub struct PropertyInferenceConfig {
     pub model_arch: String,
     pub device: String,
     pub batch_size: usize,
+    /// Benchmark partition used by foundation inference. The properties CLI
+    /// intentionally supports only train/validation; historical test remains closed.
+    pub foundation_partition: String,
     pub instrument: String,
     pub nce: i32,
     /// Optional path to a dataset whose normalization stats should be reused (e.g., training data).
@@ -46,6 +49,7 @@ impl Default for PropertyInferenceConfig {
             model_arch: String::from("rt_cnn_tf"),
             device: String::from("cpu"),
             batch_size: 64,
+            foundation_partition: String::from("validation"),
             instrument: String::from("QE"),
             nce: 20,
             normalization_reference_data: None,
@@ -96,6 +100,7 @@ impl PropertyInferenceConfig {
         load_or_default!(model_arch);
         load_or_default!(device);
         load_or_default!(batch_size);
+        load_or_default!(foundation_partition);
         load_or_default!(instrument);
         load_or_default!(nce);
         load_or_default!(normalization_reference_data);
@@ -145,6 +150,9 @@ impl PropertyInferenceConfig {
         }
         if let Ok(Some(model_arch)) = matches.try_get_one::<String>("model_arch") {
             config.model_arch = model_arch.clone();
+        }
+        if let Ok(Some(partition)) = matches.try_get_one::<String>("foundation_partition") {
+            config.foundation_partition = partition.clone();
         }
         if let Some(inference_data) = matches.get_one::<PathBuf>("inference_data") {
             config.inference_data = inference_data.to_string_lossy().into_owned();

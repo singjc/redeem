@@ -2,8 +2,8 @@ use crate::properties::inference::input::PropertyInferenceConfig;
 use crate::properties::train::input::PropertyTrainConfig;
 use anyhow::{Context, Result};
 use redeem_properties::foundation::{
-    FoundationModel, FoundationTrainingConfig, load_foundation_records_from_run,
-    train_foundation_model,
+    FoundationModel, FoundationPartition, FoundationTrainingConfig,
+    load_foundation_records_from_run_partition, train_foundation_model,
 };
 use redeem_properties::utils::utils::get_device;
 use std::fs::File;
@@ -61,9 +61,19 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
         anyhow::bail!("foundation inference batch_size must be positive");
     }
 
+    let partition = match config.foundation_partition.as_str() {
+        "train" => FoundationPartition::Train,
+        "validation" => FoundationPartition::Validation,
+        "test" => anyhow::bail!(
+            "foundation properties inference keeps the historical test partition closed"
+        ),
+        other => anyhow::bail!(
+            "unsupported foundation inference partition '{other}'; use train or validation"
+        ),
+    };
     let device = get_device(&config.device)?;
     let model = FoundationModel::load(&config.model_path, device)?;
-    let records = load_foundation_records_from_run(&config.inference_data)?;
+    let records = load_foundation_records_from_run_partition(&config.inference_data, partition)?;
     let output = File::create(&config.output_file)
         .with_context(|| format!("create foundation inference output {}", config.output_file))?;
     let mut writer = BufWriter::new(output);
@@ -120,6 +130,7 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
     writer.flush()?;
 
     println!("foundation_inference=PASS");
+    println!("partition={}", config.foundation_partition);
     println!("records={written}");
     println!("output={}", config.output_file);
     Ok(())

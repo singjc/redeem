@@ -151,6 +151,7 @@ fn inference_config_default_values() {
     let cfg = PropertyInferenceConfig::default();
     assert_eq!(cfg.model_arch, "rt_cnn_tf");
     assert_eq!(cfg.device, "cpu");
+    assert_eq!(cfg.foundation_partition, "validation");
     assert!(cfg.batch_size > 0);
 }
 
@@ -160,6 +161,7 @@ fn inference_config_serializes() {
     let json = serde_json::to_string(&cfg).unwrap();
     assert!(json.contains("model_arch"));
     assert!(json.contains("batch_size"));
+    assert!(json.contains("foundation_partition"));
 }
 
 #[test]
