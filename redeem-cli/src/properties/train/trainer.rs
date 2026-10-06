@@ -21,6 +21,10 @@ use load_data::load_peptide_data;
 use super::input;
 
 pub fn run_training(config: &PropertyTrainConfig) -> Result<()> {
+    if config.model_arch == "foundation" {
+        return crate::properties::foundation::run_training(config);
+    }
+
     log::trace!("Loading modifications map");
     let modifications = load_modifications().context("Failed to load modifications")?;
 

@@ -260,7 +260,7 @@ fn no_corruption() -> FoundationCorruptionConfig {
     }
 }
 
-fn prediction_record(input: &PredictionInput) -> Result<FoundationTrainingRecord> {
+pub(crate) fn prediction_record(input: &PredictionInput) -> Result<FoundationTrainingRecord> {
     if input.sequence.is_empty() {
         anyhow::bail!("foundation prediction sequence cannot be empty");
     }

@@ -1,8 +1,8 @@
 //! Production foundation-model surface.
 //!
-//! Historical training executables remain retired, but the accepted forward
-//! inference architectures are retained privately so production callers can load
-//! the validated RT/MS2 and CCS checkpoints through [`FoundationPredictor`].
+//! [`FoundationModel`] is the stable train-from-scratch and inference path for the
+//! joint forward/inverse model. Historical accepted RT/MS2 and CCS checkpoints
+//! remain available through [`FoundationPredictor`] for compatibility and parity.
 
 mod causal;
 pub mod ccs_physics;
@@ -29,8 +29,10 @@ pub mod msp;
 pub mod normalization;
 pub mod predictor;
 pub mod rt_harmonization;
+pub mod runtime;
 pub mod spectrum;
 pub mod split;
+pub mod training;
 
 pub use ccs_physics::{
     evaluate_foundation_ccs_physics_baseline, fit_foundation_ccs_physics_baseline,
@@ -188,6 +190,16 @@ pub use normalization::{
 };
 
 pub use predictor::{FoundationPredictor, FoundationPredictorConfig};
+
+pub use runtime::{
+    read_foundation_checkpoint_metadata, FoundationCheckpointMetadata, FoundationModel,
+    FoundationModelConfig, FoundationRecordPrediction,
+};
+
+pub use training::{
+    load_foundation_records_from_run, train_foundation_model, FoundationEpochLosses,
+    FoundationTrainingConfig, FoundationTrainingSummary,
+};
 
 pub use rt_harmonization::{
     apply_foundation_rt_harmonization, fit_foundation_rt_harmonization,

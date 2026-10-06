@@ -22,6 +22,10 @@ use crate::properties::train::sample_indices;
 use crate::properties::util::write_bytes_to_file;
 
 pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
+    if config.model_arch == "foundation" {
+        return crate::properties::foundation::run_inference(config);
+    }
+
     let modifications = load_modifications().context("Failed to load modifications")?;
 
     // If requested, force decoder head selection via env var so the model loader can honor it.

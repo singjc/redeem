@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use redeem_properties::foundation::FoundationTrainingConfig;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PropertyTrainConfig {
     pub version: String,
@@ -28,6 +30,9 @@ pub struct PropertyTrainConfig {
     pub train_var_prefixes: Option<Vec<String>>,
     /// Fraction of total steps used for LR warmup (0.0–1.0). Defaults to 0.12 if omitted.
     pub warmup_fraction: Option<f32>,
+    /// Optional full configuration for the joint foundation trainer. When omitted,
+    /// the shared batch/LR/epoch fields above are applied to foundation defaults.
+    pub foundation: Option<FoundationTrainingConfig>,
 }
 
 impl Default for PropertyTrainConfig {
@@ -52,6 +57,7 @@ impl Default for PropertyTrainConfig {
             head_type: String::from("mlp"),
             head_learnable_scaler: false,
             warmup_fraction: Some(0.12),
+            foundation: None,
         }
     }
 }
@@ -104,6 +110,7 @@ impl PropertyTrainConfig {
         load_or_default!(head_learnable_scaler);
         load_or_default!(train_var_prefixes);
         load_or_default!(warmup_fraction);
+        load_or_default!(foundation);
 
         // Apply CLI overrides
         if let Some(train_data) = matches.get_one::<String>("train_data") {

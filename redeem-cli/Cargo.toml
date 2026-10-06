@@ -36,7 +36,7 @@ features = []
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "redeem-properties/cuda"]
 svm = ["redeem-classifiers/svm"]
 xgboost = ["redeem-classifiers/xgboost"]
 

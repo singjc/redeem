@@ -143,20 +143,18 @@ impl PropertyInferenceConfig {
                 }
             }
         }
+        if let Ok(Some(model_arch)) = matches.try_get_one::<String>("model_arch") {
+            config.model_arch = model_arch.clone();
+        }
         if let Some(inference_data) = matches.get_one::<PathBuf>("inference_data") {
-            let inference_data = inference_data.to_string_lossy().into_owned();
-            validate_tsv_or_csv_file(&inference_data)?;
-            config.inference_data = inference_data;
-        } else {
+            config.inference_data = inference_data.to_string_lossy().into_owned();
+        }
+        if config.model_arch != "foundation" {
             validate_tsv_or_csv_file(&config.inference_data)?;
         }
         if let Some(output_file) = matches.get_one::<PathBuf>("output_file") {
             config.output_file = output_file.to_string_lossy().into_owned();
         }
-        // Note: the inference subcommand does not define a `model_arch` CLI arg (it's defined
-        // for `train`). We intentionally skip attempting to read a CLI override here to
-        // avoid mismatched-arg panics from clap. The config file value (or default) will be
-        // used for `model_arch`.
 
         Ok(config)
     }

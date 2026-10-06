@@ -45,8 +45,7 @@ fn main() -> Result<()> {
                                 .long("train_data")
                                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                                 .help(
-                                    "Path to training data. Overrides the training data file \
-                                     specified in the configuration file.",
+                                    "Path to training data. Foundation training expects a prepared run YAML; legacy models expect their existing tabular input. Overrides the configuration file.",
                                 )
                                 .value_hint(ValueHint::FilePath),
                         )
@@ -56,8 +55,7 @@ fn main() -> Result<()> {
                                 .long("validation_data")
                                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                                 .help(
-                                    "Path to validation data. Overrides the validation data file \
-                                     specified in the configuration file.",
+                                    "Path to validation data for legacy models. Foundation training uses the prepared benchmark manifest and does not accept this option.",
                                 )
                                 .value_hint(ValueHint::FilePath),
                         )
@@ -67,8 +65,8 @@ fn main() -> Result<()> {
                                 .long("output_file")
                                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                                 .help(
-                                    "File path that the safetensors trained model will be written to. \
-                                     Overrides the directory specified in the configuration file.",
+                                    "Model output path. Foundation models use this as a checkpoint directory; legacy models write a safetensors file. \
+                                     Overrides the path specified in the configuration file.",
                                 )
                                 .value_hint(ValueHint::FilePath),
                         )
@@ -85,6 +83,8 @@ fn main() -> Result<()> {
                                     "rt_cnn_tf",
                                     "ms2_bert",
                                     "ccs_cnn_lstm",
+                                    "ccs_cnn_tf",
+                                    "foundation",
                                 ])
                                 .required(false)
                         )
@@ -94,8 +94,7 @@ fn main() -> Result<()> {
                                 .long("checkpoint_file")
                                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                                 .help(
-                                    "File path of the checkpoint safetensors file to load. \
-                                     Overrides the checkpoint_file specified in the configuration file.",
+                                    "Optional initialization checkpoint. Foundation training requires a foundation checkpoint directory; legacy behavior is unchanged.",
                                 )
                                 .value_hint(ValueHint::FilePath),
                         ),
@@ -120,15 +119,28 @@ fn main() -> Result<()> {
                         Arg::new("model_path")
                             .short('m')
                             .long("model")
-                            .help("Path to the trained model file (*.safetensors)")
+                            .help("Path to a trained model file, or a foundation checkpoint directory")
                             .value_parser(clap::value_parser!(PathBuf))
                             .value_hint(ValueHint::FilePath),
+                    )
+                    .arg(
+                        Arg::new("model_arch")
+                            .long("model_arch")
+                            .help("Model architecture to use for inference")
+                            .value_parser([
+                                "rt_cnn_lstm",
+                                "rt_cnn_tf",
+                                "ms2_bert",
+                                "ccs_cnn_lstm",
+                                "ccs_cnn_tf",
+                                "foundation",
+                            ]),
                     )
                     .arg(
                         Arg::new("inference_data")
                             .short('d')
                             .long("inference_data")
-                            .help("Path to the input data file")
+                            .help("Input data path. Foundation inference expects a prepared run YAML; legacy models expect TSV/CSV.")
                             .value_parser(clap::value_parser!(PathBuf))
                             .value_hint(ValueHint::FilePath),
                     )

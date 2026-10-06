@@ -7,6 +7,7 @@ use std::sync::{LazyLock, Mutex};
 
 use redeem_cli::classifiers::score::score::ScoreConfig;
 use redeem_cli::properties::inference::input::PropertyInferenceConfig;
+use redeem_cli::properties::train::input::PropertyTrainConfig;
 use redeem_cli::properties::util::validate_tsv_or_csv_file;
 
 static PRETRAINED_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -146,6 +147,7 @@ fn train_config_serializes() {
 #[test]
 fn inference_config_default_values() {
     use redeem_cli::properties::inference::input::PropertyInferenceConfig;
+    use redeem_cli::properties::train::input::PropertyTrainConfig;
     let cfg = PropertyInferenceConfig::default();
     assert_eq!(cfg.model_arch, "rt_cnn_tf");
     assert_eq!(cfg.device, "cpu");
@@ -263,4 +265,86 @@ fn inference_config_pretrained_overrides_model_arch() {
     assert_eq!(config.model_arch, "rt_cnn_lstm");
     assert!(config.model_path.ends_with("rt.pth"));
     assert_eq!(config.inference_data, inference_data.to_string_lossy());
+}
+
+#[test]
+fn foundation_inference_accepts_prepared_run_yaml() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("foundation_inference.json");
+    let run_yaml = dir.path().join("prepared_run.yaml");
+    std::fs::write(&run_yaml, "corpus: {}\nbenchmark_manifest: benchmark.tsv\n").unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"{{"model_arch":"foundation","inference_data":"{}"}}"#,
+            run_yaml.display()
+        ),
+    )
+    .unwrap();
+
+    let matches = Command::new("redeem")
+        .arg(Arg::new("pretrained").long("pretrained"))
+        .arg(
+            Arg::new("model_path")
+                .long("model")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(Arg::new("model_arch").long("model_arch"))
+        .arg(
+            Arg::new("inference_data")
+                .long("inference_data")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output_file")
+                .long("output_file")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .try_get_matches_from(["redeem"])
+        .unwrap();
+
+    let config = PropertyInferenceConfig::from_arguments(&config_path, &matches).unwrap();
+    assert_eq!(config.model_arch, "foundation");
+    assert_eq!(config.inference_data, run_yaml.to_string_lossy());
+}
+
+#[test]
+fn foundation_training_config_accepts_bounded_smoke_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("foundation_train.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+          "model_arch": "foundation",
+          "train_data": "prepared_run.yaml",
+          "output_file": "foundation_model",
+          "device": "cpu",
+          "foundation": {
+            "batch_size": 8,
+            "epochs": 2,
+            "max_train_batches_per_epoch": 3,
+            "max_validation_batches": 2
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let matches = Command::new("redeem")
+        .arg(Arg::new("train_data").long("train_data"))
+        .arg(Arg::new("validation_data").long("validation_data"))
+        .arg(Arg::new("output_file").long("output_file"))
+        .arg(Arg::new("model_arch").long("model_arch"))
+        .arg(Arg::new("checkpoint_file").long("checkpoint_file"))
+        .try_get_matches_from(["redeem"])
+        .unwrap();
+
+    let config = PropertyTrainConfig::from_arguments(&config_path, &matches).unwrap();
+    let foundation = config.foundation.unwrap();
+    assert_eq!(config.model_arch, "foundation");
+    assert_eq!(foundation.batch_size, 8);
+    assert_eq!(foundation.epochs, 2);
+    assert_eq!(foundation.max_train_batches_per_epoch, Some(3));
+    assert_eq!(foundation.max_validation_batches, Some(2));
+    assert!(foundation.inverse_weight > 0.0);
+    assert!(foundation.cross_modal_alignment_weight > 0.0);
 }
