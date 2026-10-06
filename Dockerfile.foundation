@@ -5,6 +5,7 @@ ARG CUDA_VERSION=12.2.2
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
 
 ARG RUST_TOOLCHAIN=stable
+ARG CUDA_COMPUTE_CAP=80
 ARG CARGO_BUILD_JOBS=1
 ARG CARGO_RELEASE_LTO=off
 ARG CARGO_RELEASE_CODEGEN_UNITS=8
@@ -33,6 +34,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf \
 
 ENV PATH=/root/.cargo/bin:${PATH}
 ENV CUDA_HOME=/usr/local/cuda
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
