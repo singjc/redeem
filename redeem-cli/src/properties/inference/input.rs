@@ -20,6 +20,10 @@ pub struct PropertyInferenceConfig {
     /// Benchmark partition used by foundation inference. The properties CLI
     /// intentionally supports only train/validation; historical test remains closed.
     pub foundation_partition: String,
+    /// Optional cap for bounded foundation inference/evaluation runs.
+    pub foundation_max_records: Option<usize>,
+    /// Keep only records with observed spectra. Useful for bounded inverse checks.
+    pub foundation_spectra_only: bool,
     pub instrument: String,
     pub nce: i32,
     /// Optional path to a dataset whose normalization stats should be reused (e.g., training data).
@@ -50,6 +54,8 @@ impl Default for PropertyInferenceConfig {
             device: String::from("cpu"),
             batch_size: 64,
             foundation_partition: String::from("validation"),
+            foundation_max_records: None,
+            foundation_spectra_only: false,
             instrument: String::from("QE"),
             nce: 20,
             normalization_reference_data: None,
@@ -101,6 +107,8 @@ impl PropertyInferenceConfig {
         load_or_default!(device);
         load_or_default!(batch_size);
         load_or_default!(foundation_partition);
+        load_or_default!(foundation_max_records);
+        load_or_default!(foundation_spectra_only);
         load_or_default!(instrument);
         load_or_default!(nce);
         load_or_default!(normalization_reference_data);

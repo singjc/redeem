@@ -152,6 +152,8 @@ fn inference_config_default_values() {
     assert_eq!(cfg.model_arch, "rt_cnn_tf");
     assert_eq!(cfg.device, "cpu");
     assert_eq!(cfg.foundation_partition, "validation");
+    assert_eq!(cfg.foundation_max_records, None);
+    assert!(!cfg.foundation_spectra_only);
     assert!(cfg.batch_size > 0);
 }
 
@@ -162,6 +164,8 @@ fn inference_config_serializes() {
     assert!(json.contains("model_arch"));
     assert!(json.contains("batch_size"));
     assert!(json.contains("foundation_partition"));
+    assert!(json.contains("foundation_max_records"));
+    assert!(json.contains("foundation_spectra_only"));
 }
 
 #[test]

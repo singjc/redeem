@@ -2,7 +2,7 @@ use crate::properties::inference::input::PropertyInferenceConfig;
 use crate::properties::train::input::PropertyTrainConfig;
 use anyhow::{Context, Result};
 use redeem_properties::foundation::{
-    FoundationModel, FoundationPartition, FoundationTrainingConfig,
+    FoundationModel, FoundationPartition, FoundationSpectrum, FoundationTrainingConfig,
     load_foundation_records_from_run_partition, train_foundation_model,
 };
 use redeem_properties::utils::utils::get_device;
@@ -72,8 +72,23 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
         ),
     };
     let device = get_device(&config.device)?;
+    if matches!(config.foundation_max_records, Some(0)) {
+        anyhow::bail!("foundation inference max records must be positive");
+    }
+
     let model = FoundationModel::load(&config.model_path, device)?;
-    let records = load_foundation_records_from_run_partition(&config.inference_data, partition)?;
+    let mut records =
+        load_foundation_records_from_run_partition(&config.inference_data, partition)?;
+    if config.foundation_spectra_only {
+        records.retain(|record| FoundationSpectrum::from_training_record(record).is_some());
+    }
+    if let Some(limit) = config.foundation_max_records {
+        records.truncate(limit);
+    }
+    if records.is_empty() {
+        anyhow::bail!("foundation inference selection contains no records");
+    }
+
     let output = File::create(&config.output_file)
         .with_context(|| format!("create foundation inference output {}", config.output_file))?;
     let mut writer = BufWriter::new(output);
@@ -131,6 +146,7 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
 
     println!("foundation_inference=PASS");
     println!("partition={}", config.foundation_partition);
+    println!("spectra_only={}", config.foundation_spectra_only);
     println!("records={written}");
     println!("output={}", config.output_file);
     Ok(())
