@@ -351,6 +351,8 @@ fn foundation_training_config_accepts_bounded_smoke_overrides() {
     assert_eq!(foundation.epochs, 2);
     assert_eq!(foundation.max_train_batches_per_epoch, Some(3));
     assert_eq!(foundation.max_validation_batches, Some(2));
+    assert_eq!(foundation.inverse_evaluation_records, 256);
+    assert_eq!(foundation.generation_evaluation_records, 16);
     assert!(foundation.inverse_weight > 0.0);
     assert!(foundation.cross_modal_alignment_weight > 0.0);
 }

@@ -4,9 +4,11 @@
 //! random initialization (or optional same-architecture warm start), one optimizer,
 //! TRAIN-only normalization, Validation-only early stopping, and one checkpoint format.
 
+use super::causal::foundation_causal_sequence_mean_nlls;
 use super::collate::{FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig};
 use super::corpus::{load_foundation_corpus, FoundationCorpusConfig};
 use super::data::{FoundationTrainingRecord, RetentionTimeObjective};
+use super::diffusion::FOUNDATION_OPEN_PTM_MASS_SCALE_DA;
 use super::experiment::{FoundationBenchmarkManifest, FoundationPartition};
 use super::loss::{
     contrastive_info_nce_loss, multi_task_loss_with_ms2_config, FoundationLossWeights,
@@ -40,6 +42,12 @@ pub struct FoundationTrainingConfig {
     pub max_train_batches_per_epoch: Option<usize>,
     /// Optional bounded validation mode; `None` evaluates the full partition.
     pub max_validation_batches: Option<usize>,
+    /// Maximum number of spectrum-bearing Validation records used for teacher-forced inverse and retrieval metrics per epoch.
+    /// Set to zero to disable inverse evaluation metrics without changing the training objective.
+    pub inverse_evaluation_records: usize,
+    /// Maximum number of spectrum-bearing Validation records decoded greedily per epoch.
+    /// Set to zero to disable free-generation metrics while retaining teacher-forced inverse metrics.
+    pub generation_evaluation_records: usize,
     pub forward_loss_weights: FoundationLossWeights,
     pub ms2_loss: FoundationMs2LossConfig,
     pub peptide_contrastive_weight: f64,
@@ -61,6 +69,8 @@ impl Default for FoundationTrainingConfig {
             seed: 20_261_006,
             max_train_batches_per_epoch: None,
             max_validation_batches: None,
+            inverse_evaluation_records: 256,
+            generation_evaluation_records: 16,
             forward_loss_weights: FoundationLossWeights {
                 rt: 1.0,
                 ccs: 1.0,
@@ -253,6 +263,35 @@ pub struct FoundationTrainingSummary {
     pub completed_epochs: usize,
     pub best_validation_loss: f64,
     pub checkpoint: PathBuf,
+    pub validation_metrics: PathBuf,
+}
+
+/// Native-unit and inverse-task diagnostics for one Validation pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FoundationEvaluationMetrics {
+    pub records: usize,
+    pub rt_count: usize,
+    pub rt_mae_native: Option<f64>,
+    pub rt_rmse_native: Option<f64>,
+    pub ccs_count: usize,
+    pub ccs_mae: Option<f64>,
+    pub ccs_rmse: Option<f64>,
+    pub ms2_point_count: usize,
+    pub ms2_rmse: Option<f64>,
+    pub ms2_spectrum_count: usize,
+    pub ms2_cosine_similarity: Option<f64>,
+    pub inverse_sequence_count: usize,
+    pub inverse_mean_nll: Option<f64>,
+    pub inverse_ptm_site_count: usize,
+    pub inverse_ptm_mass_rmse_da: Option<f64>,
+    pub retrieval_queries: usize,
+    pub retrieval_top1_accuracy: Option<f64>,
+    pub retrieval_mrr: Option<f64>,
+    pub generation_attempts: usize,
+    pub generation_success_rate: Option<f64>,
+    pub generation_sequence_exact_rate: Option<f64>,
+    pub generation_sequence_il_equivalent_rate: Option<f64>,
+    pub generation_mean_length: Option<f64>,
 }
 
 struct BatchLoss {
@@ -372,9 +411,14 @@ pub fn train_foundation_model(
         )
     })?;
     let history = output_dir.join("training_history.tsv");
+    let validation_metrics_path = output_dir.join("validation_metrics.tsv");
     fs::write(
         &history,
         "epoch\ttrain_total\ttrain_forward\ttrain_inverse\ttrain_inverse_ptm_mass\ttrain_peptide_contrastive\ttrain_cross_modal_alignment\tvalidation_total\tvalidation_forward\tvalidation_inverse\tvalidation_inverse_ptm_mass\tvalidation_peptide_contrastive\tvalidation_cross_modal_alignment\n",
+    )?;
+    fs::write(
+        &validation_metrics_path,
+        "epoch\trecords\trt_count\trt_mae_native\trt_rmse_native\tccs_count\tccs_mae\tccs_rmse\tms2_point_count\tms2_rmse\tms2_spectrum_count\tms2_cosine_similarity\tinverse_sequence_count\tinverse_mean_nll\tinverse_ptm_site_count\tinverse_ptm_mass_rmse_da\tretrieval_queries\tretrieval_top1_accuracy\tretrieval_mrr\tgeneration_attempts\tgeneration_success_rate\tgeneration_sequence_exact_rate\tgeneration_sequence_il_equivalent_rate\tgeneration_mean_length\n",
     )?;
 
     let mut best_validation_loss = f64::INFINITY;
@@ -417,13 +461,33 @@ pub fn train_foundation_model(
         completed_epochs = epoch + 1;
 
         append_history(&history, completed_epochs, train_losses, validation_losses)?;
+        let validation_metrics = evaluate_partition(
+            &model,
+            &corpus.records,
+            &validation_indices,
+            training.batch_size,
+            training.max_validation_batches,
+            training.inverse_evaluation_records,
+            training.generation_evaluation_records,
+            training.ms2_loss.cosine_epsilon,
+            &device,
+        )?;
+        append_validation_metrics(
+            &validation_metrics_path,
+            completed_epochs,
+            validation_metrics,
+        )?;
         eprintln!(
-            "foundation epoch={} train_loss={:.6} validation_loss={:.6} inverse={:.6} alignment={:.6}",
+            "foundation epoch={} train_loss={:.6} validation_loss={:.6} rt_mae={} ccs_mae={} ms2_cosine={} inverse_nll={} retrieval_mrr={} generation_exact={}",
             completed_epochs,
             train_losses.total,
             validation_losses.total,
-            validation_losses.inverse,
-            validation_losses.cross_modal_alignment,
+            optional_metric(validation_metrics.rt_mae_native),
+            optional_metric(validation_metrics.ccs_mae),
+            optional_metric(validation_metrics.ms2_cosine_similarity),
+            optional_metric(validation_metrics.inverse_mean_nll),
+            optional_metric(validation_metrics.retrieval_mrr),
+            optional_metric(validation_metrics.generation_sequence_exact_rate),
         );
 
         if validation_losses.total < best_validation_loss {
@@ -453,6 +517,7 @@ pub fn train_foundation_model(
         completed_epochs,
         best_validation_loss,
         checkpoint: output_dir.to_path_buf(),
+        validation_metrics: validation_metrics_path,
     })
 }
 
@@ -647,6 +712,449 @@ fn shuffle_indices(values: &mut [usize], seed: u64) {
     }
 }
 
+#[derive(Debug, Default)]
+struct EvaluationAccumulator {
+    records: usize,
+    rt_abs_error_sum: f64,
+    rt_squared_error_sum: f64,
+    rt_count: usize,
+    ccs_abs_error_sum: f64,
+    ccs_squared_error_sum: f64,
+    ccs_count: usize,
+    ms2_squared_error_sum: f64,
+    ms2_point_count: usize,
+    ms2_cosine_sum: f64,
+    ms2_spectrum_count: usize,
+    inverse_nll_sum: f64,
+    inverse_sequence_count: usize,
+    inverse_ptm_scaled_squared_error_sum: f64,
+    inverse_ptm_site_count: usize,
+    retrieval_top1_count: usize,
+    retrieval_reciprocal_rank_sum: f64,
+    retrieval_queries: usize,
+    generation_attempts: usize,
+    generation_successes: usize,
+    generation_exact: usize,
+    generation_il_equivalent: usize,
+    generation_length_sum: usize,
+}
+
+impl EvaluationAccumulator {
+    fn finish(self) -> FoundationEvaluationMetrics {
+        FoundationEvaluationMetrics {
+            records: self.records,
+            rt_count: self.rt_count,
+            rt_mae_native: ratio(self.rt_abs_error_sum, self.rt_count),
+            rt_rmse_native: ratio(self.rt_squared_error_sum, self.rt_count).map(f64::sqrt),
+            ccs_count: self.ccs_count,
+            ccs_mae: ratio(self.ccs_abs_error_sum, self.ccs_count),
+            ccs_rmse: ratio(self.ccs_squared_error_sum, self.ccs_count).map(f64::sqrt),
+            ms2_point_count: self.ms2_point_count,
+            ms2_rmse: ratio(self.ms2_squared_error_sum, self.ms2_point_count).map(f64::sqrt),
+            ms2_spectrum_count: self.ms2_spectrum_count,
+            ms2_cosine_similarity: ratio(self.ms2_cosine_sum, self.ms2_spectrum_count),
+            inverse_sequence_count: self.inverse_sequence_count,
+            inverse_mean_nll: ratio(self.inverse_nll_sum, self.inverse_sequence_count),
+            inverse_ptm_site_count: self.inverse_ptm_site_count,
+            inverse_ptm_mass_rmse_da: ratio(
+                self.inverse_ptm_scaled_squared_error_sum,
+                self.inverse_ptm_site_count,
+            )
+            .map(|mse| mse.sqrt() * f64::from(FOUNDATION_OPEN_PTM_MASS_SCALE_DA)),
+            retrieval_queries: self.retrieval_queries,
+            retrieval_top1_accuracy: ratio(
+                self.retrieval_top1_count as f64,
+                self.retrieval_queries,
+            ),
+            retrieval_mrr: ratio(self.retrieval_reciprocal_rank_sum, self.retrieval_queries),
+            generation_attempts: self.generation_attempts,
+            generation_success_rate: ratio(
+                self.generation_successes as f64,
+                self.generation_attempts,
+            ),
+            generation_sequence_exact_rate: ratio(
+                self.generation_exact as f64,
+                self.generation_attempts,
+            ),
+            generation_sequence_il_equivalent_rate: ratio(
+                self.generation_il_equivalent as f64,
+                self.generation_attempts,
+            ),
+            generation_mean_length: ratio(
+                self.generation_length_sum as f64,
+                self.generation_successes,
+            ),
+        }
+    }
+}
+
+fn evaluate_partition(
+    model: &FoundationModel,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    batch_size: usize,
+    max_batches: Option<usize>,
+    inverse_limit: usize,
+    generation_limit: usize,
+    ms2_cosine_epsilon: f64,
+    device: &Device,
+) -> Result<FoundationEvaluationMetrics> {
+    let mut aggregate = EvaluationAccumulator::default();
+
+    // Forward metrics use the same bounded Validation slice as early-stopping loss,
+    // but with clean (uncorrupted) peptide inputs and native-unit predictions.
+    for chunk in indices
+        .chunks(batch_size)
+        .take(max_batches.unwrap_or(usize::MAX))
+    {
+        let owned = collect_records(records, chunk, "evaluation")?;
+        if owned.is_empty() {
+            continue;
+        }
+        aggregate.records += owned.len();
+        let predictions = model.predict_records(&owned)?;
+        for (record, prediction) in owned.iter().zip(&predictions) {
+            accumulate_forward_metrics(&mut aggregate, record, prediction, ms2_cosine_epsilon);
+        }
+    }
+
+    if aggregate.records == 0 {
+        anyhow::bail!("foundation evaluation produced no records");
+    }
+
+    // Inverse diagnostics deliberately scan the whole Validation assignment for
+    // spectrum-bearing rows before applying their own cap. This prevents a
+    // property-heavy prefix of Validation from silently producing zero inverse
+    // metrics, while still keeping the engineering/scientific evaluation bounded.
+    let inverse_indices = indices
+        .iter()
+        .copied()
+        .filter(|&index| {
+            records
+                .get(index)
+                .and_then(FoundationSpectrum::from_training_record)
+                .is_some()
+        })
+        .take(inverse_limit)
+        .collect::<Vec<_>>();
+
+    for chunk in inverse_indices.chunks(batch_size) {
+        let inverse_records = collect_records(records, chunk, "inverse evaluation")?;
+        if inverse_records.is_empty() {
+            continue;
+        }
+
+        let spectra = inverse_records
+            .iter()
+            .map(|record| FoundationSpectrum::from_training_record(record).unwrap())
+            .collect::<Vec<_>>();
+        let spectrum_batch = model.spectrum_collator().collate(&spectra, device)?;
+        let peptides = inverse_records
+            .iter()
+            .map(|record| record.peptidoform.clone())
+            .collect::<Vec<_>>();
+        let causal_batch = model.causal_collator().collate(&peptides, device)?;
+        let clean = model
+            .peptide_collator()
+            .collate(&inverse_records, device, 0)?;
+        let inverse_output =
+            model.inverse_forward_t(&causal_batch, &spectrum_batch, &clean.context, false)?;
+
+        let sequence_nlls = foundation_causal_sequence_mean_nlls(&inverse_output, &causal_batch)?
+            .to_vec1::<f32>()?;
+        for value in sequence_nlls {
+            if value.is_finite() {
+                aggregate.inverse_nll_sum += f64::from(value);
+                aggregate.inverse_sequence_count += 1;
+            }
+        }
+
+        let ptm_sites = causal_batch
+            .target_modification_mask
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        if ptm_sites > 0.0 && ptm_sites.is_finite() {
+            let scaled_mse = model
+                .inverse_mass_loss(&inverse_output, &causal_batch)?
+                .to_scalar::<f32>()?;
+            if scaled_mse.is_finite() {
+                aggregate.inverse_ptm_scaled_squared_error_sum +=
+                    f64::from(scaled_mse) * f64::from(ptm_sites);
+                aggregate.inverse_ptm_site_count += ptm_sites.round() as usize;
+            }
+        }
+
+        if inverse_records.len() > 1 {
+            let peptide_output = model.forward_properties_t(&clean.input, &clean.context, false)?;
+            let spectrum_projection = model.project_spectrum(&inverse_output.spectrum_embedding)?;
+            accumulate_retrieval_metrics(
+                &mut aggregate,
+                &peptide_output.contrastive_projection,
+                &spectrum_projection,
+            )?;
+        }
+
+        for record in &inverse_records {
+            if aggregate.generation_attempts >= generation_limit {
+                break;
+            }
+            aggregate.generation_attempts += 1;
+            if let Ok(generated) = model.generate_peptide(record) {
+                aggregate.generation_successes += 1;
+                aggregate.generation_length_sum += generated.sequence.chars().count();
+                if generated.sequence == record.peptidoform.sequence {
+                    aggregate.generation_exact += 1;
+                }
+                if il_equivalent(&generated.sequence, &record.peptidoform.sequence) {
+                    aggregate.generation_il_equivalent += 1;
+                }
+            }
+        }
+    }
+
+    Ok(aggregate.finish())
+}
+
+fn collect_records(
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    context: &str,
+) -> Result<Vec<FoundationTrainingRecord>> {
+    indices
+        .iter()
+        .map(|&index| {
+            records.get(index).cloned().ok_or_else(|| {
+                anyhow::anyhow!("foundation {context} record index {index} is out of bounds")
+            })
+        })
+        .collect()
+}
+
+fn accumulate_forward_metrics(
+    aggregate: &mut EvaluationAccumulator,
+    record: &FoundationTrainingRecord,
+    prediction: &crate::models::model_interface::PredictionOutput,
+    cosine_epsilon: f64,
+) {
+    if let (Some(target), Some(predicted)) = (
+        training_rt_target(record).filter(|value| value.is_finite()),
+        prediction.rt.filter(|value| value.is_finite()),
+    ) {
+        let error = f64::from(predicted - target);
+        aggregate.rt_abs_error_sum += error.abs();
+        aggregate.rt_squared_error_sum += error * error;
+        aggregate.rt_count += 1;
+    }
+
+    if let (Some(target), Some(predicted)) = (
+        record.ccs.filter(|value| value.is_finite()),
+        prediction.ccs.filter(|value| value.is_finite()),
+    ) {
+        let error = f64::from(predicted - target);
+        aggregate.ccs_abs_error_sum += error.abs();
+        aggregate.ccs_squared_error_sum += error * error;
+        aggregate.ccs_count += 1;
+    }
+
+    let Some(predicted) = prediction.ms2.as_ref() else {
+        return;
+    };
+    let Some(channels) = predicted.first().map(Vec::len) else {
+        return;
+    };
+    if channels == 0 {
+        return;
+    }
+    let cleavage = predicted.len();
+    let mut target = vec![vec![None::<f32>; channels]; cleavage];
+    for fragment in &record.fragments {
+        if fragment.cleavage_index < cleavage
+            && fragment.channel < channels
+            && fragment.intensity.is_finite()
+        {
+            target[fragment.cleavage_index][fragment.channel] = Some(fragment.intensity);
+        }
+    }
+
+    let mut dot = 0.0f64;
+    let mut prediction_norm = 0.0f64;
+    let mut target_norm = 0.0f64;
+    let mut points = 0usize;
+    for cleavage_index in 0..cleavage {
+        for channel in 0..channels {
+            let Some(target_value) = target[cleavage_index][channel] else {
+                continue;
+            };
+            let predicted_value = predicted[cleavage_index][channel];
+            if !predicted_value.is_finite() {
+                continue;
+            }
+            let p = f64::from(predicted_value);
+            let t = f64::from(target_value);
+            let error = p - t;
+            aggregate.ms2_squared_error_sum += error * error;
+            aggregate.ms2_point_count += 1;
+            dot += p * t;
+            prediction_norm += p * p;
+            target_norm += t * t;
+            points += 1;
+        }
+    }
+    if points > 0 {
+        let denominator =
+            (prediction_norm + cosine_epsilon).sqrt() * (target_norm + cosine_epsilon).sqrt();
+        if denominator > 0.0 && denominator.is_finite() {
+            let cosine = (dot / denominator).clamp(-1.0, 1.0);
+            if cosine.is_finite() {
+                aggregate.ms2_cosine_sum += cosine;
+                aggregate.ms2_spectrum_count += 1;
+            }
+        }
+    }
+}
+
+fn accumulate_retrieval_metrics(
+    aggregate: &mut EvaluationAccumulator,
+    peptide_projection: &Tensor,
+    spectrum_projection: &Tensor,
+) -> Result<()> {
+    let peptides = peptide_projection.to_vec2::<f32>()?;
+    let spectra = spectrum_projection.to_vec2::<f32>()?;
+    if peptides.len() != spectra.len() || peptides.len() < 2 {
+        return Ok(());
+    }
+    if peptides.first().map(Vec::len) != spectra.first().map(Vec::len) {
+        anyhow::bail!("foundation cross-modal retrieval projection dimensions differ");
+    }
+    let peptide_norm = l2_normalize_rows(&peptides);
+    let spectrum_norm = l2_normalize_rows(&spectra);
+    if peptide_norm.iter().any(Option::is_none) || spectrum_norm.iter().any(Option::is_none) {
+        return Ok(());
+    }
+    let peptide_norm = peptide_norm.into_iter().flatten().collect::<Vec<_>>();
+    let spectrum_norm = spectrum_norm.into_iter().flatten().collect::<Vec<_>>();
+    accumulate_retrieval_direction(aggregate, &peptide_norm, &spectrum_norm);
+    accumulate_retrieval_direction(aggregate, &spectrum_norm, &peptide_norm);
+    Ok(())
+}
+
+fn accumulate_retrieval_direction(
+    aggregate: &mut EvaluationAccumulator,
+    queries: &[Vec<f64>],
+    candidates: &[Vec<f64>],
+) {
+    for (index, query) in queries.iter().enumerate() {
+        let positive = dot_product(query, &candidates[index]);
+        let mut better = 0usize;
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            if candidate_index != index && dot_product(query, candidate) > positive {
+                better += 1;
+            }
+        }
+        let rank = better + 1;
+        aggregate.retrieval_queries += 1;
+        if rank == 1 {
+            aggregate.retrieval_top1_count += 1;
+        }
+        aggregate.retrieval_reciprocal_rank_sum += 1.0 / rank as f64;
+    }
+}
+
+fn l2_normalize_rows(rows: &[Vec<f32>]) -> Vec<Option<Vec<f64>>> {
+    rows.iter()
+        .map(|row| {
+            let norm = row
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if !(norm > 0.0 && norm.is_finite()) {
+                return None;
+            }
+            Some(row.iter().map(|value| f64::from(*value) / norm).collect())
+        })
+        .collect()
+}
+
+fn dot_product(left: &[f64], right: &[f64]) -> f64 {
+    left.iter().zip(right).map(|(a, b)| a * b).sum()
+}
+
+fn training_rt_target(record: &FoundationTrainingRecord) -> Option<f32> {
+    record.retention_time.normalized
+}
+
+fn il_equivalent(left: &str, right: &str) -> bool {
+    left.chars().count() == right.chars().count()
+        && left
+            .chars()
+            .zip(right.chars())
+            .all(|(a, b)| canonical_il(a) == canonical_il(b))
+}
+
+fn canonical_il(residue: char) -> char {
+    if matches!(residue, 'I' | 'L') {
+        'J'
+    } else {
+        residue
+    }
+}
+
+fn ratio(sum: f64, count: usize) -> Option<f64> {
+    if count > 0 {
+        Some(sum / count as f64)
+    } else {
+        None
+    }
+}
+
+fn optional_metric(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "NA".to_string())
+}
+
+fn append_validation_metrics(
+    path: &Path,
+    epoch: usize,
+    metrics: FoundationEvaluationMetrics,
+) -> Result<()> {
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    writeln!(
+        file,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        epoch,
+        metrics.records,
+        metrics.rt_count,
+        tsv_metric(metrics.rt_mae_native),
+        tsv_metric(metrics.rt_rmse_native),
+        metrics.ccs_count,
+        tsv_metric(metrics.ccs_mae),
+        tsv_metric(metrics.ccs_rmse),
+        metrics.ms2_point_count,
+        tsv_metric(metrics.ms2_rmse),
+        metrics.ms2_spectrum_count,
+        tsv_metric(metrics.ms2_cosine_similarity),
+        metrics.inverse_sequence_count,
+        tsv_metric(metrics.inverse_mean_nll),
+        metrics.inverse_ptm_site_count,
+        tsv_metric(metrics.inverse_ptm_mass_rmse_da),
+        metrics.retrieval_queries,
+        tsv_metric(metrics.retrieval_top1_accuracy),
+        tsv_metric(metrics.retrieval_mrr),
+        metrics.generation_attempts,
+        tsv_metric(metrics.generation_success_rate),
+        tsv_metric(metrics.generation_sequence_exact_rate),
+        tsv_metric(metrics.generation_sequence_il_equivalent_rate),
+        tsv_metric(metrics.generation_mean_length),
+    )?;
+    Ok(())
+}
+
+fn tsv_metric(value: Option<f64>) -> String {
+    value.map(|value| format!("{value:.8}")).unwrap_or_default()
+}
+
 fn append_history(
     path: &Path,
     epoch: usize,
@@ -685,6 +1193,27 @@ mod tests {
         assert!(config.inverse_weight > 0.0);
         assert!(config.cross_modal_alignment_weight > 0.0);
         assert!(config.peptide_contrastive_weight > 0.0);
+        assert_eq!(config.inverse_evaluation_records, 256);
+        assert_eq!(config.generation_evaluation_records, 16);
+    }
+
+    #[test]
+    fn il_equivalence_collapses_only_isoleucine_and_leucine() {
+        assert!(il_equivalent("PEPTIDE", "PEPTLDE"));
+        assert!(il_equivalent("LLLL", "IIII"));
+        assert!(!il_equivalent("PEPTIDE", "PEPTVDE"));
+        assert!(!il_equivalent("PEPTIDE", "PEPTIDES"));
+    }
+
+    #[test]
+    fn retrieval_metrics_reward_diagonal_pairs() {
+        let peptide = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (2, 2), &Device::Cpu).unwrap();
+        let spectrum = Tensor::from_vec(vec![0.9f32, 0.1, 0.1, 0.9], (2, 2), &Device::Cpu).unwrap();
+        let mut metrics = EvaluationAccumulator::default();
+        accumulate_retrieval_metrics(&mut metrics, &peptide, &spectrum).unwrap();
+        assert_eq!(metrics.retrieval_queries, 4);
+        assert_eq!(metrics.retrieval_top1_count, 4);
+        assert!((metrics.retrieval_reciprocal_rank_sum - 4.0).abs() < 1e-9);
     }
 
     #[test]

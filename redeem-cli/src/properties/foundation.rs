@@ -43,6 +43,10 @@ pub fn run_training(config: &PropertyTrainConfig) -> Result<()> {
     println!("completed_epochs={}", summary.completed_epochs);
     println!("best_validation_loss={:.8}", summary.best_validation_loss);
     println!("checkpoint={}", summary.checkpoint.display());
+    println!(
+        "validation_metrics={}",
+        summary.validation_metrics.display()
+    );
     Ok(())
 }
 

@@ -198,8 +198,8 @@ pub use runtime::{
 
 pub use training::{
     load_foundation_records_from_run, load_foundation_records_from_run_partition,
-    train_foundation_model, FoundationEpochLosses, FoundationTrainingConfig,
-    FoundationTrainingSummary,
+    train_foundation_model, FoundationEpochLosses, FoundationEvaluationMetrics,
+    FoundationTrainingConfig, FoundationTrainingSummary,
 };
 
 pub use rt_harmonization::{
