@@ -326,6 +326,10 @@ fn foundation_training_config_accepts_bounded_smoke_overrides() {
           "output_file": "foundation_model",
           "device": "cpu",
           "foundation": {
+            "strategy": "research_curriculum",
+            "warmup_steps": 500,
+            "min_learning_rate_ratio": 0.10,
+            "max_gradient_norm": 1.0,
             "batch_size": 8,
             "epochs": 2,
             "max_train_batches_per_epoch": 3,
@@ -360,5 +364,34 @@ fn foundation_training_config_accepts_bounded_smoke_overrides() {
         redeem_properties::foundation::FoundationTrainingStrategy::ResearchCurriculum
     );
     assert_eq!(foundation.warmup_steps, 500);
+    assert_eq!(foundation.min_learning_rate_ratio, 0.10);
     assert_eq!(foundation.max_gradient_norm, Some(1.0));
+}
+
+#[test]
+fn foundation_training_config_legacy_json_defaults_to_joint() {
+    use redeem_properties::foundation::{FoundationTrainingConfig, FoundationTrainingStrategy};
+
+    // Missing strategy/schedule fields must keep pre-curriculum runs reproducible.
+    let config: FoundationTrainingConfig =
+        serde_json::from_str(r#"{"batch_size": 8, "epochs": 2}"#).unwrap();
+    assert_eq!(config.strategy, FoundationTrainingStrategy::Joint);
+    assert_eq!(config.warmup_steps, 0);
+    assert_eq!(config.min_learning_rate_ratio, 1.0);
+    assert_eq!(config.max_gradient_norm, None);
+}
+
+#[test]
+fn foundation_training_new_default_selects_research_curriculum() {
+    use redeem_properties::foundation::{FoundationTrainingConfig, FoundationTrainingStrategy};
+
+    // New Rust defaults intentionally differ from legacy JSON missing-field defaults.
+    let config = FoundationTrainingConfig::default();
+    assert_eq!(
+        config.strategy,
+        FoundationTrainingStrategy::ResearchCurriculum
+    );
+    assert_eq!(config.warmup_steps, 500);
+    assert_eq!(config.min_learning_rate_ratio, 0.10);
+    assert_eq!(config.max_gradient_norm, Some(1.0));
 }
