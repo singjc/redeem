@@ -24,6 +24,7 @@ pub mod inverse_identifier_v0751;
 pub mod layers;
 pub mod loss;
 pub mod metadata;
+mod mobility_consensus;
 pub mod model;
 pub mod msp;
 pub mod normalization;

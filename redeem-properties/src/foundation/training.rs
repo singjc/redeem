@@ -14,6 +14,10 @@ use super::loss::{
     contrastive_info_nce_loss, multi_task_loss_with_ms2_config, FoundationLossWeights,
     FoundationMs2LossConfig, FoundationTargets,
 };
+use super::mobility_consensus::{
+    bruker_ccs_factor_from_values, build_train_consensus_supervision, deterministic_example_order,
+    finite_mobility_ccs_indices, MobilityConsensusExample, MobilityConsensusSupervision,
+};
 use super::normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
     FoundationTargetNormalizationConfig,
@@ -73,6 +77,10 @@ pub struct FoundationTrainingConfig {
     /// Optional global gradient norm clip. Historical configs leave clipping disabled.
     #[serde(default = "legacy_max_gradient_norm")]
     pub max_gradient_norm: Option<f64>,
+    /// Enable TRAIN-only source-aware Bruker mobility consensus in curriculum stage D.
+    /// Missing field in historical JSON remains disabled (old direct-CCS stage).
+    #[serde(default)]
+    pub mobility_consensus_supervision: bool,
     pub epochs: usize,
     pub early_stopping_patience: usize,
     pub seed: u64,
@@ -106,6 +114,7 @@ impl Default for FoundationTrainingConfig {
             warmup_steps: 500,
             min_learning_rate_ratio: 0.10,
             max_gradient_norm: Some(1.0),
+            mobility_consensus_supervision: true,
             epochs: 20,
             early_stopping_patience: 4,
             seed: 20_261_006,
@@ -439,6 +448,25 @@ pub fn train_foundation_model(
         model.load_weights(checkpoint)?;
     }
 
+    // Fit the source affine/reliability model using TRAIN identities only.
+    // Never refit on Validation; historical TEST and TRAIN-HOLDOUT stay closed.
+    let mobility_consensus = if training.strategy == FoundationTrainingStrategy::ResearchCurriculum
+        && training.mobility_consensus_supervision
+    {
+        let eligible = finite_mobility_ccs_indices(&corpus.records, &train_indices);
+        if eligible.is_empty() {
+            anyhow::bail!("TRAIN contains no valid mobility/charge/mz records for curriculum mobility consensus");
+        }
+        let fitted =
+            build_train_consensus_supervision(&corpus.records, &corpus.provenance, &eligible)?;
+        if fitted.examples.is_empty() {
+            anyhow::bail!("TRAIN produced no source-aware mobility consensus examples");
+        }
+        Some(fitted)
+    } else {
+        None
+    };
+
     let train_collator = FoundationCollator::new(
         model_config.peptide.clone(),
         FoundationCollatorConfig {
@@ -488,6 +516,9 @@ pub fn train_foundation_model(
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("create foundation output {}", output_dir.display()))?;
+    if let Some(consensus) = mobility_consensus.as_ref() {
+        write_mobility_consensus_provenance(output_dir, consensus)?;
+    }
     let mut resolved_training = training.clone();
     resolved_training.model = model_config.clone();
     fs::write(
@@ -540,6 +571,7 @@ pub fn train_foundation_model(
                 &order,
                 &train_collator,
                 &training,
+                mobility_consensus.as_ref(),
                 peptide_optimizer
                     .as_mut()
                     .expect("research peptide optimizer"),
@@ -760,6 +792,7 @@ fn run_epoch_research_curriculum(
     indices: &[usize],
     collator: &FoundationCollator,
     config: &FoundationTrainingConfig,
+    mobility_consensus: Option<&MobilityConsensusSupervision>,
     peptide_optimizer: &mut FoundationAdamW,
     inverse_optimizer: &mut FoundationAdamW,
     max_batches: Option<usize>,
@@ -769,6 +802,18 @@ fn run_epoch_research_curriculum(
     device: &Device,
 ) -> Result<FoundationEpochLosses> {
     let mut aggregate = FoundationEpochLosses::default();
+    let cycles = indices
+        .chunks(config.batch_size)
+        .len()
+        .min(max_batches.unwrap_or(usize::MAX));
+    let consensus_order = mobility_consensus.map(|supervision| {
+        deterministic_example_order(
+            &supervision.examples,
+            cycles.saturating_mul(config.batch_size),
+            seed,
+            config.seed,
+        )
+    });
     for (batch_index, chunk) in indices
         .chunks(config.batch_size)
         .take(max_batches.unwrap_or(usize::MAX))
@@ -802,15 +847,36 @@ fn run_epoch_research_curriculum(
                 FoundationCurriculumStage::Representation => collator,
                 _ => model.peptide_collator(),
             };
-            let loss = batch_loss(
-                model,
-                &owned,
-                stage_collator,
-                &staged,
-                stage_seed,
-                true,
-                device,
-            )?;
+            let loss = if matches!(stage, FoundationCurriculumStage::Mobility)
+                && mobility_consensus.is_some()
+            {
+                let supervision = mobility_consensus.expect("checked presence");
+                let order = consensus_order.as_ref().expect("consensus order exists");
+                let start = batch_index.saturating_mul(config.batch_size);
+                let end = (start + config.batch_size).min(order.len());
+                let examples = order[start..end]
+                    .iter()
+                    .map(|&index| supervision.examples[index].clone())
+                    .collect::<Vec<_>>();
+                mobility_consensus_batch_loss(
+                    model,
+                    records,
+                    &examples,
+                    staged.forward_loss_weights.ccs,
+                    stage_seed,
+                    device,
+                )?
+            } else {
+                batch_loss(
+                    model,
+                    &owned,
+                    stage_collator,
+                    &staged,
+                    stage_seed,
+                    true,
+                    device,
+                )?
+            };
             let lr = scheduled_learning_rate(config, *global_update, planned_updates);
             match stage {
                 FoundationCurriculumStage::Inverse => {
@@ -830,6 +896,114 @@ fn run_epoch_research_curriculum(
         anyhow::bail!("foundation research-curriculum epoch produced no updates");
     }
     Ok(aggregate.means())
+}
+
+fn mobility_consensus_batch_loss(
+    model: &FoundationModel,
+    records: &[FoundationTrainingRecord],
+    examples: &[MobilityConsensusExample],
+    ccs_weight: f64,
+    seed: u64,
+    device: &Device,
+) -> Result<BatchLoss> {
+    if examples.is_empty() {
+        anyhow::bail!("mobility consensus batch has no examples");
+    }
+    let mut owned = Vec::with_capacity(examples.len());
+    let mut ccs_values = Vec::with_capacity(examples.len());
+    let mut weights = Vec::with_capacity(examples.len());
+    for example in examples {
+        let record = records
+            .get(example.representative_index)
+            .ok_or_else(|| anyhow::anyhow!("consensus representative outside corpus"))?;
+        let charge = record
+            .context
+            .charge
+            .ok_or_else(|| anyhow::anyhow!("consensus representative missing charge"))?;
+        let mz = record
+            .context
+            .precursor_mz
+            .ok_or_else(|| anyhow::anyhow!("consensus representative missing precursor m/z"))?;
+        let factor = bruker_ccs_factor_from_values(charge, mz)
+            .ok_or_else(|| anyhow::anyhow!("invalid Bruker CCS conversion physics"))?;
+        let ccs = f64::from(example.target_mobility) * factor;
+        if !ccs.is_finite() || ccs <= 0.0 || !example.weight.is_finite() || example.weight <= 0.0 {
+            anyhow::bail!("invalid mobility consensus target/weight");
+        }
+        ccs_values.push(ccs as f32);
+        weights.push(example.weight);
+        owned.push(record.clone());
+    }
+    let input = model.peptide_collator().collate(&owned, device, seed)?;
+    let output = model.forward_properties_t(&input.input, &input.context, true)?;
+    // The production specialist currently predicts standardized CCS, not native mobility.
+    // Convert source-aware mobility consensus to native CCS *before* TRAIN-fitted
+    // CCS standardization. This preserves a physically meaningful supervision target.
+    let native_ccs = Tensor::from_vec(ccs_values, (examples.len(), 1), device)?;
+    let target = model
+        .target_normalization()
+        .ccs
+        .normalize_tensor(&native_ccs)?;
+    let weight = Tensor::from_vec(weights, (examples.len(), 1), device)?;
+    let delta = (&output.ccs - &target)?;
+    let weight_sum = weight.sum_all()?.clamp(1.0e-6, f64::INFINITY)?;
+    let mse = delta
+        .sqr()?
+        .broadcast_mul(&weight)?
+        .sum_all()?
+        .broadcast_div(&weight_sum)?;
+    // Historical-style normalized pseudo-Huber alongside a lower-weight MSE.
+    let robust = delta
+        .affine(2.0, 0.0)?
+        .sqr()?
+        .affine(1.0, 1.0)?
+        .sqrt()?
+        .affine(0.25, -0.25)?;
+    let pseudo_huber = robust
+        .broadcast_mul(&weight)?
+        .sum_all()?
+        .broadcast_div(&weight_sum)?;
+    let combined = (pseudo_huber + mse.affine(0.25, 0.0)?)?.affine(ccs_weight, 0.0)?;
+    let scalar = combined.to_scalar::<f32>()?;
+    Ok(BatchLoss {
+        total: combined,
+        scalars: BatchLossScalars {
+            total: scalar,
+            forward: scalar,
+            ..BatchLossScalars::default()
+        },
+    })
+}
+
+fn write_mobility_consensus_provenance(
+    output_dir: &Path,
+    supervision: &MobilityConsensusSupervision,
+) -> Result<()> {
+    let mut detail = String::from("source\traw_records\tshared_identities\taffine_intercept\taffine_slope\tresidual_mae\treliability\n");
+    for (source, entry) in &supervision.source_supervision {
+        use std::fmt::Write as _;
+        let (intercept, slope) = entry.affine_parameters();
+        writeln!(
+            &mut detail,
+            "{}\t{}\t{}\t{:.8}\t{:.8}\t{:.8}\t{:.8}",
+            source,
+            entry.raw_records,
+            entry.shared_identities,
+            intercept,
+            slope,
+            entry.residual_mae,
+            entry.reliability
+        )?;
+    }
+    fs::write(output_dir.join("mobility_source_reliability.tsv"), detail)?;
+    fs::write(output_dir.join("mobility_consensus_summary.tsv"), format!(
+        "metric\tvalue\ntrain_valid_mobility_records\t{}\ntrain_consensus_examples\t{}\nmultisource_examples\t{}\nsingleton_examples\t{}\nmean_weight\t{:.8}\nmean_adjusted_delta\t{:.8}\nfingerprint\tfnv1a64:{:016x}\n",
+        supervision.raw_records, supervision.examples.len(),
+        supervision.multisource_examples, supervision.singleton_examples,
+        supervision.mean_weight, supervision.mean_abs_adjusted_delta_to_consensus,
+        supervision.fingerprint,
+    ))?;
+    Ok(())
 }
 
 fn staged_training_config(
@@ -1570,6 +1744,7 @@ mod tests {
         assert_eq!(config.warmup_steps, 500);
         assert!((config.min_learning_rate_ratio - 0.10).abs() < 1e-12);
         assert_eq!(config.max_gradient_norm, Some(1.0));
+        assert!(config.mobility_consensus_supervision);
         assert!((scheduled_learning_rate(&config, 0, 10_000) - 4.0e-8).abs() < 1e-12);
         let final_lr = scheduled_learning_rate(&config, 9_999, 10_000);
         assert!(final_lr >= config.learning_rate * config.min_learning_rate_ratio);
@@ -1584,6 +1759,7 @@ mod tests {
             "warmup_steps",
             "min_learning_rate_ratio",
             "max_gradient_norm",
+            "mobility_consensus_supervision",
         ] {
             value
                 .as_mapping_mut()
@@ -1595,6 +1771,7 @@ mod tests {
         assert_eq!(restored.warmup_steps, 0);
         assert_eq!(restored.min_learning_rate_ratio, 1.0);
         assert_eq!(restored.max_gradient_norm, None);
+        assert!(!restored.mobility_consensus_supervision);
     }
 
     #[test]
