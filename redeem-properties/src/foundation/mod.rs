@@ -4,6 +4,7 @@
 //! joint forward/inverse model. Historical accepted RT/MS2 and CCS checkpoints
 //! remain available through [`FoundationPredictor`] for compatibility and parity.
 
+mod auxiliary_supervision;
 mod causal;
 pub mod ccs_physics;
 mod checkpoint_compat;

@@ -4,6 +4,10 @@
 //! random initialization (or optional same-architecture warm start), one optimizer,
 //! TRAIN-only normalization, Validation-only early stopping, and one checkpoint format.
 
+use super::auxiliary_supervision::{
+    chemistry_summary_targets, conformation_proxy_targets_v0520, masked_bce_with_logits,
+    masked_mse, pair_interaction_targets,
+};
 use super::causal::foundation_causal_sequence_mean_nlls;
 use super::collate::{FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig};
 use super::corpus::{load_foundation_corpus, FoundationCorpusConfig};
@@ -81,6 +85,15 @@ pub struct FoundationTrainingConfig {
     /// Missing field in historical JSON remains disabled (old direct-CCS stage).
     #[serde(default)]
     pub mobility_consensus_supervision: bool,
+    /// v0.50 six-class residue-pair geometry/composition proxy.
+    #[serde(default)]
+    pub pair_auxiliary_weight: f64,
+    /// v0.50 eight-component chemistry summary.
+    #[serde(default)]
+    pub chemistry_summary_weight: f64,
+    /// v0.52 fourteen-component coarse conformation/charge proxy.
+    #[serde(default)]
+    pub conformation_proxy_weight: f64,
     pub epochs: usize,
     pub early_stopping_patience: usize,
     pub seed: u64,
@@ -115,6 +128,9 @@ impl Default for FoundationTrainingConfig {
             min_learning_rate_ratio: 0.10,
             max_gradient_norm: Some(1.0),
             mobility_consensus_supervision: true,
+            pair_auxiliary_weight: 0.10,
+            chemistry_summary_weight: 0.10,
+            conformation_proxy_weight: 0.10,
             epochs: 20,
             early_stopping_patience: 4,
             seed: 20_261_006,
@@ -179,6 +195,22 @@ impl FoundationTrainingConfig {
             }
         }
         self.model.validate()?;
+        if self.strategy == FoundationTrainingStrategy::ResearchCurriculum
+            && (self.pair_auxiliary_weight > 0.0
+                || self.chemistry_summary_weight > 0.0
+                || self.conformation_proxy_weight > 0.0)
+            && (!self.model.auxiliary_supervision_heads
+                || self.model.peptide_backbone
+                    != super::runtime::FoundationPeptideBackbone::ResiduePairTaskTokens)
+        {
+            anyhow::bail!("research auxiliary losses require a residue-pair backbone with auxiliary supervision heads");
+        }
+        if self.strategy == FoundationTrainingStrategy::ResearchCurriculum
+            && self.conformation_proxy_weight > 0.0
+            && (!self.model.specialists.enabled || !self.model.specialists.mobility_ccs)
+        {
+            anyhow::bail!("conformation auxiliary requires the native mobility specialist");
+        }
         for (name, value) in [
             ("rt", self.forward_loss_weights.rt),
             ("ccs", self.forward_loss_weights.ccs),
@@ -207,6 +239,9 @@ impl FoundationTrainingConfig {
             }
         }
         for (name, value) in [
+            ("pair_auxiliary_weight", self.pair_auxiliary_weight),
+            ("chemistry_summary_weight", self.chemistry_summary_weight),
+            ("conformation_proxy_weight", self.conformation_proxy_weight),
             (
                 "peptide_contrastive_weight",
                 self.peptide_contrastive_weight,
@@ -863,6 +898,7 @@ fn run_epoch_research_curriculum(
                     records,
                     &examples,
                     staged.forward_loss_weights.ccs,
+                    staged.conformation_proxy_weight,
                     stage_seed,
                     device,
                 )?
@@ -903,6 +939,7 @@ fn mobility_consensus_batch_loss(
     records: &[FoundationTrainingRecord],
     examples: &[MobilityConsensusExample],
     ccs_weight: f64,
+    conformation_proxy_weight: f64,
     seed: u64,
     device: &Device,
 ) -> Result<BatchLoss> {
@@ -935,7 +972,8 @@ fn mobility_consensus_batch_loss(
         owned.push(record.clone());
     }
     let input = model.peptide_collator().collate(&owned, device, seed)?;
-    let output = model.forward_properties_t(&input.input, &input.context, true)?;
+    let (output, auxiliaries) =
+        model.forward_properties_with_auxiliaries_t(&input.input, &input.context, true)?;
     // The production specialist currently predicts standardized CCS, not native mobility.
     // Convert source-aware mobility consensus to native CCS *before* TRAIN-fitted
     // CCS standardization. This preserves a physically meaningful supervision target.
@@ -963,7 +1001,23 @@ fn mobility_consensus_batch_loss(
         .broadcast_mul(&weight)?
         .sum_all()?
         .broadcast_div(&weight_sum)?;
-    let combined = (pseudo_huber + mse.affine(0.25, 0.0)?)?.affine(ccs_weight, 0.0)?;
+    let mut combined = (pseudo_huber + mse.affine(0.25, 0.0)?)?.affine(ccs_weight, 0.0)?;
+    if conformation_proxy_weight > 0.0 {
+        let proxy = auxiliaries
+            .as_ref()
+            .and_then(|aux| aux.conformation_proxy.as_ref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("conformation auxiliary requested without enabled mobility head")
+            })?;
+        let target = conformation_proxy_targets_v0520(
+            &owned,
+            model.config().peptide.max_sequence_len,
+            device,
+        )?;
+        let mask = Tensor::ones(target.dims().to_vec(), candle_core::DType::F32, device)?;
+        let loss = masked_mse(proxy, &target, &mask)?;
+        combined = (combined + loss.affine(conformation_proxy_weight, 0.0)?)?;
+    }
     let scalar = combined.to_scalar::<f32>()?;
     Ok(BatchLoss {
         total: combined,
@@ -1023,19 +1077,27 @@ fn staged_training_config(
     config.inverse_weight = 0.0;
     config.inverse_ptm_mass_weight = 0.0;
     config.cross_modal_alignment_weight = 0.0;
+    config.pair_auxiliary_weight = 0.0;
+    config.chemistry_summary_weight = 0.0;
+    config.conformation_proxy_weight = 0.0;
     match stage {
         FoundationCurriculumStage::Property => {
             config.forward_loss_weights.rt = base.forward_loss_weights.rt;
             config.forward_loss_weights.ms2 = base.forward_loss_weights.ms2;
+            config.pair_auxiliary_weight = base.pair_auxiliary_weight;
+            config.chemistry_summary_weight = base.chemistry_summary_weight;
         }
         FoundationCurriculumStage::Representation => {
             config.forward_loss_weights.masked_residue =
                 base.forward_loss_weights.masked_residue.max(0.15);
             config.forward_loss_weights.chemistry = base.forward_loss_weights.chemistry.max(0.10);
             config.peptide_contrastive_weight = base.peptide_contrastive_weight.max(0.05);
+            config.pair_auxiliary_weight = base.pair_auxiliary_weight;
+            config.chemistry_summary_weight = base.chemistry_summary_weight;
         }
         FoundationCurriculumStage::Mobility => {
             config.forward_loss_weights.ccs = base.forward_loss_weights.ccs;
+            config.conformation_proxy_weight = base.conformation_proxy_weight;
         }
         FoundationCurriculumStage::Inverse => {
             config.inverse_weight = base.inverse_weight;
@@ -1078,7 +1140,22 @@ fn batch_loss(
     device: &Device,
 ) -> Result<BatchLoss> {
     let views = collator.collate_views(records, device, seed)?;
-    let first = model.forward_properties_t(&views.first.input, &views.first.context, train)?;
+    let use_auxiliary = train
+        && (config.pair_auxiliary_weight > 0.0
+            || config.chemistry_summary_weight > 0.0
+            || config.conformation_proxy_weight > 0.0);
+    let (first, auxiliaries) = if use_auxiliary {
+        model.forward_properties_with_auxiliaries_t(
+            &views.first.input,
+            &views.first.context,
+            train,
+        )?
+    } else {
+        (
+            model.forward_properties_t(&views.first.input, &views.first.context, train)?,
+            None,
+        )
+    };
     let targets = normalized_targets(&views.first.targets, model.target_normalization())?;
     let forward = multi_task_loss_with_ms2_config(
         &first,
@@ -1087,6 +1164,34 @@ fn batch_loss(
         config.ms2_loss,
     )?;
     let mut total = forward.total.clone();
+    if use_auxiliary {
+        let aux = auxiliaries.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("auxiliary losses configured but auxiliary model heads are disabled")
+        })?;
+        let sequence_len = aux.pair_logits.dims4()?.1;
+        if config.pair_auxiliary_weight > 0.0 {
+            let (target, mask) = pair_interaction_targets(records, sequence_len, device)?;
+            let loss = masked_bce_with_logits(&aux.pair_logits, &target, &mask)?;
+            total = (total + loss.affine(config.pair_auxiliary_weight, 0.0)?)?;
+        }
+        if config.chemistry_summary_weight > 0.0 {
+            let target = chemistry_summary_targets(records, sequence_len, device)?;
+            let mask = Tensor::ones(target.dims().to_vec(), candle_core::DType::F32, device)?;
+            let loss = masked_mse(&aux.chemistry_summary, &target, &mask)?;
+            total = (total + loss.affine(config.chemistry_summary_weight, 0.0)?)?;
+        }
+        if config.conformation_proxy_weight > 0.0 {
+            let prediction = aux.conformation_proxy.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "conformation auxiliary enabled without the native mobility specialist"
+                )
+            })?;
+            let target = conformation_proxy_targets_v0520(records, sequence_len, device)?;
+            let mask = Tensor::ones(target.dims().to_vec(), candle_core::DType::F32, device)?;
+            let loss = masked_mse(prediction, &target, &mask)?;
+            total = (total + loss.affine(config.conformation_proxy_weight, 0.0)?)?;
+        }
+    }
 
     let peptide_contrastive = if records.len() > 1 && config.peptide_contrastive_weight > 0.0 {
         let second =
@@ -1772,6 +1877,35 @@ mod tests {
         assert_eq!(restored.min_learning_rate_ratio, 1.0);
         assert_eq!(restored.max_gradient_norm, None);
         assert!(!restored.mobility_consensus_supervision);
+    }
+
+    #[test]
+    fn historical_training_config_without_auxiliary_weights_stays_zero_weight() {
+        let mut value = serde_yaml::to_value(FoundationTrainingConfig::default()).unwrap();
+        for field in [
+            "pair_auxiliary_weight",
+            "chemistry_summary_weight",
+            "conformation_proxy_weight",
+        ] {
+            value
+                .as_mapping_mut()
+                .unwrap()
+                .remove(&serde_yaml::Value::String(field.into()));
+        }
+        let restored: FoundationTrainingConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(restored.pair_auxiliary_weight, 0.0);
+        assert_eq!(restored.chemistry_summary_weight, 0.0);
+        assert_eq!(restored.conformation_proxy_weight, 0.0);
+    }
+
+    #[test]
+    fn research_auxiliary_heads_must_be_enabled_for_nonzero_weights() {
+        let mut config = FoundationTrainingConfig::default();
+        assert_eq!(config.pair_auxiliary_weight, 0.10);
+        assert_eq!(config.chemistry_summary_weight, 0.10);
+        assert_eq!(config.conformation_proxy_weight, 0.10);
+        config.model.auxiliary_supervision_heads = false;
+        assert!(config.validate().is_err());
     }
 
     #[test]

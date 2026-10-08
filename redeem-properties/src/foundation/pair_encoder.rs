@@ -40,6 +40,14 @@ struct PairRepresentation {
     pair_embeddings: Tensor,
 }
 
+/// Auxiliary predictions are training-only; public RT/CCS/MS2 outputs remain unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct PairTaskAuxiliaryPredictions {
+    pub(crate) pair_logits: Tensor,
+    pub(crate) chemistry_summary: Tensor,
+    pub(crate) conformation_proxy: Option<Tensor>,
+}
+
 #[derive(Clone)]
 struct PairConditionedSelfAttention {
     query: Linear,
@@ -811,11 +819,12 @@ struct PairAwareMobilitySpecialist {
     hidden: Linear,
     bottleneck: Linear,
     output: Linear,
+    conformation_proxy: Option<Linear>,
     model_dim: usize,
 }
 
 impl PairAwareMobilitySpecialist {
-    fn new(config: &FoundationConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(config: &FoundationConfig, auxiliary_heads: bool, vb: VarBuilder<'_>) -> Result<Self> {
         let blocks = (0..2)
             .map(|index| {
                 PeptideTransformerBlock::new(
@@ -847,16 +856,20 @@ impl PairAwareMobilitySpecialist {
             hidden: nn::linear(4 * config.model_dim + 6, 640, vb.pp("hidden"))?,
             bottleneck: nn::linear(640, 320, vb.pp("bottleneck"))?,
             output: nn::linear(320, 1, vb.pp("output"))?,
+            conformation_proxy: auxiliary_heads
+                .then(|| nn::linear(320, 14, vb.pp("conformation_proxy")))
+                .transpose()?,
             model_dim: config.model_dim,
         })
     }
 
-    fn forward_t(
+    fn forward_with_proxy_t(
         &self,
         representation: &PairRepresentation,
         context: &PrecursorContextBatch,
         train: bool,
-    ) -> Result<Tensor> {
+        need_auxiliary: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let residues = &representation.foundation.residue_embeddings;
         let mask = &representation.foundation.residue_mask;
         let pair = &representation.pair_embeddings;
@@ -943,7 +956,16 @@ impl PairAwareMobilitySpecialist {
         )?;
         let hidden = self.hidden.forward(&features)?.relu()?;
         let hidden = self.bottleneck.forward(&hidden)?.relu()?;
-        self.output.forward(&hidden)
+        let ccs = self.output.forward(&hidden)?;
+        let proxy = if need_auxiliary {
+            self.conformation_proxy
+                .as_ref()
+                .map(|head| head.forward(&hidden))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok((ccs, proxy))
     }
 }
 
@@ -988,6 +1010,8 @@ pub(crate) struct PairTaskPeptideModel {
     residue_head: Linear,
     chemistry_head: Linear,
     contrastive_head: Linear,
+    pair_class_head: Option<Linear>,
+    chemistry_summary_head: Option<Linear>,
     rt_specialist: Option<NativeRtSpecialist>,
     ms2_specialist: Option<NativeMs2Specialist>,
     mobility_specialist: Option<PairAwareMobilitySpecialist>,
@@ -999,6 +1023,7 @@ impl PairTaskPeptideModel {
     pub(crate) fn new(
         config: FoundationConfig,
         specialist_config: FoundationSpecialistConfig,
+        auxiliary_heads: bool,
         vb: VarBuilder<'_>,
     ) -> Result<Self> {
         config.validate().map_err(candle_core::Error::Msg)?;
@@ -1038,6 +1063,12 @@ impl PairTaskPeptideModel {
                 config.contrastive_dim,
                 vb.pp("heads.contrastive"),
             )?,
+            pair_class_head: auxiliary_heads
+                .then(|| nn::linear(PAIR_DIM, 6, vb.pp("heads.pair_classes")))
+                .transpose()?,
+            chemistry_summary_head: auxiliary_heads
+                .then(|| nn::linear(config.model_dim, 8, vb.pp("heads.chemistry_summary")))
+                .transpose()?,
             rt_specialist: (specialist_config.enabled && specialist_config.rt)
                 .then(|| NativeRtSpecialist::new(config.model_dim, vb.pp("specialists.rt")))
                 .transpose()?,
@@ -1046,7 +1077,11 @@ impl PairTaskPeptideModel {
                 .transpose()?,
             mobility_specialist: (specialist_config.enabled && specialist_config.mobility_ccs)
                 .then(|| {
-                    PairAwareMobilitySpecialist::new(&config, vb.pp("specialists.mobility_ccs"))
+                    PairAwareMobilitySpecialist::new(
+                        &config,
+                        auxiliary_heads,
+                        vb.pp("specialists.mobility_ccs"),
+                    )
                 })
                 .transpose()?,
             specialist_config,
@@ -1061,6 +1096,32 @@ impl PairTaskPeptideModel {
         context: &PrecursorContextBatch,
         train: bool,
     ) -> Result<FoundationMultiTaskOutput> {
+        self.forward_impl(batch, context, train, false)
+            .map(|(main, _)| main)
+    }
+
+    pub(crate) fn forward_with_auxiliaries_t(
+        &self,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+    ) -> Result<(
+        FoundationMultiTaskOutput,
+        Option<PairTaskAuxiliaryPredictions>,
+    )> {
+        self.forward_impl(batch, context, train, true)
+    }
+
+    fn forward_impl(
+        &self,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+        need_auxiliary: bool,
+    ) -> Result<(
+        FoundationMultiTaskOutput,
+        Option<PairTaskAuxiliaryPredictions>,
+    )> {
         let representation = self.encoder.forward_t(batch, context, train)?;
         let rt = if let Some(specialist) = &self.rt_specialist {
             specialist.forward(&representation, context)?
@@ -1104,10 +1165,10 @@ impl PairTaskPeptideModel {
         } else {
             ccs_residual
         };
-        let ccs = if let Some(specialist) = &self.mobility_specialist {
-            specialist.forward_t(&representation, context, train)?
+        let (ccs, conformation_proxy) = if let Some(specialist) = &self.mobility_specialist {
+            specialist.forward_with_proxy_t(&representation, context, train, need_auxiliary)?
         } else {
-            legacy_ccs
+            (legacy_ccs, None)
         };
 
         let ms2 = if let Some(specialist) = &self.ms2_specialist {
@@ -1131,15 +1192,47 @@ impl PairTaskPeptideModel {
             .contrastive_head
             .forward(&representation.foundation.peptide_embedding)?;
 
-        Ok(FoundationMultiTaskOutput {
-            foundation: representation.foundation,
-            rt,
-            ccs,
-            ms2,
-            residue_logits,
-            chemistry_reconstruction,
-            contrastive_projection,
-        })
+        // Construct auxiliary tensors before moving the shared representation
+        // into the public prediction struct. Old checkpoints have no such heads.
+        let auxiliaries = if need_auxiliary {
+            if let (Some(pair_head), Some(chemistry_head)) =
+                (&self.pair_class_head, &self.chemistry_summary_head)
+            {
+                let (batch_size, seq_len, _) =
+                    representation.foundation.residue_embeddings.dims3()?;
+                let pair = representation
+                    .pair_embeddings
+                    .narrow(1, TASK_COUNT, seq_len)?
+                    .narrow(2, TASK_COUNT, seq_len)?
+                    .contiguous()?;
+                let pair_logits = pair_head
+                    .forward(&pair.reshape((batch_size * seq_len * seq_len, PAIR_DIM))?)?
+                    .reshape((batch_size, seq_len, seq_len, 6))?;
+                let chemistry_summary =
+                    chemistry_head.forward(&representation.foundation.peptide_embedding)?;
+                Some(PairTaskAuxiliaryPredictions {
+                    pair_logits,
+                    chemistry_summary,
+                    conformation_proxy,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok((
+            FoundationMultiTaskOutput {
+                foundation: representation.foundation,
+                rt,
+                ccs,
+                ms2,
+                residue_logits,
+                chemistry_reconstruction,
+                contrastive_projection,
+            },
+            auxiliaries,
+        ))
     }
 
     fn forward_ms2(
@@ -1302,9 +1395,23 @@ mod tests {
         let context = PrecursorContextBatch::unknown(2, &device)?;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model =
-            PairTaskPeptideModel::new(config.clone(), FoundationSpecialistConfig::default(), vb)?;
-        let output = model.forward_t(&batch, &context, false)?;
+        let model = PairTaskPeptideModel::new(
+            config.clone(),
+            FoundationSpecialistConfig::default(),
+            true,
+            vb,
+        )?;
+        let (output, auxiliaries) = model.forward_with_auxiliaries_t(&batch, &context, false)?;
+        let auxiliaries = auxiliaries.expect("enabled pair/chemistry heads");
+        assert_eq!(
+            auxiliaries.pair_logits.dims4()?,
+            (2, config.max_sequence_len, config.max_sequence_len, 6)
+        );
+        assert_eq!(auxiliaries.chemistry_summary.dims2()?, (2, 8));
+        assert_eq!(
+            auxiliaries.conformation_proxy.as_ref().unwrap().dims2()?,
+            (2, 14)
+        );
 
         assert_eq!(output.rt.dims2()?, (2, 1));
         assert_eq!(output.ccs.dims2()?, (2, 1));

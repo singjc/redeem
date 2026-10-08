@@ -22,7 +22,7 @@ use super::model::{
     FoundationMultiTaskOutput, PeptideFoundationMultiTaskModel, PrecursorContextBatch,
 };
 use super::normalization::FoundationTargetNormalizationConfig;
-use super::pair_encoder::PairTaskPeptideModel;
+use super::pair_encoder::{PairTaskAuxiliaryPredictions, PairTaskPeptideModel};
 use super::predictor::prediction_record;
 use super::spectrum::{FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator};
 use crate::models::model_interface::{PredictionInput, PredictionModel, PredictionOutput};
@@ -96,6 +96,10 @@ pub struct FoundationModelConfig {
     /// predate these heads deserialize with them disabled.
     #[serde(default = "legacy_foundation_specialists")]
     pub specialists: FoundationSpecialistConfig,
+    /// Adds supervised pair, chemistry-summary and conformation heads for new
+    /// from-scratch models. Missing in older checkpoint metadata => disabled.
+    #[serde(default)]
+    pub auxiliary_supervision_heads: bool,
     /// Spectrum encoder plus autoregressive peptide decoder.
     pub inverse: FoundationDiffusionConfig,
 }
@@ -132,6 +136,7 @@ impl Default for FoundationModelConfig {
             peptide,
             peptide_backbone: FoundationPeptideBackbone::ResiduePairTaskTokens,
             specialists: FoundationSpecialistConfig::default(),
+            auxiliary_supervision_heads: true,
             inverse,
         }
     }
@@ -234,6 +239,23 @@ impl FoundationPeptideModel {
             Self::ResiduePairTaskTokens(model) => model.forward_t(batch, context, train),
         }
     }
+
+    fn forward_with_auxiliaries_t(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+    ) -> candle_core::Result<(
+        FoundationMultiTaskOutput,
+        Option<PairTaskAuxiliaryPredictions>,
+    )> {
+        match self {
+            Self::ResidueTransformer(model) => Ok((model.forward_t(batch, context, train)?, None)),
+            Self::ResiduePairTaskTokens(model) => {
+                model.forward_with_auxiliaries_t(batch, context, train)
+            }
+        }
+    }
 }
 
 pub struct FoundationModel {
@@ -280,6 +302,7 @@ impl FoundationModel {
                 FoundationPeptideModel::ResiduePairTaskTokens(PairTaskPeptideModel::new(
                     config.peptide.clone(),
                     config.specialists,
+                    config.auxiliary_supervision_heads,
                     vb.pp("peptide"),
                 )?)
             }
@@ -423,6 +446,19 @@ impl FoundationModel {
         train: bool,
     ) -> candle_core::Result<FoundationMultiTaskOutput> {
         self.peptide.forward_t(batch, context, train)
+    }
+
+    pub(crate) fn forward_properties_with_auxiliaries_t(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+    ) -> candle_core::Result<(
+        FoundationMultiTaskOutput,
+        Option<PairTaskAuxiliaryPredictions>,
+    )> {
+        self.peptide
+            .forward_with_auxiliaries_t(batch, context, train)
     }
 
     pub(crate) fn inverse_forward_t(
@@ -773,6 +809,21 @@ mod tests {
         assert!(!restored.specialists.rt);
         assert!(!restored.specialists.ms2);
         assert!(!restored.specialists.mobility_ccs);
+    }
+
+    #[test]
+    fn missing_auxiliary_heads_preserves_older_checkpoint_parameter_tree() {
+        let defaults = FoundationModelConfig::default();
+        assert!(defaults.auxiliary_supervision_heads);
+        let mut value = serde_yaml::to_value(defaults).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String(
+                "auxiliary_supervision_heads".into(),
+            ));
+        let legacy: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
+        assert!(!legacy.auxiliary_supervision_heads);
     }
 
     #[test]
