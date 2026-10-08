@@ -27,6 +27,7 @@ pub mod metadata;
 pub mod model;
 pub mod msp;
 pub mod normalization;
+mod pair_encoder;
 pub mod predictor;
 pub mod rt_harmonization;
 pub mod runtime;
@@ -193,7 +194,7 @@ pub use predictor::{FoundationPredictor, FoundationPredictorConfig};
 
 pub use runtime::{
     read_foundation_checkpoint_metadata, FoundationCheckpointMetadata, FoundationModel,
-    FoundationModelConfig, FoundationRecordPrediction,
+    FoundationModelConfig, FoundationPeptideBackbone, FoundationRecordPrediction,
 };
 
 pub use training::{

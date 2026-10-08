@@ -492,7 +492,7 @@ impl PeptideFoundationMultiTaskModel {
 /// The prior is intentionally parameter-free. This lets a model start from a
 /// strong precursor-physics prediction while reserving all learned CCS
 /// capacity for peptide-specific deviations from that baseline.
-fn standardized_ccs_physics_baseline(
+pub(crate) fn standardized_ccs_physics_baseline(
     foundation: &FoundationOutput,
     context: &PrecursorContextBatch,
     baseline: &FoundationCcsPhysicsBaselineConfig,

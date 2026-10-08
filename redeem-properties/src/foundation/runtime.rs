@@ -22,6 +22,7 @@ use super::model::{
     FoundationMultiTaskOutput, PeptideFoundationMultiTaskModel, PrecursorContextBatch,
 };
 use super::normalization::FoundationTargetNormalizationConfig;
+use super::pair_encoder::PairTaskPeptideModel;
 use super::predictor::prediction_record;
 use super::spectrum::{FoundationSpectrum, FoundationSpectrumBatch, FoundationSpectrumCollator};
 use crate::models::model_interface::{PredictionInput, PredictionModel, PredictionOutput};
@@ -34,12 +35,31 @@ use std::path::Path;
 
 const CHECKPOINT_SCHEMA: &str = "redeem.foundation.model";
 
+/// Production peptide representation used by the end-to-end foundation model.
+///
+/// Missing values in checkpoints created before the pair-backbone restoration
+/// deserialize as `ResidueTransformer`, preserving those checkpoints exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoundationPeptideBackbone {
+    #[default]
+    ResidueTransformer,
+    ResiduePairTaskTokens,
+}
+
+fn legacy_peptide_backbone() -> FoundationPeptideBackbone {
+    FoundationPeptideBackbone::ResidueTransformer
+}
+
 /// One stable architecture config shared by training and inference.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FoundationModelConfig {
     /// Peptide encoder plus RT/CCS/MS2 and self-supervision heads.
     pub peptide: FoundationConfig,
+    /// Peptide representation used by the production property model.
+    #[serde(default = "legacy_peptide_backbone")]
+    pub peptide_backbone: FoundationPeptideBackbone,
     /// Spectrum encoder plus autoregressive peptide decoder.
     pub inverse: FoundationDiffusionConfig,
 }
@@ -72,7 +92,11 @@ impl Default for FoundationModelConfig {
         inverse.decoder_layers = 6;
         inverse.dropout = 0.05;
 
-        Self { peptide, inverse }
+        Self {
+            peptide,
+            peptide_backbone: FoundationPeptideBackbone::ResiduePairTaskTokens,
+            inverse,
+        }
     }
 }
 
@@ -156,11 +180,30 @@ pub struct FoundationRecordPrediction {
 /// learned representation space through the alignment projection/loss. This is
 /// intentional: the two modalities need different input encoders while still
 /// being forced to describe the same peptidoform identity.
+enum FoundationPeptideModel {
+    ResidueTransformer(PeptideFoundationMultiTaskModel),
+    ResiduePairTaskTokens(PairTaskPeptideModel),
+}
+
+impl FoundationPeptideModel {
+    fn forward_t(
+        &self,
+        batch: &super::featurize::FoundationBatch,
+        context: &PrecursorContextBatch,
+        train: bool,
+    ) -> candle_core::Result<FoundationMultiTaskOutput> {
+        match self {
+            Self::ResidueTransformer(model) => model.forward_t(batch, context, train),
+            Self::ResiduePairTaskTokens(model) => model.forward_t(batch, context, train),
+        }
+    }
+}
+
 pub struct FoundationModel {
     config: FoundationModelConfig,
     device: Device,
     variables: VarMap,
-    peptide: PeptideFoundationMultiTaskModel,
+    peptide: FoundationPeptideModel,
     inverse: PeptideSpectrumCausalModel,
     spectrum_alignment: Linear,
     peptide_collator: FoundationCollator,
@@ -189,8 +232,20 @@ impl FoundationModel {
         }
         let variables = VarMap::new();
         let vb = VarBuilder::from_varmap(&variables, DType::F32, &device);
-        let peptide =
-            PeptideFoundationMultiTaskModel::new(config.peptide.clone(), vb.pp("peptide"))?;
+        let peptide = match config.peptide_backbone {
+            FoundationPeptideBackbone::ResidueTransformer => {
+                FoundationPeptideModel::ResidueTransformer(PeptideFoundationMultiTaskModel::new(
+                    config.peptide.clone(),
+                    vb.pp("peptide"),
+                )?)
+            }
+            FoundationPeptideBackbone::ResiduePairTaskTokens => {
+                FoundationPeptideModel::ResiduePairTaskTokens(PairTaskPeptideModel::new(
+                    config.peptide.clone(),
+                    vb.pp("peptide"),
+                )?)
+            }
+        };
         let inverse =
             PeptideSpectrumCausalModel::new_open_ptm(config.inverse.clone(), vb.pp("inverse"))?;
         let spectrum_alignment = nn::linear(
@@ -628,8 +683,26 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.peptide.model_dim, 320);
         assert_eq!(config.peptide.transformer_layers, 8);
+        assert_eq!(
+            config.peptide_backbone,
+            FoundationPeptideBackbone::ResiduePairTaskTokens
+        );
         assert_eq!(config.inverse.model_dim, 320);
         assert_eq!(config.inverse.decoder_layers, 6);
+    }
+
+    #[test]
+    fn historical_model_config_without_backbone_defaults_to_residue_transformer() {
+        let mut value = serde_yaml::to_value(FoundationModelConfig::default()).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("peptide_backbone".into()));
+        let restored: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(
+            restored.peptide_backbone,
+            FoundationPeptideBackbone::ResidueTransformer
+        );
     }
 
     #[test]
