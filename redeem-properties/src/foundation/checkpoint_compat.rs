@@ -1229,6 +1229,7 @@ mod base_forward {
                     FoundationMs2LossConfig {
                         pointwise_weight: 0.0,
                         cosine_weight: 1.0,
+                        pearson_weight: 0.0,
                         cosine_epsilon: 1.0e-8,
                     },
                 )?;

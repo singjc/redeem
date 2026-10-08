@@ -18,15 +18,41 @@ use super::normalization::{
     FoundationRegressionNormalization, FoundationRegressionNormalizationStrategy,
     FoundationTargetNormalizationConfig,
 };
+use super::optimizer::{FoundationAdamW, FoundationAdamWConfig};
 use super::runtime::{FoundationCheckpointMetadata, FoundationModel, FoundationModelConfig};
 use super::spectrum::FoundationSpectrum;
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Production training controller. `Joint` preserves the cleanup-era behavior;
+/// `ResearchCurriculum` trains one random-init model with deterministic staged
+/// property, representation, mobility, and inverse updates inspired by the
+/// successful v0.35-v0.52 research program.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoundationTrainingStrategy {
+    #[default]
+    Joint,
+    ResearchCurriculum,
+}
+
+fn legacy_training_strategy() -> FoundationTrainingStrategy {
+    FoundationTrainingStrategy::Joint
+}
+
+fn legacy_warmup_steps() -> usize {
+    0
+}
+fn legacy_min_lr_ratio() -> f64 {
+    1.0
+}
+fn legacy_max_gradient_norm() -> Option<f64> {
+    None
+}
 
 /// Hyperparameters for the one supported end-to-end foundation training regime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +61,18 @@ pub struct FoundationTrainingConfig {
     pub model: FoundationModelConfig,
     pub batch_size: usize,
     pub learning_rate: f64,
+    /// Update schedule. Historical configs deserialize as `joint`.
+    #[serde(default = "legacy_training_strategy")]
+    pub strategy: FoundationTrainingStrategy,
+    /// Linear warmup updates before cosine decay. Historical configs use zero.
+    #[serde(default = "legacy_warmup_steps")]
+    pub warmup_steps: usize,
+    /// Final/base LR ratio after cosine decay. Historical configs use one (constant LR).
+    #[serde(default = "legacy_min_lr_ratio")]
+    pub min_learning_rate_ratio: f64,
+    /// Optional global gradient norm clip. Historical configs leave clipping disabled.
+    #[serde(default = "legacy_max_gradient_norm")]
+    pub max_gradient_norm: Option<f64>,
     pub epochs: usize,
     pub early_stopping_patience: usize,
     pub seed: u64,
@@ -63,7 +101,11 @@ impl Default for FoundationTrainingConfig {
         Self {
             model: FoundationModelConfig::default(),
             batch_size: 32,
-            learning_rate: 3.0e-5,
+            learning_rate: 2.0e-5,
+            strategy: FoundationTrainingStrategy::ResearchCurriculum,
+            warmup_steps: 500,
+            min_learning_rate_ratio: 0.10,
+            max_gradient_norm: Some(1.0),
             epochs: 20,
             early_stopping_patience: 4,
             seed: 20_261_006,
@@ -82,6 +124,7 @@ impl Default for FoundationTrainingConfig {
             ms2_loss: FoundationMs2LossConfig {
                 pointwise_weight: 1.0,
                 cosine_weight: 0.25,
+                pearson_weight: 0.25,
                 cosine_epsilon: 1.0e-8,
             },
             peptide_contrastive_weight: 0.10,
@@ -103,6 +146,17 @@ impl FoundationTrainingConfig {
         }
         if !(self.learning_rate > 0.0 && self.learning_rate.is_finite()) {
             anyhow::bail!("foundation learning_rate must be positive and finite");
+        }
+        if !(self.min_learning_rate_ratio > 0.0
+            && self.min_learning_rate_ratio <= 1.0
+            && self.min_learning_rate_ratio.is_finite())
+        {
+            anyhow::bail!("foundation min_learning_rate_ratio must be finite and in (0, 1]");
+        }
+        if let Some(max_norm) = self.max_gradient_norm {
+            if !(max_norm > 0.0 && max_norm.is_finite()) {
+                anyhow::bail!("foundation max_gradient_norm must be positive and finite");
+            }
         }
         for (name, value) in [
             (
@@ -280,6 +334,8 @@ pub struct FoundationEvaluationMetrics {
     pub ms2_rmse: Option<f64>,
     pub ms2_spectrum_count: usize,
     pub ms2_cosine_similarity: Option<f64>,
+    pub ms2_spectral_angle: Option<f64>,
+    pub ms2_pearson: Option<f64>,
     pub inverse_sequence_count: usize,
     pub inverse_mean_nll: Option<f64>,
     pub inverse_ptm_site_count: usize,
@@ -390,11 +446,45 @@ pub fn train_foundation_model(
             corruption: training.corruption,
         },
     )?;
-    let params = ParamsAdamW {
-        lr: training.learning_rate,
-        ..Default::default()
+    let optimizer_config = FoundationAdamWConfig {
+        learning_rate: training.learning_rate,
+        ..FoundationAdamWConfig::default()
     };
-    let mut optimizer = AdamW::new(model.trainable_variables(), params)?;
+    let mut joint_optimizer = match training.strategy {
+        FoundationTrainingStrategy::Joint => {
+            Some(FoundationAdamW::new(model.varmap(), optimizer_config)?)
+        }
+        FoundationTrainingStrategy::ResearchCurriculum => None,
+    };
+    let mut peptide_optimizer =
+        match training.strategy {
+            FoundationTrainingStrategy::ResearchCurriculum => Some(
+                FoundationAdamW::new_for_prefixes(model.varmap(), optimizer_config, &["peptide."])?,
+            ),
+            FoundationTrainingStrategy::Joint => None,
+        };
+    let mut inverse_optimizer = match training.strategy {
+        FoundationTrainingStrategy::ResearchCurriculum => Some(FoundationAdamW::new_for_prefixes(
+            model.varmap(),
+            optimizer_config,
+            &["inverse.", "alignment."],
+        )?),
+        FoundationTrainingStrategy::Joint => None,
+    };
+    let train_batches_per_epoch = training
+        .max_train_batches_per_epoch
+        .unwrap_or_else(|| (train_indices.len() + training.batch_size - 1) / training.batch_size)
+        .min((train_indices.len() + training.batch_size - 1) / training.batch_size);
+    let updates_per_cycle = match training.strategy {
+        FoundationTrainingStrategy::Joint => 1usize,
+        FoundationTrainingStrategy::ResearchCurriculum => 5usize,
+    };
+    let planned_updates = training
+        .epochs
+        .saturating_mul(train_batches_per_epoch)
+        .saturating_mul(updates_per_cycle)
+        .max(1);
+    let mut global_update = 0usize;
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("create foundation output {}", output_dir.display()))?;
@@ -418,28 +508,52 @@ pub fn train_foundation_model(
     )?;
     fs::write(
         &validation_metrics_path,
-        "epoch\trecords\trt_count\trt_mae_native\trt_rmse_native\tccs_count\tccs_mae\tccs_rmse\tms2_point_count\tms2_rmse\tms2_spectrum_count\tms2_cosine_similarity\tinverse_sequence_count\tinverse_mean_nll\tinverse_ptm_site_count\tinverse_ptm_mass_rmse_da\tretrieval_queries\tretrieval_top1_accuracy\tretrieval_mrr\tgeneration_attempts\tgeneration_success_rate\tgeneration_sequence_exact_rate\tgeneration_sequence_il_equivalent_rate\tgeneration_mean_length\n",
+        "epoch\trecords\trt_count\trt_mae_native\trt_rmse_native\tccs_count\tccs_mae\tccs_rmse\tms2_point_count\tms2_rmse\tms2_spectrum_count\tms2_cosine_similarity\tms2_spectral_angle\tms2_pearson\tinverse_sequence_count\tinverse_mean_nll\tinverse_ptm_site_count\tinverse_ptm_mass_rmse_da\tretrieval_queries\tretrieval_top1_accuracy\tretrieval_mrr\tgeneration_attempts\tgeneration_success_rate\tgeneration_sequence_exact_rate\tgeneration_sequence_il_equivalent_rate\tgeneration_mean_length\n",
     )?;
 
     let mut best_validation_loss = f64::INFINITY;
+    let mut best_forward_score = f64::INFINITY;
+    let mut best_inverse_nll = f64::INFINITY;
     let mut epochs_without_improvement = 0usize;
     let mut completed_epochs = 0usize;
 
     for epoch in 0..training.epochs {
         let mut order = train_indices.clone();
         shuffle_indices(&mut order, training.seed ^ epoch as u64);
-        let train_losses = run_epoch(
-            &model,
-            &corpus.records,
-            &order,
-            &train_collator,
-            &training,
-            Some(&mut optimizer),
-            training.max_train_batches_per_epoch,
-            epoch as u64,
-            &device,
-        )?;
-        let validation_losses = run_epoch(
+        let train_losses = match training.strategy {
+            FoundationTrainingStrategy::Joint => run_epoch_joint(
+                &model,
+                &corpus.records,
+                &order,
+                &train_collator,
+                &training,
+                joint_optimizer.as_mut(),
+                training.max_train_batches_per_epoch,
+                epoch as u64,
+                &mut global_update,
+                planned_updates,
+                &device,
+            )?,
+            FoundationTrainingStrategy::ResearchCurriculum => run_epoch_research_curriculum(
+                &model,
+                &corpus.records,
+                &order,
+                &train_collator,
+                &training,
+                peptide_optimizer
+                    .as_mut()
+                    .expect("research peptide optimizer"),
+                inverse_optimizer
+                    .as_mut()
+                    .expect("research inverse optimizer"),
+                training.max_train_batches_per_epoch,
+                epoch as u64,
+                &mut global_update,
+                planned_updates,
+                &device,
+            )?,
+        };
+        let validation_losses = run_epoch_joint(
             &model,
             &corpus.records,
             &validation_indices,
@@ -448,6 +562,8 @@ pub fn train_foundation_model(
             None,
             training.max_validation_batches,
             training.seed ^ 0xa5a5_5a5a_1234_5678,
+            &mut global_update,
+            planned_updates,
             &device,
         )?;
         if !train_losses.total.is_finite() || !validation_losses.total.is_finite() {
@@ -477,6 +593,34 @@ pub fn train_foundation_model(
             completed_epochs,
             validation_metrics,
         )?;
+        if let Some(score) = forward_balanced_score(validation_metrics) {
+            if score < best_forward_score {
+                best_forward_score = score;
+                let metadata = checkpoint_metadata(
+                    model_config.clone(),
+                    normalization,
+                    &corpus,
+                    &benchmark,
+                    completed_epochs,
+                    validation_losses.total,
+                );
+                model.save_checkpoint(output_dir.join("best_forward"), &metadata)?;
+            }
+        }
+        if let Some(inverse_nll) = validation_metrics.inverse_mean_nll {
+            if inverse_nll < best_inverse_nll {
+                best_inverse_nll = inverse_nll;
+                let metadata = checkpoint_metadata(
+                    model_config.clone(),
+                    normalization,
+                    &corpus,
+                    &benchmark,
+                    completed_epochs,
+                    validation_losses.total,
+                );
+                model.save_checkpoint(output_dir.join("best_inverse"), &metadata)?;
+            }
+        }
         eprintln!(
             "foundation epoch={} train_loss={:.6} validation_loss={:.6} rt_mae={} ccs_mae={} ms2_cosine={} inverse_nll={} retrieval_mrr={} generation_exact={}",
             completed_epochs,
@@ -493,17 +637,14 @@ pub fn train_foundation_model(
         if validation_losses.total < best_validation_loss {
             best_validation_loss = validation_losses.total;
             epochs_without_improvement = 0;
-            let mut metadata = FoundationCheckpointMetadata::new(
+            let metadata = checkpoint_metadata(
                 model_config.clone(),
                 normalization,
-                corpus.instrument_names.clone(),
+                &corpus,
+                &benchmark,
+                completed_epochs,
+                best_validation_loss,
             );
-            metadata.completed_epochs = completed_epochs;
-            metadata.best_validation_loss = Some(best_validation_loss);
-            metadata.corpus_fingerprint =
-                Some(format!("fnv1a64:{:016x}", corpus.corpus_fingerprint));
-            metadata.benchmark_fingerprint =
-                Some(format!("fnv1a64:{:016x}", benchmark.manifest_fingerprint()));
             model.save_checkpoint(output_dir, &metadata)?;
         } else {
             epochs_without_improvement += 1;
@@ -521,15 +662,47 @@ pub fn train_foundation_model(
     })
 }
 
-fn run_epoch(
+fn checkpoint_metadata(
+    model_config: FoundationModelConfig,
+    normalization: FoundationTargetNormalizationConfig,
+    corpus: &super::corpus::FoundationCorpus,
+    benchmark: &FoundationBenchmarkManifest,
+    completed_epochs: usize,
+    validation_loss: f64,
+) -> FoundationCheckpointMetadata {
+    let mut metadata = FoundationCheckpointMetadata::new(
+        model_config,
+        normalization,
+        corpus.instrument_names.clone(),
+    );
+    metadata.completed_epochs = completed_epochs;
+    metadata.best_validation_loss = Some(validation_loss);
+    metadata.corpus_fingerprint = Some(format!("fnv1a64:{:016x}", corpus.corpus_fingerprint));
+    metadata.benchmark_fingerprint =
+        Some(format!("fnv1a64:{:016x}", benchmark.manifest_fingerprint()));
+    metadata
+}
+
+fn forward_balanced_score(metrics: FoundationEvaluationMetrics) -> Option<f64> {
+    let rt = metrics.rt_mae_native? / 4.528375;
+    let ccs = metrics.ccs_mae? / 8.80611929;
+    let cosine = (1.0 - metrics.ms2_cosine_similarity?) / (1.0 - 0.904061);
+    let spectral = (1.0 - metrics.ms2_spectral_angle?) / (1.0 - 0.747700);
+    let pearson = (1.0 - metrics.ms2_pearson?) / (1.0 - 0.684548);
+    Some(0.25 * rt + 0.40 * ccs + 0.12 * cosine + 0.12 * spectral + 0.11 * pearson)
+}
+
+fn run_epoch_joint(
     model: &FoundationModel,
     records: &[FoundationTrainingRecord],
     indices: &[usize],
     collator: &FoundationCollator,
     config: &FoundationTrainingConfig,
-    mut optimizer: Option<&mut AdamW>,
+    mut optimizer: Option<&mut FoundationAdamW>,
     max_batches: Option<usize>,
     seed: u64,
+    global_update: &mut usize,
+    planned_updates: usize,
     device: &Device,
 ) -> Result<FoundationEpochLosses> {
     let mut aggregate = FoundationEpochLosses::default();
@@ -560,7 +733,10 @@ fn run_epoch(
             device,
         )?;
         if let Some(opt) = optimizer.as_mut() {
-            (*opt).backward_step(&loss.total)?;
+            let lr = scheduled_learning_rate(config, *global_update, planned_updates);
+            (*opt).set_learning_rate(lr)?;
+            (*opt).backward_step(&loss.total, config.max_gradient_norm)?;
+            *global_update = (*global_update).saturating_add(1);
         }
         aggregate.add(loss.scalars);
     }
@@ -568,6 +744,154 @@ fn run_epoch(
         anyhow::bail!("foundation epoch produced no batches");
     }
     Ok(aggregate.means())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FoundationCurriculumStage {
+    Property,
+    Representation,
+    Mobility,
+    Inverse,
+}
+
+fn run_epoch_research_curriculum(
+    model: &FoundationModel,
+    records: &[FoundationTrainingRecord],
+    indices: &[usize],
+    collator: &FoundationCollator,
+    config: &FoundationTrainingConfig,
+    peptide_optimizer: &mut FoundationAdamW,
+    inverse_optimizer: &mut FoundationAdamW,
+    max_batches: Option<usize>,
+    seed: u64,
+    global_update: &mut usize,
+    planned_updates: usize,
+    device: &Device,
+) -> Result<FoundationEpochLosses> {
+    let mut aggregate = FoundationEpochLosses::default();
+    for (batch_index, chunk) in indices
+        .chunks(config.batch_size)
+        .take(max_batches.unwrap_or(usize::MAX))
+        .enumerate()
+    {
+        let owned = chunk
+            .iter()
+            .map(|&index| {
+                records.get(index).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("foundation training record index {index} is out of bounds")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if owned.is_empty() {
+            continue;
+        }
+        let cycle_seed = seed ^ (batch_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for (stage_index, stage) in [
+            FoundationCurriculumStage::Property,
+            FoundationCurriculumStage::Property,
+            FoundationCurriculumStage::Representation,
+            FoundationCurriculumStage::Mobility,
+            FoundationCurriculumStage::Inverse,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let stage_seed = cycle_seed ^ (stage_index as u64).wrapping_mul(0xd1b5_4a32_d192_ed03);
+            let staged = staged_training_config(config, stage);
+            let stage_collator = match stage {
+                FoundationCurriculumStage::Representation => collator,
+                _ => model.peptide_collator(),
+            };
+            let loss = batch_loss(
+                model,
+                &owned,
+                stage_collator,
+                &staged,
+                stage_seed,
+                true,
+                device,
+            )?;
+            let lr = scheduled_learning_rate(config, *global_update, planned_updates);
+            match stage {
+                FoundationCurriculumStage::Inverse => {
+                    inverse_optimizer.set_learning_rate(lr)?;
+                    inverse_optimizer.backward_step(&loss.total, config.max_gradient_norm)?;
+                }
+                _ => {
+                    peptide_optimizer.set_learning_rate(lr)?;
+                    peptide_optimizer.backward_step(&loss.total, config.max_gradient_norm)?;
+                }
+            }
+            *global_update = (*global_update).saturating_add(1);
+            aggregate.add(loss.scalars);
+        }
+    }
+    if aggregate.batches == 0 {
+        anyhow::bail!("foundation research-curriculum epoch produced no updates");
+    }
+    Ok(aggregate.means())
+}
+
+fn staged_training_config(
+    base: &FoundationTrainingConfig,
+    stage: FoundationCurriculumStage,
+) -> FoundationTrainingConfig {
+    let mut config = base.clone();
+    config.forward_loss_weights = FoundationLossWeights {
+        rt: 0.0,
+        ccs: 0.0,
+        ms2: 0.0,
+        masked_residue: 0.0,
+        chemistry: 0.0,
+        contrastive: 0.0,
+    };
+    config.peptide_contrastive_weight = 0.0;
+    config.inverse_weight = 0.0;
+    config.inverse_ptm_mass_weight = 0.0;
+    config.cross_modal_alignment_weight = 0.0;
+    match stage {
+        FoundationCurriculumStage::Property => {
+            config.forward_loss_weights.rt = base.forward_loss_weights.rt;
+            config.forward_loss_weights.ms2 = base.forward_loss_weights.ms2;
+        }
+        FoundationCurriculumStage::Representation => {
+            config.forward_loss_weights.masked_residue =
+                base.forward_loss_weights.masked_residue.max(0.15);
+            config.forward_loss_weights.chemistry = base.forward_loss_weights.chemistry.max(0.10);
+            config.peptide_contrastive_weight = base.peptide_contrastive_weight.max(0.05);
+        }
+        FoundationCurriculumStage::Mobility => {
+            config.forward_loss_weights.ccs = base.forward_loss_weights.ccs;
+        }
+        FoundationCurriculumStage::Inverse => {
+            config.inverse_weight = base.inverse_weight;
+            config.inverse_ptm_mass_weight = base.inverse_ptm_mass_weight;
+            config.cross_modal_alignment_weight = base.cross_modal_alignment_weight;
+        }
+    }
+    config
+}
+
+fn scheduled_learning_rate(
+    config: &FoundationTrainingConfig,
+    update: usize,
+    planned_updates: usize,
+) -> f64 {
+    if config.strategy == FoundationTrainingStrategy::Joint
+        && config.warmup_steps == 0
+        && (config.min_learning_rate_ratio - 1.0).abs() <= f64::EPSILON
+    {
+        return config.learning_rate;
+    }
+    if config.warmup_steps > 0 && update < config.warmup_steps {
+        return config.learning_rate * ((update + 1) as f64 / config.warmup_steps as f64);
+    }
+    let decay_start = config.warmup_steps.min(planned_updates);
+    let decay_steps = planned_updates.saturating_sub(decay_start).max(1);
+    let progress = update.saturating_sub(decay_start).min(decay_steps) as f64 / decay_steps as f64;
+    let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+    let ratio = config.min_learning_rate_ratio + (1.0 - config.min_learning_rate_ratio) * cosine;
+    config.learning_rate * ratio
 }
 
 fn batch_loss(
@@ -724,6 +1048,9 @@ struct EvaluationAccumulator {
     ms2_squared_error_sum: f64,
     ms2_point_count: usize,
     ms2_cosine_sum: f64,
+    ms2_spectral_angle_sum: f64,
+    ms2_pearson_sum: f64,
+    ms2_pearson_count: usize,
     ms2_spectrum_count: usize,
     inverse_nll_sum: f64,
     inverse_sequence_count: usize,
@@ -753,6 +1080,8 @@ impl EvaluationAccumulator {
             ms2_rmse: ratio(self.ms2_squared_error_sum, self.ms2_point_count).map(f64::sqrt),
             ms2_spectrum_count: self.ms2_spectrum_count,
             ms2_cosine_similarity: ratio(self.ms2_cosine_sum, self.ms2_spectrum_count),
+            ms2_spectral_angle: ratio(self.ms2_spectral_angle_sum, self.ms2_spectrum_count),
+            ms2_pearson: ratio(self.ms2_pearson_sum, self.ms2_pearson_count),
             inverse_sequence_count: self.inverse_sequence_count,
             inverse_mean_nll: ratio(self.inverse_nll_sum, self.inverse_sequence_count),
             inverse_ptm_site_count: self.inverse_ptm_site_count,
@@ -980,6 +1309,8 @@ fn accumulate_forward_metrics(
     let mut prediction_norm = 0.0f64;
     let mut target_norm = 0.0f64;
     let mut points = 0usize;
+    let mut pred_values = Vec::new();
+    let mut target_values = Vec::new();
     for cleavage_index in 0..cleavage {
         for channel in 0..channels {
             let Some(target_value) = target[cleavage_index][channel] else {
@@ -997,6 +1328,8 @@ fn accumulate_forward_metrics(
             dot += p * t;
             prediction_norm += p * p;
             target_norm += t * t;
+            pred_values.push(p);
+            target_values.push(t);
             points += 1;
         }
     }
@@ -1007,10 +1340,38 @@ fn accumulate_forward_metrics(
             let cosine = (dot / denominator).clamp(-1.0, 1.0);
             if cosine.is_finite() {
                 aggregate.ms2_cosine_sum += cosine;
+                aggregate.ms2_spectral_angle_sum +=
+                    1.0 - (2.0 / std::f64::consts::PI) * cosine.acos();
                 aggregate.ms2_spectrum_count += 1;
+                if let Some(pearson) = pearson_correlation(&pred_values, &target_values) {
+                    aggregate.ms2_pearson_sum += pearson;
+                    aggregate.ms2_pearson_count += 1;
+                }
             }
         }
     }
+}
+
+fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len() || left.len() < 2 {
+        return None;
+    }
+    let n = left.len() as f64;
+    let left_mean = left.iter().sum::<f64>() / n;
+    let right_mean = right.iter().sum::<f64>() / n;
+    let mut covariance = 0.0;
+    let mut left_variance = 0.0;
+    let mut right_variance = 0.0;
+    for (&a, &b) in left.iter().zip(right) {
+        let da = a - left_mean;
+        let db = b - right_mean;
+        covariance += da * db;
+        left_variance += da * da;
+        right_variance += db * db;
+    }
+    let denominator = (left_variance * right_variance).sqrt();
+    (denominator > 0.0 && denominator.is_finite())
+        .then(|| (covariance / denominator).clamp(-1.0, 1.0))
 }
 
 fn accumulate_retrieval_metrics(
@@ -1122,7 +1483,7 @@ fn append_validation_metrics(
     let mut file = OpenOptions::new().append(true).open(path)?;
     writeln!(
         file,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         epoch,
         metrics.records,
         metrics.rt_count,
@@ -1135,6 +1496,8 @@ fn append_validation_metrics(
         tsv_metric(metrics.ms2_rmse),
         metrics.ms2_spectrum_count,
         tsv_metric(metrics.ms2_cosine_similarity),
+        tsv_metric(metrics.ms2_spectral_angle),
+        tsv_metric(metrics.ms2_pearson),
         metrics.inverse_sequence_count,
         tsv_metric(metrics.inverse_mean_nll),
         metrics.inverse_ptm_site_count,
@@ -1195,6 +1558,43 @@ mod tests {
         assert!(config.peptide_contrastive_weight > 0.0);
         assert_eq!(config.inverse_evaluation_records, 256);
         assert_eq!(config.generation_evaluation_records, 16);
+    }
+
+    #[test]
+    fn unified_defaults_use_research_curriculum_controls() {
+        let config = FoundationTrainingConfig::default();
+        assert_eq!(
+            config.strategy,
+            FoundationTrainingStrategy::ResearchCurriculum
+        );
+        assert_eq!(config.warmup_steps, 500);
+        assert!((config.min_learning_rate_ratio - 0.10).abs() < 1e-12);
+        assert_eq!(config.max_gradient_norm, Some(1.0));
+        assert!((scheduled_learning_rate(&config, 0, 10_000) - 4.0e-8).abs() < 1e-12);
+        let final_lr = scheduled_learning_rate(&config, 9_999, 10_000);
+        assert!(final_lr >= config.learning_rate * config.min_learning_rate_ratio);
+        assert!(final_lr < config.learning_rate * 0.101);
+    }
+
+    #[test]
+    fn historical_training_config_without_curriculum_fields_stays_joint_constant_lr() {
+        let mut value = serde_yaml::to_value(FoundationTrainingConfig::default()).unwrap();
+        for key in [
+            "strategy",
+            "warmup_steps",
+            "min_learning_rate_ratio",
+            "max_gradient_norm",
+        ] {
+            value
+                .as_mapping_mut()
+                .unwrap()
+                .remove(&serde_yaml::Value::String(key.into()));
+        }
+        let restored: FoundationTrainingConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(restored.strategy, FoundationTrainingStrategy::Joint);
+        assert_eq!(restored.warmup_steps, 0);
+        assert_eq!(restored.min_learning_rate_ratio, 1.0);
+        assert_eq!(restored.max_gradient_norm, None);
     }
 
     #[test]

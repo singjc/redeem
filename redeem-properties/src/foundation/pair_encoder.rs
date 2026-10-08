@@ -10,11 +10,12 @@
 use super::chemistry::ATOM_FEATURE_DIM;
 use super::config::{FoundationCcsContextMode, FoundationConfig};
 use super::featurize::FoundationBatch;
-use super::layers::{FoundationLayerNorm, GraphMessageLayer};
+use super::layers::{FoundationLayerNorm, GraphMessageLayer, PeptideTransformerBlock};
 use super::model::{
     apply_ms2_output_activation, standardized_ccs_physics_baseline, FoundationMultiTaskOutput,
     FoundationOutput, PrecursorContextBatch,
 };
+use super::runtime::FoundationSpecialistConfig;
 use candle_core::{DType, Module, ModuleT, Result, Tensor, D};
 use candle_nn::{self as nn, ops, Dropout, Embedding, Linear, VarBuilder};
 
@@ -36,6 +37,7 @@ struct PairRepresentation {
     rt_embedding: Tensor,
     ccs_embedding: Tensor,
     ms2_embedding: Tensor,
+    pair_embeddings: Tensor,
 }
 
 #[derive(Clone)]
@@ -457,6 +459,7 @@ impl ProductionPairEncoder {
             rt_embedding,
             ccs_embedding,
             ms2_embedding,
+            pair_embeddings: pair,
         })
     }
 
@@ -623,6 +626,355 @@ impl ProductionPairEncoder {
     }
 }
 
+#[derive(Clone)]
+struct NativeRtSpecialist {
+    hidden: Linear,
+    bottleneck: Linear,
+    output: Linear,
+}
+
+impl NativeRtSpecialist {
+    fn new(model_dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
+        Ok(Self {
+            hidden: nn::linear(2 * model_dim + 6, 640, vb.pp("hidden"))?,
+            bottleneck: nn::linear(640, 320, vb.pp("bottleneck"))?,
+            output: nn::linear(320, 1, vb.pp("output"))?,
+        })
+    }
+
+    fn forward(
+        &self,
+        representation: &PairRepresentation,
+        context: &PrecursorContextBatch,
+    ) -> Result<Tensor> {
+        let scalar = specialist_scalar_context(context)?;
+        let features = Tensor::cat(
+            &[
+                &representation.rt_embedding,
+                &representation.foundation.peptide_embedding,
+                &scalar,
+            ],
+            1,
+        )?;
+        let hidden = self.hidden.forward(&features)?.relu()?;
+        let hidden = self.bottleneck.forward(&hidden)?.relu()?;
+        self.output.forward(&hidden)
+    }
+}
+
+#[derive(Clone)]
+struct NativeMs2Specialist {
+    instrument_embedding: Embedding,
+    context_projection: Linear,
+    input_norm: FoundationLayerNorm,
+    context_blocks: Vec<PeptideTransformerBlock>,
+    fragment_blocks: Vec<PeptideTransformerBlock>,
+    fragment_projection: Linear,
+    presence_head: Linear,
+    intensity_head: Linear,
+    model_dim: usize,
+    channels: usize,
+}
+
+impl NativeMs2Specialist {
+    fn new(config: &FoundationConfig, vb: VarBuilder<'_>) -> Result<Self> {
+        let context_blocks = (0..3)
+            .map(|index| {
+                PeptideTransformerBlock::new(
+                    config.model_dim,
+                    config.num_attention_heads,
+                    config.transformer_ff_dim,
+                    config.dropout,
+                    vb.pp(format!("context_transformer.{index}")),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fragment_blocks = (0..2)
+            .map(|index| {
+                PeptideTransformerBlock::new(
+                    config.model_dim,
+                    config.num_attention_heads,
+                    config.transformer_ff_dim,
+                    config.dropout,
+                    vb.pp(format!("fragment_transformer.{index}")),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            instrument_embedding: nn::embedding(
+                config.instrument_vocab_size,
+                32,
+                vb.pp("instrument_embedding"),
+            )?,
+            context_projection: nn::linear(38, config.model_dim, vb.pp("context_projection"))?,
+            input_norm: FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("input_norm"))?,
+            context_blocks,
+            fragment_blocks,
+            fragment_projection: nn::linear(
+                3 * config.model_dim,
+                config.model_dim,
+                vb.pp("fragment_projection"),
+            )?,
+            presence_head: nn::linear(
+                config.model_dim,
+                config.ms2_fragment_channels,
+                vb.pp("presence"),
+            )?,
+            intensity_head: nn::linear(
+                config.model_dim,
+                config.ms2_fragment_channels,
+                vb.pp("intensity"),
+            )?,
+            model_dim: config.model_dim,
+            channels: config.ms2_fragment_channels,
+        })
+    }
+
+    fn forward_t(
+        &self,
+        representation: &PairRepresentation,
+        batch: &FoundationBatch,
+        context: &PrecursorContextBatch,
+        activation: super::config::FoundationMs2OutputActivation,
+        train: bool,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, model_dim) =
+            representation.foundation.residue_embeddings.dims3()?;
+        let instrument = self.instrument_embedding.forward(&context.instrument_ids)?;
+        let scalar = specialist_scalar_context(context)?;
+        let context_features = Tensor::cat(&[&instrument, &scalar], 1)?;
+        let context_hidden = self.context_projection.forward(&context_features)?;
+        let context_hidden =
+            context_hidden
+                .unsqueeze(1)?
+                .broadcast_as((batch_size, sequence_len, model_dim))?;
+        let mut residues = (&representation.foundation.residue_embeddings + &context_hidden)?;
+        residues = self.input_norm.forward(&residues)?;
+        residues = residues.broadcast_mul(&batch.residue_mask.unsqueeze(2)?.broadcast_as((
+            batch_size,
+            sequence_len,
+            model_dim,
+        ))?)?;
+        for block in &self.context_blocks {
+            residues = block.forward_t(&residues, &batch.residue_mask, train)?;
+        }
+        if sequence_len < 2 {
+            candle_core::bail!("foundation contextual MS2 requires at least two residues");
+        }
+        let cleavages = sequence_len - 1;
+        let left = residues.narrow(1, 0, cleavages)?;
+        let right = residues.narrow(1, 1, cleavages)?;
+        let task = representation.ms2_embedding.unsqueeze(1)?.broadcast_as((
+            batch_size,
+            cleavages,
+            self.model_dim,
+        ))?;
+        let token_features = Tensor::cat(&[&left, &right, &task], 2)?.contiguous()?;
+        let mut tokens = self
+            .fragment_projection
+            .forward(
+                &token_features
+                    .reshape((batch_size * cleavages, 3 * self.model_dim))?
+                    .contiguous()?,
+            )?
+            .reshape((batch_size, cleavages, self.model_dim))?;
+        let cleavage_mask = batch
+            .residue_mask
+            .narrow(1, 0, cleavages)?
+            .broadcast_mul(&batch.residue_mask.narrow(1, 1, cleavages)?)?;
+        for block in &self.fragment_blocks {
+            tokens = block.forward_t(&tokens, &cleavage_mask, train)?;
+        }
+        let presence_logits = self.presence_head.forward(&tokens)?;
+        let intensity_logits = self.intensity_head.forward(&tokens)?;
+        let presence = ops::sigmoid(&presence_logits)?;
+        let positive = apply_ms2_output_activation(&intensity_logits, activation)?;
+        let prediction = presence.broadcast_mul(&positive)?;
+        prediction.broadcast_mul(&cleavage_mask.unsqueeze(2)?.broadcast_as((
+            batch_size,
+            cleavages,
+            self.channels,
+        ))?)
+    }
+}
+
+#[derive(Clone)]
+struct PairAwareMobilitySpecialist {
+    physics_projection: Linear,
+    physics_pair_gate: Linear,
+    mobility_to_residue_projection: Linear,
+    residue_to_mobility_projection: Linear,
+    residue_pair_projection: Linear,
+    pair_global_projection: Linear,
+    input_norm: FoundationLayerNorm,
+    blocks: Vec<PeptideTransformerBlock>,
+    hidden: Linear,
+    bottleneck: Linear,
+    output: Linear,
+    model_dim: usize,
+}
+
+impl PairAwareMobilitySpecialist {
+    fn new(config: &FoundationConfig, vb: VarBuilder<'_>) -> Result<Self> {
+        let blocks = (0..2)
+            .map(|index| {
+                PeptideTransformerBlock::new(
+                    config.model_dim,
+                    config.num_attention_heads,
+                    config.transformer_ff_dim,
+                    config.dropout,
+                    vb.pp(format!("transformer.{index}")),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            physics_projection: nn::linear(6, config.model_dim, vb.pp("physics_projection"))?,
+            physics_pair_gate: nn::linear(6, PAIR_DIM, vb.pp("physics_pair_gate"))?,
+            mobility_to_residue_projection: nn::linear(
+                PAIR_DIM,
+                config.model_dim,
+                vb.pp("mobility_to_residue"),
+            )?,
+            residue_to_mobility_projection: nn::linear(
+                PAIR_DIM,
+                config.model_dim,
+                vb.pp("residue_to_mobility"),
+            )?,
+            residue_pair_projection: nn::linear(PAIR_DIM, config.model_dim, vb.pp("residue_pair"))?,
+            pair_global_projection: nn::linear(PAIR_DIM, config.model_dim, vb.pp("pair_global"))?,
+            input_norm: FoundationLayerNorm::new(config.model_dim, 1e-5, vb.pp("input_norm"))?,
+            blocks,
+            hidden: nn::linear(4 * config.model_dim + 6, 640, vb.pp("hidden"))?,
+            bottleneck: nn::linear(640, 320, vb.pp("bottleneck"))?,
+            output: nn::linear(320, 1, vb.pp("output"))?,
+            model_dim: config.model_dim,
+        })
+    }
+
+    fn forward_t(
+        &self,
+        representation: &PairRepresentation,
+        context: &PrecursorContextBatch,
+        train: bool,
+    ) -> Result<Tensor> {
+        let residues = &representation.foundation.residue_embeddings;
+        let mask = &representation.foundation.residue_mask;
+        let pair = &representation.pair_embeddings;
+        let (batch, sequence, model_dim) = residues.dims3()?;
+        let expected_tokens = TASK_COUNT + sequence;
+        let (_, pair_left, pair_right, pair_dim) = pair.dims4()?;
+        if model_dim != self.model_dim
+            || pair_left != expected_tokens
+            || pair_right != expected_tokens
+            || pair_dim != PAIR_DIM
+        {
+            candle_core::bail!("foundation pair-aware mobility specialist shape mismatch");
+        }
+        let mobility_to_residue = pair
+            .narrow(1, TASK_CCS, 1)?
+            .squeeze(1)?
+            .narrow(1, TASK_COUNT, sequence)?
+            .contiguous()?;
+        let residue_to_mobility = pair
+            .narrow(1, TASK_COUNT, sequence)?
+            .narrow(2, TASK_CCS, 1)?
+            .squeeze(2)?
+            .contiguous()?;
+        let residue_pair = pair
+            .narrow(1, TASK_COUNT, sequence)?
+            .narrow(2, TASK_COUNT, sequence)?
+            .contiguous()?;
+        let partner_count = mask
+            .sum(1)?
+            .clamp(1.0, f64::INFINITY)?
+            .unsqueeze(1)?
+            .unsqueeze(2)?;
+        let pair_summary = residue_pair
+            .sum(2)?
+            .broadcast_div(&partner_count.broadcast_as((batch, sequence, 1))?)?
+            .broadcast_mul(
+                &mask
+                    .unsqueeze(2)?
+                    .broadcast_as((batch, sequence, PAIR_DIM))?,
+            )?;
+        let physics = specialist_scalar_context(context)?;
+        let gate = ops::sigmoid(&self.physics_pair_gate.forward(&physics)?)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, sequence, PAIR_DIM))?;
+        let pair_summary = pair_summary.broadcast_mul(&gate)?;
+        let mobility_out = self
+            .mobility_to_residue_projection
+            .forward(&mobility_to_residue.broadcast_mul(&gate)?.contiguous()?)?;
+        let mobility_in = self
+            .residue_to_mobility_projection
+            .forward(&residue_to_mobility.broadcast_mul(&gate)?.contiguous()?)?;
+        let pair_residue = self
+            .residue_pair_projection
+            .forward(&pair_summary.contiguous()?)?;
+        let physics_residue = self
+            .physics_projection
+            .forward(&physics)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, sequence, self.model_dim))?;
+        let mut hidden = (((residues + &pair_residue)? + &mobility_out)? + &mobility_in)?;
+        hidden = (hidden + physics_residue)?;
+        hidden = self.input_norm.forward(&hidden)?;
+        hidden = hidden.broadcast_mul(&mask.unsqueeze(2)?.broadcast_as((
+            batch,
+            sequence,
+            self.model_dim,
+        ))?)?;
+        for block in &self.blocks {
+            hidden = block.forward_t(&hidden, mask, train)?;
+        }
+        let pooled = masked_mean_specialist(&hidden, mask)?;
+        let pair_global = self
+            .pair_global_projection
+            .forward(&masked_mean_specialist(&pair_summary, mask)?)?;
+        let features = Tensor::cat(
+            &[
+                &representation.ccs_embedding,
+                &representation.foundation.peptide_embedding,
+                &pooled,
+                &pair_global,
+                &physics,
+            ],
+            1,
+        )?;
+        let hidden = self.hidden.forward(&features)?.relu()?;
+        let hidden = self.bottleneck.forward(&hidden)?.relu()?;
+        self.output.forward(&hidden)
+    }
+}
+
+fn specialist_scalar_context(context: &PrecursorContextBatch) -> Result<Tensor> {
+    let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
+    let scaled_mz = context
+        .precursor_mz
+        .affine(1.0 / 2000.0, 0.0)?
+        .unsqueeze(1)?;
+    let scaled_nce = context.nce.affine(1.0 / 50.0, 0.0)?.unsqueeze(1)?;
+    Tensor::cat(
+        &[
+            &scaled_charge,
+            &context.charge_present.unsqueeze(1)?,
+            &scaled_mz,
+            &context.precursor_mz_present.unsqueeze(1)?,
+            &scaled_nce,
+            &context.nce_present.unsqueeze(1)?,
+        ],
+        1,
+    )
+}
+
+fn masked_mean_specialist(hidden: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    let (batch, sequence, dim) = hidden.dims3()?;
+    let expanded = mask.unsqueeze(2)?.broadcast_as((batch, sequence, dim))?;
+    let numerator = hidden.broadcast_mul(&expanded)?.sum(1)?;
+    let denominator = mask.sum(1)?.clamp(1.0, f64::INFINITY)?.unsqueeze(1)?;
+    numerator.broadcast_div(&denominator)
+}
+
 /// Version-free production peptide-property model using the residue-pair/task-token backbone.
 #[derive(Clone)]
 pub(crate) struct PairTaskPeptideModel {
@@ -636,11 +988,19 @@ pub(crate) struct PairTaskPeptideModel {
     residue_head: Linear,
     chemistry_head: Linear,
     contrastive_head: Linear,
+    rt_specialist: Option<NativeRtSpecialist>,
+    ms2_specialist: Option<NativeMs2Specialist>,
+    mobility_specialist: Option<PairAwareMobilitySpecialist>,
+    specialist_config: FoundationSpecialistConfig,
     config: FoundationConfig,
 }
 
 impl PairTaskPeptideModel {
-    pub(crate) fn new(config: FoundationConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(crate) fn new(
+        config: FoundationConfig,
+        specialist_config: FoundationSpecialistConfig,
+        vb: VarBuilder<'_>,
+    ) -> Result<Self> {
         config.validate().map_err(candle_core::Error::Msg)?;
         let encoder = ProductionPairEncoder::new(config.clone(), vb.pp("encoder"))?;
         let ccs_context_dim = 2;
@@ -678,6 +1038,18 @@ impl PairTaskPeptideModel {
                 config.contrastive_dim,
                 vb.pp("heads.contrastive"),
             )?,
+            rt_specialist: (specialist_config.enabled && specialist_config.rt)
+                .then(|| NativeRtSpecialist::new(config.model_dim, vb.pp("specialists.rt")))
+                .transpose()?,
+            ms2_specialist: (specialist_config.enabled && specialist_config.ms2)
+                .then(|| NativeMs2Specialist::new(&config, vb.pp("specialists.ms2")))
+                .transpose()?,
+            mobility_specialist: (specialist_config.enabled && specialist_config.mobility_ccs)
+                .then(|| {
+                    PairAwareMobilitySpecialist::new(&config, vb.pp("specialists.mobility_ccs"))
+                })
+                .transpose()?,
+            specialist_config,
             encoder,
             config,
         })
@@ -690,12 +1062,16 @@ impl PairTaskPeptideModel {
         train: bool,
     ) -> Result<FoundationMultiTaskOutput> {
         let representation = self.encoder.forward_t(batch, context, train)?;
-        let rt = self.rt_head_output.forward(
-            &self
-                .rt_head_hidden
-                .forward(&representation.rt_embedding)?
-                .relu()?,
-        )?;
+        let rt = if let Some(specialist) = &self.rt_specialist {
+            specialist.forward(&representation, context)?
+        } else {
+            self.rt_head_output.forward(
+                &self
+                    .rt_head_hidden
+                    .forward(&representation.rt_embedding)?
+                    .relu()?,
+            )?
+        };
 
         let scaled_charge = context.charge.affine(1.0 / 6.0, 0.0)?.unsqueeze(1)?;
         let ccs_scalar_context = match self.config.ccs_context_mode {
@@ -718,7 +1094,7 @@ impl PairTaskPeptideModel {
         let ccs_residual = self
             .ccs_head_output
             .forward(&self.ccs_head_hidden.forward(&ccs_features)?.relu()?)?;
-        let ccs = if let Some(physics_baseline) = &self.config.ccs_physics_baseline {
+        let legacy_ccs = if let Some(physics_baseline) = &self.config.ccs_physics_baseline {
             let baseline = standardized_ccs_physics_baseline(
                 &representation.foundation,
                 context,
@@ -728,8 +1104,23 @@ impl PairTaskPeptideModel {
         } else {
             ccs_residual
         };
+        let ccs = if let Some(specialist) = &self.mobility_specialist {
+            specialist.forward_t(&representation, context, train)?
+        } else {
+            legacy_ccs
+        };
 
-        let ms2 = self.forward_ms2(&representation, batch)?;
+        let ms2 = if let Some(specialist) = &self.ms2_specialist {
+            specialist.forward_t(
+                &representation,
+                batch,
+                context,
+                self.config.ms2_output_activation,
+                train,
+            )?
+        } else {
+            self.forward_ms2(&representation, batch)?
+        };
         let residue_logits = self
             .residue_head
             .forward(&representation.foundation.residue_embeddings)?;
@@ -911,7 +1302,8 @@ mod tests {
         let context = PrecursorContextBatch::unknown(2, &device)?;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = PairTaskPeptideModel::new(config.clone(), vb)?;
+        let model =
+            PairTaskPeptideModel::new(config.clone(), FoundationSpecialistConfig::default(), vb)?;
         let output = model.forward_t(&batch, &context, false)?;
 
         assert_eq!(output.rt.dims2()?, (2, 1));

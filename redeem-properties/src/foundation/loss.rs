@@ -39,6 +39,10 @@ pub struct FoundationTargets {
     pub chemistry_mask: Option<Tensor>,
 }
 
+fn legacy_ms2_pearson_weight() -> f64 {
+    0.0
+}
+
 /// Shape-aware MS2 objective configuration.
 ///
 /// The historical behavior is represented by the default (`pointwise_weight=1`,
@@ -52,7 +56,11 @@ pub struct FoundationMs2LossConfig {
     pub pointwise_weight: f64,
     /// Weight multiplying mean per-spectrum `(1 - cosine_similarity)`.
     pub cosine_weight: f64,
-    /// Numerical stabilizer for cosine norms.
+    /// Weight multiplying mean per-spectrum `(1 - Pearson correlation)`.
+    /// Historical serialized configs default this to zero.
+    #[serde(default = "legacy_ms2_pearson_weight")]
+    pub pearson_weight: f64,
+    /// Numerical stabilizer for cosine/correlation norms.
     pub cosine_epsilon: f64,
 }
 
@@ -61,6 +69,7 @@ impl Default for FoundationMs2LossConfig {
         Self {
             pointwise_weight: 1.0,
             cosine_weight: 0.0,
+            pearson_weight: 0.0,
             cosine_epsilon: 1.0e-8,
         }
     }
@@ -73,6 +82,7 @@ impl FoundationMs2LossConfig {
         Self {
             pointwise_weight: 1.0,
             cosine_weight: 0.25,
+            pearson_weight: 0.25,
             cosine_epsilon: 1.0e-8,
         }
     }
@@ -82,12 +92,13 @@ impl FoundationMs2LossConfig {
         for (name, value) in [
             ("MS2 pointwise weight", self.pointwise_weight),
             ("MS2 cosine weight", self.cosine_weight),
+            ("MS2 Pearson weight", self.pearson_weight),
         ] {
             if !(value >= 0.0 && value.is_finite()) {
                 candle_core::bail!("foundation {name} must be finite and non-negative");
             }
         }
-        if self.pointwise_weight == 0.0 && self.cosine_weight == 0.0 {
+        if self.pointwise_weight == 0.0 && self.cosine_weight == 0.0 && self.pearson_weight == 0.0 {
             candle_core::bail!(
                 "foundation MS2 objective requires at least one positive component weight"
             );
@@ -108,6 +119,8 @@ pub struct FoundationMs2Losses {
     pub pointwise: Tensor,
     /// Mean per-spectrum `(1 - cosine_similarity)` over annotated channels.
     pub cosine: Tensor,
+    /// Mean per-spectrum `(1 - Pearson correlation)` over annotated channels.
+    pub pearson: Tensor,
 }
 
 /// Relative contributions of supervised and self-supervised objectives.
@@ -303,10 +316,12 @@ pub fn foundation_ms2_loss(
         );
     }
     let pointwise = masked_mse(prediction, target, mask)?;
-    if config.cosine_weight == 0.0 {
+    if config.cosine_weight == 0.0 && config.pearson_weight == 0.0 {
+        let zero = pointwise.affine(0.0, 0.0)?;
         return Ok(FoundationMs2Losses {
             total: pointwise.affine(config.pointwise_weight, 0.0)?,
-            cosine: pointwise.affine(0.0, 0.0)?,
+            cosine: zero.clone(),
+            pearson: zero,
             pointwise,
         });
     }
@@ -332,12 +347,33 @@ pub fn foundation_ms2_loss(
     let cosine_denominator = spectrum_present.sum_all()?.clamp(1.0, f64::INFINITY)?;
     let cosine_loss = cosine_numerator.broadcast_div(&cosine_denominator)?;
 
-    let total = (pointwise.affine(config.pointwise_weight, 0.0)?
-        + cosine_loss.affine(config.cosine_weight, 0.0)?)?;
+    let annotated_count = flat_mask.sum(1)?.clamp(1.0, f64::INFINITY)?;
+    let pred_mean = masked_prediction.sum(1)?.broadcast_div(&annotated_count)?;
+    let target_mean = masked_target.sum(1)?.broadcast_div(&annotated_count)?;
+    let pred_centered = flat_prediction
+        .broadcast_sub(&pred_mean.unsqueeze(1)?)?
+        .broadcast_mul(&flat_mask)?;
+    let target_centered = flat_target
+        .broadcast_sub(&target_mean.unsqueeze(1)?)?
+        .broadcast_mul(&flat_mask)?;
+    let covariance = pred_centered.broadcast_mul(&target_centered)?.sum(1)?;
+    let pred_variance = pred_centered.sqr()?.sum(1)?;
+    let target_variance = target_centered.sqr()?.sum(1)?;
+    let pearson_denominator =
+        (pred_variance.broadcast_mul(&target_variance)? + config.cosine_epsilon)?.sqrt()?;
+    let pearson = covariance.broadcast_div(&pearson_denominator)?;
+    let pearson_shape = pearson.affine(-1.0, 1.0)?;
+    let pearson_numerator = pearson_shape.broadcast_mul(&spectrum_present)?.sum_all()?;
+    let pearson_loss = pearson_numerator.broadcast_div(&cosine_denominator)?;
+
+    let total = ((pointwise.affine(config.pointwise_weight, 0.0)?
+        + cosine_loss.affine(config.cosine_weight, 0.0)?)?
+        + pearson_loss.affine(config.pearson_weight, 0.0)?)?;
     Ok(FoundationMs2Losses {
         total,
         pointwise,
         cosine: cosine_loss,
+        pearson: pearson_loss,
     })
 }
 
@@ -473,5 +509,6 @@ mod tests {
         let config = FoundationMs2LossConfig::spectral_shape_v0137();
         assert_eq!(config.pointwise_weight, 1.0);
         assert_eq!(config.cosine_weight, 0.25);
+        assert_eq!(config.pearson_weight, 0.25);
     }
 }

@@ -51,6 +51,38 @@ fn legacy_peptide_backbone() -> FoundationPeptideBackbone {
     FoundationPeptideBackbone::ResidueTransformer
 }
 
+/// Native specialist heads distilled from the successful v0.51/v0.52 research
+/// architecture.  These are ordinary trainable components of the production
+/// model; they do not depend on historical teacher or parent checkpoints.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FoundationSpecialistConfig {
+    pub enabled: bool,
+    pub rt: bool,
+    pub ms2: bool,
+    pub mobility_ccs: bool,
+}
+
+impl Default for FoundationSpecialistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rt: true,
+            ms2: true,
+            mobility_ccs: true,
+        }
+    }
+}
+
+fn legacy_foundation_specialists() -> FoundationSpecialistConfig {
+    FoundationSpecialistConfig {
+        enabled: false,
+        rt: false,
+        ms2: false,
+        mobility_ccs: false,
+    }
+}
+
 /// One stable architecture config shared by training and inference.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -60,6 +92,10 @@ pub struct FoundationModelConfig {
     /// Peptide representation used by the production property model.
     #[serde(default = "legacy_peptide_backbone")]
     pub peptide_backbone: FoundationPeptideBackbone,
+    /// Native best-of-research specialist heads. Historical checkpoints that
+    /// predate these heads deserialize with them disabled.
+    #[serde(default = "legacy_foundation_specialists")]
+    pub specialists: FoundationSpecialistConfig,
     /// Spectrum encoder plus autoregressive peptide decoder.
     pub inverse: FoundationDiffusionConfig,
 }
@@ -95,6 +131,7 @@ impl Default for FoundationModelConfig {
         Self {
             peptide,
             peptide_backbone: FoundationPeptideBackbone::ResiduePairTaskTokens,
+            specialists: FoundationSpecialistConfig::default(),
             inverse,
         }
     }
@@ -242,6 +279,7 @@ impl FoundationModel {
             FoundationPeptideBackbone::ResiduePairTaskTokens => {
                 FoundationPeptideModel::ResiduePairTaskTokens(PairTaskPeptideModel::new(
                     config.peptide.clone(),
+                    config.specialists,
                     vb.pp("peptide"),
                 )?)
             }
@@ -307,6 +345,10 @@ impl FoundationModel {
         &self.instrument_names
     }
 
+    pub(crate) fn varmap(&self) -> &VarMap {
+        &self.variables
+    }
+
     pub(crate) fn trainable_variables(&self) -> Vec<Var> {
         self.variables
             .data()
@@ -314,6 +356,20 @@ impl FoundationModel {
             .expect("foundation VarMap lock poisoned")
             .values()
             .cloned()
+            .collect()
+    }
+
+    /// Select trainable variables by stable production namespace prefixes.
+    /// This supports staged curriculum updates without creating separate model
+    /// instances or historical version-specific optimizers.
+    pub(crate) fn trainable_variables_with_prefixes(&self, prefixes: &[&str]) -> Vec<Var> {
+        self.variables
+            .data()
+            .lock()
+            .expect("foundation VarMap lock poisoned")
+            .iter()
+            .filter(|(name, _)| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+            .map(|(_, var)| var.clone())
             .collect()
     }
 
@@ -703,6 +759,20 @@ mod tests {
             restored.peptide_backbone,
             FoundationPeptideBackbone::ResidueTransformer
         );
+    }
+
+    #[test]
+    fn historical_model_config_without_specialists_keeps_old_parameter_tree() {
+        let mut value = serde_yaml::to_value(FoundationModelConfig::default()).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("specialists".into()));
+        let restored: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
+        assert!(!restored.specialists.enabled);
+        assert!(!restored.specialists.rt);
+        assert!(!restored.specialists.ms2);
+        assert!(!restored.specialists.mobility_ccs);
     }
 
     #[test]
