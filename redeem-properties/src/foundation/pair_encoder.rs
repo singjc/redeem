@@ -680,12 +680,15 @@ struct NativeMs2Specialist {
     fragment_projection: Linear,
     presence_head: Linear,
     intensity_head: Linear,
+    // Optional source-proven v0.51-style gate. Old MS2-only specialist
+    // checkpoints do not instantiate this parameter.
+    blend_gate: Option<Linear>,
     model_dim: usize,
     channels: usize,
 }
 
 impl NativeMs2Specialist {
-    fn new(config: &FoundationConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(config: &FoundationConfig, residual_blend: bool, vb: VarBuilder<'_>) -> Result<Self> {
         let context_blocks = (0..3)
             .map(|index| {
                 PeptideTransformerBlock::new(
@@ -733,6 +736,15 @@ impl NativeMs2Specialist {
                 config.ms2_fragment_channels,
                 vb.pp("intensity"),
             )?,
+            blend_gate: residual_blend
+                .then(|| {
+                    zero_initialized_ms2_blend_gate(
+                        config.model_dim,
+                        config.ms2_fragment_channels,
+                        vb.pp("blend_gate"),
+                    )
+                })
+                .transpose()?,
             model_dim: config.model_dim,
             channels: config.ms2_fragment_channels,
         })
@@ -744,6 +756,7 @@ impl NativeMs2Specialist {
         batch: &FoundationBatch,
         context: &PrecursorContextBatch,
         activation: super::config::FoundationMs2OutputActivation,
+        base_ms2: Option<&Tensor>,
         train: bool,
     ) -> Result<Tensor> {
         let (batch_size, sequence_len, model_dim) =
@@ -797,13 +810,55 @@ impl NativeMs2Specialist {
         let intensity_logits = self.intensity_head.forward(&tokens)?;
         let presence = ops::sigmoid(&presence_logits)?;
         let positive = apply_ms2_output_activation(&intensity_logits, activation)?;
-        let prediction = presence.broadcast_mul(&positive)?;
+        let factorized = presence.broadcast_mul(&positive)?;
+        let prediction = match base_ms2 {
+            Some(base) => {
+                let gate = match &self.blend_gate {
+                    Some(gate) => gate,
+                    None => {
+                        candle_core::bail!("MS2 baseline supplied without a residual blend gate")
+                    }
+                };
+                blend_native_ms2_with_base(base, &factorized, &tokens, gate)?
+            }
+            None => factorized,
+        };
         prediction.broadcast_mul(&cleavage_mask.unsqueeze(2)?.broadcast_as((
             batch_size,
             cleavages,
             self.channels,
         ))?)
     }
+}
+
+/// Construct an exactly zero-starting v0.51-style fragment interpolation gate.
+/// The native branch cannot erase the known-good pair-head MS2 prediction at
+/// initialization. New gate variables exist only in the explicitly enabled mode.
+fn zero_initialized_ms2_blend_gate(
+    model_dim: usize,
+    channels: usize,
+    vb: VarBuilder<'_>,
+) -> Result<Linear> {
+    let weight = vb.get_with_hints((channels, model_dim), "weight", nn::Init::Const(0.0))?;
+    let bias = vb.get_with_hints(channels, "bias", nn::Init::Const(0.0))?;
+    Ok(Linear::new(weight, Some(bias)))
+}
+
+/// Historical v0.51 signed interpolation: gate == 0 at initialization, so the
+/// output is exactly the stable pair-head baseline. The gate is differentiable,
+/// permitting the contextual specialist to take over as it proves useful.
+fn blend_native_ms2_with_base(
+    base: &Tensor,
+    factorized: &Tensor,
+    tokens: &Tensor,
+    blend_gate: &Linear,
+) -> Result<Tensor> {
+    if base.dims() != factorized.dims() {
+        candle_core::bail!("native MS2 specialist and base MS2 shapes differ");
+    }
+    let gate = ops::sigmoid(&blend_gate.forward(tokens)?)?.affine(2.0, -1.0)?;
+    let delta = (factorized - base)?;
+    (base + gate.broadcast_mul(&delta)?)?.relu()
 }
 
 #[derive(Clone)]
@@ -1073,7 +1128,13 @@ impl PairTaskPeptideModel {
                 .then(|| NativeRtSpecialist::new(config.model_dim, vb.pp("specialists.rt")))
                 .transpose()?,
             ms2_specialist: (specialist_config.enabled && specialist_config.ms2)
-                .then(|| NativeMs2Specialist::new(&config, vb.pp("specialists.ms2")))
+                .then(|| {
+                    NativeMs2Specialist::new(
+                        &config,
+                        specialist_config.ms2_residual_blend,
+                        vb.pp("specialists.ms2"),
+                    )
+                })
                 .transpose()?,
             mobility_specialist: (specialist_config.enabled && specialist_config.mobility_ccs)
                 .then(|| {
@@ -1172,11 +1233,17 @@ impl PairTaskPeptideModel {
         };
 
         let ms2 = if let Some(specialist) = &self.ms2_specialist {
+            let base_ms2 = if self.specialist_config.ms2_residual_blend {
+                Some(self.forward_ms2(&representation, batch)?)
+            } else {
+                None
+            };
             specialist.forward_t(
                 &representation,
                 batch,
                 context,
                 self.config.ms2_output_activation,
+                base_ms2.as_ref(),
                 train,
             )?
         } else {
@@ -1379,6 +1446,84 @@ mod tests {
             features.dims4().unwrap(),
             (1, TASK_COUNT + 8, TASK_COUNT + 8, RELATIVE_FEATURE_DIM)
         );
+    }
+
+    #[test]
+    fn ms2_residual_gate_preserves_pair_head_at_step_zero_and_has_gradients() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let gate = zero_initialized_ms2_blend_gate(3, 2, vb.pp("gate"))?;
+        let base = Tensor::new(&[[[0.2f32, 0.7], [0.4, 0.1]]], &device)?;
+        let native = Tensor::new(&[[[0.9f32, 0.2], [0.8, 0.6]]], &device)?;
+        let tokens = Tensor::new(&[[[1.0f32, 2.0, 3.0], [0.5, 1.5, 4.0]]], &device)?;
+        let output = blend_native_ms2_with_base(&base, &native, &tokens, &gate)?;
+        let max_difference = (&output - &base)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            max_difference <= 1.0e-7,
+            "blend must preserve base MS2 at initialization"
+        );
+
+        let gradients = output.sum_all()?.backward()?;
+        let vars = varmap.data().lock().unwrap();
+        let weight = vars.get("gate.weight").expect("gate variable");
+        let gradient = gradients.get(weight).expect("gate receives gradient");
+        assert!(gradient.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn blended_specialist_matches_pair_ms2_head_at_initialization() -> Result<()> {
+        let device = Device::Cpu;
+        let mut config = smoke_config();
+        config.ms2_output_activation =
+            super::super::config::FoundationMs2OutputActivation::SoftplusV0138;
+        let featurizer = PeptideGraphFeaturizer::new(config.clone())?;
+        let batch = featurizer.featurize(&[PeptidoformInput::unmodified("PEPTIDE")], &device)?;
+        let context = PrecursorContextBatch::unknown(1, &device)?;
+        // Share VarMap/variable names so the established head and encoder have
+        // identical parameters across both model configurations.
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let blended = PairTaskPeptideModel::new(
+            config.clone(),
+            FoundationSpecialistConfig::default(),
+            false,
+            vb.clone(),
+        )?;
+        let baseline = PairTaskPeptideModel::new(
+            config,
+            FoundationSpecialistConfig {
+                ms2: false,
+                ..FoundationSpecialistConfig::default()
+            },
+            false,
+            vb,
+        )?;
+        let new_output = blended.forward_t(&batch, &context, false)?;
+        let base_output = baseline.forward_t(&batch, &context, false)?;
+        let difference = (&new_output.ms2 - &base_output.ms2)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            difference <= 1.0e-6,
+            "blended MS2 must start at the working pair head"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ms2_residual_gate_rejects_mismatched_fragment_canvases() -> Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let gate = zero_initialized_ms2_blend_gate(3, 2, vb.pp("gate"))?;
+        let base = Tensor::zeros((1, 2, 2), DType::F32, &device)?;
+        let wrong = Tensor::zeros((1, 2, 3), DType::F32, &device)?;
+        let tokens = Tensor::zeros((1, 2, 3), DType::F32, &device)?;
+        assert!(blend_native_ms2_with_base(&base, &wrong, &tokens, &gate).is_err());
+        Ok(())
     }
 
     #[test]

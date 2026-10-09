@@ -61,6 +61,10 @@ pub struct FoundationSpecialistConfig {
     pub rt: bool,
     pub ms2: bool,
     pub mobility_ccs: bool,
+    /// Keep the trainable pair-head MS2 surface and learn a gated specialist
+    /// correction. Missing on old serialized checkpoints => replacement mode.
+    #[serde(default)]
+    pub ms2_residual_blend: bool,
 }
 
 impl Default for FoundationSpecialistConfig {
@@ -70,6 +74,7 @@ impl Default for FoundationSpecialistConfig {
             rt: true,
             ms2: true,
             mobility_ccs: true,
+            ms2_residual_blend: true,
         }
     }
 }
@@ -80,6 +85,7 @@ fn legacy_foundation_specialists() -> FoundationSpecialistConfig {
         rt: false,
         ms2: false,
         mobility_ccs: false,
+        ms2_residual_blend: false,
     }
 }
 
@@ -809,6 +815,21 @@ mod tests {
         assert!(!restored.specialists.rt);
         assert!(!restored.specialists.ms2);
         assert!(!restored.specialists.mobility_ccs);
+    }
+
+    #[test]
+    fn native_ms2_blend_is_new_default_but_missing_field_keeps_old_checkpoint_mode() {
+        let defaults = FoundationSpecialistConfig::default();
+        assert!(defaults.ms2);
+        assert!(defaults.ms2_residual_blend);
+        let mut value = serde_yaml::to_value(defaults).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("ms2_residual_blend".into()));
+        let old: FoundationSpecialistConfig = serde_yaml::from_value(value).unwrap();
+        assert!(old.ms2);
+        assert!(!old.ms2_residual_blend);
     }
 
     #[test]
