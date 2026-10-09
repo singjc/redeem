@@ -36,32 +36,40 @@ tqdm = "0.8.0"
 rayon = "1.5"
 sysinfo = "0.33.1"
 rustyms = { version = "0.11", default-features = false }
+candle-core = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
+candle-nn = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
+candle-transformers = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
+
+candle-onnx-export = {git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export", optional = true}
 
 # Optional embedding of pretrained model files into the crate binary.
 [dependencies.include_dir]
 version = "0.7"
 optional = true
 
-[dependencies.candle-core]
-version = "0.8.4"
-default-features = false
-features = []
+# [dependencies.candle-core]
+# version = "0.11.0"
+# default-features = false
+# features = []
 
-[dependencies.candle-nn]
-version = "0.8.4"
-default-features = false
-features = []
+# [dependencies.candle-nn]
+# version = "0.11.0"
+# default-features = false
+# features = []
 
-[dependencies.candle-transformers]
-version = "0.8.4"
-default-features = false
-features = []
+# [dependencies.candle-transformers]
+# version = "0.11.0"
+# default-features = false
+# features = []
+
+
 
 [features]
 default = ["legacy-peptdeep-models", "pretrained-download"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 embed-pretrained = ["include_dir"]
 legacy-peptdeep-models = []
+onnx-export = ["dep:candle-onnx-export"]
 pretrained-download = ["dep:reqwest", "dep:zip"]
 
 

@@ -325,6 +325,19 @@ impl ModelInterface for RTCNNLSTMModel {
     }
 }
 
+#[cfg(feature = "onnx-export")]
+impl candle_onnx_export::ToOnnx for RTCNNLSTMModel {
+    fn to_onnx(
+        &self,
+        _ctx: &mut candle_onnx_export::ExportContext<'_>,
+        _inputs: &[candle_onnx_export::Value],
+    ) -> candle_onnx_export::Result<Vec<candle_onnx_export::Value>> {
+        Err(candle_onnx_export::Error::UnsupportedTensor(
+            "full ONNX export for rt_cnn_lstm is not implemented yet".to_string(),
+        ))
+    }
+}
+
 // Module Trait Implementation
 
 // impl Module for RTCNNLSTMModel {

@@ -13,10 +13,11 @@ redeem-properties = { path = "../redeem-properties" }
 pyo3 = { version = "0.22", features = ["extension-module"] }
 numpy = "0.22"
 anyhow = "1.0"
+candle-core = { git = "https://github.com/singjc/candle.git", branch = "add/candle-onnx-export" }
 
-[dependencies.candle-core]
-version = "0.8.4"
-default-features = false
+# [dependencies.candle-core]
+# version = "0.8.4"
+# default-features = false
 
 [features]
 default = []

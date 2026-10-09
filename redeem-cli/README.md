@@ -102,6 +102,60 @@ redeem properties inference inference_config.json \
     -o predictions.tsv
 ```
 
+### Properties — ONNX Export
+
+Export a supported property model to ONNX. Full-model export is currently implemented for
+`rt_cnn_tf` and `ccs_cnn_tf` through the `ToOnnx` implementations in `redeem-properties`.
+The previous decoder/head-only export remains available with `--component decoder`.
+
+```bash
+redeem properties to-onnx \
+    --model <MODEL_PATH> \
+    --model_arch <MODEL_ARCH> \
+    --output <OUTPUT_ONNX> \
+    [--component full|decoder] \
+    [--constants <CONSTANTS_YAML>] \
+    [--external-data]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `-m`, `--model` | Path to the trained model file (`.safetensors`, `.pt`, `.pth`, or `.pkl`) |
+| `-a`, `--model_arch` | Model architecture (`rt_cnn_tf`, `ccs_cnn_tf`, `rt_cnn_lstm`, `ccs_cnn_lstm`, `ms2_bert`) |
+| `-o`, `--output` | Path to write the ONNX model |
+| `--component` | Component to export. Defaults to `full`; use `decoder` for the legacy head-only export |
+| `--constants` | Optional model constants YAML |
+| `--external-data` | Store initializer bytes in a sidecar `.onnx.data` file |
+| `--data-file` | Optional external data file name recorded in the ONNX model |
+
+**Full RT transformer example:**
+
+```bash
+redeem properties to-onnx \
+    --model redeem-properties/assets/pretrained_models/redeem/20251205_100_epochs_min_max_rt_cnn_tf.safetensors \
+    --model_arch rt_cnn_tf \
+    --output redeem-properties/assets/pretrained_models/redeem/redeem_rt_cnn_tf.onnx 
+```
+
+**Full CCS transformer example:**
+
+```bash
+redeem properties to-onnx \
+    --model redeem-properties/assets/pretrained_models/redeem/20251205_500_epochs_early_stopped_100_min_max_ccs_cnn_tf.safetensors \
+    --model_arch ccs_cnn_tf \
+    --output redeem-properties/assets/pretrained_models/redeem/redeem_ccs_cnn_tf.onnx
+```
+
+**Decoder/head-only export:**
+
+```bash
+redeem properties to-onnx \
+    --model model.safetensors \
+    --model_arch rt_cnn_tf \
+    --component decoder \
+    --output rt_decoder.onnx
+```
+
 ### Classifiers — Score
 
 Score a Percolator `.pin` file using the semi-supervised classifier.

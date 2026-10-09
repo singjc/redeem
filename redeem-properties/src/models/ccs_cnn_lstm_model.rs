@@ -219,6 +219,19 @@ impl ModelInterface for CCSCNNLSTMModel {
     }
 }
 
+#[cfg(feature = "onnx-export")]
+impl candle_onnx_export::ToOnnx for CCSCNNLSTMModel {
+    fn to_onnx(
+        &self,
+        _ctx: &mut candle_onnx_export::ExportContext<'_>,
+        _inputs: &[candle_onnx_export::Value],
+    ) -> candle_onnx_export::Result<Vec<candle_onnx_export::Value>> {
+        Err(candle_onnx_export::Error::UnsupportedTensor(
+            "full ONNX export for ccs_cnn_lstm is not implemented yet".to_string(),
+        ))
+    }
+}
+
 // // Forward Module Trait Implementation
 // impl  Module for CCSCNNLSTMModel {
 //     fn forward(&self, input: &Tensor) -> Result<Tensor, candle_core::Error> {

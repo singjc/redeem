@@ -81,6 +81,34 @@ fn properties_inference_no_config_prints_template() {
         .stderr(predicate::str::contains("No config file provided"));
 }
 
+#[test]
+fn properties_help_lists_to_onnx() {
+    cmd()
+        .args(["properties", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("to-onnx"));
+}
+
+#[test]
+fn properties_to_onnx_help_mentions_full_and_decoder_components() {
+    cmd()
+        .args(["properties", "to-onnx", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("full"))
+        .stdout(predicate::str::contains("decoder"));
+}
+
+#[test]
+fn properties_to_onnx_missing_args_errors() {
+    cmd()
+        .args(["properties", "to-onnx"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+}
+
 // ---------------------------------------------------------------------------
 // Classifiers subcommand
 // ---------------------------------------------------------------------------
