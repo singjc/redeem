@@ -99,6 +99,10 @@ pub struct FoundationTrainingConfig {
     pub seed: u64,
     /// Optional bounded smoke/debug mode; `None` trains the full partition.
     pub max_train_batches_per_epoch: Option<usize>,
+    /// Opt-in v0.51/v0.52 training: two disjoint property batches per curriculum
+    /// cycle. `None` retains the historical unified-trainer batch reuse.
+    #[serde(default)]
+    pub property_batch_size: Option<usize>,
     /// Optional bounded validation mode; `None` evaluates the full partition.
     pub max_validation_batches: Option<usize>,
     /// Maximum number of spectrum-bearing Validation records used for teacher-forced inverse and retrieval metrics per epoch.
@@ -135,6 +139,7 @@ impl Default for FoundationTrainingConfig {
             early_stopping_patience: 4,
             seed: 20_261_006,
             max_train_batches_per_epoch: None,
+            property_batch_size: None,
             max_validation_batches: None,
             inverse_evaluation_records: 256,
             generation_evaluation_records: 16,
@@ -189,10 +194,18 @@ impl FoundationTrainingConfig {
                 self.max_train_batches_per_epoch,
             ),
             ("max_validation_batches", self.max_validation_batches),
+            ("property_batch_size", self.property_batch_size),
         ] {
             if matches!(value, Some(0)) {
                 anyhow::bail!("foundation {name} must be positive when set");
             }
+        }
+        if self.strategy == FoundationTrainingStrategy::ResearchCurriculum
+            && self
+                .property_batch_size
+                .is_some_and(|size| size < self.batch_size)
+        {
+            anyhow::bail!("research property_batch_size must be at least batch_size");
         }
         self.model.validate()?;
         if self.strategy == FoundationTrainingStrategy::ResearchCurriculum
@@ -534,10 +547,16 @@ pub fn train_foundation_model(
         )?),
         FoundationTrainingStrategy::Joint => None,
     };
-    let train_batches_per_epoch = training
-        .max_train_batches_per_epoch
-        .unwrap_or_else(|| (train_indices.len() + training.batch_size - 1) / training.batch_size)
-        .min((train_indices.len() + training.batch_size - 1) / training.batch_size);
+    let train_batches_per_epoch = match training.strategy {
+        FoundationTrainingStrategy::Joint => train_indices.len().div_ceil(training.batch_size),
+        FoundationTrainingStrategy::ResearchCurriculum => {
+            research_curriculum_cycles(train_indices.len(), &training)
+        }
+    }
+    .min(training.max_train_batches_per_epoch.unwrap_or(usize::MAX));
+    if train_batches_per_epoch == 0 {
+        anyhow::bail!("TRAIN is too small for one research curriculum cycle with the configured property_batch_size");
+    }
     let updates_per_cycle = match training.strategy {
         FoundationTrainingStrategy::Joint => 1usize,
         FoundationTrainingStrategy::ResearchCurriculum => 5usize,
@@ -548,6 +567,14 @@ pub fn train_foundation_model(
         .saturating_mul(updates_per_cycle)
         .max(1);
     let mut global_update = 0usize;
+    // A byte per corpus record is cheaper than a set and reports exact across-epoch
+    // coverage without materializing another copy of multi-million-record indices.
+    let mut seen_property_records =
+        if training.strategy == FoundationTrainingStrategy::ResearchCurriculum {
+            vec![false; corpus.records.len()]
+        } else {
+            Vec::new()
+        };
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("create foundation output {}", output_dir.display()))?;
@@ -567,6 +594,10 @@ pub fn train_foundation_model(
         )
     })?;
     let history = output_dir.join("training_history.tsv");
+    let exposure_path = output_dir.join("training_exposure.tsv");
+    if training.strategy == FoundationTrainingStrategy::ResearchCurriculum {
+        fs::write(&exposure_path, "epoch\tcycles\tproperty_updates\tproperty_batch_size\tproperty_records\tnew_property_records\tcumulative_unique_property_records\ttrain_records\trt_labelled\tms2_labelled\tccs_labelled\tinverse_spectrum_records\n")?;
+    }
     let validation_metrics_path = output_dir.join("validation_metrics.tsv");
     fs::write(
         &history,
@@ -620,6 +651,18 @@ pub fn train_foundation_model(
                 &device,
             )?,
         };
+        if training.strategy == FoundationTrainingStrategy::ResearchCurriculum {
+            write_research_exposure(
+                &exposure_path,
+                epoch + 1,
+                &order,
+                &corpus.records,
+                &training,
+                train_batches_per_epoch,
+                train_indices.len(),
+                &mut seen_property_records,
+            )?;
+        }
         let validation_losses = run_epoch_joint(
             &model,
             &corpus.records,
@@ -821,6 +864,98 @@ enum FoundationCurriculumStage {
     Inverse,
 }
 
+// The opt-in research schedule consumes two *different* property batches per
+// cycle, as v0.51/v0.52 did. Missing config preserves the unified trainer's
+// original same-batch schedule for existing experiments and small fixtures.
+fn research_curriculum_cycles(records: usize, config: &FoundationTrainingConfig) -> usize {
+    match config.property_batch_size {
+        Some(size) => records / size.saturating_mul(2).max(1),
+        None => records.div_ceil(config.batch_size),
+    }
+}
+
+fn research_property_batches<'a>(
+    indices: &'a [usize],
+    cycle: usize,
+    config: &FoundationTrainingConfig,
+) -> (&'a [usize], &'a [usize]) {
+    match config.property_batch_size {
+        Some(size) => {
+            let start = cycle * size * 2;
+            (
+                &indices[start..start + size],
+                &indices[start + size..start + size * 2],
+            )
+        }
+        None => {
+            let start = cycle * config.batch_size;
+            let batch = &indices[start..(start + config.batch_size).min(indices.len())];
+            (batch, batch)
+        }
+    }
+}
+
+fn write_research_exposure(
+    path: &Path,
+    epoch: usize,
+    indices: &[usize],
+    records: &[FoundationTrainingRecord],
+    config: &FoundationTrainingConfig,
+    cycles: usize,
+    train_records: usize,
+    seen: &mut [bool],
+) -> Result<()> {
+    let mut selected = 0usize;
+    let mut fresh = 0usize;
+    let mut rt = 0usize;
+    let mut ms2 = 0usize;
+    let mut ccs = 0usize;
+    let mut inverse = 0usize;
+    for cycle in 0..cycles {
+        let (a, b) = research_property_batches(indices, cycle, config);
+        for &index in a.iter().chain(b.iter()) {
+            let record = &records[index];
+            selected += 1;
+            if !seen[index] {
+                seen[index] = true;
+                fresh += 1;
+            }
+            if record.retention_time.normalized.is_some_and(f32::is_finite)
+                || record.retention_time.harmonized.is_some_and(f32::is_finite)
+                || record
+                    .retention_time
+                    .observed_seconds
+                    .is_some_and(f32::is_finite)
+            {
+                rt += 1;
+            }
+            if !record.fragments.is_empty() {
+                ms2 += 1;
+            }
+            if record.ccs.is_some_and(f32::is_finite) {
+                ccs += 1;
+            }
+        }
+        // Inverse uses only the first `batch_size` rows of property batch B.
+        for &index in b.iter().take(config.batch_size) {
+            let record = &records[index];
+            if !record.observed_spectrum_peaks.is_empty() || !record.fragments.is_empty() {
+                inverse += 1;
+            }
+        }
+    }
+    let cumulative_unique = seen.iter().filter(|&&value| value).count();
+    let property_batch_size = config.property_batch_size.unwrap_or(config.batch_size);
+    let line = format!("{epoch}\t{cycles}\t{}\t{property_batch_size}\t{selected}\t{fresh}\t{cumulative_unique}\t{}\t{rt}\t{ms2}\t{ccs}\t{inverse}\n",
+        cycles * 2, train_records);
+    OpenOptions::new()
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())?;
+    println!("foundation_train_exposure\t{}", line.trim_end());
+    Ok(())
+}
+
 fn run_epoch_research_curriculum(
     model: &FoundationModel,
     records: &[FoundationTrainingRecord],
@@ -837,10 +972,9 @@ fn run_epoch_research_curriculum(
     device: &Device,
 ) -> Result<FoundationEpochLosses> {
     let mut aggregate = FoundationEpochLosses::default();
-    let cycles = indices
-        .chunks(config.batch_size)
-        .len()
-        .min(max_batches.unwrap_or(usize::MAX));
+    let mut stage_loss_sums = [0.0f64; 5];
+    let cycles =
+        research_curriculum_cycles(indices.len(), config).min(max_batches.unwrap_or(usize::MAX));
     let consensus_order = mobility_consensus.map(|supervision| {
         deterministic_example_order(
             &supervision.examples,
@@ -849,22 +983,24 @@ fn run_epoch_research_curriculum(
             config.seed,
         )
     });
-    for (batch_index, chunk) in indices
-        .chunks(config.batch_size)
-        .take(max_batches.unwrap_or(usize::MAX))
-        .enumerate()
-    {
-        let owned = chunk
-            .iter()
-            .map(|&index| {
-                records.get(index).cloned().ok_or_else(|| {
-                    anyhow::anyhow!("foundation training record index {index} is out of bounds")
-                })
+    for batch_index in 0..cycles {
+        let (first_indices, second_indices) =
+            research_property_batches(indices, batch_index, config);
+        let property_batches = [first_indices, second_indices]
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&index| {
+                        records.get(index).cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "foundation training record index {index} is out of bounds"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
+            .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        if owned.is_empty() {
-            continue;
-        }
         let cycle_seed = seed ^ (batch_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for (stage_index, stage) in [
             FoundationCurriculumStage::Property,
@@ -903,9 +1039,22 @@ fn run_epoch_research_curriculum(
                     device,
                 )?
             } else {
+                let selected = match stage {
+                    FoundationCurriculumStage::Property => &property_batches[stage_index],
+                    FoundationCurriculumStage::Representation => &property_batches[0],
+                    FoundationCurriculumStage::Inverse => &property_batches[1],
+                    FoundationCurriculumStage::Mobility => &property_batches[0],
+                };
+                // Historical v0.52 used distinct property batches but smaller
+                // representation batches; use a bounded inverse subset as well.
+                let selected = if matches!(stage, FoundationCurriculumStage::Property) {
+                    selected.as_slice()
+                } else {
+                    &selected[..selected.len().min(config.batch_size)]
+                };
                 batch_loss(
                     model,
-                    &owned,
+                    selected,
                     stage_collator,
                     &staged,
                     stage_seed,
@@ -925,12 +1074,17 @@ fn run_epoch_research_curriculum(
                 }
             }
             *global_update = (*global_update).saturating_add(1);
+            stage_loss_sums[stage_index] += f64::from(loss.scalars.total);
             aggregate.add(loss.scalars);
         }
     }
     if aggregate.batches == 0 {
         anyhow::bail!("foundation research-curriculum epoch produced no updates");
     }
+    let n = cycles as f64;
+    println!("foundation_stage_losses\tproperty_a={:.6}\tproperty_b={:.6}\trepresentation={:.6}\tmobility={:.6}\tinverse={:.6}",
+        stage_loss_sums[0] / n, stage_loss_sums[1] / n,
+        stage_loss_sums[2] / n, stage_loss_sums[3] / n, stage_loss_sums[4] / n);
     Ok(aggregate.means())
 }
 
@@ -1925,6 +2079,35 @@ mod tests {
         assert_eq!(metrics.retrieval_queries, 4);
         assert_eq!(metrics.retrieval_top1_count, 4);
         assert!((metrics.retrieval_reciprocal_rank_sum - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn research_property_batches_are_distinct_and_cover_expected_records() {
+        let mut config = FoundationTrainingConfig::default();
+        config.batch_size = 8;
+        config.property_batch_size = Some(16);
+        config.validate().unwrap();
+        let indices: Vec<_> = (0..68).collect();
+        assert_eq!(research_curriculum_cycles(indices.len(), &config), 2);
+        let (a, b) = research_property_batches(&indices, 1, &config);
+        assert_eq!(a, &(32..48).collect::<Vec<_>>());
+        assert_eq!(b, &(48..64).collect::<Vec<_>>());
+        assert!(a.iter().all(|index| !b.contains(index)));
+        assert_eq!(a.len(), 16);
+        assert_eq!(b.len(), 16);
+        config.property_batch_size = None;
+        let (a, b) = research_property_batches(&indices, 1, &config);
+        assert_eq!(a, b); // Old serialized configs keep the legacy path.
+        assert_eq!(research_curriculum_cycles(indices.len(), &config), 9);
+        config.property_batch_size = Some(4);
+        assert!(config.validate().is_err());
+        let mut encoded = serde_yaml::to_value(FoundationTrainingConfig::default()).unwrap();
+        encoded
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("property_batch_size".into()));
+        let legacy: FoundationTrainingConfig = serde_yaml::from_value(encoded).unwrap();
+        assert_eq!(legacy.property_batch_size, None);
     }
 
     #[test]
