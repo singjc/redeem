@@ -95,16 +95,9 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
         metadata_scalar(&metadata, "objective") == Some("v0520_mobility_aware_pair_representation"),
         "incorrect reference checkpoint objective"
     );
-    let dataset = format!("fnv1a64:{:016x}", benchmark.dataset_fingerprint);
-    let split = format!("fnv1a64:{:016x}", benchmark.manifest_fingerprint());
-    ensure!(
-        metadata_scalar(&metadata, "corpus_fingerprint") == Some(dataset.as_str()),
-        "reference corpus fingerprint mismatch"
-    );
-    ensure!(
-        metadata_scalar(&metadata, "benchmark_manifest_fingerprint") == Some(split.as_str()),
-        "reference benchmark fingerprint mismatch"
-    );
+    // The benchmark dataset hash describes records, while the corpus hash also
+    // incorporates source provenance. Their values are not interchangeable.
+    validate_reference_fingerprints(&metadata, benchmark.manifest_fingerprint())?;
 
     let prefix = benchmark.partition_indices(FoundationPartition::Validation);
     ensure!(
@@ -193,6 +186,19 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
     println!("annotated_ms2={}", fragment_destination.display());
     println!("historical_train_holdout_previously_consumed=YES");
     println!("train_holdout_read_by_this_adapter=NO");
+    Ok(())
+}
+
+fn validate_reference_fingerprints(metadata: &str, manifest_fingerprint: u64) -> Result<()> {
+    let corpus = metadata_scalar(metadata, "corpus_fingerprint")
+        .context("missing historical reference corpus fingerprint")?;
+    let corpus_hash = corpus.strip_prefix("fnv1a64:")
+        .context("invalid historical reference corpus fingerprint")?;
+    ensure!(corpus_hash.len() == 16 && u64::from_str_radix(corpus_hash, 16).is_ok(),
+        "invalid historical reference corpus fingerprint");
+    let benchmark_hash = format!("fnv1a64:{manifest_fingerprint:016x}");
+    ensure!(metadata_scalar(metadata, "benchmark_manifest_fingerprint") == Some(benchmark_hash.as_str()),
+        "reference benchmark fingerprint mismatch");
     Ok(())
 }
 
@@ -338,6 +344,20 @@ fn validate_fragments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_fingerprints_distinguish_corpus_from_benchmark_dataset() {
+        // Historical and production checkpoint corpus hashes matched in job 62823987,
+        // but benchmark.dataset_fingerprint hashes a different object.
+        let metadata = "corpus_fingerprint: fnv1a64:a2a6f57d31064ba6\n\
+benchmark_manifest_fingerprint: fnv1a64:2133c039625f77df\n";
+        assert!(validate_reference_fingerprints(metadata, 0x2133c039625f77df).is_ok());
+        assert!(validate_reference_fingerprints(metadata, 0).is_err());
+        assert!(validate_reference_fingerprints(
+            "corpus_fingerprint: corrupted\nbenchmark_manifest_fingerprint: fnv1a64:2133c039625f77df\n",
+            0x2133c039625f77df,
+        ).is_err());
+    }
 
     #[test]
     fn reference_export_adapter_preserves_rt_and_rejects_mismatched_sequences() {
