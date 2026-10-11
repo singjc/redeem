@@ -24,6 +24,12 @@ pub struct PropertyInferenceConfig {
     pub foundation_max_records: Option<usize>,
     /// Keep only records with observed spectra. Useful for bounded inverse checks.
     pub foundation_spectra_only: bool,
+    /// `unified` (default) or the opt-in source-faithful v0.52 export adapter.
+    pub foundation_backend: String,
+    /// Directory produced by the original frozen v0.52 exporter.
+    pub foundation_reference_export_dir: Option<String>,
+    /// Exact benchmark TSV assigning original corpus indices to Validation.
+    pub foundation_reference_benchmark: Option<String>,
     pub instrument: String,
     pub nce: i32,
     /// Optional path to a dataset whose normalization stats should be reused (e.g., training data).
@@ -56,6 +62,9 @@ impl Default for PropertyInferenceConfig {
             foundation_partition: String::from("validation"),
             foundation_max_records: None,
             foundation_spectra_only: false,
+            foundation_backend: String::from("unified"),
+            foundation_reference_export_dir: None,
+            foundation_reference_benchmark: None,
             instrument: String::from("QE"),
             nce: 20,
             normalization_reference_data: None,
@@ -109,6 +118,9 @@ impl PropertyInferenceConfig {
         load_or_default!(foundation_partition);
         load_or_default!(foundation_max_records);
         load_or_default!(foundation_spectra_only);
+        load_or_default!(foundation_backend);
+        load_or_default!(foundation_reference_export_dir);
+        load_or_default!(foundation_reference_benchmark);
         load_or_default!(instrument);
         load_or_default!(nce);
         load_or_default!(normalization_reference_data);

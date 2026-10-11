@@ -51,6 +51,13 @@ pub fn run_training(config: &PropertyTrainConfig) -> Result<()> {
 }
 
 pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
+    match config.foundation_backend.as_str() {
+        "v0520_reference_export" => {
+            return super::foundation_v0520_export::run_inference(config);
+        }
+        "unified" => {}
+        other => anyhow::bail!("unsupported foundation backend '{other}'"),
+    }
     if config.model_path.trim().is_empty() {
         anyhow::bail!(
             "foundation inference requires model_path to point to a checkpoint directory"
