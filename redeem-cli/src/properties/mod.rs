@@ -3,6 +3,7 @@ mod foundation_v0520_all;
 mod foundation_v0520_ccs;
 mod foundation_v0520_export;
 mod foundation_v0520_native;
+mod foundation_v0520_panel;
 pub mod inference;
 pub mod load_data;
 pub mod train;

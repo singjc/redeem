@@ -64,6 +64,9 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
         "v0520_native_all" => {
             return super::foundation_v0520_all::run_inference(config);
         }
+        "v0520_peptide_panel" => {
+            return super::foundation_v0520_panel::run_inference(config);
+        }
         "unified" => {}
         other => anyhow::bail!("unsupported foundation backend '{other}'"),
     }
