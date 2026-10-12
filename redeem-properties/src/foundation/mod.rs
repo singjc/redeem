@@ -27,6 +27,14 @@ pub mod loss;
 pub mod metadata;
 mod mobility_consensus;
 pub mod model;
+mod multimodal_v0270;
+mod multimodal_v0310;
+mod multimodal_v0350;
+mod multimodal_v0360;
+mod multimodal_v0500;
+mod multimodal_v0510;
+mod multimodal_v0520;
+mod research_v0520;
 pub mod msp;
 pub mod normalization;
 pub mod optimizer;
@@ -194,6 +202,8 @@ pub use normalization::{
 };
 
 pub use predictor::{FoundationPredictor, FoundationPredictorConfig};
+
+pub use research_v0520::{ResearchForwardPrediction, ResearchV0520Forward};
 
 pub use runtime::{
     read_foundation_checkpoint_metadata, FoundationCheckpointMetadata, FoundationModel,
