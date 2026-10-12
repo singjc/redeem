@@ -7,11 +7,16 @@ Both files must have corresponding `.annotated_fragments.tsv` files.
 import csv
 import math
 import sys
-from collections import Counter
+from collections import defaultdict
 from pathlib import Path
 
 ABS_TOLERANCE = 1.0e-4
 REL_TOLERANCE = 2.0e-6
+FRAGMENT_IDENTITY = (
+    'record_index', 'sequence', 'cleavage_index', 'channel',
+    'charged_frag_type', 'fragment_number', 'product_mz',
+)
+
 
 
 def load(path):
@@ -27,11 +32,23 @@ def check_float(expected, actual, label):
         raise ValueError(f"{label}: reference={expected} native={actual}")
 
 
-def compare(ref_file, native_file):
+def group_fragments(rows):
+    # The historical exporter orders selected MS2 precursors by a seeded hash;
+    # the native backend writes corpus-index order. Compare identities, not rows.
+    grouped = defaultdict(list)
+    for row in rows:
+        identity = tuple(row[field] for field in FRAGMENT_IDENTITY)
+        grouped[identity].append((
+            float(row['target_intensity']), float(row['foundation_intensity'])
+        ))
+    return grouped
+
+
+def compare(ref_file, native_file, expected_rt=793, expected_ms2=404):
     ref = load(ref_file)
     native = load(native_file)
-    if len(ref) != 793 or len(native) != len(ref):
-        raise ValueError(f"RT/precursor counts differ or not frozen 793: {len(ref)}, {len(native)}")
+    if len(ref) != expected_rt or len(native) != len(ref):
+        raise ValueError(f"RT/precursor counts differ or not frozen {expected_rt}: {len(ref)}, {len(native)}")
     for i, (a, b) in enumerate(zip(ref, native)):
         for field in ('record_index', 'corpus_record_index', 'sequence', 'charge', 'ms2_annotation_scope'):
             if a.get(field) != b.get(field):
@@ -42,15 +59,25 @@ def compare(ref_file, native_file):
     if len(ref_ms2) != len(native_ms2):
         raise ValueError(f"fragment counts differ: {len(ref_ms2)}, {len(native_ms2)}")
     precursor_count = len({row['record_index'] for row in ref_ms2})
-    if precursor_count != 404:
+    if precursor_count != expected_ms2:
         raise ValueError(f"unexpected frozen MS2 precursor count: {precursor_count}")
-    for i, (a, b) in enumerate(zip(ref_ms2, native_ms2)):
-        for field in ('record_index', 'sequence', 'cleavage_index', 'channel',
-                      'charged_frag_type', 'fragment_number', 'product_mz'):
-            if a[field] != b[field]:
-                raise ValueError(f"MS2 row {i}: {field} {a[field]!r} != {b[field]!r}")
-        check_float(a['target_intensity'], b['target_intensity'], f"MS2 target row {i}")
-        check_float(a['foundation_intensity'], b['foundation_intensity'], f"MS2 prediction row {i}")
+    ref_groups = group_fragments(ref_ms2)
+    native_groups = group_fragments(native_ms2)
+    if ref_groups.keys() != native_groups.keys():
+        missing = ref_groups.keys() - native_groups.keys()
+        extra = native_groups.keys() - ref_groups.keys()
+        raise ValueError(f"MS2 fragment identities differ: missing={len(missing)} "
+                         f"extra={len(extra)} sample_missing={next(iter(missing), None)} "
+                         f"sample_extra={next(iter(extra), None)}")
+    for identity in sorted(ref_groups):
+        expected = sorted(ref_groups[identity])
+        actual = sorted(native_groups[identity])
+        if len(expected) != len(actual):
+            raise ValueError(f"MS2 fragment multiplicity differs for {identity}: "
+                             f"reference={len(expected)} native={len(actual)}")
+        for i, ((target_a, pred_a), (target_b, pred_b)) in enumerate(zip(expected, actual)):
+            check_float(target_a, target_b, f"MS2 target {identity} duplicate {i}")
+            check_float(pred_a, pred_b, f"MS2 prediction {identity} duplicate {i}")
     print('v0520_native_common_validation_parity=PASS')
     print(f'rt_records={len(ref)}')
     print(f'ms2_precursors={precursor_count}')
@@ -63,16 +90,46 @@ def self_test():
     with tempfile.TemporaryDirectory() as td:
         a = Path(td) / 'a.tsv'
         b = Path(td) / 'b.tsv'
-        a.write_text('record_index\tcorpus_record_index\tsequence\tcharge\tms2_annotation_scope\tpredicted_rt\n0\t1\tPEPTIDE\t2\tnone\t1.0\n')
-        b.write_text(a.read_text().replace('1.0', '1.0000001'))
-        assert load(a)[0]['sequence'] == 'PEPTIDE'
-        check_float('1.0', '1.0000001', 'self-test')
-        try:
-            check_float('1.0', '1.1', 'self-test')
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('mismatch was not detected')
+        precursor_header = ('record_index', 'corpus_record_index', 'sequence',
+                            'charge', 'ms2_annotation_scope', 'predicted_rt')
+        precursors = [
+            ('0', '13428', 'PEPTIDEK', '2', 'annotated_fragments_only', '10.0'),
+            ('1', '30699', 'OTHERTIDEK', '3', 'annotated_fragments_only', '20.0'),
+        ]
+        fragment_header = (*FRAGMENT_IDENTITY, 'target_intensity', 'foundation_intensity')
+        fragments = [
+            ('30699', 'OTHERTIDEK', '0', '0', 'b_z1', '1', '100.00000000', '0.4', '0.5'),
+            ('13428', 'PEPTIDEK', '1', '2', 'y_z1', '6', '200.00000000', '0.2', '0.3'),
+            ('30699', 'OTHERTIDEK', '2', '0', 'b_z1', '3', '300.00000000', '0.6', '0.7'),
+            # Repeated annotated coordinate must compare as a multiset, not by order.
+            ('30699', 'OTHERTIDEK', '0', '0', 'b_z1', '1', '100.00000000', '0.3', '0.35'),
+        ]
+        def write_tsv(path, header, rows):
+            with path.open('w', newline='') as handle:
+                writer = csv.writer(handle, delimiter='\t')
+                writer.writerow(header)
+                writer.writerows(rows)
+        write_tsv(a, precursor_header, precursors)
+        write_tsv(b, precursor_header, precursors)
+        fa = Path(str(a) + '.annotated_fragments.tsv')
+        fb = Path(str(b) + '.annotated_fragments.tsv')
+        write_tsv(fa, fragment_header, fragments)
+        write_tsv(fb, fragment_header, list(reversed(fragments)))
+        compare(a, b, expected_rt=2, expected_ms2=2)
+
+        # Fail closed on an altered fragment prediction, missing row, or identity.
+        for corrupted in (
+            [*fragments[:2], (*fragments[2][:-1], '0.9'), *fragments[3:]],
+            list(reversed(fragments))[:-1],
+            [*fragments[:2], ('99999', *fragments[2][1:]), *fragments[3:]],
+        ):
+            write_tsv(fb, fragment_header, corrupted)
+            try:
+                compare(a, b, expected_rt=2, expected_ms2=2)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('corrupt MS2 rows were accepted')
     print('v0520_native_comparator_self_test=PASS')
 
 
