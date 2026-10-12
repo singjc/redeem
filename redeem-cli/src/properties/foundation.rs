@@ -58,6 +58,9 @@ pub fn run_inference(config: &PropertyInferenceConfig) -> Result<()> {
         "v0520_native" => {
             return super::foundation_v0520_native::run_inference(config);
         }
+        "v0520_native_ccs" => {
+            return super::foundation_v0520_ccs::run_inference(config);
+        }
         "unified" => {}
         other => anyhow::bail!("unsupported foundation backend '{other}'"),
     }

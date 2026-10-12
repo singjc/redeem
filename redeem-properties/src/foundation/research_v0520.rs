@@ -163,9 +163,168 @@ impl ResearchV0520Forward {
     }
 }
 
+/// Native mobility and CCS outputs from the frozen v0.35 teacher + v0.52 student.
+#[derive(Debug, Clone)]
+pub struct ResearchMobilityPrediction {
+    pub native_mobility: f32,
+    pub ccs: f32,
+    pub factor: f32,
+}
+
+/// Separate wrapper: the proven native RT/MS2 path remains untouched.
+pub struct ResearchV0520Mobility {
+    student: ResearchV0520Forward,
+    teacher: super::multimodal_v0510::FoundationV0350TeacherV0510,
+}
+
+#[derive(Deserialize)]
+struct HistoricalTeacherMetadata {
+    version: u32,
+    objective: String,
+    completed_steps: usize,
+    v0350_config: super::multimodal_v0350::PeptideFoundationMultimodalV0350Config,
+    target_normalization: FoundationTargetNormalizationConfig,
+    corpus_fingerprint: String,
+    benchmark_manifest_fingerprint: String,
+}
+
+impl ResearchV0520Mobility {
+    pub fn load(
+        student_checkpoint: &Path,
+        teacher_checkpoint: &Path,
+        device: Device,
+    ) -> Result<Self> {
+        let student = ResearchV0520Forward::load(student_checkpoint, device)?;
+        let path = teacher_checkpoint.join("metadata.yaml");
+        let meta: HistoricalTeacherMetadata = serde_yaml::from_str(
+            &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
+        )?;
+        ensure!(
+            meta.version == 350
+                && meta.objective
+                    == "v0350_trainable_forward_representation_context_conditioned_ms2"
+                && meta.completed_steps > 0,
+            "requires original trained v0.35 teacher"
+        );
+        meta.v0350_config.validate()?;
+        ensure!(
+            meta.corpus_fingerprint == student.corpus_fingerprint
+                && meta.benchmark_manifest_fingerprint == student.benchmark_fingerprint,
+            "v0.35 teacher/v0.52 student fingerprints disagree"
+        );
+        // v0.52 inherited the v0.35 TRAIN-fitted normalization; do not silently replace it.
+        ensure!(
+            serde_yaml::to_value(&meta.target_normalization)?
+                == serde_yaml::to_value(&student.normalization)?,
+            "v0.35 teacher/v0.52 student normalization mismatch"
+        );
+        let mut variables = VarMap::new();
+        let vb = VarBuilder::from_varmap(&variables, DType::F32, &student.device);
+        let model = super::multimodal_v0350::PeptideFoundationMultimodalV0350Model::new(
+            meta.v0350_config,
+            vb,
+        )?;
+        let weights = teacher_checkpoint.join("model.safetensors");
+        variables
+            .load(&weights)
+            .with_context(|| format!("load v0.35 teacher {}", weights.display()))?;
+        Ok(Self {
+            student,
+            teacher: super::multimodal_v0510::FoundationV0350TeacherV0510::new(model),
+        })
+    }
+
+    pub fn verify_fingerprints(&self, corpus: u64, benchmark: u64) -> Result<()> {
+        self.student.verify_fingerprints(corpus, benchmark)
+    }
+
+    pub fn infer(
+        &self,
+        records: &[FoundationTrainingRecord],
+    ) -> Result<Vec<ResearchMobilityPrediction>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch = self
+            .student
+            .collator
+            .collate(records, &self.student.device, 0)?;
+        let physics = FoundationScalarPhysicsBatchV0360::from_records(
+            records,
+            self.student.max_sequence_len,
+            &self.student.device,
+        )?;
+        let mobility =
+            self.student
+                .model
+                .mobility_aware_t(&batch.input, &batch.context, &physics, false)?;
+        let base_ccs_model = self
+            .teacher
+            .protected_ccs_detached_t(&batch.input, &batch.context)?;
+        let base_ccs_native = self
+            .student
+            .normalization
+            .ccs
+            .denormalize_tensor(&base_ccs_model)?;
+        let factor = original_bruker_ccs_factor(&batch.context)?;
+        let base_mobility = base_ccs_native.broadcast_div(&factor)?;
+        let predicted_mobility = (&base_mobility + &mobility.mobility_residual_native)?;
+        let predicted_ccs = predicted_mobility.broadcast_mul(&factor)?;
+        let native = predicted_mobility.to_vec2::<f32>()?;
+        let ccs = predicted_ccs.to_vec2::<f32>()?;
+        let factors = factor.to_vec2::<f32>()?;
+        ensure!(
+            native.len() == records.len()
+                && ccs.len() == records.len()
+                && factors.len() == records.len(),
+            "mobility inference output count mismatch"
+        );
+        Ok((0..records.len())
+            .map(|i| ResearchMobilityPrediction {
+                native_mobility: native[i][0],
+                ccs: ccs[i][0],
+                factor: factors[i][0],
+            })
+            .collect())
+    }
+}
+
+// Exact tensor operations and constant from historical
+// foundation_train_multimodal_v0520.rs::bruker_ccs_factor.
+fn original_bruker_ccs_factor(
+    context: &super::model::PrecursorContextBatch,
+) -> Result<candle_core::Tensor> {
+    let charge = context.charge.unsqueeze(1)?;
+    let mz = context.precursor_mz.unsqueeze(1)?;
+    let neutral_mass = charge.broadcast_mul(&mz)?;
+    let reduced_mass = neutral_mass
+        .affine(28.0, 0.0)?
+        .broadcast_div(&neutral_mass.affine(1.0, 28.0)?)?;
+    let denominator = reduced_mass.sqrt()?.clamp(1.0e-6, f64::INFINITY)?;
+    Ok(charge
+        .affine(1059.62245, 0.0)?
+        .broadcast_div(&denominator)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_bruker_factor_matches_analytical_conversion() {
+        let device = Device::Cpu;
+        let mut context = super::super::model::PrecursorContextBatch::unknown(1, &device).unwrap();
+        context.charge = candle_core::Tensor::new(&[2.0f32], &device).unwrap();
+        context.precursor_mz = candle_core::Tensor::new(&[400.0f32], &device).unwrap();
+        let actual = original_bruker_ccs_factor(&context)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()[0][0];
+        let neutral_mass = 800.0f64;
+        let reduced_mass = 28.0 * neutral_mass / (neutral_mass + 28.0);
+        let expected = 2.0 * 1059.62245 / reduced_mass.sqrt();
+        assert!((f64::from(actual) - expected).abs() < 1.0e-4);
+    }
+
     #[test]
     fn original_research_modules_retain_all_student_namespaces() {
         let map = VarMap::new();

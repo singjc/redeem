@@ -30,6 +30,8 @@ pub struct PropertyInferenceConfig {
     pub foundation_reference_export_dir: Option<String>,
     /// Exact benchmark TSV assigning original corpus indices to Validation.
     pub foundation_reference_benchmark: Option<String>,
+    /// Frozen original v0.35 teacher checkpoint for v0520_native_ccs.
+    pub foundation_v0350_teacher_checkpoint: Option<String>,
     pub instrument: String,
     pub nce: i32,
     /// Optional path to a dataset whose normalization stats should be reused (e.g., training data).
@@ -65,6 +67,7 @@ impl Default for PropertyInferenceConfig {
             foundation_backend: String::from("unified"),
             foundation_reference_export_dir: None,
             foundation_reference_benchmark: None,
+            foundation_v0350_teacher_checkpoint: None,
             instrument: String::from("QE"),
             nce: 20,
             normalization_reference_data: None,
@@ -121,6 +124,7 @@ impl PropertyInferenceConfig {
         load_or_default!(foundation_backend);
         load_or_default!(foundation_reference_export_dir);
         load_or_default!(foundation_reference_benchmark);
+        load_or_default!(foundation_v0350_teacher_checkpoint);
         load_or_default!(instrument);
         load_or_default!(nce);
         load_or_default!(normalization_reference_data);
