@@ -1,0 +1,16 @@
+.git
+.git/**
+target
+**/target
+*.sif
+*.img
+*.sqsh
+*.tar
+*.tar.gz
+*.zip
+*.time.txt
+__pycache__
+**/__pycache__
+.ipynb_checkpoints
+**/.ipynb_checkpoints
+.DS_Store

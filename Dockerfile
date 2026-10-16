@@ -64,33 +64,14 @@ COPY redeem-properties ./redeem-properties
 COPY redeem-properties-py ./redeem-properties-py
 COPY scripts ./scripts
 
-# Build the production CLI and the current foundation research binaries.  Keep
+# Build the production CLI and the frozen production foundation identifier. Keep
 # Cargo parallelism deliberately conservative for workstation image builds;
 # this controls peak host RAM and linker pressure without changing the emitted
 # model architecture or runtime numerics.
 RUN set -eux; \
     echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"; \
     cargo build --release --locked --bin redeem --features cuda; \
-    FOUNDATION_EXAMPLES="\
-foundation_initialize_model \
-foundation_prepare_benchmark \
-foundation_prepare_corpus_benchmark \
-foundation_train_corpus \
-foundation_train_diffusion \
-foundation_train_causal \
-foundation_train_reverse_causal \
-foundation_train_unified \
-foundation_generate_unified \
-foundation_evaluate_checkpoint \
-foundation_embedding \
-foundation_benchmark_unified_forward \
-foundation_train_trainable_interaction_reranker \
-foundation_train_compatibility_pretraining \
-foundation_train_compatibility_pretraining_v0171 \
-foundation_train_compatibility_pretraining_v0180 \
-foundation_train_direct_decoder_v0190 \
-foundation_export_alphapeptdeep_comparison \
-foundation_export_alphapeptdeep_comparison_v0240"; \
+    FOUNDATION_EXAMPLES="foundation_identify_stream_v0770"; \
     EXAMPLE_ARGS=""; \
     for example_name in ${FOUNDATION_EXAMPLES}; do \
         test -f "redeem-properties/examples/${example_name}.rs"; \
@@ -152,11 +133,7 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 
 WORKDIR /work
 
-COPY scripts/compare_foundation_alphapeptdeep.py /opt/redeem/scripts/compare_foundation_alphapeptdeep.py
-COPY scripts/render_foundation_alphapeptdeep_report.py /opt/redeem/scripts/render_foundation_alphapeptdeep_report.py
 COPY redeem-properties/nbs/redeem_foundation_validation_report.ipynb /opt/redeem/notebooks/redeem_foundation_validation_report.ipynb
-COPY scripts/redeem-foundation /usr/local/bin/redeem-foundation
-COPY scripts/redeem-container-info /usr/local/bin/redeem-container-info
 
 ENV MAX_JOBS=${PYTHON_BUILD_THREADS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${PYTHON_BUILD_THREADS}
@@ -217,11 +194,6 @@ RUN apt-get -o Acquire::Retries=5 update && \
     command -v zstd && \
     rm -rf /var/lib/apt/lists/*
 
-RUN chmod 0755 \
-        /usr/local/bin/redeem-foundation \
-        /usr/local/bin/redeem-container-info \
-        /opt/redeem/scripts/compare_foundation_alphapeptdeep.py \
-        /opt/redeem/scripts/render_foundation_alphapeptdeep_report.py && \
-    /usr/local/bin/redeem-container-info --build-check
+RUN foundation_identify_stream_v0770 --self-test
 
-CMD ["redeem-foundation", "help"]
+CMD ["foundation_identify_stream_v0770", "--help"]
