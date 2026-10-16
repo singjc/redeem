@@ -288,6 +288,31 @@ impl FoundationModel {
     ) -> Result<Self> {
         config.validate()?;
         normalization.validate()?;
+        // A legacy native-unit CCS prior is standardized using its own TRAIN
+        // statistics inside the peptide encoder. The production loss and
+        // inference paths use the separately resolved CCS normalization. When
+        // both are active, these spaces must agree or the prior/residual sum
+        // silently targets the wrong physical scale.
+        if let Some(baseline) = &config.peptide.ccs_physics_baseline {
+            if normalization.ccs.is_active() {
+                let mean = normalization.ccs.mean.unwrap();
+                let std = normalization.ccs.standard_deviation.unwrap();
+                let near = |left: f64, right: f64| {
+                    (left - right).abs() <= 1e-6 * left.abs().max(right.abs()).max(1.0)
+                };
+                if !near(baseline.target_mean_native, mean)
+                    || !near(baseline.target_std_native, std)
+                {
+                    anyhow::bail!(
+                        "CCS physics baseline target-space statistics do not match CCS normalization (baseline mean={} std={}; normalization mean={} std={})",
+                        baseline.target_mean_native,
+                        baseline.target_std_native,
+                        mean,
+                        std
+                    );
+                }
+            }
+        }
         if instrument_names.len() > config.peptide.instrument_vocab_size {
             anyhow::bail!(
                 "foundation instrument vocabulary has {} names but model capacity is {}",

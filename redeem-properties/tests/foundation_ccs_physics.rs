@@ -238,7 +238,7 @@ fn trainer_rejects_a_physics_prior_whose_target_space_does_not_match_ccs_normali
     use redeem_properties::foundation::{
         FoundationCcsPhysicsBaselineConfig, FoundationConfig, FoundationRegressionNormalization,
         FoundationRegressionNormalizationStrategy, FoundationTargetNormalizationConfig,
-        FoundationTrainer, FoundationTrainerConfig,
+        FoundationModel, FoundationModelConfig,
     };
 
     let model = FoundationConfig {
@@ -258,21 +258,26 @@ fn trainer_rejects_a_physics_prior_whose_target_space_does_not_match_ccs_normali
         }),
         ..FoundationConfig::default()
     };
-    let trainer = FoundationTrainerConfig {
-        target_normalization: FoundationTargetNormalizationConfig {
-            ccs: FoundationRegressionNormalization {
-                strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
-                mean: Some(451.0),
-                standard_deviation: Some(90.0),
-                label_count: 10,
-                ..FoundationRegressionNormalization::default()
-            },
-            ..FoundationTargetNormalizationConfig::default()
+    let normalization = FoundationTargetNormalizationConfig {
+        ccs: FoundationRegressionNormalization {
+            strategy: FoundationRegressionNormalizationStrategy::TrainStandardize,
+            mean: Some(451.0),
+            standard_deviation: Some(90.0),
+            label_count: 10,
+            ..FoundationRegressionNormalization::default()
         },
-        ..FoundationTrainerConfig::default()
+        ..FoundationTargetNormalizationConfig::default()
     };
 
-    let error = match FoundationTrainer::new(model, trainer, Device::Cpu) {
+    let error = match FoundationModel::new(
+        FoundationModelConfig {
+            peptide: model,
+            ..FoundationModelConfig::default()
+        },
+        normalization,
+        Vec::new(),
+        Device::Cpu,
+    ) {
         Ok(_) => panic!("mismatched CCS physics target space should be rejected"),
         Err(error) => error,
     };
