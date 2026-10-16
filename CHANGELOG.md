@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [foundation-v0770-production-freeze] - 2026-10-06
+
+### 🚀 Features
+
+- Add missing Cargo.lock and redeem-openms-ffi to Dockerfile
+- Update CLI argument handling to use PathBuf for model_path, inference_data, and output_file
+- Enhance pretrained model handling in CLI and update documentation
+
+### 🐛 Bug Fixes
+
+- Remove Cargo.lock copy from Dockerfile
+- Improve alignment stress test
+- RL
+
+### 💼 Other
+
+- Changes
+- Corpus
+- Checkpointing
+- Dataset stuff
+- Msp spec lib reader
+- Notebook
+- Nb
+- Notebook
+
+### ⚙️ Miscellaneous Tasks
+
+- Update CHANGELOG.md
+- Clean up compilation warnings (unused imports, mut, dead code assignments)
+- Install rustfmt in nightly toolchain for xgboost build script
+- Ensure xgboost deps dir exists in rust workflow
+- Use system libxgboost for xgboost builds
+
 ## [0.1.2] - 2026-05-06
 
 ### 🚀 Features
