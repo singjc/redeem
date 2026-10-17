@@ -28,12 +28,20 @@ pub mod metadata;
 mod mobility_consensus;
 pub mod model;
 pub mod msp;
+// Frozen research checkpoint chain; not the trainable production architecture.
+#[path = "historical_checkpoints/multimodal_v0270.rs"]
 mod multimodal_v0270;
+#[path = "historical_checkpoints/multimodal_v0310.rs"]
 mod multimodal_v0310;
+#[path = "historical_checkpoints/multimodal_v0350.rs"]
 mod multimodal_v0350;
+#[path = "historical_checkpoints/multimodal_v0360.rs"]
 mod multimodal_v0360;
+#[path = "historical_checkpoints/multimodal_v0500.rs"]
 mod multimodal_v0500;
+#[path = "historical_checkpoints/multimodal_v0510.rs"]
 mod multimodal_v0510;
+#[path = "historical_checkpoints/multimodal_v0520.rs"]
 mod multimodal_v0520;
 pub mod normalization;
 pub mod optimizer;
