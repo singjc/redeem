@@ -444,6 +444,7 @@ impl FoundationModel {
                 "foundation warm-start instrument vocabulary does not match the current corpus"
             );
         }
+        ensure_warm_start_target_space(metadata.target_normalization, self.normalization)?;
         let model_path = checkpoint.join("model.safetensors");
         self.variables
             .load(&model_path)
@@ -688,6 +689,23 @@ pub fn read_foundation_checkpoint_metadata(
     read_metadata(checkpoint.as_ref())
 }
 
+// Reusing normalized regression-head weights with freshly refitted TRAIN
+// statistics changes their native-unit meaning. Historical v0.52 explicitly
+// inherited the parent normalization; a production warm start must be equally
+// strict until an explicit, tested target-space remapping exists.
+fn ensure_warm_start_target_space(
+    checkpoint: FoundationTargetNormalizationConfig,
+    active: FoundationTargetNormalizationConfig,
+) -> Result<()> {
+    if checkpoint != active {
+        anyhow::bail!(
+            "foundation warm-start target normalization does not match current TRAIN targets; \
+             refusing to load regression weights in a different target space"
+        );
+    }
+    Ok(())
+}
+
 fn read_metadata(checkpoint: &Path) -> Result<FoundationCheckpointMetadata> {
     let path = checkpoint.join("metadata.yaml");
     let metadata: FoundationCheckpointMetadata = serde_yaml::from_str(
@@ -799,6 +817,37 @@ fn no_corruption() -> FoundationCorruptionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_start_requires_identical_rt_and_ccs_target_space() {
+        use super::super::normalization::FoundationRegressionNormalizationStrategy;
+
+        let mut saved = FoundationTargetNormalizationConfig::default();
+        saved.rt.strategy = FoundationRegressionNormalizationStrategy::TrainStandardize;
+        saved.rt.mean = Some(20.0);
+        saved.rt.standard_deviation = Some(4.0);
+        saved.rt.label_count = 128;
+        saved.ccs.strategy = FoundationRegressionNormalizationStrategy::TrainStandardize;
+        saved.ccs.mean = Some(450.0);
+        saved.ccs.standard_deviation = Some(60.0);
+        saved.ccs.label_count = 100;
+
+        assert!(ensure_warm_start_target_space(saved, saved).is_ok());
+
+        let mut changed_rt = saved;
+        changed_rt.rt.mean = Some(21.0);
+        let rt_error = ensure_warm_start_target_space(saved, changed_rt)
+            .expect_err("different TRAIN RT statistics must fail closed");
+        assert!(rt_error.to_string().contains("target normalization"));
+
+        let mut changed_ccs = saved;
+        changed_ccs.ccs.standard_deviation = Some(61.0);
+        assert!(ensure_warm_start_target_space(saved, changed_ccs).is_err());
+
+        let mut changed_policy = saved;
+        changed_policy.rt.strategy = FoundationRegressionNormalizationStrategy::None;
+        assert!(ensure_warm_start_target_space(saved, changed_policy).is_err());
+    }
 
     #[test]
     fn default_model_is_deep_and_cross_modal_dimensions_are_valid() {
