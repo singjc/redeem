@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Arg, ArgAction, ArgMatches, Command, ValueHint};
 use log::LevelFilter;
 use std::path::PathBuf;
@@ -161,6 +161,42 @@ fn main() -> Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("identify")
+                .about("Identify grouped MS2 spectra using the frozen practical identifier")
+                .arg(
+                    Arg::new("catalog")
+                        .long("catalog")
+                        .help("Identifier candidate catalog YAML")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .value_hint(ValueHint::FilePath),
+                )
+                .arg(
+                    Arg::new("spectra")
+                        .long("spectra")
+                        .help("Observed centroid peak TSV grouped by query_id")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .value_hint(ValueHint::FilePath),
+                )
+                .arg(
+                    Arg::new("output_hits")
+                        .long("output-hits")
+                        .help("Output ranked identification hits TSV")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .value_hint(ValueHint::FilePath),
+                )
+                .arg(
+                    Arg::new("output_summary")
+                        .long("output-summary")
+                        .help("Output identifier summary TSV")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .value_hint(ValueHint::FilePath),
+                ),
+        )
+        .subcommand(
             Command::new("classifiers")
                 .about("Run classification tools such as rescoring")
                 .subcommand(
@@ -237,9 +273,39 @@ fn main() -> Result<()> {
 
     match matches.subcommand() {
         Some(("properties", sub_m)) => handle_properties(sub_m),
+        Some(("identify", sub_m)) => handle_identifier(sub_m),
         Some(("classifiers", sub_m)) => handle_classifiers(sub_m),
         _ => unreachable!("Subcommand is required by CLI configuration"),
     }
+}
+
+fn handle_identifier(matches: &ArgMatches) -> Result<()> {
+    // Reuse the parity-verified streaming executable; do not duplicate scientific scoring.
+    let program = std::env::current_exe()
+        .context("locate redeem executable")?
+        .with_file_name("foundation_identify_stream");
+    if !program.is_file() {
+        anyhow::bail!(
+            "identifier executable is missing: {}; install foundation_identify_stream alongside redeem",
+            program.display()
+        );
+    }
+    let status = std::process::Command::new(&program)
+        .arg("identify-stream")
+        .arg("--catalog")
+        .arg(matches.get_one::<PathBuf>("catalog").expect("required by clap"))
+        .arg("--spectra")
+        .arg(matches.get_one::<PathBuf>("spectra").expect("required by clap"))
+        .arg("--output-hits")
+        .arg(matches.get_one::<PathBuf>("output_hits").expect("required by clap"))
+        .arg("--output-summary")
+        .arg(matches.get_one::<PathBuf>("output_summary").expect("required by clap"))
+        .status()
+        .with_context(|| format!("execute {}", program.display()))?;
+    if !status.success() {
+        anyhow::bail!("identifier subprocess failed with status {status}");
+    }
+    Ok(())
 }
 
 fn handle_properties(matches: &ArgMatches) -> Result<()> {
