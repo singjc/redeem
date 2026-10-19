@@ -71,7 +71,7 @@ COPY scripts ./scripts
 RUN set -eux; \
     echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"; \
     cargo build --release --locked --bin redeem --features cuda; \
-    FOUNDATION_EXAMPLES="foundation_identify_stream_v0770"; \
+    FOUNDATION_EXAMPLES="foundation_identify_stream"; \
     EXAMPLE_ARGS=""; \
     for example_name in ${FOUNDATION_EXAMPLES}; do \
         test -f "redeem-properties/examples/${example_name}.rs"; \
@@ -194,6 +194,6 @@ RUN apt-get -o Acquire::Retries=5 update && \
     command -v zstd && \
     rm -rf /var/lib/apt/lists/*
 
-RUN foundation_identify_stream_v0770 --self-test
+RUN foundation_identify_stream --self-test
 
-CMD ["foundation_identify_stream_v0770", "--help"]
+CMD ["foundation_identify_stream", "--help"]

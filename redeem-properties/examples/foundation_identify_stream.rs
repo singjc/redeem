@@ -64,7 +64,7 @@ struct StreamCounts {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  foundation_identify_stream_v0770 batch-to-tsv --batch BATCH.yaml --output-spectra SPECTRA.tsv\n  foundation_identify_stream_v0770 identify-stream --catalog CATALOG.yaml --spectra SPECTRA.tsv --output-hits HITS.tsv --output-summary SUMMARY.tsv\n  foundation_identify_stream_v0770 --self-test\n  foundation_identify_stream_v0770 --version"
+    "usage:\n  foundation_identify_stream batch-to-tsv --batch BATCH.yaml --output-spectra SPECTRA.tsv\n  foundation_identify_stream identify-stream --catalog CATALOG.yaml --spectra SPECTRA.tsv --output-hits HITS.tsv --output-summary SUMMARY.tsv\n  foundation_identify_stream --self-test\n  foundation_identify_stream --version"
 }
 
 fn parse_named_values(args: &[String], allowed: &[&str]) -> Result<BTreeMap<String, String>> {
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn parser_rejects_tuning_flags() {
         let args = vec![
-            "foundation_identify_stream_v0770".to_string(),
+            "foundation_identify_stream".to_string(),
             "identify-stream".to_string(),
             "--catalog".to_string(),
             "catalog.yaml".to_string(),

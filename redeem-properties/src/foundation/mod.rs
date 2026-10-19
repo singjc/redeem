@@ -19,9 +19,9 @@ pub mod experiment;
 pub mod featurize;
 pub mod fragment_likelihood;
 pub mod fragment_relation;
-pub mod inverse_identifier_api_v0752;
-pub mod inverse_identifier_batch_v0760;
-pub mod inverse_identifier_v0751;
+pub mod identifier_api;
+pub mod identifier_batch;
+pub mod identifier_core;
 pub mod layers;
 pub mod loss;
 pub mod metadata;
@@ -154,7 +154,7 @@ pub use fragment_relation::{
     foundation_fragment_relation_validate_mass_geometry,
 };
 
-pub use inverse_identifier_api_v0752::{
+pub use identifier_api::{
     FOUNDATION_PRACTICAL_IDENTIFIER_API_SCHEMA_V0752,
     FOUNDATION_PRACTICAL_IDENTIFIER_API_VERSION_V0752,
     FOUNDATION_PRACTICAL_IDENTIFIER_DEFAULT_TOP_K_V0752,
@@ -165,7 +165,7 @@ pub use inverse_identifier_api_v0752::{
     FoundationPracticalIdentifierResultHitV0752, FoundationPracticalIdentifierServiceV0752,
 };
 
-pub use inverse_identifier_batch_v0760::{
+pub use identifier_batch::{
     FOUNDATION_PRACTICAL_IDENTIFIER_BATCH_RESPONSE_SCHEMA_V0760,
     FOUNDATION_PRACTICAL_IDENTIFIER_BATCH_SCHEMA_V0760,
     FOUNDATION_PRACTICAL_IDENTIFIER_BATCH_VERSION_V0760,
@@ -177,7 +177,7 @@ pub use inverse_identifier_batch_v0760::{
     FoundationPracticalIdentifierSearchSpaceV0760, materialize_catalog_v0760,
 };
 
-pub use inverse_identifier_v0751::{
+pub use identifier_core::{
     FOUNDATION_PRACTICAL_IDENTIFIER_ARCHITECTURE_V0751,
     FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POLICY_V0751,
     FOUNDATION_PRACTICAL_IDENTIFIER_CANDIDATE_POOL_V0751,
@@ -244,4 +244,17 @@ pub use spectrum::{
 pub use split::{
     FoundationSplitConfig, FoundationSplitIndices, FoundationSplitMode, FoundationSplitSummary,
     foundation_split_group_key, split_foundation_record_indices, split_foundation_records,
+};
+
+// Stable production names; historical schema and provenance values remain unchanged.
+pub use identifier_api::{
+    FoundationPracticalIdentifierCatalogV0752 as FoundationIdentifierCatalog,
+    FoundationPracticalIdentifierRequestV0752 as FoundationIdentifierRequest,
+    FoundationPracticalIdentifierResponseV0752 as FoundationIdentifierResponse,
+    FoundationPracticalIdentifierServiceV0752 as FoundationIdentifierService,
+};
+pub use identifier_batch::{
+    FoundationPracticalIdentifierBatchRequestV0760 as FoundationIdentifierBatchRequest,
+    FoundationPracticalIdentifierBatchResponseV0760 as FoundationIdentifierBatchResponse,
+    FoundationPracticalIdentifierBatchServiceV0760 as FoundationIdentifierBatchService,
 };

@@ -38,22 +38,22 @@ COPY redeem-cli ./redeem-cli
 COPY redeem-properties ./redeem-properties
 COPY redeem-properties-py ./redeem-properties-py
 
-RUN test -f redeem-properties/examples/foundation_identify_stream_v0770.rs && \
+RUN test -f redeem-properties/examples/foundation_identify_stream.rs && \
     test -f redeem-properties/examples/foundation_predict_checkpoint_smoke.rs && \
     cargo test --locked \
       -p redeem-properties \
       --no-default-features \
-      --example foundation_identify_stream_v0770 \
+      --example foundation_identify_stream \
       --example foundation_predict_checkpoint_smoke && \
     cargo build --release --locked \
       -p redeem-properties \
       --no-default-features \
-      --example foundation_identify_stream_v0770 \
+      --example foundation_identify_stream \
       --example foundation_predict_checkpoint_smoke && \
     mkdir -p /opt/redeem/bin && \
-    cp target/release/examples/foundation_identify_stream_v0770 /opt/redeem/bin/ && \
+    cp target/release/examples/foundation_identify_stream /opt/redeem/bin/ && \
     cp target/release/examples/foundation_predict_checkpoint_smoke /opt/redeem/bin/ && \
-    /opt/redeem/bin/foundation_identify_stream_v0770 --self-test
+    /opt/redeem/bin/foundation_identify_stream --self-test
 
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
@@ -69,9 +69,9 @@ ENV REDEEM_FOUNDATION_IMAGE_PROFILE=v0770-streaming-identifier
 COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
 
 RUN chmod 0755 /opt/redeem/bin/* && \
-    command -v foundation_identify_stream_v0770 && \
+    command -v foundation_identify_stream && \
     command -v foundation_predict_checkpoint_smoke && \
-    foundation_identify_stream_v0770 --self-test
+    foundation_identify_stream --self-test
 
 WORKDIR /work
-CMD ["foundation_identify_stream_v0770", "--self-test"]
+CMD ["foundation_identify_stream", "--self-test"]

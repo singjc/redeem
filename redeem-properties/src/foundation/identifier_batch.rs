@@ -5,7 +5,7 @@
 //! deterministic expansion of peptidoforms across explicit charge states plus an ordered batch
 //! request/response contract around one prebuilt v0.75.2 service.
 
-use super::inverse_identifier_api_v0752::{
+use super::identifier_api::{
     FoundationPracticalIdentifierCatalogCandidateV0752, FoundationPracticalIdentifierCatalogV0752,
     FoundationPracticalIdentifierModificationV0752, FoundationPracticalIdentifierRequestV0752,
     FoundationPracticalIdentifierResponseV0752, FoundationPracticalIdentifierServiceV0752,

@@ -57,12 +57,12 @@ RUN cargo build --release --locked --bin redeem --features cuda && \
     cargo build --release --locked \
       -p redeem-properties \
       --features cuda \
-      --example foundation_identify_stream_v0770 && \
+      --example foundation_identify_stream && \
     mkdir -p /opt/redeem/bin && \
     cp target/release/redeem /opt/redeem/bin/redeem && \
-    cp target/release/examples/foundation_identify_stream_v0770 \
-       /opt/redeem/bin/foundation_identify_stream_v0770 && \
-    /opt/redeem/bin/foundation_identify_stream_v0770 --self-test
+    cp target/release/examples/foundation_identify_stream \
+       /opt/redeem/bin/foundation_identify_stream && \
+    /opt/redeem/bin/foundation_identify_stream --self-test
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
 
@@ -88,10 +88,10 @@ COPY --from=builder /opt/redeem/bin/ /opt/redeem/bin/
 
 RUN chmod 0755 /opt/redeem/bin/* && \
     command -v redeem && \
-    command -v foundation_identify_stream_v0770 && \
+    command -v foundation_identify_stream && \
     command -v gzip && \
     command -v zstd && \
-    foundation_identify_stream_v0770 --self-test
+    foundation_identify_stream --self-test
 
 WORKDIR /work
 CMD ["redeem", "--help"]

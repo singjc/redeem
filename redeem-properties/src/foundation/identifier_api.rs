@@ -8,7 +8,7 @@
 
 use super::diffusion::foundation_precursor_neutral_mass;
 use super::featurize::{FoundationModification, FoundationModificationSite, PeptidoformInput};
-use super::inverse_identifier_v0751::{
+use super::identifier_core::{
     FoundationPracticalIdentifierBuildTimingsV0751, FoundationPracticalIdentifierCandidateV0751,
     FoundationPracticalIdentifierHitV0751, FoundationPracticalIdentifierV0751,
     FOUNDATION_PRACTICAL_IDENTIFIER_ARCHITECTURE_V0751,
