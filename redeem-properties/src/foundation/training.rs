@@ -8,7 +8,9 @@ use super::auxiliary_supervision::{
     chemistry_summary_targets, conformation_proxy_targets_v0520, masked_bce_with_logits,
     masked_mse, pair_interaction_targets,
 };
-use super::causal::foundation_causal_sequence_mean_nlls;
+use super::causal::{
+    foundation_causal_conditioning_margin_loss, foundation_causal_sequence_mean_nlls,
+};
 use super::collate::{FoundationCollator, FoundationCollatorConfig, FoundationCorruptionConfig};
 use super::corpus::{load_foundation_corpus, FoundationCorpusConfig};
 use super::data::{FoundationTrainingRecord, RetentionTimeObjective};
@@ -32,6 +34,7 @@ use super::spectrum::FoundationSpectrum;
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -117,10 +120,19 @@ pub struct FoundationTrainingConfig {
     pub inverse_weight: f64,
     pub inverse_ptm_mass_weight: f64,
     pub cross_modal_alignment_weight: f64,
+    /// TRAIN-only inverse preference for its matched observed MS/MS peaks. Zero means off.
+    #[serde(default)]
+    pub conditioning_margin_weight: f64,
+    /// Minimum positive matched-vs-negative NLL advantage, in nats/token.
+    #[serde(default = "default_conditioning_margin")]
+    pub conditioning_margin_nats: f64,
     pub contrastive_temperature: f64,
     pub corruption: FoundationCorruptionConfig,
 }
 
+fn default_conditioning_margin() -> f64 {
+    0.10
+}
 impl Default for FoundationTrainingConfig {
     fn default() -> Self {
         Self {
@@ -161,6 +173,8 @@ impl Default for FoundationTrainingConfig {
             inverse_weight: 1.0,
             inverse_ptm_mass_weight: 0.10,
             cross_modal_alignment_weight: 0.10,
+            conditioning_margin_weight: 0.0,
+            conditioning_margin_nats: default_conditioning_margin(),
             contrastive_temperature: 0.10,
             corruption: FoundationCorruptionConfig::default(),
         }
@@ -259,6 +273,11 @@ impl FoundationTrainingConfig {
                 "peptide_contrastive_weight",
                 self.peptide_contrastive_weight,
             ),
+            (
+                "conditioning_margin_weight",
+                self.conditioning_margin_weight,
+            ),
+            ("conditioning_margin_nats", self.conditioning_margin_nats),
             ("inverse_weight", self.inverse_weight),
             ("inverse_ptm_mass_weight", self.inverse_ptm_mass_weight),
             (
@@ -272,6 +291,14 @@ impl FoundationTrainingConfig {
         }
         if !(self.contrastive_temperature > 0.0 && self.contrastive_temperature.is_finite()) {
             anyhow::bail!("foundation contrastive_temperature must be positive and finite");
+        }
+        if self.conditioning_margin_weight > 0.0
+            && (self.strategy != FoundationTrainingStrategy::ResearchCurriculum
+                || self.inverse_weight == 0.0)
+        {
+            anyhow::bail!(
+                "conditioning margin requires research curriculum with nonzero inverse_weight"
+            );
         }
         self.ms2_loss.validate()?;
         Ok(())
@@ -515,6 +542,16 @@ pub fn train_foundation_model(
         None
     };
 
+    // Build the candidate index solely from TRAIN; validation and protected
+    // indices are not considered even when their records share the same corpus.
+    let conditioning_donors = if training.conditioning_margin_weight > 0.0 {
+        Some(FoundationTrainSpectrumDonors::build(
+            &corpus.records,
+            &train_indices,
+        )?)
+    } else {
+        None
+    };
     let train_collator = FoundationCollator::new(
         model_config.peptide.clone(),
         FoundationCollatorConfig {
@@ -638,6 +675,7 @@ pub fn train_foundation_model(
                 &train_collator,
                 &training,
                 mobility_consensus.as_ref(),
+                conditioning_donors.as_ref(),
                 peptide_optimizer
                     .as_mut()
                     .expect("research peptide optimizer"),
@@ -956,6 +994,178 @@ fn write_research_exposure(
     Ok(())
 }
 
+/// Experimental charge/precursor-m/z candidate index. All indices come from the
+/// TRAIN partition. Never scan the full corpus for a donor without this index.
+struct FoundationTrainSpectrumDonors {
+    bins: HashMap<(i32, i64), Vec<usize>>,
+}
+const FOUNDATION_NEGATIVE_MZ_WINDOW: f32 = 0.5;
+fn conditioning_mz_bin(mz: f32) -> Option<i64> {
+    (mz.is_finite() && mz > 0.0 && mz < 100_000.0)
+        .then(|| (mz / FOUNDATION_NEGATIVE_MZ_WINDOW).floor() as i64)
+}
+fn conditioning_has_valid_peaks(record: &FoundationTrainingRecord) -> bool {
+    record.observed_spectrum_peaks.iter().any(|peak| {
+        peak.mz.is_finite() && peak.mz > 0.0 && peak.intensity.is_finite() && peak.intensity > 0.0
+    })
+}
+impl FoundationTrainSpectrumDonors {
+    fn build(records: &[FoundationTrainingRecord], train_indices: &[usize]) -> Result<Self> {
+        let mut bins: HashMap<(i32, i64), Vec<usize>> = HashMap::new();
+        for &index in train_indices {
+            let record = records
+                .get(index)
+                .ok_or_else(|| anyhow::anyhow!("TRAIN donor index outside corpus: {index}"))?;
+            if !conditioning_has_valid_peaks(record) {
+                continue;
+            }
+            if let (Some(charge), Some(mz)) = (record.context.charge, record.context.precursor_mz) {
+                if charge > 0 {
+                    if let Some(bin) = conditioning_mz_bin(mz) {
+                        bins.entry((charge, bin)).or_default().push(index);
+                    }
+                }
+            }
+        }
+        if bins.is_empty() {
+            anyhow::bail!("TRAIN has no eligible raw observed spectrum/precursor donor entries");
+        }
+        Ok(Self { bins })
+    }
+    fn donor<'a>(
+        &self,
+        recipient: &FoundationTrainingRecord,
+        records: &'a [FoundationTrainingRecord],
+    ) -> Option<&'a FoundationTrainingRecord> {
+        let charge = recipient.context.charge.filter(|charge| *charge > 0)?;
+        let mz = recipient.context.precursor_mz?;
+        let bin = conditioning_mz_bin(mz)?;
+        let mut best: Option<(f32, usize)> = None;
+        for nearby in [bin - 1, bin, bin + 1] {
+            if let Some(indices) = self.bins.get(&(charge, nearby)) {
+                for &index in indices {
+                    let candidate = &records[index];
+                    let candidate_mz = candidate.context.precursor_mz?;
+                    let delta = (candidate_mz - mz).abs();
+                    if delta > FOUNDATION_NEGATIVE_MZ_WINDOW
+                        || candidate.peptidoform == recipient.peptidoform
+                        || candidate.observed_spectrum_peaks == recipient.observed_spectrum_peaks
+                    {
+                        continue;
+                    }
+                    if best.map_or(true, |(best_delta, best_index)| {
+                        delta < best_delta || (delta == best_delta && index < best_index)
+                    }) {
+                        best = Some((delta, index));
+                    }
+                }
+            }
+        }
+        best.map(|(_, index)| &records[index])
+    }
+}
+
+/// Only observed product-ion peaks change. All precursor and target fields are
+/// copied from recipient, not donor. Never use a generated/theoretical fragment.
+fn conditioning_training_pairs(
+    selected: &[FoundationTrainingRecord],
+    train_records: &[FoundationTrainingRecord],
+    donors: &FoundationTrainSpectrumDonors,
+) -> Result<(
+    Vec<FoundationTrainingRecord>,
+    Vec<FoundationTrainingRecord>,
+    usize,
+)> {
+    let mut matched = Vec::new();
+    let mut swapped = Vec::new();
+    let mut eligible = 0usize;
+    for recipient in selected {
+        if !conditioning_has_valid_peaks(recipient)
+            || recipient
+                .context
+                .charge
+                .filter(|charge| *charge > 0)
+                .is_none()
+            || recipient
+                .context
+                .precursor_mz
+                .and_then(conditioning_mz_bin)
+                .is_none()
+        {
+            continue;
+        }
+        eligible += 1;
+        if let Some(donor) = donors.donor(recipient, train_records) {
+            let mut negative = recipient.clone();
+            negative.observed_spectrum_peaks = donor.observed_spectrum_peaks.clone();
+            if FoundationSpectrum::from_training_record(&negative)
+                != FoundationSpectrum::from_training_record(donor)
+            {
+                anyhow::bail!("negative spectrum was not sourced from the TRAIN donor peaks");
+            }
+            let mut restored = negative.clone();
+            restored.observed_spectrum_peaks = recipient.observed_spectrum_peaks.clone();
+            if &restored != recipient {
+                anyhow::bail!(
+                    "negative spectrum changed precursor, target, or other non-peak fields"
+                );
+            }
+            matched.push(recipient.clone());
+            swapped.push(negative);
+        }
+    }
+    Ok((matched, swapped, eligible))
+}
+
+/// Evaluate the same shifted target, prefix and precursor under two peak sets.
+/// Eval mode disables stochastic dropout, but Candle still retains gradients.
+fn conditioning_pair_margin_loss(
+    model: &FoundationModel,
+    matched: &[FoundationTrainingRecord],
+    swapped: &[FoundationTrainingRecord],
+    margin: f64,
+    device: &Device,
+) -> Result<Tensor> {
+    if matched.is_empty() || matched.len() != swapped.len() {
+        anyhow::bail!("conditioning margin requires equal nonempty paired batches");
+    }
+    let peptides = matched
+        .iter()
+        .map(|record| record.peptidoform.clone())
+        .collect::<Vec<_>>();
+    let prefix = model.causal_collator().collate(&peptides, device)?;
+    let context = model
+        .peptide_collator()
+        .collate(matched, device, 0)?
+        .context;
+    let matched_peaks = matched
+        .iter()
+        .map(|record| {
+            FoundationSpectrum::from_training_record(record)
+                .ok_or_else(|| anyhow::anyhow!("missing matched observed spectrum"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let swapped_peaks = swapped
+        .iter()
+        .map(|record| {
+            FoundationSpectrum::from_training_record(record)
+                .ok_or_else(|| anyhow::anyhow!("missing swapped observed spectrum"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let matched_batch = model.spectrum_collator().collate(&matched_peaks, device)?;
+    let swapped_batch = model.spectrum_collator().collate(&swapped_peaks, device)?;
+    let correct = model.inverse_forward_t(&prefix, &matched_batch, &context, false)?;
+    let incorrect = model.inverse_forward_t(&prefix, &swapped_batch, &context, false)?;
+    // Preserve the row axis: a positive result on one peptide must not mask
+    // a negative result on another. Average individual hinge penalties only.
+    let matched_nll = foundation_causal_sequence_mean_nlls(&correct, &prefix)?;
+    let swapped_nll = foundation_causal_sequence_mean_nlls(&incorrect, &prefix)?;
+    Ok(
+        foundation_causal_conditioning_margin_loss(&matched_nll, &swapped_nll, margin)?
+            .mean_all()?,
+    )
+}
+
 fn run_epoch_research_curriculum(
     model: &FoundationModel,
     records: &[FoundationTrainingRecord],
@@ -963,6 +1173,7 @@ fn run_epoch_research_curriculum(
     collator: &FoundationCollator,
     config: &FoundationTrainingConfig,
     mobility_consensus: Option<&MobilityConsensusSupervision>,
+    conditioning_donors: Option<&FoundationTrainSpectrumDonors>,
     peptide_optimizer: &mut FoundationAdamW,
     inverse_optimizer: &mut FoundationAdamW,
     max_batches: Option<usize>,
@@ -973,6 +1184,8 @@ fn run_epoch_research_curriculum(
 ) -> Result<FoundationEpochLosses> {
     let mut aggregate = FoundationEpochLosses::default();
     let mut stage_loss_sums = [0.0f64; 5];
+    let mut conditioning_eligible = 0usize;
+    let mut conditioning_pairs = 0usize;
     let cycles =
         research_curriculum_cycles(indices.len(), config).min(max_batches.unwrap_or(usize::MAX));
     let consensus_order = mobility_consensus.map(|supervision| {
@@ -1018,7 +1231,7 @@ fn run_epoch_research_curriculum(
                 FoundationCurriculumStage::Representation => collator,
                 _ => model.peptide_collator(),
             };
-            let loss = if matches!(stage, FoundationCurriculumStage::Mobility)
+            let mut loss = if matches!(stage, FoundationCurriculumStage::Mobility)
                 && mobility_consensus.is_some()
             {
                 let supervision = mobility_consensus.expect("checked presence");
@@ -1052,7 +1265,7 @@ fn run_epoch_research_curriculum(
                 } else {
                     &selected[..selected.len().min(config.batch_size)]
                 };
-                batch_loss(
+                let mut ordinary = batch_loss(
                     model,
                     selected,
                     stage_collator,
@@ -1060,7 +1273,33 @@ fn run_epoch_research_curriculum(
                     stage_seed,
                     true,
                     device,
-                )?
+                )?;
+                if matches!(stage, FoundationCurriculumStage::Inverse)
+                    && staged.conditioning_margin_weight > 0.0
+                {
+                    let donors = conditioning_donors.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "conditioning margin enabled without a TRAIN-only donor index"
+                        )
+                    })?;
+                    let (matched, swapped, eligible) =
+                        conditioning_training_pairs(selected, records, donors)?;
+                    conditioning_eligible += eligible;
+                    conditioning_pairs += matched.len();
+                    if !matched.is_empty() {
+                        let margin = conditioning_pair_margin_loss(
+                            model,
+                            &matched,
+                            &swapped,
+                            staged.conditioning_margin_nats,
+                            device,
+                        )?;
+                        ordinary.total = (ordinary.total
+                            + margin.affine(staged.conditioning_margin_weight, 0.0)?)?;
+                        ordinary.scalars.total = ordinary.total.to_scalar::<f32>()?;
+                    }
+                }
+                ordinary
             };
             let lr = scheduled_learning_rate(config, *global_update, planned_updates);
             match stage {
@@ -1080,6 +1319,17 @@ fn run_epoch_research_curriculum(
     }
     if aggregate.batches == 0 {
         anyhow::bail!("foundation research-curriculum epoch produced no updates");
+    }
+    if config.conditioning_margin_weight > 0.0 {
+        let fraction = if conditioning_eligible == 0 {
+            0.0
+        } else {
+            conditioning_pairs as f64 / conditioning_eligible as f64
+        };
+        println!("foundation_conditioning_pairs\tpaired={conditioning_pairs}\teligible={conditioning_eligible}\tfraction={fraction:.6}");
+        if conditioning_eligible == 0 || fraction < 0.50 {
+            anyhow::bail!("TRAIN inverse spectrum-negative coverage too low: {conditioning_pairs}/{conditioning_eligible} (minimum 50%)");
+        }
     }
     let n = cycles as f64;
     println!("foundation_stage_losses\tproperty_a={:.6}\tproperty_b={:.6}\trepresentation={:.6}\tmobility={:.6}\tinverse={:.6}",
@@ -1231,6 +1481,7 @@ fn staged_training_config(
     config.inverse_weight = 0.0;
     config.inverse_ptm_mass_weight = 0.0;
     config.cross_modal_alignment_weight = 0.0;
+    config.conditioning_margin_weight = 0.0;
     config.pair_auxiliary_weight = 0.0;
     config.chemistry_summary_weight = 0.0;
     config.conformation_proxy_weight = 0.0;
@@ -1257,6 +1508,7 @@ fn staged_training_config(
             config.inverse_weight = base.inverse_weight;
             config.inverse_ptm_mass_weight = base.inverse_ptm_mass_weight;
             config.cross_modal_alignment_weight = base.cross_modal_alignment_weight;
+            config.conditioning_margin_weight = base.conditioning_margin_weight;
         }
     }
     config
@@ -1981,6 +2233,115 @@ fn append_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn example_conditioning_record(
+        sequence: &str,
+        mz: f32,
+        charge: i32,
+        peak_mz: f32,
+    ) -> FoundationTrainingRecord {
+        FoundationTrainingRecord {
+            peptidoform: super::super::featurize::PeptidoformInput::unmodified(sequence),
+            retention_time: Default::default(),
+            ccs: None,
+            fragments: Vec::new(),
+            observed_spectrum_peaks: vec![super::super::data::ObservedSpectrumPeak {
+                mz: peak_mz,
+                intensity: 100.0,
+            }],
+            context: super::super::data::TrainingContext {
+                charge: Some(charge),
+                precursor_mz: Some(mz),
+                ..Default::default()
+            },
+            run_id: None,
+        }
+    }
+    #[test]
+    fn conditioning_config_defaults_off_and_rejects_bad_weights() {
+        let mut config = FoundationTrainingConfig::default();
+        assert_eq!(config.conditioning_margin_weight, 0.0);
+        assert_eq!(config.conditioning_margin_nats, 0.10);
+        let mut value = serde_yaml::to_value(&config).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String(
+                "conditioning_margin_weight".into(),
+            ));
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String(
+                "conditioning_margin_nats".into(),
+            ));
+        let old: FoundationTrainingConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(old.conditioning_margin_weight, 0.0);
+        config.conditioning_margin_weight = f64::NAN;
+        assert!(config.validate().is_err());
+        config.conditioning_margin_weight = 0.25;
+        config.conditioning_margin_nats = -0.1;
+        assert!(config.validate().is_err());
+        config.conditioning_margin_nats = 0.10;
+        config.validate().unwrap();
+        assert_eq!(
+            staged_training_config(&config, FoundationCurriculumStage::Property)
+                .conditioning_margin_weight,
+            0.0
+        );
+        assert_eq!(
+            staged_training_config(&config, FoundationCurriculumStage::Inverse)
+                .conditioning_margin_weight,
+            0.25
+        );
+        config.strategy = FoundationTrainingStrategy::Joint;
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn conditioning_loss_preserves_per_record_hinge() {
+        let device = Device::Cpu;
+        let matched = Tensor::new(&[1.0f32, 1.0], &device).unwrap();
+        let shuffled = Tensor::new(&[1.5f32, 0.9], &device).unwrap();
+        let penalty = foundation_causal_conditioning_margin_loss(&matched, &shuffled, 0.1)
+            .unwrap()
+            .mean_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        // First record 0, second 0.2; mean 0.1. A global hinge would wrongly be 0.
+        assert!((penalty - 0.10).abs() < 1.0e-6);
+    }
+    #[test]
+    fn conditioning_negative_changes_only_measured_peaks_and_uses_train_index() {
+        let recipient = example_conditioning_record("PEPTIDE", 500.0, 2, 201.0);
+        let donor = example_conditioning_record("TESTPEP", 500.2, 2, 302.0);
+        let wrong_charge = example_conditioning_record("CHARGES", 500.1, 3, 303.0);
+        let outside_mass = example_conditioning_record("FARAWAY", 510.0, 2, 405.0);
+        let duplicate = example_conditioning_record("PEPTIDE", 500.1, 2, 309.0);
+        let corpus = vec![
+            recipient.clone(),
+            donor.clone(),
+            wrong_charge,
+            outside_mass,
+            duplicate,
+        ];
+        let indexed = FoundationTrainSpectrumDonors::build(&corpus, &[0, 1, 2, 3, 4]).unwrap();
+        let (matched, swapped, eligible) =
+            conditioning_training_pairs(&[recipient.clone()], &corpus, &indexed).unwrap();
+        assert_eq!((eligible, matched.len(), swapped.len()), (1, 1, 1));
+        assert_eq!(matched[0], recipient);
+        assert_eq!(
+            swapped[0].observed_spectrum_peaks,
+            donor.observed_spectrum_peaks
+        );
+        assert_eq!(swapped[0].peptidoform, recipient.peptidoform);
+        assert_eq!(swapped[0].context, recipient.context);
+        let restricted = FoundationTrainSpectrumDonors::build(&corpus, &[0, 2, 3, 4]).unwrap();
+        let (matched, _, eligible) =
+            conditioning_training_pairs(&[recipient], &corpus, &restricted).unwrap();
+        assert_eq!(eligible, 1);
+        assert!(matched.is_empty()); // The unindexed donor must not be used.
+    }
 
     #[test]
     fn default_training_config_enables_forward_inverse_and_alignment() {
