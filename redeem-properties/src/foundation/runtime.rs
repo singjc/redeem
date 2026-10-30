@@ -108,6 +108,10 @@ pub struct FoundationModelConfig {
     pub auxiliary_supervision_heads: bool,
     /// Spectrum encoder plus autoregressive peptide decoder.
     pub inverse: FoundationDiffusionConfig,
+    /// Intrinsic RT label the RT head predicts. Older checkpoints omit this field and
+    /// keep the source-native `IntrinsicAndObserved` target.
+    #[serde(default)]
+    pub rt_objective: RetentionTimeObjective,
 }
 
 impl Default for FoundationModelConfig {
@@ -144,6 +148,7 @@ impl Default for FoundationModelConfig {
             specialists: FoundationSpecialistConfig::default(),
             auxiliary_supervision_heads: true,
             inverse,
+            rt_objective: RetentionTimeObjective::IntrinsicAndObserved,
         }
     }
 }
@@ -348,7 +353,7 @@ impl FoundationModel {
         let peptide_collator = FoundationCollator::new(
             config.peptide.clone(),
             FoundationCollatorConfig {
-                retention_time_objective: RetentionTimeObjective::IntrinsicAndObserved,
+                retention_time_objective: config.rt_objective,
                 corruption: no_corruption(),
             },
         )?;
@@ -919,6 +924,33 @@ mod tests {
             ));
         let legacy: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
         assert!(!legacy.auxiliary_supervision_heads);
+    }
+
+    #[test]
+    fn missing_rt_objective_keeps_source_native_target_and_harmonized_is_opt_in() {
+        let mut value = serde_yaml::to_value(FoundationModelConfig::default()).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("rt_objective".into()));
+        let legacy: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(
+            legacy.rt_objective,
+            RetentionTimeObjective::IntrinsicAndObserved
+        );
+        let labels = super::super::data::RetentionTimeLabels {
+            normalized: Some(40.0),
+            harmonized: Some(50.0),
+            observed_seconds: Some(1800.0),
+        };
+        assert_eq!(legacy.rt_objective.target(&labels), Some(40.0));
+        assert_eq!(
+            RetentionTimeObjective::Harmonized.target(&labels),
+            Some(50.0)
+        );
+        let harmonized: FoundationModelConfig =
+            serde_yaml::from_str("rt_objective: Harmonized").unwrap();
+        assert_eq!(harmonized.rt_objective, RetentionTimeObjective::Harmonized);
     }
 
     #[test]

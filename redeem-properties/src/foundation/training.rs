@@ -478,11 +478,8 @@ pub fn train_foundation_model(
             ..FoundationRegressionNormalization::default()
         },
     };
-    normalization.resolve_from_training_partition(
-        &corpus.records,
-        &train_indices,
-        RetentionTimeObjective::IntrinsicAndObserved,
-    )?;
+    let rt_objective = training.model.rt_objective;
+    normalization.resolve_from_training_partition(&corpus.records, &train_indices, rt_objective)?;
 
     let mut model_config = training.model.clone();
     model_config.peptide.instrument_vocab_size = source.corpus.instrument_vocab_size;
@@ -518,7 +515,7 @@ pub fn train_foundation_model(
     let train_collator = FoundationCollator::new(
         model_config.peptide.clone(),
         FoundationCollatorConfig {
-            retention_time_objective: RetentionTimeObjective::IntrinsicAndObserved,
+            retention_time_objective: rt_objective,
             corruption: training.corruption,
         },
     )?;
@@ -1576,7 +1573,13 @@ fn evaluate_partition(
         aggregate.records += owned.len();
         let predictions = model.predict_records(&owned)?;
         for (record, prediction) in owned.iter().zip(&predictions) {
-            accumulate_forward_metrics(&mut aggregate, record, prediction, ms2_cosine_epsilon);
+            accumulate_forward_metrics(
+                &mut aggregate,
+                record,
+                prediction,
+                ms2_cosine_epsilon,
+                model.config().rt_objective,
+            );
         }
     }
 
@@ -1697,9 +1700,12 @@ fn accumulate_forward_metrics(
     record: &FoundationTrainingRecord,
     prediction: &crate::models::model_interface::PredictionOutput,
     cosine_epsilon: f64,
+    rt_objective: RetentionTimeObjective,
 ) {
     if let (Some(target), Some(predicted)) = (
-        training_rt_target(record).filter(|value| value.is_finite()),
+        rt_objective
+            .target(&record.retention_time)
+            .filter(|value| value.is_finite()),
         prediction.rt.filter(|value| value.is_finite()),
     ) {
         let error = f64::from(predicted - target);
@@ -1872,10 +1878,6 @@ fn l2_normalize_rows(rows: &[Vec<f32>]) -> Vec<Option<Vec<f64>>> {
 
 fn dot_product(left: &[f64], right: &[f64]) -> f64 {
     left.iter().zip(right).map(|(a, b)| a * b).sum()
-}
-
-fn training_rt_target(record: &FoundationTrainingRecord) -> Option<f32> {
-    record.retention_time.normalized
 }
 
 fn il_equivalent(left: &str, right: &str) -> bool {
