@@ -232,7 +232,7 @@ pub use rt_harmonization::{
     FoundationRtCrossSourceConsistency, FoundationRtHarmonizationFitConfig,
     FoundationRtHarmonizationFitResult, FoundationRtHarmonizationTransform,
     FoundationRtSourceCalibrationSummary, apply_foundation_rt_harmonization,
-    fit_foundation_rt_harmonization,
+    fit_foundation_rt_harmonization, foundation_rt_partition_consistency,
 };
 
 pub use spectrum::{
