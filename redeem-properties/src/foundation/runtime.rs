@@ -954,6 +954,27 @@ mod tests {
     }
 
     #[test]
+    fn rt_objective_override_requires_full_model_block() {
+        // A partial block falls back to legacy field defaults (different architecture).
+        let partial: FoundationModelConfig =
+            serde_yaml::from_str("rt_objective: Harmonized").unwrap();
+        assert_ne!(
+            partial.peptide_backbone,
+            FoundationModelConfig::default().peptide_backbone
+        );
+        // The full default block with only rt_objective changed keeps the architecture.
+        let mut value = serde_yaml::to_value(FoundationModelConfig::default()).unwrap();
+        value.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("rt_objective".into()),
+            serde_yaml::Value::String("Harmonized".into()),
+        );
+        let full: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
+        let mut expected = FoundationModelConfig::default();
+        expected.rt_objective = RetentionTimeObjective::Harmonized;
+        assert_eq!(full, expected);
+    }
+
+    #[test]
     fn greedy_token_filter_enforces_basic_peptide_grammar() {
         assert!(!token_allowed(FOUNDATION_DIFFUSION_EOS, false, false));
         assert!(token_allowed(
