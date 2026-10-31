@@ -53,7 +53,13 @@ main() {
   fi
   gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
   if [[ "$gpu_name" != *A100* ]]; then echo "ERROR: expected A100, got $gpu_name" >&2; return 2; fi
-  out="$exp/runs/arm${F1_ARM}_${source_sha:0:12}_${SLURM_JOB_ID}"
+  # Output root is selectable because /nfs/research (gpfs) filled to 100% during 14976065/6.
+  local out_root="${F1_OUT_ROOT:-$exp/runs}"
+  if ! mkdir -p "$out_root"; then echo "ERROR: cannot create $out_root" >&2; return 2; fi
+  if [ "$(df -Pk "$out_root" | awk 'NR==2{print $4}')" -lt 5242880 ]; then
+    echo "ERROR: less than 5 GiB free at $out_root" >&2; return 2
+  fi
+  out="$out_root/arm${F1_ARM}_${source_sha:0:12}_${SLURM_JOB_ID}"
   if [ -e "$out" ]; then echo "ERROR: refusing to overwrite $out" >&2; return 2; fi
   if ! mkdir -p "$out"; then echo 'ERROR: unable to create output directory' >&2; return 2; fi
   config="$out/config.json"
@@ -103,7 +109,7 @@ print(f'F1_RTOBJ_CONFIG_PREFLIGHT=PASS rt_objective={objective}')
 PY
   then echo 'ERROR: training config preflight failed' >&2; return 3; fi
   sha256sum "$config" > "$out/config_sha256.txt"
-  if ! singularity exec --nv --bind "$root:$root" "$SIF" \
+  if ! singularity exec --nv --bind "$root:$root" --bind "$out_root:$out_root" "$SIF" \
       /opt/redeem/bin/redeem properties train "$config" > "$out/train.log" 2>&1; then
     echo 'ERROR: training failed; tail of log:' >&2; tail -n 100 "$out/train.log" >&2; return 5
   fi
@@ -138,7 +144,7 @@ cfg=dict(model_arch='foundation',device='cuda',model_path=model,
 with open(path,'w') as f: json.dump(cfg,f,sort_keys=True,indent=2)
 PY
     then echo "ERROR: failed to write inference config $tag" >&2; return 5; fi
-    if ! singularity exec --nv --bind "$root:$root" "$SIF" \
+    if ! singularity exec --nv --bind "$root:$root" --bind "$out_root:$out_root" "$SIF" \
       /opt/redeem/bin/redeem properties inference "$inf_cfg" > "$out/reload_${tag}.log" 2>&1; then
       echo "ERROR: checkpoint reload failed for $tag" >&2; tail -n 80 "$out/reload_${tag}.log" >&2; return 5
     fi
