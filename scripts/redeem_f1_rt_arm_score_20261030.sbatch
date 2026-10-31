@@ -17,7 +17,7 @@ RUN_YAML="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/pre
 RUN_SHA=7214b9cdd3836ec028655d5d6b8bb088280558626b24c9afc63ec06d582b4201
 CORPUS_FNV=fnv1a64:a2a6f57d31064ba6
 BENCH_FNV=fnv1a64:2133c039625f77df
-OUT="$EXP/runs/arm_score_${SLURM_JOB_ID}"
+OUT="${F1_OUT_ROOT:-$EXP/runs}/arm_score_${SLURM_JOB_ID}"  # F1_OUT_ROOT: /gpfs was 100% full on 2026-10-31
 test -n "${EXPECTED_BIN_SHA256:-}" || { echo "BLOCKED: EXPECTED_BIN_SHA256 unset"; exit 2; }
 test -n "${CKPTS:-}" || { echo "BLOCKED: CKPTS unset"; exit 2; }
 test ! -e "$OUT" || { echo "BLOCKED: output exists $OUT"; exit 2; }
