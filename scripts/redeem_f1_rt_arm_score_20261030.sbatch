@@ -12,7 +12,7 @@
 set -euo pipefail
 ROOT=/nfs/research/juan/DIA/singj/foundation_model
 EXP="$ROOT/experiments/redeem_f1_rt_contract_audit_20261030"
-BIN="$EXP/bin/foundation_f1_rt_arm_score"
+BIN="$EXP/bin/${F1_SCORER_BIN:-foundation_f1_rt_arm_score}"  # F1_SCORER_BIN selects a newer pinned build
 RUN_YAML="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/run_v0260.yaml"
 RUN_SHA=7214b9cdd3836ec028655d5d6b8bb088280558626b24c9afc63ec06d582b4201
 CORPUS_FNV=fnv1a64:a2a6f57d31064ba6
@@ -27,7 +27,7 @@ for c in "${CK[@]}"; do test -s "$c/model.safetensors" -a -s "$c/metadata.yaml" 
 mkdir -p "$OUT"
 {
   echo "job_id=$SLURM_JOB_ID"; echo "host=$(hostname)"; echo "bin_sha256=$EXPECTED_BIN_SHA256"
-  echo "source_commit=3f17de4"; echo "run_yaml_sha256=$RUN_SHA"; echo "max_records=1024"
+  echo "source_commit=${F1_SCORER_COMMIT:-3f17de4}"; echo "bin=$BIN"; echo "run_yaml_sha256=$RUN_SHA"; echo "max_records=1024"
   echo "test_labels_read=NO"; for c in "${CK[@]}"; do sha256sum "$c/model.safetensors" "$c/metadata.yaml"; done
   date -u +started=%FT%TZ
 } > "$OUT/provenance.txt"
