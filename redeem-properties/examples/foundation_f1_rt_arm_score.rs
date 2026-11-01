@@ -7,13 +7,17 @@
 //!
 //! usage: foundation_f1_rt_arm_score RUN.yaml RUN_SHA256 CORPUS_FNV BENCHMARK_FNV MAX_RECORDS CKPT...
 //!        foundation_f1_rt_arm_score --self-test
+//!
+//! A checkpoint whose metadata has `version: 520` is read with the frozen v0.52 forward
+//! reader (`ResearchV0520Forward`); its RT objective comes from its metadata.
 
 use anyhow::{Context, Result};
 use candle_core::Device;
 use redeem_properties::foundation::{
     load_foundation_corpus, FoundationBenchmarkManifest, FoundationCheckpointMetadata,
     FoundationCorpusConfig, FoundationModel, FoundationPartition,
-    FoundationRtHarmonizationTransform, RetentionTimeObjective,
+    FoundationRtHarmonizationTransform, FoundationTrainingRecord, ResearchV0520Forward,
+    RetentionTimeObjective,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -56,6 +60,33 @@ impl Errors {
             vp += (p - mp).powi(2);
         }
         c / (vt * vp).sqrt()
+    }
+}
+
+/// Frozen v0.52 checkpoint header (only the fields the scorer needs).
+#[derive(Deserialize)]
+struct V0520Header {
+    version: u32,
+    rt_objective: RetentionTimeObjective,
+    completed_updates: usize,
+}
+
+/// One checkpoint behind a common RT-prediction call.
+enum Scored {
+    Unified(FoundationModel),
+    V0520(ResearchV0520Forward),
+}
+
+impl Scored {
+    fn rt(&self, records: &[FoundationTrainingRecord]) -> Result<Vec<Option<f32>>> {
+        Ok(match self {
+            Self::Unified(m) => m
+                .predict_records(records)?
+                .into_iter()
+                .map(|p| p.rt)
+                .collect(),
+            Self::V0520(m) => m.infer(records)?.into_iter().map(|p| Some(p.rt)).collect(),
+        })
     }
 }
 
@@ -174,25 +205,39 @@ fn main() -> Result<()> {
     );
     println!("#source\tcheckpoint\tsource\tn\tmae_harmonized");
     for checkpoint in &args[6..] {
-        let metadata: FoundationCheckpointMetadata = serde_yaml::from_str(
-            &std::fs::read_to_string(PathBuf::from(checkpoint).join("metadata.yaml"))?,
-        )?;
-        anyhow::ensure!(
-            metadata.corpus_fingerprint.as_deref() == Some(corpus_fnv.as_str())
-                && metadata.benchmark_fingerprint.as_deref() == Some(benchmark_fnv.as_str()),
-            "checkpoint fingerprints differ: {checkpoint}"
-        );
-        let model = FoundationModel::load(checkpoint, Device::Cpu)?;
-        let objective = model.config().rt_objective;
+        let text = std::fs::read_to_string(PathBuf::from(checkpoint).join("metadata.yaml"))?;
+        let v0520 = serde_yaml::from_str::<V0520Header>(&text)
+            .ok()
+            .filter(|h| h.version == 520);
+        let (model, objective, progress) = if let Some(header) = v0520 {
+            let model = ResearchV0520Forward::load(checkpoint.as_ref(), Device::Cpu)?;
+            model
+                .verify_fingerprints(corpus.corpus_fingerprint, benchmark.manifest_fingerprint())?;
+            let progress = format!("updates={}", header.completed_updates);
+            (Scored::V0520(model), header.rt_objective, progress)
+        } else {
+            let metadata: FoundationCheckpointMetadata = serde_yaml::from_str(&text)?;
+            anyhow::ensure!(
+                metadata.corpus_fingerprint.as_deref() == Some(corpus_fnv.as_str())
+                    && metadata.benchmark_fingerprint.as_deref() == Some(benchmark_fnv.as_str()),
+                "checkpoint fingerprints differ: {checkpoint}"
+            );
+            let model = FoundationModel::load(checkpoint, Device::Cpu)?;
+            let objective = model.config().rt_objective;
+            (
+                Scored::Unified(model),
+                objective,
+                metadata.completed_epochs.to_string(),
+            )
+        };
         let mut all = Errors::default();
         let mut by_source = BTreeMap::<String, Errors>::new();
         for chunk in eligible.chunks(8) {
             let records: Vec<_> = chunk.iter().map(|&i| corpus.records[i].clone()).collect();
-            for (&i, prediction) in chunk.iter().zip(model.predict_records(&records)?) {
+            for (&i, rt) in chunk.iter().zip(model.rt(&records)?) {
                 let source = &corpus.provenance[i].source_id;
                 let target = f64::from(corpus.records[i].retention_time.harmonized.unwrap());
-                let predicted = prediction
-                    .rt
+                let predicted = rt
                     .and_then(|p| to_harmonized(objective, p, &transforms[source]))
                     .with_context(|| format!("no RT prediction for record {i}"))?;
                 all.push(target, predicted);
@@ -203,8 +248,7 @@ fn main() -> Result<()> {
             }
         }
         println!(
-            "score\t{checkpoint}\t{objective:?}\t{}\t{}\t{:.6}\t{:.6}",
-            metadata.completed_epochs,
+            "score\t{checkpoint}\t{objective:?}\t{progress}\t{}\t{:.6}\t{:.6}",
             all.target.len(),
             all.mae(),
             all.pearson()
