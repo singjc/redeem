@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=redeem-f2b-seed
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
+#SBATCH --time=1-00:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --output=/nfs/research/juan/DIA/singj/foundation_model/redeem-f2b-seed-%j.out
+#SBATCH --error=/nfs/research/juan/DIA/singj/foundation_model/redeem-f2b-seed-%j.err
+
+# F2-B seed replicates of the 62709585 ("u51") recipe. Derived from
+# slurm_foundation_research_sampling_convergence_v1.sbatch (SHA 17fe28de...).
+# Changes ONLY: new commit/SIF pins (82f490d = a832c3a + log-only gradient lines,
+# opt-in init_seed and save_epoch_checkpoints), env F2B_SEED (data order) and
+# F2B_INIT_SEED (CUDA RNG, "default" = Candle fixed seed as in 62709585),
+# per-epoch checkpoints, gradient-line check, new output root.
+# Recipe otherwise identical: 10 x 1024 five-stage cycles = 51,200 updates.
+# Random initialization. Validation only; TEST and TRAIN-HOLDOUT remain closed.
+# Do not use set -e or set -u: explicitly check return codes.
+module load singularityce/4.1.0
+module_rc=$?
+if [ "$module_rc" -ne 0 ]; then
+  echo "ERROR: singularityce module load failed ($module_rc)" >&2
+  exit "$module_rc"
+fi
+
+ROOT=/nfs/research/juan/DIA/singj/foundation_model
+PREPARED_RUN="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/run_v0260.yaml"
+RUN_ROOT="$ROOT/experiments/redeem_f2b_seed_replicates_20261101/runs"
+EXPECTED_COMMIT=82f490de1178b71dbe98c7257b4a8687b0d1f898
+FROZEN_SIF_SHA256=${F2B_FROZEN_SIF_SHA256:-}
+F2B_SEED=${F2B_SEED:-}
+F2B_INIT_SEED=${F2B_INIT_SEED:-}
+case "$F2B_SEED" in
+  ''|*[!0-9]*) echo "ERROR: F2B_SEED must be a non-negative integer" >&2; exit 2;;
+esac
+case "$F2B_INIT_SEED" in
+  default) INIT_SEED_JSON=null;;
+  ''|*[!0-9]*) echo "ERROR: F2B_INIT_SEED must be an integer or 'default'" >&2; exit 2;;
+  *) INIT_SEED_JSON=$F2B_INIT_SEED;;
+esac
+if [ -z "$FROZEN_SIF_SHA256" ]; then
+  echo "ERROR: F2B_FROZEN_SIF_SHA256 is required" >&2
+  exit 2
+fi
+
+SIF=${SIF:-}
+EXPECTED_SIF_SHA256=${EXPECTED_SIF_SHA256:-}
+EXPECTED_GIT_SHA=${EXPECTED_GIT_SHA:-}
+
+if [ -z "${SLURM_JOB_ID:-}" ] || [ -z "$SIF" ] || [ -z "$EXPECTED_SIF_SHA256" ] || [ -z "$EXPECTED_GIT_SHA" ]; then
+  echo "ERROR: run via sbatch with SIF, EXPECTED_SIF_SHA256, EXPECTED_GIT_SHA" >&2
+  exit 2
+fi
+if [ "$EXPECTED_GIT_SHA" != "$EXPECTED_COMMIT" ]; then
+  echo "ERROR: expected exact source commit $EXPECTED_COMMIT, got $EXPECTED_GIT_SHA" >&2
+  exit 2
+fi
+if [ ! -s "$SIF" ] || [ ! -s "$PREPARED_RUN" ]; then
+  echo "ERROR: SIF or prepared run missing" >&2
+  exit 2
+fi
+ACTUAL_SIF_SHA256=$(sha256sum "$SIF" | awk '{print $1}')
+if [ "$EXPECTED_SIF_SHA256" != "$FROZEN_SIF_SHA256" ] || [ "$EXPECTED_SIF_SHA256" != "$ACTUAL_SIF_SHA256" ]; then
+  echo "ERROR: SIF SHA mismatch: expected=$EXPECTED_SIF_SHA256 actual=$ACTUAL_SIF_SHA256" >&2
+  exit 2
+fi
+if ! command -v singularity >/dev/null 2>&1 || ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "ERROR: Singularity and a GPU allocation are required" >&2
+  exit 127
+fi
+
+SHORT=${EXPECTED_GIT_SHA:0:12}
+OUT="$RUN_ROOT/seed${F2B_SEED}_init${F2B_INIT_SEED}_${SHORT}_${SLURM_JOB_ID}"
+MODEL="$OUT/model"
+CFG="$OUT/foundation_train.json"
+TRAIN_LOG="$OUT/train.log"
+GPU_TSV="$OUT/gpu_usage.tsv"
+GPU_STOP="$OUT/.stop_gpu_telemetry"
+
+if [ -e "$OUT" ]; then
+  echo "ERROR: output already exists: $OUT" >&2
+  exit 2
+fi
+mkdir -p "$RUN_ROOT" || exit 2
+if [ "$(df -Pk "$RUN_ROOT" | awk 'NR==2{print $4}')" -lt 20971520 ]; then
+  echo "ERROR: less than 20 GiB free at $RUN_ROOT" >&2
+  exit 2
+fi
+mkdir -p "$OUT"
+mkdir_rc=$?
+if [ "$mkdir_rc" -ne 0 ]; then exit "$mkdir_rc"; fi
+
+# The explicit fields below are essential: Serde intentionally maps omitted
+# historical model/training compatibility fields to legacy defaults.
+cat > "$CFG" <<JSON
+{
+  "version": "0.1.2",
+  "train_data": "$PREPARED_RUN",
+  "validation_data": null,
+  "output_file": "$MODEL",
+  "normalization": "min_max",
+  "model_arch": "foundation",
+  "device": "cuda",
+  "batch_size": 8,
+  "validation_batch_size": null,
+  "learning_rate": 0.00002,
+  "epochs": 10,
+  "early_stopping_patience": 10,
+  "checkpoint_file": null,
+  "instrument": "QE",
+  "nce": 20,
+  "head_type": "mlp",
+  "head_learnable_scaler": false,
+  "train_var_prefixes": null,
+  "warmup_fraction": 0.12,
+  "foundation": {
+    "model": {
+      "peptide_backbone": "residue_pair_task_tokens",
+      "specialists": {
+        "enabled": true,
+        "rt": true,
+        "ms2": true,
+        "ms2_residual_blend": true,
+        "mobility_ccs": true
+      },
+      "auxiliary_supervision_heads": true,
+      "peptide": {
+        "max_sequence_len": 64,
+        "max_atoms_per_residue": 24,
+        "atom_feature_dim": 12,
+        "graph_hidden_dim": 128,
+        "graph_layers": 5,
+        "model_dim": 320,
+        "num_attention_heads": 8,
+        "transformer_ff_dim": 1280,
+        "transformer_layers": 8,
+        "dropout": 0.05,
+        "contrastive_dim": 128,
+        "instrument_vocab_size": 16,
+        "ms2_fragment_channels": 8,
+        "ms2_output_activation": "softplus-v0138",
+        "ccs_context_mode": "neutral-mass-charge",
+        "ccs_physics_baseline": null
+      },
+      "inverse": {
+        "max_tokens": 80,
+        "model_dim": 320,
+        "num_attention_heads": 8,
+        "feed_forward_dim": 1280,
+        "spectrum_layers": 6,
+        "decoder_layers": 6,
+        "dropout": 0.05
+      }
+    },
+    "ms2_loss": {
+      "pointwise_weight": 1.0,
+      "cosine_weight": 0.25,
+      "pearson_weight": 0.25,
+      "cosine_epsilon": 1e-8
+    },
+    "strategy": "research_curriculum",
+    "batch_size": 8,
+    "property_batch_size": 16,
+    "learning_rate": 0.00002,
+    "epochs": 10,
+    "early_stopping_patience": 10,
+    "max_train_batches_per_epoch": 1024,
+    "max_validation_batches": 256,
+    "inverse_evaluation_records": 256,
+    "generation_evaluation_records": 16,
+    "warmup_steps": 500,
+    "min_learning_rate_ratio": 0.10,
+    "max_gradient_norm": 1.0,
+    "mobility_consensus_supervision": true,
+    "pair_auxiliary_weight": 0.10,
+    "chemistry_summary_weight": 0.10,
+    "conformation_proxy_weight": 0.10,
+    "seed": $F2B_SEED,
+    "init_seed": $INIT_SEED_JSON,
+    "save_epoch_checkpoints": true
+  }
+}
+JSON
+config_rc=$?
+if [ "$config_rc" -ne 0 ]; then
+  echo "ERROR: config write failed" >&2
+  exit "$config_rc"
+fi
+
+# Fail before loading millions of TRAIN records if nested Serde defaults silently
+# replaced deep-model dimensions or MS2 shape-loss controls.
+python3 - "$CFG" <<'PY_CONFIG_CHECK'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    cfg = json.load(stream)["foundation"]
+model = cfg["model"]
+peptide = model["peptide"]
+inverse = model["inverse"]
+assert model["peptide_backbone"] == "residue_pair_task_tokens"
+assert model["specialists"] == {
+    "enabled": True,
+    "rt": True,
+    "ms2": True,
+    "ms2_residual_blend": True,
+    "mobility_ccs": True,
+}
+assert model["auxiliary_supervision_heads"] is True
+for key, expected in {
+    "max_atoms_per_residue": 24,
+    "graph_hidden_dim": 128,
+    "graph_layers": 5,
+    "model_dim": 320,
+    "num_attention_heads": 8,
+    "transformer_ff_dim": 1280,
+    "transformer_layers": 8,
+    "ms2_output_activation": "softplus-v0138",
+}.items():
+    assert peptide[key] == expected, (key, peptide[key])
+for key, expected in {
+    "model_dim": 320, "num_attention_heads": 8,
+    "feed_forward_dim": 1280, "spectrum_layers": 6,
+    "decoder_layers": 6,
+}.items():
+    assert inverse[key] == expected, (key, inverse[key])
+assert cfg["strategy"] == "research_curriculum"
+assert cfg["property_batch_size"] == 16
+assert cfg["batch_size"] == 8
+assert cfg["ms2_loss"]["cosine_weight"] == 0.25
+assert cfg["ms2_loss"]["pearson_weight"] == 0.25
+assert cfg["ms2_loss"]["pointwise_weight"] == 1.0
+assert cfg["epochs"] == 10
+assert cfg["max_train_batches_per_epoch"] == 1024
+assert cfg["max_validation_batches"] == 256
+assert cfg["warmup_steps"] == 500
+assert cfg["min_learning_rate_ratio"] == 0.10
+assert cfg["max_gradient_norm"] == 1.0
+assert cfg["early_stopping_patience"] == 10
+assert cfg["mobility_consensus_supervision"] is True
+for name in ["pair_auxiliary_weight", "chemistry_summary_weight", "conformation_proxy_weight"]:
+    assert cfg[name] == 0.10, (name, cfg[name])
+assert cfg["epochs"] * cfg["max_train_batches_per_epoch"] * 5 == 51200
+assert isinstance(cfg["seed"], int) and cfg["save_epoch_checkpoints"] is True
+assert cfg["init_seed"] is None or isinstance(cfg["init_seed"], int)
+print("explicit_deep_research_sampling_convergence_preflight=PASS")
+PY_CONFIG_CHECK
+CONFIG_CHECK_RC=$?
+if [ "$CONFIG_CHECK_RC" -ne 0 ]; then
+  echo "ERROR: preflight rejected model/training configuration" >&2
+  exit "$CONFIG_CHECK_RC"
+fi
+
+{
+  printf 'key\tvalue\n'
+  printf 'job_id\t%s\n' "$SLURM_JOB_ID"
+  printf 'git_sha\t%s\n' "$EXPECTED_GIT_SHA"
+  printf 'sif\t%s\n' "$SIF"
+  printf 'sif_sha256\t%s\n' "$ACTUAL_SIF_SHA256"
+  printf 'prepared_run\t%s\n' "$PREPARED_RUN"
+  printf 'random_init\tYES\n'
+  printf 'data_order_seed\t%s\n' "$F2B_SEED"
+  printf 'cuda_init_seed\t%s\n' "$F2B_INIT_SEED"
+  printf 'recipe_parent_job\t62709585\n'
+  printf 'backbone\tresidue_pair_task_tokens\n'
+    printf 'native_specialists\tRT,mobility_CCS,MS2 (gated)\n'
+  printf 'auxiliary_heads\tYES\n'
+  printf 'ms2_residual_blend\ttrue\n'
+  printf 'checkpoint_initialization\tNO\n'
+  printf 'source_sampling_gate_job\t62685397\n'
+  printf 'training_strategy\tresearch_curriculum\n'
+  printf 'mobility_consensus_supervision\tYES\n'
+  printf 'batch_size\t8\n'
+  printf 'property_batch_size\t16\n'
+  printf 'property_records_per_epoch\t32768\n'
+  printf 'property_records_total_selected\t327680\n'
+  printf 'epochs\t10\n'
+  printf 'max_train_cycles_per_epoch\t1024\n'
+  printf 'planned_optimizer_updates\t51200\n'
+  printf 'max_validation_batches\t256\n'
+  printf 'expected_forward_validation_records\t2048\n'
+  printf 'ms2_activation\tsoftplus-v0138\n'
+  printf 'ms2_cosine_weight\t0.25\n'
+  printf 'ms2_pearson_weight\t0.25\n'
+  printf 'planned_stage_visits\t51200\n'
+  printf 'lr_warmup_updates\t500\n'
+  printf 'historical_test_consumed\tNO\n'
+  printf 'train_holdout_consumed\tNO\n'
+  printf 'output\t%s\n' "$OUT"
+} > "$OUT/provenance.tsv"
+
+scontrol show job -dd "$SLURM_JOB_ID" > "$OUT/slurm_job_snapshot.txt" 2>&1
+singularity inspect --json "$SIF" > "$OUT/sif_inspect.json" 2>&1
+nvidia-smi -L > "$OUT/gpu_inventory.txt" 2>&1
+printf 'timestamp,index,name,gpu_util_percent,memory_used_mib,memory_total_mib,temperature_c,power_w\n' > "$GPU_TSV"
+(
+  while [ ! -f "$GPU_STOP" ]; do
+    nvidia-smi \
+      --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+      --format=csv,noheader,nounits >> "$GPU_TSV" 2>> "$OUT/gpu_usage.err"
+    sleep 10
+  done
+) &
+GPU_PID=$!
+
+printf '===== RESEARCH PROPERTY-SAMPLING CONVERGENCE =====\n'
+printf 'job_id=%s\nsource_git_sha=%s\nsif_sha256=%s\noutput=%s\n' \
+  "$SLURM_JOB_ID" "$EXPECTED_GIT_SHA" "$ACTUAL_SIF_SHA256" "$OUT"
+printf 'historical_test_consumed=NO\ntrain_holdout_consumed=NO\n'
+printf 'total_optimizer_updates_planned=51200\n'
+cat "$OUT/gpu_inventory.txt"
+
+/usr/bin/time -v -o "$OUT/train.time.txt" \
+  singularity exec --nv --bind "$ROOT:$ROOT" "$SIF" \
+    redeem properties train "$CFG" \
+  2>&1 | tee "$TRAIN_LOG"
+TRAIN_RC=${PIPESTATUS[0]}
+
+touch "$GPU_STOP"
+wait "$GPU_PID"
+GPU_RC=$?
+rm -f "$GPU_STOP"
+if [ "$GPU_RC" -ne 0 ]; then
+  echo "WARNING: GPU telemetry process exited with rc=$GPU_RC" >&2
+fi
+
+awk -F',' '
+  NR == 1 { next }
+  { for (i=1; i<=NF; i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+    count++; util=$4+0; used=$5+0; total=$6+0
+    usum+=util; msum+=used
+    if (count == 1 || util > umax) umax=util
+    if (count == 1 || used > mmax) mmax=used
+    if (total > mtot) mtot=total
+  }
+  END { print "metric\tvalue"; print "samples\t" count
+    if (count > 0) {
+      printf "mean_gpu_util_percent\t%.3f\n",usum/count
+      printf "max_gpu_util_percent\t%.3f\n",umax
+      printf "mean_gpu_memory_used_mib\t%.3f\n",msum/count
+      printf "max_gpu_memory_used_mib\t%.3f\n",mmax
+      printf "gpu_memory_total_mib\t%.3f\n",mtot
+      if (mtot > 0) printf "max_gpu_memory_util_percent\t%.3f\n",100*mmax/mtot
+    }
+  }' "$GPU_TSV" > "$OUT/gpu_usage_summary.tsv"
+
+if [ "$TRAIN_RC" -ne 0 ]; then
+  echo "foundation_research_sampling_convergence=FAIL rc=$TRAIN_RC" >&2
+  echo "output=$OUT" >&2
+  exit "$TRAIN_RC"
+fi
+
+# Prove non-repeated, exposure-aware property-stage sampling across epochs.
+EXPOSURE="$MODEL/training_exposure.tsv"
+if [ ! -s "$EXPOSURE" ]; then
+  echo "ERROR: missing property training exposure report" >&2
+  exit 2
+fi
+if ! awk -F '\t' '
+  NR==1 {for(i=1;i<=NF;i++) h[$i]=i; next}
+  NR>=2 {
+    n=split("epoch cycles property_updates property_batch_size property_records new_property_records cumulative_unique_property_records train_records rt_labelled ms2_labelled ccs_labelled inverse_spectrum_records", required," ");
+    for(i=1;i<=n;i++) if(!h[required[i]] || $h[required[i]]=="") bad=1;
+    if(($h["epoch"]+0)!=NR-1 || ($h["cycles"]+0)!=1024 ||
+       ($h["property_updates"]+0)!=2048 || ($h["property_batch_size"]+0)!=16 ||
+       ($h["property_records"]+0)!=32768 || ($h["train_records"]+0)<3650000 ||
+       ($h["rt_labelled"]+0)<1 || ($h["ms2_labelled"]+0)<1 ||
+       ($h["ccs_labelled"]+0)<1 || ($h["inverse_spectrum_records"]+0)<1) bad=1;
+    cur=$h["cumulative_unique_property_records"]+0;
+    fresh=$h["new_property_records"]+0;
+    if(cur<prior || cur-prior!=fresh || fresh<=0 || fresh>32768) bad=1;
+    prior=cur; rows++;
+  }
+  END {
+    printf "property_sampling_epochs=%d\n",rows;
+    printf "property_sampling_cumulative_unique=%d\n",prior;
+    if(bad || rows!=10 || prior<280000) exit 1;
+  }
+' "$EXPOSURE"; then
+  echo "ERROR: research property exposure contract failed" >&2
+  cat "$EXPOSURE" >&2
+  exit 2
+fi
+if [ "$(grep -c '^foundation_stage_losses' "$TRAIN_LOG")" -ne 10 ]; then
+  echo "ERROR: missing per-stage research curriculum losses" >&2
+  exit 2
+fi
+if [ "$(grep -c '^foundation_stage_gradients' "$TRAIN_LOG")" -ne 10 ]; then
+  echo "ERROR: missing per-stage gradient diagnostics" >&2
+  exit 2
+fi
+for e in 001 002 003 004 005 006 007 008 009 010; do
+  if [ ! -s "$MODEL/epoch_$e/model.safetensors" ] || [ ! -s "$MODEL/epoch_$e/metadata.yaml" ]; then
+    echo "ERROR: missing per-epoch checkpoint epoch_$e" >&2
+    exit 2
+  fi
+done
+for spec in "seed: $F2B_SEED" "save_epoch_checkpoints: true"; do
+  if ! grep -Fqx "$spec" "$MODEL/training.yaml"; then
+    echo "ERROR: saved training config did not record $spec" >&2
+    exit 2
+  fi
+done
+printf 'research_property_sampling_exposure=PASS\n'
+
+# Preserve the deterministic Validation prefix (2048 records); explicitly
+# check RT/CCS/MS2 support before interpreting best-forward checkpointing.
+if ! awk -F '\t' '
+  NR==1 { for (i=1;i<=NF;i++) col[$i]=i; next }
+  NR>=2 {
+    if (!col["records"] || !col["rt_count"] || !col["ccs_count"] ||
+        !col["ms2_spectrum_count"]) exit 1;
+    if (($col["records"]+0)!=2048 || ($col["rt_count"]+0)<1 ||
+        ($col["ccs_count"]+0)<1 || ($col["ms2_spectrum_count"]+0)<1) exit 1;
+    rows++;
+  }
+  END { if (rows != 10) exit 1 }
+' "$MODEL/validation_metrics.tsv"; then
+  echo "ERROR: insufficient Validation forward-label coverage; best_forward is not scoreable" >&2
+  cat "$MODEL/validation_metrics.tsv" >&2
+  exit 2
+fi
+
+# Detect renewed zero-spectrum collapse without confusing the research target
+# with an engineering-gate pass. All epochs require defined metrics; at least
+# one epoch must show useful MS2 signal. Nonmonotone learning is allowed.
+if ! awk -F '\t' '
+  NR==1 { for(i=1;i<=NF;i++) col[$i]=i; next }
+  NR>=2 {
+    keys[1]="ms2_cosine_similarity"; keys[2]="ms2_spectral_angle";
+    keys[3]="ms2_pearson"; keys[4]="ms2_rmse";
+    keys[5]="ms2_spectrum_count";
+    for(i=1;i<=5;i++) {key=keys[i]; if(!col[key] || $col[key]=="") bad=1}
+    cosine=$col["ms2_cosine_similarity"]+0;
+    angle=$col["ms2_spectral_angle"]+0;
+    pearson=$col["ms2_pearson"]+0;
+    rmse=$col["ms2_rmse"]+0;
+    spectra=$col["ms2_spectrum_count"]+0;
+    if(spectra<1 || rmse<=0) bad=1;
+    if(cosine>best_cosine) best_cosine=cosine;
+    if(cosine>0.20 && angle>0.20 && pearson>0 && rmse<0.54) useful++;
+    count++;
+  }
+  END {
+    printf "ms2_convergence_epoch_count=%d\n",count;
+    printf "ms2_convergence_best_cosine=%.8f\n",best_cosine;
+    printf "ms2_convergence_useful_epochs=%d\n",useful;
+    if(bad || count!=10 || useful<1) exit 1;
+  }
+' "$MODEL/validation_metrics.tsv"; then
+  echo "ERROR: gated MS2 convergence lost useful spectral signal or missing metrics" >&2
+  cat "$MODEL/validation_metrics.tsv" >&2
+  exit 2
+fi
+printf 'ms2_noncollapse_gate=PASS\n'
+
+
+for path in \
+  "$MODEL/model.safetensors" \
+  "$MODEL/metadata.yaml" \
+  "$MODEL/training.yaml" \
+  "$MODEL/training_history.tsv" \
+  "$MODEL/validation_metrics.tsv" \
+  "$MODEL/mobility_source_reliability.tsv" \
+  "$MODEL/mobility_consensus_summary.tsv" \
+  "$MODEL/best_forward/model.safetensors" \
+  "$MODEL/best_inverse/model.safetensors"; do
+  if [ ! -s "$path" ]; then
+    echo "ERROR: missing or empty learning artifact: $path" >&2
+    exit 2
+  fi
+done
+
+for spec in \
+  'peptide_backbone:[[:space:]]*residue_pair_task_tokens' \
+  'auxiliary_supervision_heads:[[:space:]]*true' \
+  'enabled:[[:space:]]*true' \
+  'mobility_ccs:[[:space:]]*true'; do
+  if ! grep -Eq "$spec" "$MODEL/metadata.yaml"; then
+    echo "ERROR: checkpoint model metadata did not record $spec" >&2
+    exit 2
+  fi
+done
+if ! grep -Eq 'ms2:[[:space:]]*true' "$MODEL/metadata.yaml"; then
+  echo "ERROR: saved checkpoint does not enable native MS2 specialist" >&2
+  exit 2
+fi
+if ! grep -Eq 'ms2_residual_blend:[[:space:]]*true' "$MODEL/metadata.yaml"; then
+  echo "ERROR: saved checkpoint does not enable gated pair-head preservation" >&2
+  exit 2
+fi
+if ! grep -Eq 'ms2_output_activation:[[:space:]]*softplus-v0138' "$MODEL/metadata.yaml"; then
+  echo "ERROR: saved checkpoint is NOT configured for Softplus MS2" >&2
+  exit 2
+fi
+for spec in \
+  'cosine_weight:[[:space:]]*0.25' \
+  'pearson_weight:[[:space:]]*0.25'; do
+  if ! grep -Eq "$spec" "$MODEL/training.yaml"; then
+    echo "ERROR: saved training config missing MS2 shape loss $spec" >&2
+    exit 2
+  fi
+done
+
+for spec in \
+  'strategy:[[:space:]]*research_curriculum' \
+  'property_batch_size:[[:space:]]*16' \
+  'mobility_consensus_supervision:[[:space:]]*true' \
+  'pair_auxiliary_weight:[[:space:]]*0.1' \
+  'chemistry_summary_weight:[[:space:]]*0.1' \
+  'conformation_proxy_weight:[[:space:]]*0.1'; do
+  if ! grep -Eq "$spec" "$MODEL/training.yaml"; then
+    echo "ERROR: saved training config did not record $spec" >&2
+    exit 2
+  fi
+done
+
+# Assert nonzero forward and inverse training losses for every completed epoch.
+if ! awk -F '\t' 'NR==1 { for(i=1;i<=NF;i++) col[$i]=i; next }
+    NR>=2 {if(!(col["train_forward"] && col["train_inverse"])) exit 1;
+      if(($col["train_forward"]+0)<=0 || ($col["train_inverse"]+0)<=0) exit 1;
+      rows++} END{if(rows != 10) exit 1}' "$MODEL/training_history.tsv"; then
+  echo "ERROR: forward/inverse training losses not both positive; five-stage exercise not demonstrated" >&2
+  exit 2
+fi
+if ! awk -F '\t' '$1=="train_consensus_examples" && ($2+0)>0 {found=1} END{if(!found) exit 1}' \
+  "$MODEL/mobility_consensus_summary.tsv"; then
+  echo "ERROR: zero source-aware consensus examples" >&2
+  exit 2
+fi
+if ! awk -F '\t' 'NR==1 {for(i=1;i<=NF;i++) col[$i]=i; next}
+  NR>=2 {if(!col["inverse_sequence_count"] || ($col["inverse_sequence_count"]+0)<=0) exit 1;
+         rows++} END{if(rows != 10) exit 1}' "$MODEL/validation_metrics.tsv"; then
+  echo "ERROR: inverse Validation evaluation did not exercise spectrum-bearing records" >&2
+  exit 2
+fi
+
+# Reload the just-saved checkpoint via the public production inference CLI.
+cat > "$OUT/foundation_inference.json" <<JSON
+{
+  "model_path": "$MODEL",
+  "inference_data": "$PREPARED_RUN",
+  "output_file": "$OUT/validation_predictions.tsv",
+  "model_arch": "foundation",
+  "device": "cuda",
+  "batch_size": 4,
+  "foundation_partition": "validation",
+  "foundation_max_records": 16,
+  "foundation_spectra_only": false
+}
+JSON
+singularity exec --nv --bind "$ROOT:$ROOT" "$SIF" \
+  redeem properties inference "$OUT/foundation_inference.json" \
+  > "$OUT/inference.log" 2>&1
+INFERENCE_RC=$?
+if [ "$INFERENCE_RC" -ne 0 ]; then
+  echo "ERROR: checkpoint reload / Validation inference failed rc=$INFERENCE_RC" >&2
+  cat "$OUT/inference.log" >&2
+  exit "$INFERENCE_RC"
+fi
+if ! grep -q '^foundation_inference=PASS' "$OUT/inference.log"; then
+  echo "ERROR: inference CLI did not emit PASS" >&2
+  cat "$OUT/inference.log" >&2
+  exit 2
+fi
+if ! awk 'END{if(NR != 17) exit 1}' "$OUT/validation_predictions.tsv"; then
+  echo "ERROR: unexpected Validation inference output size (expected header + 16 records)" >&2
+  exit 2
+fi
+
+# Read back the independently selected balanced-forward and inverse checkpoints.
+for selected in best_forward best_inverse; do
+  cat > "$OUT/inference_${selected}.json" <<JSON
+{
+  "model_path": "$MODEL/$selected",
+  "inference_data": "$PREPARED_RUN",
+  "output_file": "$OUT/validation_predictions_${selected}.tsv",
+  "model_arch": "foundation",
+  "device": "cuda",
+  "batch_size": 4,
+  "foundation_partition": "validation",
+  "foundation_max_records": 16,
+  "foundation_spectra_only": false
+}
+JSON
+  singularity exec --nv --bind "$ROOT:$ROOT" "$SIF" \
+    redeem properties inference "$OUT/inference_${selected}.json" \
+    > "$OUT/inference_${selected}.log" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! grep -q '^foundation_inference=PASS' "$OUT/inference_${selected}.log"; then
+    echo "ERROR: $selected checkpoint inference failed rc=$rc" >&2
+    cat "$OUT/inference_${selected}.log" >&2
+    exit 2
+  fi
+  if ! awk 'END{if(NR != 17) exit 1}' "$OUT/validation_predictions_${selected}.tsv"; then
+    echo "ERROR: unexpected $selected Validation inference output size" >&2
+    exit 2
+  fi
+done
+
+# Report the actual forward-balanced selection, not independent minima
+# assembled from different epochs. All metrics below come from Validation.
+python3 - "$MODEL/validation_metrics.tsv" "$MODEL/metadata.yaml" "$MODEL/best_forward/metadata.yaml" "$MODEL/best_inverse/metadata.yaml" "$OUT/convergence_summary.tsv" <<'PY_SUMMARY'
+import csv, math, pathlib, re, sys
+metrics, main_yaml, forward_yaml, inverse_yaml, dest = map(pathlib.Path, sys.argv[1:])
+with metrics.open(encoding="utf-8", newline="") as handle:
+    rows = list(csv.DictReader(handle, delimiter="\t"))
+if len(rows) != 10:
+    raise SystemExit("expected exactly 10 Validation epochs")
+
+def selected_epoch(path):
+    txt = path.read_text(encoding="utf-8")
+    match = re.search(r"(?m)^completed_epochs:\s*(\d+)", txt)
+    if not match:
+        raise SystemExit(f"missing completed_epochs in {path}")
+    epoch = int(match.group(1))
+    if epoch < 1 or epoch > len(rows):
+        raise SystemExit(f"invalid selected epoch {epoch} in {path}")
+    return epoch
+
+tep = selected_epoch(main_yaml)
+fep = selected_epoch(forward_yaml)
+iep = selected_epoch(inverse_yaml)
+fields = ["rt_mae_native", "ccs_mae", "ms2_cosine_similarity", "ms2_spectral_angle", "ms2_pearson", "ms2_rmse", "inverse_mean_nll", "retrieval_mrr"]
+with dest.open("w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle, delimiter="\t")
+    writer.writerow(["checkpoint", "epoch", *fields])
+    for label, epoch in [("best_total", tep), ("best_forward", fep), ("best_inverse", iep), ("final_validation_only", len(rows))]:
+        row = rows[epoch-1]
+        values = []
+        for field in fields:
+            val = row.get(field, "")
+            if val == "" or not math.isfinite(float(val)):
+                raise SystemExit(f"invalid {field} at epoch {epoch}")
+            values.append(val)
+        writer.writerow([label, epoch, *values])
+print("selected_total_epoch=", tep, sep="")
+print("selected_forward_epoch=", fep, sep="")
+print("selected_inverse_epoch=", iep, sep="")
+print("selected_checkpoint_metric_summary=PASS")
+PY_SUMMARY
+SUMMARY_RC=$?
+if [ "$SUMMARY_RC" -ne 0 ]; then
+  echo "ERROR: cannot audit selected checkpoint metrics" >&2
+  exit "$SUMMARY_RC"
+fi
+
+: > "$OUT/output_sha256.txt"
+for path in \
+  "$CFG" \
+  "$OUT/foundation_inference.json" \
+  "$OUT/validation_predictions.tsv" \
+  "$OUT/inference.log" \
+  "$OUT/inference_best_forward.json" \
+  "$OUT/validation_predictions_best_forward.tsv" \
+  "$OUT/inference_best_forward.log" \
+  "$OUT/inference_best_inverse.json" \
+  "$OUT/validation_predictions_best_inverse.tsv" \
+  "$OUT/inference_best_inverse.log" \
+  "$OUT/provenance.tsv" "$OUT/train.log" "$OUT/train.time.txt" \
+  "$OUT/convergence_summary.tsv" \
+  "$GPU_TSV" "$OUT/gpu_usage_summary.tsv" \
+  "$MODEL/model.safetensors" "$MODEL/metadata.yaml" "$MODEL/training.yaml" \
+  "$MODEL/training_history.tsv" "$MODEL/validation_metrics.tsv" \
+  "$MODEL/training_exposure.tsv" \
+  "$MODEL/mobility_consensus_summary.tsv" "$MODEL/mobility_source_reliability.tsv" \
+  "$MODEL/best_forward/model.safetensors" "$MODEL/best_inverse/model.safetensors" \
+  "$MODEL"/epoch_0*/model.safetensors; do
+  sha256sum "$path" >> "$OUT/output_sha256.txt"
+  hash_rc=$?
+  if [ "$hash_rc" -ne 0 ]; then exit "$hash_rc"; fi
+done
+
+printf '\n===== SELECTED FORWARD/INVERSE METRICS =====\n'
+cat "$OUT/convergence_summary.tsv"
+printf '\n===== PROPERTY TRAIN EXPOSURE =====\n'
+cat "$MODEL/training_exposure.tsv"
+printf '\n===== TRAINING HISTORY =====\n'
+cat "$MODEL/training_history.tsv"
+printf '\n===== VALIDATION METRICS =====\n'
+cat "$MODEL/validation_metrics.tsv"
+printf '\n===== MOBILITY CONSENSUS =====\n'
+cat "$MODEL/mobility_consensus_summary.tsv"
+printf '\n===== GPU SUMMARY =====\n'
+cat "$OUT/gpu_usage_summary.tsv"
+printf '\n===== SELECTED CHECKPOINT METADATA =====\n'
+for selected in "$MODEL" "$MODEL/best_forward" "$MODEL/best_inverse"; do
+  echo "checkpoint_directory=$selected"
+  grep -E '^completed_epochs:|^best_validation_loss:' "$selected/metadata.yaml" || true
+done
+printf '\n===== OUTPUT HASHES =====\n'
+cat "$OUT/output_sha256.txt"
+printf '\nfoundation_f2b_seed_replicate=PASS\n'
+printf 'SCIENTIFIC_ADVANCEMENT=NOT_DECIDED_FROM_ENGINEERING_PASS\n'
+printf 'historical_test_consumed=NO\ntrain_holdout_consumed=NO\n'
+printf 'output=%s\n' "$OUT"
