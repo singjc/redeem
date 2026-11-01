@@ -97,8 +97,9 @@ pub struct FoundationTrainingConfig {
     pub epochs: usize,
     pub early_stopping_patience: usize,
     pub seed: u64,
-    /// Opt-in CUDA weight-initialization seed. `None` keeps Candle's fixed default
-    /// (all historical runs), so only `seed` (data order) varied between them.
+    /// Opt-in CUDA device RNG seed, set once before model creation. It changes weight
+    /// initialization and all later device-side random draws. `None` keeps Candle's
+    /// fixed default (all historical runs), so only `seed` (data order) varied between them.
     #[serde(default)]
     pub init_seed: Option<u64>,
     /// Opt-in: also save `epoch_NNN` checkpoints after every epoch (learning curves).
