@@ -1,9 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=redeem-f2-scorecard
-#SBATCH --partition=short
+#SBATCH --partition=standard
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=03:50:00
+#SBATCH --time=12:00:00
+# Timing estimate (15179621: 3,024 records in 749 s; 15223424: 2,016 in 525 s): about 4 records/s
+# per checkpoint on CPU, load included. 5 checkpoints x up to 16,896 records is about 6 h at most.
 # F2-A fixed scorecard (CPU). select -> score (v0.52 + 4 unified checkpoints) -> summary.
 # Required env: OUT_ROOT, EXPECTED_BIN_SHA256, EXPECTED_SUMMARY_SHA256. Validation only, no TEST.
 # Standalone batch script: normal failure exits are allowed.
