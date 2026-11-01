@@ -97,6 +97,13 @@ pub struct FoundationTrainingConfig {
     pub epochs: usize,
     pub early_stopping_patience: usize,
     pub seed: u64,
+    /// Opt-in CUDA weight-initialization seed. `None` keeps Candle's fixed default
+    /// (all historical runs), so only `seed` (data order) varied between them.
+    #[serde(default)]
+    pub init_seed: Option<u64>,
+    /// Opt-in: also save `epoch_NNN` checkpoints after every epoch (learning curves).
+    #[serde(default)]
+    pub save_epoch_checkpoints: bool,
     /// Optional bounded smoke/debug mode; `None` trains the full partition.
     pub max_train_batches_per_epoch: Option<usize>,
     /// Opt-in v0.51/v0.52 training: two disjoint property batches per curriculum
@@ -138,6 +145,8 @@ impl Default for FoundationTrainingConfig {
             epochs: 20,
             early_stopping_patience: 4,
             seed: 20_261_006,
+            init_seed: None,
+            save_epoch_checkpoints: false,
             max_train_batches_per_epoch: None,
             property_batch_size: None,
             max_validation_batches: None,
@@ -483,6 +492,12 @@ pub fn train_foundation_model(
 
     let mut model_config = training.model.clone();
     model_config.peptide.instrument_vocab_size = source.corpus.instrument_vocab_size;
+    if let Some(init_seed) = training.init_seed {
+        if !device.is_cuda() {
+            anyhow::bail!("foundation init_seed is supported on CUDA only");
+        }
+        device.set_seed(init_seed)?;
+    }
     let mut model = FoundationModel::new(
         model_config.clone(),
         normalization,
@@ -700,6 +715,20 @@ pub fn train_foundation_model(
             completed_epochs,
             validation_metrics,
         )?;
+        if training.save_epoch_checkpoints {
+            let metadata = checkpoint_metadata(
+                model_config.clone(),
+                normalization,
+                &corpus,
+                &benchmark,
+                completed_epochs,
+                validation_losses.total,
+            );
+            model.save_checkpoint(
+                output_dir.join(format!("epoch_{completed_epochs:03}")),
+                &metadata,
+            )?;
+        }
         if let Some(score) = forward_balanced_score(validation_metrics) {
             if score < best_forward_score {
                 best_forward_score = score;
@@ -970,6 +999,8 @@ fn run_epoch_research_curriculum(
 ) -> Result<FoundationEpochLosses> {
     let mut aggregate = FoundationEpochLosses::default();
     let mut stage_loss_sums = [0.0f64; 5];
+    // Log-only gradient diagnostics per stage: sum of pre-clip norms, max norm, clipped count.
+    let mut stage_grad = [(0.0f64, 0.0f64, 0usize); 5];
     let cycles =
         research_curriculum_cycles(indices.len(), config).min(max_batches.unwrap_or(usize::MAX));
     let consensus_order = mobility_consensus.map(|supervision| {
@@ -1060,17 +1091,21 @@ fn run_epoch_research_curriculum(
                 )?
             };
             let lr = scheduled_learning_rate(config, *global_update, planned_updates);
-            match stage {
+            let step = match stage {
                 FoundationCurriculumStage::Inverse => {
                     inverse_optimizer.set_learning_rate(lr)?;
-                    inverse_optimizer.backward_step(&loss.total, config.max_gradient_norm)?;
+                    inverse_optimizer.backward_step(&loss.total, config.max_gradient_norm)?
                 }
                 _ => {
                     peptide_optimizer.set_learning_rate(lr)?;
-                    peptide_optimizer.backward_step(&loss.total, config.max_gradient_norm)?;
+                    peptide_optimizer.backward_step(&loss.total, config.max_gradient_norm)?
                 }
-            }
+            };
             *global_update = (*global_update).saturating_add(1);
+            let grad = &mut stage_grad[stage_index];
+            grad.0 += step.gradient_norm;
+            grad.1 = grad.1.max(step.gradient_norm);
+            grad.2 += usize::from(step.gradient_scale < 1.0);
             stage_loss_sums[stage_index] += f64::from(loss.scalars.total);
             aggregate.add(loss.scalars);
         }
@@ -1082,6 +1117,24 @@ fn run_epoch_research_curriculum(
     println!("foundation_stage_losses\tproperty_a={:.6}\tproperty_b={:.6}\trepresentation={:.6}\tmobility={:.6}\tinverse={:.6}",
         stage_loss_sums[0] / n, stage_loss_sums[1] / n,
         stage_loss_sums[2] / n, stage_loss_sums[3] / n, stage_loss_sums[4] / n);
+    let mut line = String::from("foundation_stage_gradients");
+    for (name, (sum, max, clipped)) in [
+        "property_a",
+        "property_b",
+        "representation",
+        "mobility",
+        "inverse",
+    ]
+    .iter()
+    .zip(stage_grad)
+    {
+        line.push_str(&format!(
+            "\t{name}_mean_norm={:.6}\t{name}_max_norm={max:.6}\t{name}_clip_fraction={:.6}",
+            sum / n,
+            clipped as f64 / n
+        ));
+    }
+    println!("{line}");
     Ok(aggregate.means())
 }
 
@@ -2033,6 +2086,22 @@ mod tests {
         assert_eq!(restored.min_learning_rate_ratio, 1.0);
         assert_eq!(restored.max_gradient_norm, None);
         assert!(!restored.mobility_consensus_supervision);
+    }
+
+    #[test]
+    fn historical_training_config_without_seed_and_epoch_fields_keeps_defaults() {
+        let mut value = serde_yaml::to_value(FoundationTrainingConfig::default()).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("init_seed".into()));
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("save_epoch_checkpoints".into()));
+        let restored: FoundationTrainingConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(restored.init_seed, None);
+        assert!(!restored.save_epoch_checkpoints);
     }
 
     #[test]
