@@ -31,8 +31,9 @@ R0="$RUNS/seed20261006_initdefault_82f490de1178_20306282/model"
 R1="$RUNS/seed20261007_init1_82f490de1178_20306283/model"
 R2="$RUNS/seed20261008_init2_82f490de1178_20306284/model"
 CKPTS=()
-for e in 006 008 010; do
-  CKPTS+=("r0_ep${e#0}=$R0/epoch_$e" "r1_ep${e#0}=$R1/epoch_$e" "r2_ep${e#0}=$R2/epoch_$e")
+for e in 6 8 10; do
+  p=$(printf '%03d' "$e")
+  CKPTS+=("r0_ep$e=$R0/epoch_$p" "r1_ep$e=$R1/epoch_$p" "r2_ep$e=$R2/epoch_$p")
 done
 OUT="$ROOT/experiments/redeem_f2b_seed_replicates_20261101/score/score_${SLURM_JOB_ID}"
 test ! -e "$OUT" || { echo "BLOCKED: output exists $OUT"; exit 2; }
