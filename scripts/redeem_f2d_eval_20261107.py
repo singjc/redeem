@@ -5,7 +5,7 @@ Rule text: rolling handoff 2026-11-07 00:08 (+ 00:11 addendum). Metric = mean ov
 usage: f2d_eval.py TRAIN_SCORES SEEN_TSV VAL_V052_SCORES(15264522) VAL_R_SCORES(22808699)
        f2d_eval.py --self-test
 """
-import statistics, sys
+import random, statistics, sys
 from collections import defaultdict
 
 MDE = {'rt': 0.58, 'ccs': 2.28, 'ms2': 0.124}  # F2-B one-seed MDE; >= 2x every F2-A CI half-width
@@ -35,6 +35,18 @@ def smean(by_source, keep=None):
     return (statistics.fmean(means) if means else float('nan')), n
 
 
+def boot_half_width(by_source, keep=None, reps=500, seed=20261107):
+    """95% CI half-width of the source-mean, records resampled within each source."""
+    rng = random.Random(seed)
+    groups = [[v for r, v in recs.items() if keep is None or r in keep] for recs in by_source.values()]
+    groups = [g for g in groups if g]
+    if not groups:
+        return float('nan')
+    out = sorted(statistics.fmean(statistics.fmean(rng.choices(g, k=len(g))) for g in groups)
+                 for _ in range(reps))
+    return (out[int(0.975 * reps) - 1] - out[int(0.025 * reps)]) / 2
+
+
 def load_seen(path):
     seen = defaultdict(set)  # seed -> {rec}
     cols = None
@@ -49,7 +61,9 @@ def load_seen(path):
     return seen
 
 
-def decide(task, u_tr, u_val, v_tr, v_val):
+def decide(task, u_tr, u_val, v_tr, v_val, margin=None):
+    """margin = max(MDE, 2 x record CI half-width) per the 00:08 rule; defaults to MDE."""
+    margin = MDE[task] if margin is None else margin
     lower = task != 'ms2'
     g_u = (u_val - u_tr) if lower else (u_tr - u_val)
     g_v = (v_val - v_tr) if lower else (v_tr - v_val)
@@ -59,7 +73,7 @@ def decide(task, u_tr, u_val, v_tr, v_val):
     else:
         underfit = u_tr <= v_val and g_u <= 0.25 * (v_val - u_val)
         fits = u_tr >= v_val
-    general = fits and g_u > g_v + MDE[task]
+    general = fits and g_u > g_v + margin
     verdict = 'UNDERFIT' if underfit else 'GENERALIZATION' if general else 'MIXED'
     return verdict, g_u, g_v
 
@@ -80,30 +94,37 @@ def evaluate(train_path, seen_path, v052_path, r_path, out=print):
             a, n = smean(tr[(lab, task)])
             val, _ = smean(vr[(lab, task)])
             rows[lab] = (a, val)
-            out(f'{task}\tall\t{lab}\t{a:.4f}\t{val:.4f}\t{n}')
+            hw_all = boot_half_width(tr[(lab, task)])
+            out(f'{task}\tall\t{lab}\t{a:.4f}\t{val:.4f}\t{n}\tci_hw={hw_all:.4f}')
             if task != 'ccs':
                 s, ns = smean(tr[(lab, task)], seen[SEEDS[lab]])
+                hw_seen = boot_half_width(tr[(lab, task)], seen[SEEDS[lab]])
                 all_recs = {r for src in tr[(lab, task)].values() for r in src}
                 u, nu = smean(tr[(lab, task)], all_recs - seen[SEEDS[lab]])
-                out(f'{task}\tseen\t{lab}\t{s:.4f}\t{val:.4f}\t{ns}')
+                out(f'{task}\tseen\t{lab}\t{s:.4f}\t{val:.4f}\t{ns}\tci_hw={hw_seen:.4f}')
                 out(f'{task}\tunseen\t{lab}\t{u:.4f}\t{val:.4f}\t{nu}')
-                rows[lab] = rows[lab] + (s, ns)
+                rows[lab] = rows[lab] + (s, ns, hw_all, hw_seen)
+            else:
+                rows[lab] = rows[lab] + (float('nan'), 0, hw_all, float('nan'))
         u_val = statistics.fmean(r[1] for r in rows.values())
         u_all = statistics.fmean(r[0] for r in rows.values())
-        subsets = [('all', u_all)]
+        subsets = [('all', u_all, max(r[4] for r in rows.values()))]
         if task != 'ccs':
             seen_n = sum(r[3] for r in rows.values()) / 3
-            have = [r[2] for r in rows.values() if r[3] > 0]
+            have = [r for r in rows.values() if r[3] > 0]
             if have:
-                subsets.append(('seen', statistics.fmean(have)))
-        for name, u_tr in subsets:
-            verdict, g_u, g_v = decide(task, u_tr, u_val, v_tr, v_val)
+                subsets.append(('seen', statistics.fmean(r[2] for r in have),
+                                max(r[5] for r in have)))
+        # ponytail: worst per-seed CI half-width (conservative); no pooling across seeds.
+        for name, u_tr, hw in subsets:
+            margin = max(MDE[task], 2 * hw)
+            verdict, g_u, g_v = decide(task, u_tr, u_val, v_tr, v_val, margin)
             note = ''
             if name == 'seen' and seen_n < 200:
                 note = f'\tDESCRIPTIVE_ONLY(mean_seen_n={seen_n:.0f}<200)'
             out(f'rule\t{task}\t{name}\tunified_train={u_tr:.4f}\tunified_val={u_val:.4f}\t'
                 f'v052_train={v_tr:.4f}\tv052_val={v_val:.4f}\tG_unified={g_u:+.4f}\t'
-                f'G_v052={g_v:+.4f}\tverdict={verdict}{note}')
+                f'G_v052={g_v:+.4f}\tmargin={margin:.4f}\tverdict={verdict}{note}')
             verdicts[(task, name)] = verdict
     out('F2D_EVAL=COMPLETE')
     return verdicts
@@ -120,6 +141,10 @@ def self_test():
     assert decide('rt', 3.2, 3.5, 2.5, 3.3)[0] == 'MIXED'
     # Neither fits (3.34 > 3.3) nor underfit (3.34 < 0.75 * 4.5) -> MIXED.
     assert decide('rt', 3.34, 4.5, 2.5, 3.3)[0] == 'MIXED'
+    # A wide record CI raises the margin and turns a GENERALIZATION call into MIXED.
+    assert decide('rt', 2.0, 4.5, 2.5, 3.3, margin=2.0)[0] == 'MIXED'
+    hw = boot_half_width({'a': {1: 1.0, 2: 3.0, 3: 2.0}, 'b': {4: 5.0, 5: 5.0}})
+    assert 0.0 < hw < 1.0, hw
     print('F2D_EVAL_SELF_TEST=PASS')
 
 
