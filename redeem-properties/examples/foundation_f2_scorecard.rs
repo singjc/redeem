@@ -5,6 +5,10 @@
 //! Per source and per task, up to PER_TASK labelled records are drawn with a fixed seed.
 //! Never reads TEST or any other partition.
 //!
+//! F2-D: env `F2_PARTITION=train` switches `select` and the `score` guard to the TRAIN
+//! partition (no prefix exclusion). Default and any other value stay Validation. The
+//! benchmark `Test` partition is the protected TRAIN-HOLDOUT and can never be selected.
+//!
 //! usage:
 //!   foundation_f2_scorecard select RUN.yaml RUN_SHA256 CORPUS_FNV BENCHMARK_FNV SEED PER_TASK > cohort.tsv
 //!   foundation_f2_scorecard score  RUN.yaml RUN_SHA256 CORPUS_FNV BENCHMARK_FNV COHORT.tsv V035_TEACHER LABEL=CKPT...
@@ -30,6 +34,18 @@ const EXCLUDED_PREFIX: usize = 2048;
 const MS2_CHANNELS: usize = 4;
 const MIN_MS2_FRAGMENTS: usize = 6;
 const BATCH: usize = 16;
+
+/// Validation (default) or TRAIN. Test (protected TRAIN-HOLDOUT) is not reachable.
+fn cohort_partition() -> (FoundationPartition, usize, &'static str) {
+    match std::env::var("F2_PARTITION").as_deref() {
+        Ok("train") => (FoundationPartition::Train, 0, "train"),
+        _ => (
+            FoundationPartition::Validation,
+            EXCLUDED_PREFIX,
+            "validation",
+        ),
+    }
+}
 
 #[derive(Deserialize)]
 struct Run {
@@ -168,13 +184,12 @@ fn select(args: &[String]) -> Result<()> {
     let l = load(args)?;
     let seed: u64 = args[4].parse().context("SEED")?;
     let per_task: usize = args[5].parse().context("PER_TASK")?;
-    let validation = l
-        .benchmark
-        .partition_indices(FoundationPartition::Validation);
-    anyhow::ensure!(validation.len() > EXCLUDED_PREFIX, "Validation too small");
+    let (partition, prefix, partition_name) = cohort_partition();
+    let validation = l.benchmark.partition_indices(partition);
+    anyhow::ensure!(validation.len() > prefix, "partition too small");
     // pool[source][task] -> record indices
     let mut pool: BTreeMap<String, [Vec<usize>; 3]> = BTreeMap::new();
-    for &i in &validation[EXCLUDED_PREFIX..] {
+    for &i in &validation[prefix..] {
         let r = &l.corpus.records[i];
         let source = l.corpus.provenance[i].source_id.clone();
         let entry = pool.entry(source.clone()).or_default();
@@ -188,9 +203,13 @@ fn select(args: &[String]) -> Result<()> {
             entry[2].push(i);
         }
     }
-    println!(
-        "#seed\t{seed}\n#per_task\t{per_task}\n#excluded_validation_prefix\t{EXCLUDED_PREFIX}"
-    );
+    if partition_name == "validation" {
+        println!(
+            "#seed\t{seed}\n#per_task\t{per_task}\n#excluded_validation_prefix\t{EXCLUDED_PREFIX}"
+        );
+    } else {
+        println!("#seed\t{seed}\n#per_task\t{per_task}\n#partition\t{partition_name}");
+    }
     println!("#pool\tsource\trt\tccs\tms2");
     for (s, p) in &pool {
         println!("#pool\t{s}\t{}\t{}\t{}", p[0].len(), p[1].len(), p[2].len());
@@ -225,9 +244,13 @@ fn score(args: &[String]) -> Result<()> {
     let l = load(args)?;
     let cohort_sha = sha256_file(&args[4])?;
     println!("#cohort_sha256\t{cohort_sha}");
+    let (partition, _, partition_name) = cohort_partition();
+    if partition_name != "validation" {
+        println!("#partition\t{partition_name}");
+    }
     let validation: BTreeSet<usize> = l
         .benchmark
-        .partition_indices(FoundationPartition::Validation)
+        .partition_indices(partition)
         .into_iter()
         .collect();
     let mut tasks: BTreeMap<&'static str, Vec<usize>> = BTreeMap::new();
@@ -241,7 +264,7 @@ fn score(args: &[String]) -> Result<()> {
         let i: usize = f[2].parse()?;
         anyhow::ensure!(
             validation.contains(&i),
-            "cohort record {i} is not Validation"
+            "cohort record {i} is not in partition {partition_name}"
         );
         anyhow::ensure!(
             l.corpus.provenance[i].source_id == f[1],
@@ -349,6 +372,23 @@ fn self_test() {
         to_harmonized(RetentionTimeObjective::Harmonized, 40.0, &t),
         Some(40.0)
     );
+    let saved = std::env::var("F2_PARTITION").ok();
+    for (value, expected) in [
+        (Some("train"), FoundationPartition::Train),
+        (Some("test"), FoundationPartition::Validation),
+        (Some("Test"), FoundationPartition::Validation),
+        (None, FoundationPartition::Validation),
+    ] {
+        match value {
+            Some(v) => std::env::set_var("F2_PARTITION", v),
+            None => std::env::remove_var("F2_PARTITION"),
+        }
+        assert_eq!(cohort_partition().0, expected, "{value:?}");
+    }
+    match saved {
+        Some(v) => std::env::set_var("F2_PARTITION", v),
+        None => std::env::remove_var("F2_PARTITION"),
+    }
     println!("F2_SCORECARD_SELF_TEST=PASS");
 }
 
