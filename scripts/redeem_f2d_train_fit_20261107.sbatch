@@ -16,6 +16,8 @@ EXP="$ROOT/experiments/redeem_f2d_train_fit_20261107"
 BIN="$EXP/bin/foundation_f2_scorecard_2a9d48f"
 SUMMARY="$ROOT/experiments/redeem_f2_scorecard_20261101/scripts/redeem_f2_scorecard_summary_20261101.py"
 SUMMARY_SHA=2bd3a71efe0b2b7f659fb2044f561d50b46106b8e4b4441c6ad9c5b83b5946a1
+SEEN="$EXP/scripts/redeem_f2d_seen_20261107.py"
+BENCH_TSV="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/benchmark_train_derived_v0260.tsv"
 RUN_YAML="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/run_v0260.yaml"
 RUN_SHA=7214b9cdd3836ec028655d5d6b8bb088280558626b24c9afc63ec06d582b4201
 CORPUS_FNV=fnv1a64:a2a6f57d31064ba6
@@ -28,12 +30,13 @@ CKPTS=(
   "r1_ep10=$RUNS/seed20261007_init1_82f490de1178_20306283/model/epoch_010"
   "r2_ep10=$RUNS/seed20261008_init2_82f490de1178_20306284/model/epoch_010"
 )
-: "${EXPECTED_BIN_SHA256:?}"
+: "${EXPECTED_BIN_SHA256:?}" "${EXPECTED_SEEN_SHA256:?}"
 export F2_PARTITION=train
 OUT="$EXP/runs/train_${SLURM_JOB_ID}"
 test ! -e "$OUT" || { echo "BLOCKED: output exists $OUT"; exit 2; }
 echo "$EXPECTED_BIN_SHA256  $BIN" | sha256sum -c - || { echo "BLOCKED: binary SHA mismatch"; exit 2; }
 echo "$SUMMARY_SHA  $SUMMARY" | sha256sum -c - || { echo "BLOCKED: summary SHA mismatch"; exit 2; }
+echo "$EXPECTED_SEEN_SHA256  $SEEN" | sha256sum -c - || { echo "BLOCKED: seen script SHA mismatch"; exit 2; }
 for spec in "${CKPTS[@]}" "teacher=$TEACHER"; do
   c="${spec#*=}"; test -s "$c/model.safetensors" -a -s "$c/metadata.yaml" || { echo "BLOCKED: $c"; exit 2; }
 done
@@ -50,11 +53,19 @@ mkdir -p "$OUT"
 grep -q '^#F2_SCORECARD_SELECT=COMPLETE$' "$OUT/cohort.tsv"
 grep -qx '#partition	train' "$OUT/cohort.tsv"
 sha256sum "$OUT/cohort.tsv" >> "$OUT/provenance.txt"
+# Mark per seed which TRAIN cohort records the property stages saw (exact rebuild, checked
+# against each run's training_exposure.tsv; fails on any mismatch).
+python3 "$SEEN" "$BENCH_TSV" "$OUT/cohort.tsv" \
+  20261006="$RUNS/seed20261006_initdefault_82f490de1178_20306282/model/training_exposure.tsv" \
+  20261007="$RUNS/seed20261007_init1_82f490de1178_20306283/model/training_exposure.tsv" \
+  20261008="$RUNS/seed20261008_init2_82f490de1178_20306284/model/training_exposure.tsv" \
+  > "$OUT/seen.tsv"
+grep -q '^F2D_SEEN=COMPLETE$' "$OUT/seen.tsv"
 /usr/bin/time -v "$BIN" score "$RUN_YAML" "$RUN_SHA" "$CORPUS_FNV" "$BENCH_FNV" "$OUT/cohort.tsv" "$TEACHER" "${CKPTS[@]}" \
   > "$OUT/scores.tsv" 2> "$OUT/score.stderr"
 grep -q '^#F2_SCORECARD_SCORE=COMPLETE$' "$OUT/scores.tsv"
 python3 "$SUMMARY" "$OUT/scores.tsv" --reference v052 > "$OUT/summary.tsv"
 grep -q '^F2_SUMMARY=COMPLETE$' "$OUT/summary.tsv"
 date -u +finished=%FT%TZ >> "$OUT/provenance.txt"
-sha256sum "$OUT/cohort.tsv" "$OUT/scores.tsv" "$OUT/summary.tsv" > "$OUT/output_sha256.txt"
+sha256sum "$OUT/cohort.tsv" "$OUT/seen.tsv" "$OUT/scores.tsv" "$OUT/summary.tsv" > "$OUT/output_sha256.txt"
 echo "F2D_TRAIN_JOB=PASS out=$OUT"
