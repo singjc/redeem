@@ -22,7 +22,8 @@ fi
 
 ROOT=/nfs/research/juan/DIA/singj/foundation_model
 PREPARED_RUN="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/run_v0260.yaml"
-RUN_ROOT="$ROOT/experiments/redeem_f2e_budget_20261107/runs"
+RUN_ROOT="$ROOT/experiments/${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}/runs"
+case "${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}" in redeem_f2e_budget_20261107|redeem_f2f_arms_20261109) ;; *) echo "ERROR: unknown F2F_EXPERIMENT" >&2; exit 2;; esac
 EPOCHS=${F2E_EPOCHS:-30}
 case "$EPOCHS" in ''|*[!0-9]*) echo "ERROR: F2E_EPOCHS must be an integer" >&2; exit 2;; esac
 [ "$EPOCHS" -ge 10 ] && [ "$EPOCHS" -le 60 ] || { echo "ERROR: F2E_EPOCHS out of range 10..60" >&2; exit 2; }
