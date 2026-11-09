@@ -65,6 +65,13 @@ pub struct FoundationSpecialistConfig {
     /// correction. Missing on old serialized checkpoints => replacement mode.
     #[serde(default)]
     pub ms2_residual_blend: bool,
+    /// Opt-in v0.51-style fragment tokens: one token per (cleavage, channel) with a
+    /// learned channel embedding (ion series and fragment charge are fixed per channel)
+    /// plus a precursor-charge embedding, then one transformer block over all tokens and
+    /// 1-output heads. `false` (default and all older checkpoints) keeps one token per
+    /// cleavage with 8-output heads.
+    #[serde(default)]
+    pub ms2_fragment_tokens: bool,
 }
 
 impl Default for FoundationSpecialistConfig {
@@ -75,6 +82,7 @@ impl Default for FoundationSpecialistConfig {
             ms2: true,
             mobility_ccs: true,
             ms2_residual_blend: true,
+            ms2_fragment_tokens: false,
         }
     }
 }
@@ -86,6 +94,7 @@ fn legacy_foundation_specialists() -> FoundationSpecialistConfig {
         ms2: false,
         mobility_ccs: false,
         ms2_residual_blend: false,
+        ms2_fragment_tokens: false,
     }
 }
 
