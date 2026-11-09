@@ -27,7 +27,16 @@ EPOCHS=${F2E_EPOCHS:-30}
 case "$EPOCHS" in ''|*[!0-9]*) echo "ERROR: F2E_EPOCHS must be an integer" >&2; exit 2;; esac
 [ "$EPOCHS" -ge 10 ] && [ "$EPOCHS" -le 60 ] || { echo "ERROR: F2E_EPOCHS out of range 10..60" >&2; exit 2; }
 UPDATES=$((EPOCHS * 1024 * 5))
-EXPECTED_COMMIT=82f490de1178b71dbe98c7257b4a8687b0d1f898
+# F2-F arms: optional MS2 fragment tokens (needs commit 7c964c6+) and an arm tag for the folder.
+MS2_TOKENS=${F2F_MS2_TOKENS:-0}
+case "$MS2_TOKENS" in 0) MS2_TOKENS_JSON=false;; 1) MS2_TOKENS_JSON=true;; *) echo "ERROR: F2F_MS2_TOKENS must be 0 or 1" >&2; exit 2;; esac
+ARM_TAG=${F2F_ARM_TAG:-}
+case "$ARM_TAG" in ''|ms2tok|rtlong) ;; *) echo "ERROR: F2F_ARM_TAG must be empty, ms2tok or rtlong" >&2; exit 2;; esac
+EXPECTED_COMMIT=${F2F_EXPECTED_COMMIT:-82f490de1178b71dbe98c7257b4a8687b0d1f898}
+if [ "$MS2_TOKENS" = 1 ] && [ "$EXPECTED_COMMIT" = 82f490de1178b71dbe98c7257b4a8687b0d1f898 ]; then
+  echo "ERROR: F2F_MS2_TOKENS=1 needs F2F_EXPECTED_COMMIT pointing at a build with 7c964c6" >&2
+  exit 2
+fi
 FROZEN_SIF_SHA256=${F2B_FROZEN_SIF_SHA256:-}
 F2B_SEED=${F2B_SEED:-}
 F2B_INIT_SEED=${F2B_INIT_SEED:-}
@@ -71,7 +80,7 @@ if ! command -v singularity >/dev/null 2>&1 || ! command -v nvidia-smi >/dev/nul
 fi
 
 SHORT=${EXPECTED_GIT_SHA:0:12}
-OUT="$RUN_ROOT/ep${EPOCHS}_seed${F2B_SEED}_init${F2B_INIT_SEED}_${SHORT}_${SLURM_JOB_ID}"
+OUT="$RUN_ROOT/${ARM_TAG:+${ARM_TAG}_}ep${EPOCHS}_seed${F2B_SEED}_init${F2B_INIT_SEED}_${SHORT}_${SLURM_JOB_ID}"
 MODEL="$OUT/model"
 CFG="$OUT/foundation_train.json"
 TRAIN_LOG="$OUT/train.log"
@@ -122,7 +131,8 @@ cat > "$CFG" <<JSON
         "rt": true,
         "ms2": true,
         "ms2_residual_blend": true,
-        "mobility_ccs": true
+        "mobility_ccs": true,
+        "ms2_fragment_tokens": $MS2_TOKENS_JSON
       },
       "auxiliary_supervision_heads": true,
       "peptide": {
@@ -190,7 +200,7 @@ fi
 
 # Fail before loading millions of TRAIN records if nested Serde defaults silently
 # replaced deep-model dimensions or MS2 shape-loss controls.
-python3 - "$CFG" "$EPOCHS" <<'PY_CONFIG_CHECK'
+python3 - "$CFG" "$EPOCHS" "$MS2_TOKENS" <<'PY_CONFIG_CHECK'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     cfg = json.load(stream)["foundation"]
@@ -204,6 +214,7 @@ assert model["specialists"] == {
     "ms2": True,
     "ms2_residual_blend": True,
     "mobility_ccs": True,
+    "ms2_fragment_tokens": sys.argv[3] == "1",
 }
 assert model["auxiliary_supervision_heads"] is True
 for key, expected in {
@@ -258,6 +269,8 @@ fi
   printf 'sif_sha256\t%s\n' "$ACTUAL_SIF_SHA256"
   printf 'prepared_run\t%s\n' "$PREPARED_RUN"
   printf 'random_init\tYES\n'
+  printf 'ms2_fragment_tokens\t%s\n' "$MS2_TOKENS"
+  printf 'arm_tag\t%s\n' "${ARM_TAG:-none}"
   printf 'data_order_seed\t%s\n' "$F2B_SEED"
   printf 'cuda_init_seed\t%s\n' "$F2B_INIT_SEED"
   printf 'recipe_parent_job\t62709585\n'
@@ -400,6 +413,11 @@ for spec in "seed: $F2B_SEED" "save_epoch_checkpoints: true"; do
     exit 2
   fi
 done
+# The token arm must really be active: an older binary would silently ignore the field.
+if [ "$MS2_TOKENS" = 1 ] && ! grep -Eq '^\s*ms2_fragment_tokens:\s*true\s*$' "$MODEL/metadata.yaml"; then
+  echo "ERROR: ms2_fragment_tokens=true requested but not recorded in model metadata" >&2
+  exit 2
+fi
 printf 'research_property_sampling_exposure=PASS\n'
 
 # Preserve the deterministic Validation prefix (2048 records); explicitly
