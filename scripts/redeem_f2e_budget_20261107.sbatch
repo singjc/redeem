@@ -4,8 +4,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=3-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --output=/nfs/research/juan/DIA/singj/foundation_model/redeem-f2e-budget-%j.out
-#SBATCH --error=/nfs/research/juan/DIA/singj/foundation_model/redeem-f2e-budget-%j.err
+#SBATCH --output=/nfs/research/juan/singj/foundation_model/redeem-f2e-budget-%j.out
+#SBATCH --error=/nfs/research/juan/singj/foundation_model/redeem-f2e-budget-%j.err
 
 # F2-E training-budget arm. Derived from redeem_f2b_seed_replicates_20261101.sbatch
 # (16ce5af6...). The ONLY recipe change is EPOCHS (env F2E_EPOCHS, default 30): the cosine
@@ -20,14 +20,39 @@ if [ "$module_rc" -ne 0 ]; then
   exit "$module_rc"
 fi
 
-ROOT=/nfs/research/juan/DIA/singj/foundation_model
-PREPARED_RUN="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/run_v0260.yaml"
+# 2026-11-11: the project root moved out of DIA/ (user). Every dataset path inside the original
+# run_v0260.yaml is absolute, so a re-rooted copy (prefix replaced only, pinned by SHA) is used.
+# Corpus and benchmark fingerprints do not hash paths, so they are unchanged.
+ROOT=/nfs/research/juan/singj/foundation_model
+PREPARED_RUN="$ROOT/experiments/redeem_f2f_arms_20261109/prepared/run_v0260_root20261111.yaml"
+PREPARED_RUN_SHA256=${F2F_PREPARED_RUN_SHA256:-}
+[ -n "$PREPARED_RUN_SHA256" ] || { echo "ERROR: F2F_PREPARED_RUN_SHA256 is required" >&2; exit 2; }
 RUN_ROOT="$ROOT/experiments/${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}/runs"
 case "${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}" in redeem_f2e_budget_20261107|redeem_f2f_arms_20261109) ;; *) echo "ERROR: unknown F2F_EXPERIMENT" >&2; exit 2;; esac
 EPOCHS=${F2E_EPOCHS:-30}
 case "$EPOCHS" in ''|*[!0-9]*) echo "ERROR: F2E_EPOCHS must be an integer" >&2; exit 2;; esac
 [ "$EPOCHS" -ge 10 ] && [ "$EPOCHS" -le 60 ] || { echo "ERROR: F2E_EPOCHS out of range 10..60" >&2; exit 2; }
 UPDATES=$((EPOCHS * 1024 * 5))
+# Opt-in resume of an interrupted run (needs a build with f563ae3): F2F_RESUME_RUN = the old run
+# folder name under RUN_ROOT, F2F_RESUME_EPOCH = N (its epoch_NNN checkpoint). Epochs 1..N are
+# replayed for data order/exposure and LR only; AdamW moments restart from zero.
+RESUME_RUN=${F2F_RESUME_RUN:-}
+RESUME_EPOCH=${F2F_RESUME_EPOCH:-0}
+case "$RESUME_EPOCH" in ''|*[!0-9]*) echo "ERROR: F2F_RESUME_EPOCH must be an integer" >&2; exit 2;; esac
+if [ "$RESUME_EPOCH" -gt 0 ]; then
+  [ -n "$RESUME_RUN" ] && [ "$RESUME_EPOCH" -lt "$EPOCHS" ] || { echo "ERROR: resume needs F2F_RESUME_RUN and F2F_RESUME_EPOCH < epochs" >&2; exit 2; }
+  RESUME_CKPT="$RUN_ROOT/$RESUME_RUN/model/epoch_$(printf '%03d' "$RESUME_EPOCH")"
+  [ -s "$RESUME_CKPT/model.safetensors" ] && grep -qx "completed_epochs: $RESUME_EPOCH" "$RESUME_CKPT/metadata.yaml" || { echo "ERROR: resume checkpoint invalid: $RESUME_CKPT" >&2; exit 2; }
+  CHECKPOINT_JSON="\"$RESUME_CKPT\""
+  RESUME_JSON=$RESUME_EPOCH
+else
+  [ -z "$RESUME_RUN" ] || { echo "ERROR: F2F_RESUME_RUN set without F2F_RESUME_EPOCH" >&2; exit 2; }
+  RESUME_CKPT=none
+  CHECKPOINT_JSON=null
+  RESUME_JSON=null
+fi
+# Rows written by THIS run (validation, history, stage logs); exposure always has EPOCHS rows.
+RUN_EPOCHS=$((EPOCHS - RESUME_EPOCH))
 # F2-F arms: optional MS2 fragment tokens (needs commit 7c964c6+) and an arm tag for the folder.
 MS2_TOKENS=${F2F_MS2_TOKENS:-0}
 case "$MS2_TOKENS" in 0) MS2_TOKENS_JSON=false;; 1) MS2_TOKENS_JSON=true;; *) echo "ERROR: F2F_MS2_TOKENS must be 0 or 1" >&2; exit 2;; esac
@@ -70,6 +95,10 @@ if [ ! -s "$SIF" ] || [ ! -s "$PREPARED_RUN" ]; then
   echo "ERROR: SIF or prepared run missing" >&2
   exit 2
 fi
+if [ "$(sha256sum "$PREPARED_RUN" | awk '{print $1}')" != "$PREPARED_RUN_SHA256" ]; then
+  echo "ERROR: prepared run SHA mismatch" >&2
+  exit 2
+fi
 ACTUAL_SIF_SHA256=$(sha256sum "$SIF" | awk '{print $1}')
 if [ "$EXPECTED_SIF_SHA256" != "$FROZEN_SIF_SHA256" ] || [ "$EXPECTED_SIF_SHA256" != "$ACTUAL_SIF_SHA256" ]; then
   echo "ERROR: SIF SHA mismatch: expected=$EXPECTED_SIF_SHA256 actual=$ACTUAL_SIF_SHA256" >&2
@@ -81,7 +110,7 @@ if ! command -v singularity >/dev/null 2>&1 || ! command -v nvidia-smi >/dev/nul
 fi
 
 SHORT=${EXPECTED_GIT_SHA:0:12}
-OUT="$RUN_ROOT/${ARM_TAG:+${ARM_TAG}_}ep${EPOCHS}_seed${F2B_SEED}_init${F2B_INIT_SEED}_${SHORT}_${SLURM_JOB_ID}"
+OUT="$RUN_ROOT/${ARM_TAG:+${ARM_TAG}_}ep${EPOCHS}${RESUME_RUN:+_resume${RESUME_EPOCH}}_seed${F2B_SEED}_init${F2B_INIT_SEED}_${SHORT}_${SLURM_JOB_ID}"
 MODEL="$OUT/model"
 CFG="$OUT/foundation_train.json"
 TRAIN_LOG="$OUT/train.log"
@@ -117,7 +146,7 @@ cat > "$CFG" <<JSON
   "learning_rate": 0.00002,
   "epochs": $EPOCHS,
   "early_stopping_patience": $EPOCHS,
-  "checkpoint_file": null,
+  "checkpoint_file": $CHECKPOINT_JSON,
   "instrument": "QE",
   "nce": 20,
   "head_type": "mlp",
@@ -189,7 +218,8 @@ cat > "$CFG" <<JSON
     "conformation_proxy_weight": 0.10,
     "seed": $F2B_SEED,
     "init_seed": $INIT_SEED_JSON,
-    "save_epoch_checkpoints": true
+    "save_epoch_checkpoints": true,
+    "resume_from_epoch": $RESUME_JSON
   }
 }
 JSON
@@ -201,7 +231,7 @@ fi
 
 # Fail before loading millions of TRAIN records if nested Serde defaults silently
 # replaced deep-model dimensions or MS2 shape-loss controls.
-python3 - "$CFG" "$EPOCHS" "$MS2_TOKENS" <<'PY_CONFIG_CHECK'
+python3 - "$CFG" "$EPOCHS" "$MS2_TOKENS" "$RESUME_EPOCH" <<'PY_CONFIG_CHECK'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     cfg = json.load(stream)["foundation"]
@@ -254,6 +284,9 @@ for name in ["pair_auxiliary_weight", "chemistry_summary_weight", "conformation_
 assert cfg["epochs"] * cfg["max_train_batches_per_epoch"] * 5 == int(sys.argv[2]) * 1024 * 5
 assert isinstance(cfg["seed"], int) and cfg["save_epoch_checkpoints"] is True
 assert cfg["init_seed"] is None or isinstance(cfg["init_seed"], int)
+resume = int(sys.argv[4])
+assert cfg["resume_from_epoch"] == (resume or None)
+assert (json.load(open(sys.argv[1]))["checkpoint_file"] is None) == (resume == 0)
 print("explicit_deep_research_sampling_convergence_preflight=PASS")
 PY_CONFIG_CHECK
 CONFIG_CHECK_RC=$?
@@ -269,7 +302,11 @@ fi
   printf 'sif\t%s\n' "$SIF"
   printf 'sif_sha256\t%s\n' "$ACTUAL_SIF_SHA256"
   printf 'prepared_run\t%s\n' "$PREPARED_RUN"
-  printf 'random_init\tYES\n'
+  printf 'random_init\t%s\n' "$([ "$RESUME_EPOCH" -gt 0 ] && echo NO_RESUMED || echo YES)"
+  printf 'resume_from_epoch\t%s\n' "$RESUME_EPOCH"
+  printf 'resume_checkpoint\t%s\n' "$RESUME_CKPT"
+  printf 'resume_adam_moments\t%s\n' "$([ "$RESUME_EPOCH" -gt 0 ] && echo RESET || echo NA)"
+  printf 'prepared_run_sha256\t%s\n' "$PREPARED_RUN_SHA256"
   printf 'ms2_fragment_tokens\t%s\n' "$MS2_TOKENS"
   printf 'arm_tag\t%s\n' "${ARM_TAG:-none}"
   printf 'data_order_seed\t%s\n' "$F2B_SEED"
@@ -394,15 +431,19 @@ if ! awk -F '\t' '
   cat "$EXPOSURE" >&2
   exit 2
 fi
-if [ "$(grep -c '^foundation_stage_losses' "$TRAIN_LOG")" -ne "$EPOCHS" ]; then
+if [ "$(grep -c '^foundation_stage_losses' "$TRAIN_LOG")" -ne "$RUN_EPOCHS" ]; then
   echo "ERROR: missing per-stage research curriculum losses" >&2
   exit 2
 fi
-if [ "$(grep -c '^foundation_stage_gradients' "$TRAIN_LOG")" -ne "$EPOCHS" ]; then
+if [ "$(grep -c '^foundation_stage_gradients' "$TRAIN_LOG")" -ne "$RUN_EPOCHS" ]; then
   echo "ERROR: missing per-stage gradient diagnostics" >&2
   exit 2
 fi
-for e in $(seq -f '%03g' 1 "$EPOCHS"); do
+if [ "$RESUME_EPOCH" -gt 0 ] && ! grep -q "^foundation_resume from_epoch=$RESUME_EPOCH global_update=$((RESUME_EPOCH * 1024 * 5)) planned_updates=$UPDATES " "$TRAIN_LOG"; then
+  echo "ERROR: trainer did not report the expected resume point" >&2
+  exit 2
+fi
+for e in $(seq -f '%03g' $((RESUME_EPOCH + 1)) "$EPOCHS"); do
   if [ ! -s "$MODEL/epoch_$e/model.safetensors" ] || [ ! -s "$MODEL/epoch_$e/metadata.yaml" ]; then
     echo "ERROR: missing per-epoch checkpoint epoch_$e" >&2
     exit 2
@@ -433,7 +474,7 @@ if ! awk -F '\t' '
     rows++;
   }
   END { if (rows != epochs) exit 1 }
-' epochs="$EPOCHS" "$MODEL/validation_metrics.tsv"; then
+' epochs="$RUN_EPOCHS" "$MODEL/validation_metrics.tsv"; then
   echo "ERROR: insufficient Validation forward-label coverage; best_forward is not scoreable" >&2
   cat "$MODEL/validation_metrics.tsv" >&2
   exit 2
@@ -465,7 +506,7 @@ if ! awk -F '\t' '
     printf "ms2_convergence_useful_epochs=%d\n",useful;
     if(bad || count!=epochs || useful<1) exit 1;
   }
-' epochs="$EPOCHS" "$MODEL/validation_metrics.tsv"; then
+' epochs="$RUN_EPOCHS" "$MODEL/validation_metrics.tsv"; then
   echo "ERROR: gated MS2 convergence lost useful spectral signal or missing metrics" >&2
   cat "$MODEL/validation_metrics.tsv" >&2
   exit 2
@@ -537,7 +578,7 @@ done
 if ! awk -F '\t' 'NR==1 { for(i=1;i<=NF;i++) col[$i]=i; next }
     NR>=2 {if(!(col["train_forward"] && col["train_inverse"])) exit 1;
       if(($col["train_forward"]+0)<=0 || ($col["train_inverse"]+0)<=0) exit 1;
-      rows++} END{if(rows != epochs) exit 1}' epochs="$EPOCHS" "$MODEL/training_history.tsv"; then
+      rows++} END{if(rows != epochs) exit 1}' epochs="$RUN_EPOCHS" "$MODEL/training_history.tsv"; then
   echo "ERROR: forward/inverse training losses not both positive; five-stage exercise not demonstrated" >&2
   exit 2
 fi
@@ -548,7 +589,7 @@ if ! awk -F '\t' '$1=="train_consensus_examples" && ($2+0)>0 {found=1} END{if(!f
 fi
 if ! awk -F '\t' 'NR==1 {for(i=1;i<=NF;i++) col[$i]=i; next}
   NR>=2 {if(!col["inverse_sequence_count"] || ($col["inverse_sequence_count"]+0)<=0) exit 1;
-         rows++} END{if(rows != epochs) exit 1}' epochs="$EPOCHS" "$MODEL/validation_metrics.tsv"; then
+         rows++} END{if(rows != epochs) exit 1}' epochs="$RUN_EPOCHS" "$MODEL/validation_metrics.tsv"; then
   echo "ERROR: inverse Validation evaluation did not exercise spectrum-bearing records" >&2
   exit 2
 fi
@@ -618,13 +659,16 @@ done
 
 # Report the actual forward-balanced selection, not independent minima
 # assembled from different epochs. All metrics below come from Validation.
-python3 - "$MODEL/validation_metrics.tsv" "$MODEL/metadata.yaml" "$MODEL/best_forward/metadata.yaml" "$MODEL/best_inverse/metadata.yaml" "$OUT/convergence_summary.tsv" "$EPOCHS" <<'PY_SUMMARY'
+python3 - "$MODEL/validation_metrics.tsv" "$MODEL/metadata.yaml" "$MODEL/best_forward/metadata.yaml" "$MODEL/best_inverse/metadata.yaml" "$OUT/convergence_summary.tsv" "$RUN_EPOCHS" <<'PY_SUMMARY'
 import csv, math, pathlib, re, sys
 metrics, main_yaml, forward_yaml, inverse_yaml, dest = map(pathlib.Path, sys.argv[1:6])
 with metrics.open(encoding="utf-8", newline="") as handle:
     rows = list(csv.DictReader(handle, delimiter="\t"))
 if len(rows) != int(sys.argv[6]):
     raise SystemExit("unexpected number of Validation epochs")
+# Rows are keyed by their epoch column (a resumed run starts after epoch 1).
+by_epoch = {int(r["epoch"]): r for r in rows}
+last_epoch = max(by_epoch)
 
 def selected_epoch(path):
     txt = path.read_text(encoding="utf-8")
@@ -632,7 +676,7 @@ def selected_epoch(path):
     if not match:
         raise SystemExit(f"missing completed_epochs in {path}")
     epoch = int(match.group(1))
-    if epoch < 1 or epoch > len(rows):
+    if epoch not in by_epoch:
         raise SystemExit(f"invalid selected epoch {epoch} in {path}")
     return epoch
 
@@ -643,8 +687,8 @@ fields = ["rt_mae_native", "ccs_mae", "ms2_cosine_similarity", "ms2_spectral_ang
 with dest.open("w", encoding="utf-8", newline="") as handle:
     writer = csv.writer(handle, delimiter="\t")
     writer.writerow(["checkpoint", "epoch", *fields])
-    for label, epoch in [("best_total", tep), ("best_forward", fep), ("best_inverse", iep), ("final_validation_only", len(rows))]:
-        row = rows[epoch-1]
+    for label, epoch in [("best_total", tep), ("best_forward", fep), ("best_inverse", iep), ("final_validation_only", last_epoch)]:
+        row = by_epoch[epoch]
         values = []
         for field in fields:
             val = row.get(field, "")

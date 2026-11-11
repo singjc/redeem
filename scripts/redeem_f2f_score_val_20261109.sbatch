@@ -4,14 +4,14 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=16:00:00
-#SBATCH --output=/nfs/research/juan/DIA/singj/foundation_model/redeem-f2f-score-%j.out
-#SBATCH --error=/nfs/research/juan/DIA/singj/foundation_model/redeem-f2f-score-%j.err
+#SBATCH --output=/nfs/research/juan/singj/foundation_model/redeem-f2f-score-%j.out
+#SBATCH --error=/nfs/research/juan/singj/foundation_model/redeem-f2f-score-%j.err
 # F2-F Validation scoring (CPU). Copy of redeem_f2e_score_val_20261107.sbatch (2a045532...) with
 # the checkpoint list taken from env: F2F_ARM (label prefix), F2F_RUN0/1/2 (run folders under
 # redeem_f2f_arms_20261109/runs), F2F_EPOCHS (space-separated). Same binary, summary and fixed
 # F2-A cohort. Validation only, no TEST.
 set -euo pipefail
-ROOT=/nfs/research/juan/DIA/singj/foundation_model
+ROOT=/nfs/research/juan/singj/foundation_model
 EXP="$ROOT/experiments/redeem_f2_scorecard_20261101"
 BIN="${F2F_BIN:-$EXP/bin/foundation_f2_scorecard_dea11c0}"
 SUMMARY="$EXP/scripts/redeem_f2_scorecard_summary_20261101.py"
@@ -19,8 +19,9 @@ COHORT="$EXP/runs/scorecard_15264522/cohort.tsv"
 COHORT_SHA=3f640cbdd3a5dc4183a9055a5892d8cd9a291a31f8a54055b7ad24afb8a98056
 BIN_SHA="${F2F_BIN_SHA:-5cfb01c86aa7011821a801f7ebab1356fc7b0b89645222eb9048569cfa3569c5}"
 SUMMARY_SHA=2bd3a71efe0b2b7f659fb2044f561d50b46106b8e4b4441c6ad9c5b83b5946a1
-RUN_YAML="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/run_v0260.yaml"
-RUN_SHA=7214b9cdd3836ec028655d5d6b8bb088280558626b24c9afc63ec06d582b4201
+# 2026-11-11 root move: re-rooted copy of run_v0260.yaml (prefix only; fingerprints are checked below).
+RUN_YAML="$ROOT/experiments/redeem_f2f_arms_20261109/prepared/run_v0260_root20261111.yaml"
+RUN_SHA=ca642a6f7fe53d5a2faa3830b3eeea75c430bfb2521acf20210968d35de276c7
 CORPUS_FNV=fnv1a64:a2a6f57d31064ba6
 BENCH_FNV=fnv1a64:2133c039625f77df
 TEACHER="$ROOT/experiments/multimodal_v0350_01_trainable_forward_representation/model/best"
