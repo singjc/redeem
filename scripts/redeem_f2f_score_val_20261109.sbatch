@@ -32,9 +32,15 @@ R0="$RUNS/$F2F_RUN0/model"
 R1="$RUNS/$F2F_RUN1/model"
 R2="$RUNS/$F2F_RUN2/model"
 CKPTS=()
+# Resumed runs (2026-11-11): optional F2F_LATE_RUN0/1/2 = the resume folder of each seed. An epoch
+# is read from the late folder if it holds that epoch_NNN, else from the original folder. The
+# two folders never share an epoch (the resume folder starts after the resume epoch).
+pick() { local late="$1" main="$2" p="$3"
+  if [ -n "$late" ] && [ -d "$RUNS/$late/model/epoch_$p" ]; then echo "$RUNS/$late/model/epoch_$p"
+  else echo "$main/epoch_$p"; fi; }
 for e in $F2F_EPOCHS; do
   p=$(printf '%03d' "$e")
-  CKPTS+=("${F2F_ARM}0_ep$e=$R0/epoch_$p" "${F2F_ARM}1_ep$e=$R1/epoch_$p" "${F2F_ARM}2_ep$e=$R2/epoch_$p")
+  CKPTS+=("${F2F_ARM}0_ep$e=$(pick "${F2F_LATE_RUN0:-}" "$R0" "$p")" "${F2F_ARM}1_ep$e=$(pick "${F2F_LATE_RUN1:-}" "$R1" "$p")" "${F2F_ARM}2_ep$e=$(pick "${F2F_LATE_RUN2:-}" "$R2" "$p")")
 done
 LAST=${F2F_EPOCHS##* }
 # Optional binary-equivalence control: one F2-E checkpoint, rows must equal the F2-E scores.
