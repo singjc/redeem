@@ -12,7 +12,7 @@
 set -euo pipefail
 ROOT=/nfs/research/juan/DIA/singj/foundation_model
 EXP="$ROOT/experiments/redeem_f2d_train_fit_20261107"
-BIN="$EXP/bin/foundation_f2_scorecard_2a9d48f"
+BIN="${F2F_BIN:-$EXP/bin/foundation_f2_scorecard_2a9d48f}"
 OUT_EXP="$ROOT/experiments/redeem_f2f_arms_20261109"
 SUMMARY="$ROOT/experiments/redeem_f2_scorecard_20261101/scripts/redeem_f2_scorecard_summary_20261101.py"
 SUMMARY_SHA=2bd3a71efe0b2b7f659fb2044f561d50b46106b8e4b4441c6ad9c5b83b5946a1

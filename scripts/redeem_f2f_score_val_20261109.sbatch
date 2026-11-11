@@ -13,11 +13,11 @@
 set -euo pipefail
 ROOT=/nfs/research/juan/DIA/singj/foundation_model
 EXP="$ROOT/experiments/redeem_f2_scorecard_20261101"
-BIN="$EXP/bin/foundation_f2_scorecard_dea11c0"
+BIN="${F2F_BIN:-$EXP/bin/foundation_f2_scorecard_dea11c0}"
 SUMMARY="$EXP/scripts/redeem_f2_scorecard_summary_20261101.py"
 COHORT="$EXP/runs/scorecard_15264522/cohort.tsv"
 COHORT_SHA=3f640cbdd3a5dc4183a9055a5892d8cd9a291a31f8a54055b7ad24afb8a98056
-BIN_SHA=5cfb01c86aa7011821a801f7ebab1356fc7b0b89645222eb9048569cfa3569c5
+BIN_SHA="${F2F_BIN_SHA:-5cfb01c86aa7011821a801f7ebab1356fc7b0b89645222eb9048569cfa3569c5}"
 SUMMARY_SHA=2bd3a71efe0b2b7f659fb2044f561d50b46106b8e4b4441c6ad9c5b83b5946a1
 RUN_YAML="$ROOT/experiments/multimodal_v0261_03_openptm_fragmentgeometryfix2/prepared/run_v0260.yaml"
 RUN_SHA=7214b9cdd3836ec028655d5d6b8bb088280558626b24c9afc63ec06d582b4201
@@ -36,6 +36,8 @@ for e in $F2F_EPOCHS; do
   CKPTS+=("${F2F_ARM}0_ep$e=$R0/epoch_$p" "${F2F_ARM}1_ep$e=$R1/epoch_$p" "${F2F_ARM}2_ep$e=$R2/epoch_$p")
 done
 LAST=${F2F_EPOCHS##* }
+# Optional binary-equivalence control: one F2-E checkpoint, rows must equal the F2-E scores.
+[ -n "${F2F_CONTROL_CKPT:-}" ] && CKPTS+=("ctl_e0_ep30=$F2F_CONTROL_CKPT")
 OUT="$ROOT/experiments/redeem_f2f_arms_20261109/score/${F2F_ARM}_val_${SLURM_JOB_ID}"
 test ! -e "$OUT" || { echo "BLOCKED: output exists $OUT"; exit 2; }
 echo "$BIN_SHA  $BIN" | sha256sum -c - || { echo "BLOCKED: binary SHA mismatch"; exit 2; }
