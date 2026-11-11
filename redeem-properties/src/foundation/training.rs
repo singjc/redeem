@@ -105,6 +105,14 @@ pub struct FoundationTrainingConfig {
     /// Opt-in: also save `epoch_NNN` checkpoints after every epoch (learning curves).
     #[serde(default)]
     pub save_epoch_checkpoints: bool,
+    /// Opt-in resume of an interrupted run from its `epoch_NNN` checkpoint (passed as the
+    /// initial checkpoint, whose metadata must record `completed_epochs == N`). Epochs
+    /// 1..=N are skipped: their data order is replayed only to rebuild the exposure report,
+    /// and the LR schedule continues at the exact global update. AdamW moments are NOT
+    /// restored (checkpoints do not store them), so they restart from zero with bias
+    /// correction. `None` = normal training (all historical runs).
+    #[serde(default)]
+    pub resume_from_epoch: Option<usize>,
     /// Opt-in diagnostic: every N curriculum cycles, also compute one gradient per weighted
     /// loss term (extra backward passes, no parameter change) and log its global norm and
     /// cosine with the total gradient. `None` = off (all historical runs).
@@ -153,6 +161,7 @@ impl Default for FoundationTrainingConfig {
             seed: 20_261_006,
             init_seed: None,
             save_epoch_checkpoints: false,
+            resume_from_epoch: None,
             term_gradient_probe_every: None,
             max_train_batches_per_epoch: None,
             property_batch_size: None,
@@ -206,6 +215,14 @@ impl FoundationTrainingConfig {
         }
         if self.term_gradient_probe_every == Some(0) {
             anyhow::bail!("foundation term_gradient_probe_every must be positive when set");
+        }
+        if let Some(resume) = self.resume_from_epoch {
+            if resume == 0 || resume >= self.epochs {
+                anyhow::bail!(
+                    "foundation resume_from_epoch must be in 1..epochs ({}); got {resume}",
+                    self.epochs
+                );
+            }
         }
         for (name, value) in [
             (
@@ -520,6 +537,26 @@ pub fn train_foundation_model(
     if let Some(checkpoint) = initial_checkpoint {
         model.load_weights(checkpoint)?;
     }
+    let start_epoch = match training.resume_from_epoch {
+        None => 0,
+        Some(resume) => {
+            let checkpoint = initial_checkpoint.context(
+                "foundation resume_from_epoch requires the epoch checkpoint as checkpoint_file",
+            )?;
+            let path = checkpoint.join("metadata.yaml");
+            let metadata: super::runtime::FoundationCheckpointMetadata =
+                serde_yaml::from_str(&fs::read_to_string(&path).with_context(|| {
+                    format!("read resume metadata {}", path.display())
+                })?)?;
+            if metadata.completed_epochs != resume {
+                anyhow::bail!(
+                    "foundation resume_from_epoch={resume} but checkpoint records completed_epochs={}",
+                    metadata.completed_epochs
+                );
+            }
+            resume
+        }
+    };
 
     // Fit the source affine/reliability model using TRAIN identities only.
     // Never refit on Validation; historical TEST and TRAIN-HOLDOUT stay closed.
@@ -639,7 +676,35 @@ pub fn train_foundation_model(
     let mut epochs_without_improvement = 0usize;
     let mut completed_epochs = 0usize;
 
-    for epoch in 0..training.epochs {
+    // Resume: replay the skipped epochs' data order (pure function of seed ^ epoch) so the
+    // exposure report and seen-record set match an uninterrupted run, and continue the LR
+    // schedule at the exact update index. No training happens for these epochs.
+    for epoch in 0..start_epoch {
+        if training.strategy == FoundationTrainingStrategy::ResearchCurriculum {
+            let mut order = train_indices.clone();
+            shuffle_indices(&mut order, training.seed ^ epoch as u64);
+            write_research_exposure(
+                &exposure_path,
+                epoch + 1,
+                &order,
+                &corpus.records,
+                &training,
+                train_batches_per_epoch,
+                train_indices.len(),
+                &mut seen_property_records,
+            )?;
+        }
+        global_update += train_batches_per_epoch * updates_per_cycle;
+        completed_epochs = epoch + 1;
+    }
+    if start_epoch > 0 {
+        eprintln!(
+            "foundation_resume from_epoch={start_epoch} global_update={global_update} planned_updates={planned_updates} lr={:.9e} adam_moments=reset",
+            scheduled_learning_rate(&training, global_update, planned_updates)
+        );
+    }
+
+    for epoch in start_epoch..training.epochs {
         let mut order = train_indices.clone();
         shuffle_indices(&mut order, training.seed ^ epoch as u64);
         let train_losses = match training.strategy {
@@ -2327,6 +2392,34 @@ mod tests {
         assert_eq!(restored.init_seed, None);
         assert!(!restored.save_epoch_checkpoints);
         assert_eq!(restored.term_gradient_probe_every, None);
+    }
+
+    #[test]
+    fn resume_from_epoch_defaults_off_validates_range_and_continues_lr_schedule() {
+        let mut value = serde_yaml::to_value(FoundationTrainingConfig::default()).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("resume_from_epoch".into()));
+        let restored: FoundationTrainingConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(restored.resume_from_epoch, None);
+
+        let mut config = FoundationTrainingConfig::default();
+        config.epochs = 60;
+        for bad in [0, 60, 61] {
+            config.resume_from_epoch = Some(bad);
+            assert!(config.validate().is_err(), "resume {bad} must be rejected");
+        }
+        config.resume_from_epoch = Some(40);
+        config.validate().unwrap();
+
+        // The resumed run starts at update 40 * cycles * 5. The LR there is exactly the LR an
+        // uninterrupted run uses at its first update of epoch 41 (same function, same index).
+        let (cycles, planned) = (1024usize, 60 * 1024 * 5);
+        let resumed_first = 40 * cycles * 5;
+        let lr = scheduled_learning_rate(&config, resumed_first, planned);
+        assert!(lr < config.learning_rate && lr > config.learning_rate * config.min_learning_rate_ratio);
+        assert!(scheduled_learning_rate(&config, resumed_first - 1, planned) > lr);
     }
 
     #[test]
