@@ -107,7 +107,7 @@ def self_test():
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         self_test()
-    elif len(sys.argv) >= 4:
+    elif len(sys.argv) >= 3:
         average(sys.argv[1], sys.argv[2:])
         print(f"F2G_AVERAGE=COMPLETE n={len(sys.argv) - 2} out={sys.argv[1]}")
     else:
