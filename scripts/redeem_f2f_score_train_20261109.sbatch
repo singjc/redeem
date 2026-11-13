@@ -14,7 +14,7 @@ ROOT=/nfs/research/juan/singj/foundation_model
 EXP="$ROOT/experiments/redeem_f2d_train_fit_20261107"
 BIN="${F2F_BIN:-$EXP/bin/foundation_f2_scorecard_2a9d48f}"
 OUT_EXP="$ROOT/experiments/${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}"
-case "${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}" in redeem_f2f_arms_20261109|redeem_f2h_rt_harmonized_20261113) ;; *) echo "BLOCKED: unknown F2F_SCORE_EXPERIMENT"; exit 2;; esac
+case "${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}" in redeem_f2f_arms_20261109|redeem_f2h_rt_harmonized_20261113|redeem_f2i_ccs_ms2_20261113) ;; *) echo "BLOCKED: unknown F2F_SCORE_EXPERIMENT"; exit 2;; esac
 SUMMARY="$ROOT/experiments/redeem_f2_scorecard_20261101/scripts/redeem_f2_scorecard_summary_20261101.py"
 SUMMARY_SHA=2bd3a71efe0b2b7f659fb2044f561d50b46106b8e4b4441c6ad9c5b83b5946a1
 SEEN="$EXP/scripts/redeem_f2d_seen_20261107_v2.py"
@@ -27,7 +27,7 @@ BENCH_FNV=fnv1a64:2133c039625f77df
 TEACHER="$ROOT/experiments/multimodal_v0350_01_trainable_forward_representation/model/best"
 RUNS="$OUT_EXP/runs"
 : "${F2F_ARM:?}" "${F2F_RUN0:?}" "${F2F_RUN1:?}" "${F2F_RUN2:?}" "${F2F_LAST_EPOCH:?}"
-case "$F2F_ARM" in ms2tok|rtlong|rtharm) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok, rtlong or rtharm"; exit 2;; esac
+case "$F2F_ARM" in ms2tok|rtlong|rtharm|ccsx) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok, rtlong, rtharm or ccsx"; exit 2;; esac
 E0="$RUNS/$F2F_RUN0/model"
 E1="$RUNS/$F2F_RUN1/model"
 E2="$RUNS/$F2F_RUN2/model"
