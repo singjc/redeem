@@ -1021,11 +1021,21 @@ struct PairAwareMobilitySpecialist {
     bottleneck: Linear,
     output: Linear,
     conformation_proxy: Option<Linear>,
+    /// Opt-in zero-initialized length/mass prior into the hidden layer (`mobility_length_mass`).
+    length_mass: Option<Linear>,
     model_dim: usize,
 }
 
+/// Number of explicit length/mass features for the opt-in CCS prior.
+const MOBILITY_LENGTH_MASS_FEATURES: usize = 6;
+
 impl PairAwareMobilitySpecialist {
-    fn new(config: &FoundationConfig, auxiliary_heads: bool, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(
+        config: &FoundationConfig,
+        auxiliary_heads: bool,
+        length_mass: bool,
+        vb: VarBuilder<'_>,
+    ) -> Result<Self> {
         let blocks = (0..2)
             .map(|index| {
                 PeptideTransformerBlock::new(
@@ -1060,8 +1070,47 @@ impl PairAwareMobilitySpecialist {
             conformation_proxy: auxiliary_heads
                 .then(|| nn::linear(320, 14, vb.pp("conformation_proxy")))
                 .transpose()?,
+            length_mass: length_mass
+                .then(|| {
+                    // Exactly zero at initialization: the specialist starts as the historical one.
+                    let weight = vb.get_with_hints(
+                        (640, MOBILITY_LENGTH_MASS_FEATURES),
+                        "length_mass.weight",
+                        nn::Init::Const(0.0),
+                    )?;
+                    let bias = vb.get_with_hints(640, "length_mass.bias", nn::Init::Const(0.0))?;
+                    Ok::<_, candle_core::Error>(Linear::new(weight, Some(bias)))
+                })
+                .transpose()?,
             model_dim: config.model_dim,
         })
+    }
+
+    /// `[batch, 6]` length/mass features: length/30, neutral-mass proxy/3000, sqrt(mass)/60,
+    /// length x charge/120, and the charge and m/z presence flags. Mass uses the same
+    /// charge x precursor m/z proxy as the CCS physics prior; it is zero when either is absent.
+    fn length_mass_features(mask: &Tensor, context: &PrecursorContextBatch) -> Result<Tensor> {
+        let length = mask.sum(1)?;
+        let present = context
+            .charge_present
+            .broadcast_mul(&context.precursor_mz_present)?;
+        let mass = context
+            .precursor_mz
+            .broadcast_mul(&context.charge)?
+            .broadcast_mul(&present)?
+            .clamp(0.0, f64::INFINITY)?;
+        let charge = context.charge.broadcast_mul(&context.charge_present)?;
+        Tensor::stack(
+            &[
+                length.affine(1.0 / 30.0, 0.0)?,
+                mass.affine(1.0 / 3000.0, 0.0)?,
+                mass.sqrt()?.affine(1.0 / 60.0, 0.0)?,
+                length.broadcast_mul(&charge)?.affine(1.0 / 120.0, 0.0)?,
+                context.charge_present.clone(),
+                context.precursor_mz_present.clone(),
+            ],
+            1,
+        )
     }
 
     fn forward_with_proxy_t(
@@ -1155,7 +1204,11 @@ impl PairAwareMobilitySpecialist {
             ],
             1,
         )?;
-        let hidden = self.hidden.forward(&features)?.relu()?;
+        let mut hidden = self.hidden.forward(&features)?;
+        if let Some(prior) = &self.length_mass {
+            hidden = (hidden + prior.forward(&Self::length_mass_features(mask, context)?)?)?;
+        }
+        let hidden = hidden.relu()?;
         let hidden = self.bottleneck.forward(&hidden)?.relu()?;
         let ccs = self.output.forward(&hidden)?;
         let proxy = if need_auxiliary {
@@ -1288,6 +1341,7 @@ impl PairTaskPeptideModel {
                     PairAwareMobilitySpecialist::new(
                         &config,
                         auxiliary_heads,
+                        specialist_config.mobility_length_mass,
                         vb.pp("specialists.mobility_ccs"),
                     )
                 })
@@ -1723,6 +1777,69 @@ mod tests {
         assert!(g.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
         // Default path is unchanged: the old 8-channel gate is NOT created with tokens on.
         assert!(!vars.contains_key("specialists.ms2.blend_gate.weight"));
+        Ok(())
+    }
+
+    #[test]
+    fn mobility_length_mass_prior_starts_exact_and_learns() -> Result<()> {
+        let device = Device::Cpu;
+        let config = smoke_config();
+        let featurizer = PeptideGraphFeaturizer::new(config.clone())?;
+        let batch = featurizer.featurize(
+            &[
+                PeptidoformInput::unmodified("PEPTIDEK"),
+                PeptidoformInput::unmodified("ACDKLMNPQR"),
+            ],
+            &device,
+        )?;
+        let mut context = PrecursorContextBatch::unknown(2, &device)?;
+        context.charge = Tensor::new(&[2.0f32, 3.0], &device)?;
+        context.charge_present = Tensor::new(&[1.0f32, 1.0], &device)?;
+        context.precursor_mz = Tensor::new(&[450.0f32, 400.0], &device)?;
+        context.precursor_mz_present = Tensor::new(&[1.0f32, 1.0], &device)?;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let prior = PairTaskPeptideModel::new(
+            config.clone(),
+            FoundationSpecialistConfig {
+                mobility_length_mass: true,
+                ..FoundationSpecialistConfig::default()
+            },
+            false,
+            vb.clone(),
+        )?;
+        let base = PairTaskPeptideModel::new(config, FoundationSpecialistConfig::default(), false, vb)?;
+        let out = prior.forward_t(&batch, &context, false)?;
+        let reference = base.forward_t(&batch, &context, false)?;
+        let difference = (&out.ccs - &reference.ccs)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(difference <= 1.0e-6, "length/mass prior must start exactly at the old CCS");
+        let gradients = out.ccs.sum_all()?.backward()?;
+        let vars = varmap.data().lock().unwrap();
+        let weight = vars
+            .get("specialists.mobility_ccs.length_mass.weight")
+            .expect("prior weight exists when enabled");
+        let g = gradients.get(weight).expect("prior gradient");
+        assert!(g.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0, "prior must receive gradient");
+        Ok(())
+    }
+
+    #[test]
+    fn default_specialist_config_keeps_length_mass_prior_off() -> Result<()> {
+        assert!(!FoundationSpecialistConfig::default().mobility_length_mass);
+        let old: FoundationSpecialistConfig = serde_yaml::from_str(
+            "{enabled: true, rt: true, ms2: true, mobility_ccs: true, ms2_residual_blend: true}",
+        )
+        .unwrap();
+        assert!(!old.mobility_length_mass);
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        PairTaskPeptideModel::new(smoke_config(), FoundationSpecialistConfig::default(), false, vb)?;
+        let vars = varmap.data().lock().unwrap();
+        assert!(!vars.keys().any(|k| k.contains("length_mass")), "default creates no new variables");
         Ok(())
     }
 

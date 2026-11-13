@@ -72,6 +72,12 @@ pub struct FoundationSpecialistConfig {
     /// cleavage with 8-output heads.
     #[serde(default)]
     pub ms2_fragment_tokens: bool,
+    /// Opt-in CCS length/mass prior: a zero-initialized linear path from explicit peptide
+    /// length, neutral mass, sqrt(mass), length x charge and their presence flags into the
+    /// mobility specialist hidden layer. `false` (default and all older checkpoints) keeps
+    /// the historical specialist with no new variables.
+    #[serde(default)]
+    pub mobility_length_mass: bool,
 }
 
 impl Default for FoundationSpecialistConfig {
@@ -83,6 +89,7 @@ impl Default for FoundationSpecialistConfig {
             mobility_ccs: true,
             ms2_residual_blend: true,
             ms2_fragment_tokens: false,
+            mobility_length_mass: false,
         }
     }
 }
@@ -95,6 +102,7 @@ fn legacy_foundation_specialists() -> FoundationSpecialistConfig {
         mobility_ccs: false,
         ms2_residual_blend: false,
         ms2_fragment_tokens: false,
+        mobility_length_mass: false,
     }
 }
 

@@ -124,6 +124,10 @@ pub struct FoundationTrainingConfig {
     /// cycle. `None` retains the historical unified-trainer batch reuse.
     #[serde(default)]
     pub property_batch_size: Option<usize>,
+    /// Opt-in research-curriculum Mobility-stage batch size (source-aware CCS consensus
+    /// examples per cycle). `None` keeps the historical value `batch_size` (all earlier runs).
+    #[serde(default)]
+    pub mobility_batch_size: Option<usize>,
     /// Optional bounded validation mode; `None` evaluates the full partition.
     pub max_validation_batches: Option<usize>,
     /// Maximum number of spectrum-bearing Validation records used for teacher-forced inverse and retrieval metrics per epoch.
@@ -165,6 +169,7 @@ impl Default for FoundationTrainingConfig {
             term_gradient_probe_every: None,
             max_train_batches_per_epoch: None,
             property_batch_size: None,
+            mobility_batch_size: None,
             max_validation_batches: None,
             inverse_evaluation_records: 256,
             generation_evaluation_records: 16,
@@ -231,6 +236,7 @@ impl FoundationTrainingConfig {
             ),
             ("max_validation_batches", self.max_validation_batches),
             ("property_batch_size", self.property_batch_size),
+            ("mobility_batch_size", self.mobility_batch_size),
         ] {
             if matches!(value, Some(0)) {
                 anyhow::bail!("foundation {name} must be positive when set");
@@ -1084,7 +1090,7 @@ fn run_epoch_research_curriculum(
     let consensus_order = mobility_consensus.map(|supervision| {
         deterministic_example_order(
             &supervision.examples,
-            cycles.saturating_mul(config.batch_size),
+            cycles.saturating_mul(config.mobility_batch_size.unwrap_or(config.batch_size)),
             seed,
             config.seed,
         )
@@ -1129,8 +1135,9 @@ fn run_epoch_research_curriculum(
             {
                 let supervision = mobility_consensus.expect("checked presence");
                 let order = consensus_order.as_ref().expect("consensus order exists");
-                let start = batch_index.saturating_mul(config.batch_size);
-                let end = (start + config.batch_size).min(order.len());
+                let mobility_batch = config.mobility_batch_size.unwrap_or(config.batch_size);
+                let start = batch_index.saturating_mul(mobility_batch);
+                let end = (start + mobility_batch).min(order.len());
                 let examples = order[start..end]
                     .iter()
                     .map(|&index| supervision.examples[index].clone())
@@ -2392,6 +2399,22 @@ mod tests {
         assert_eq!(restored.init_seed, None);
         assert!(!restored.save_epoch_checkpoints);
         assert_eq!(restored.term_gradient_probe_every, None);
+    }
+
+    #[test]
+    fn mobility_batch_size_defaults_off_and_rejects_zero() {
+        let mut value = serde_yaml::to_value(FoundationTrainingConfig::default()).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("mobility_batch_size".into()));
+        let restored: FoundationTrainingConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(restored.mobility_batch_size, None);
+        let mut config = FoundationTrainingConfig::default();
+        config.mobility_batch_size = Some(0);
+        assert!(config.validate().is_err());
+        config.mobility_batch_size = Some(32);
+        config.validate().unwrap();
     }
 
     #[test]
