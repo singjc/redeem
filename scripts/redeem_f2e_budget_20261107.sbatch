@@ -28,7 +28,7 @@ PREPARED_RUN="$ROOT/experiments/redeem_f2f_arms_20261109/prepared/run_v0260_root
 PREPARED_RUN_SHA256=${F2F_PREPARED_RUN_SHA256:-}
 [ -n "$PREPARED_RUN_SHA256" ] || { echo "ERROR: F2F_PREPARED_RUN_SHA256 is required" >&2; exit 2; }
 RUN_ROOT="$ROOT/experiments/${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}/runs"
-case "${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}" in redeem_f2e_budget_20261107|redeem_f2f_arms_20261109|redeem_f2h_rt_harmonized_20261113) ;; *) echo "ERROR: unknown F2F_EXPERIMENT" >&2; exit 2;; esac
+case "${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}" in redeem_f2e_budget_20261107|redeem_f2f_arms_20261109|redeem_f2h_rt_harmonized_20261113|redeem_f2i_ccs_ms2_20261113) ;; *) echo "ERROR: unknown F2F_EXPERIMENT" >&2; exit 2;; esac
 EPOCHS=${F2E_EPOCHS:-30}
 case "$EPOCHS" in ''|*[!0-9]*) echo "ERROR: F2E_EPOCHS must be an integer" >&2; exit 2;; esac
 [ "$EPOCHS" -ge 10 ] && [ "$EPOCHS" -le 60 ] || { echo "ERROR: F2E_EPOCHS out of range 10..60" >&2; exit 2; }
@@ -57,11 +57,16 @@ RUN_EPOCHS=$((EPOCHS - RESUME_EPOCH))
 MS2_TOKENS=${F2F_MS2_TOKENS:-0}
 case "$MS2_TOKENS" in 0) MS2_TOKENS_JSON=false;; 1) MS2_TOKENS_JSON=true;; *) echo "ERROR: F2F_MS2_TOKENS must be 0 or 1" >&2; exit 2;; esac
 ARM_TAG=${F2F_ARM_TAG:-}
-case "$ARM_TAG" in ''|ms2tok|rtlong|rtharm) ;; *) echo "ERROR: F2F_ARM_TAG must be empty, ms2tok, rtlong or rtharm" >&2; exit 2;; esac
+case "$ARM_TAG" in ''|ms2tok|rtlong|rtharm|ccsx) ;; *) echo "ERROR: F2F_ARM_TAG must be empty, ms2tok, rtlong, rtharm or ccsx" >&2; exit 2;; esac
 # F2-H: opt-in RT target coordinate. Default = the trainer default (IntrinsicAndObserved), which is
 # what every earlier F2 run used; the field is then omitted from the JSON, so old renders are unchanged.
 RT_OBJECTIVE=${F2H_RT_OBJECTIVE:-}
 case "$RT_OBJECTIVE" in '') RT_OBJECTIVE_JSON='';; Harmonized) RT_OBJECTIVE_JSON='"rt_objective": "Harmonized",';; *) echo "ERROR: F2H_RT_OBJECTIVE must be empty or Harmonized" >&2; exit 2;; esac
+# F2-I (needs a build with 585fe9d): opt-in CCS changes. Empty/0 = the historical recipe.
+MOBILITY_BATCH=${F2I_MOBILITY_BATCH:-}
+case "$MOBILITY_BATCH" in '') MOBILITY_BATCH_JSON=null;; *[!0-9]*|0) echo "ERROR: F2I_MOBILITY_BATCH must be a positive integer" >&2; exit 2;; *) MOBILITY_BATCH_JSON=$MOBILITY_BATCH;; esac
+CCS_LENGTH_MASS=${F2I_CCS_LENGTH_MASS:-0}
+case "$CCS_LENGTH_MASS" in 0) CCS_LENGTH_MASS_JSON=false;; 1) CCS_LENGTH_MASS_JSON=true;; *) echo "ERROR: F2I_CCS_LENGTH_MASS must be 0 or 1" >&2; exit 2;; esac
 EXPECTED_COMMIT=${F2F_EXPECTED_COMMIT:-82f490de1178b71dbe98c7257b4a8687b0d1f898}
 if [ "$MS2_TOKENS" = 1 ] && [ "$EXPECTED_COMMIT" = 82f490de1178b71dbe98c7257b4a8687b0d1f898 ]; then
   echo "ERROR: F2F_MS2_TOKENS=1 needs F2F_EXPECTED_COMMIT pointing at a build with 7c964c6" >&2
@@ -167,7 +172,8 @@ cat > "$CFG" <<JSON
         "ms2": true,
         "ms2_residual_blend": true,
         "mobility_ccs": true,
-        "ms2_fragment_tokens": $MS2_TOKENS_JSON
+        "ms2_fragment_tokens": $MS2_TOKENS_JSON,
+        "mobility_length_mass": $CCS_LENGTH_MASS_JSON
       },
       "auxiliary_supervision_heads": true,
       "peptide": {
@@ -207,6 +213,7 @@ cat > "$CFG" <<JSON
     "strategy": "research_curriculum",
     "batch_size": 8,
     "property_batch_size": 16,
+    "mobility_batch_size": $MOBILITY_BATCH_JSON,
     "learning_rate": 0.00002,
     "epochs": $EPOCHS,
     "early_stopping_patience": $EPOCHS,
@@ -236,7 +243,7 @@ fi
 
 # Fail before loading millions of TRAIN records if nested Serde defaults silently
 # replaced deep-model dimensions or MS2 shape-loss controls.
-python3 - "$CFG" "$EPOCHS" "$MS2_TOKENS" "$RESUME_EPOCH" "$RT_OBJECTIVE" <<'PY_CONFIG_CHECK'
+python3 - "$CFG" "$EPOCHS" "$MS2_TOKENS" "$RESUME_EPOCH" "$RT_OBJECTIVE" "$MOBILITY_BATCH" "$CCS_LENGTH_MASS" <<'PY_CONFIG_CHECK'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     cfg = json.load(stream)["foundation"]
@@ -252,6 +259,7 @@ assert model["specialists"] == {
     "ms2_residual_blend": True,
     "mobility_ccs": True,
     "ms2_fragment_tokens": sys.argv[3] == "1",
+    "mobility_length_mass": sys.argv[7] == "1",
 }
 assert model["auxiliary_supervision_heads"] is True
 for key, expected in {
@@ -273,6 +281,7 @@ for key, expected in {
     assert inverse[key] == expected, (key, inverse[key])
 assert cfg["strategy"] == "research_curriculum"
 assert cfg["property_batch_size"] == 16
+assert cfg["mobility_batch_size"] == (int(sys.argv[6]) if sys.argv[6] else None)
 assert cfg["batch_size"] == 8
 assert cfg["ms2_loss"]["cosine_weight"] == 0.25
 assert cfg["ms2_loss"]["pearson_weight"] == 0.25
@@ -316,6 +325,8 @@ fi
   printf 'ms2_fragment_tokens\t%s\n' "$MS2_TOKENS"
   printf 'arm_tag\t%s\n' "${ARM_TAG:-none}"
   printf 'rt_objective\t%s\n' "${RT_OBJECTIVE:-default_IntrinsicAndObserved}"
+  printf 'mobility_batch_size\t%s\n' "${MOBILITY_BATCH:-default_batch_size}"
+  printf 'mobility_length_mass\t%s\n' "$CCS_LENGTH_MASS"
   printf 'data_order_seed\t%s\n' "$F2B_SEED"
   printf 'cuda_init_seed\t%s\n' "$F2B_INIT_SEED"
   printf 'recipe_parent_job\t62709585\n'
