@@ -25,9 +25,10 @@ RUN_SHA=ca642a6f7fe53d5a2faa3830b3eeea75c430bfb2521acf20210968d35de276c7
 CORPUS_FNV=fnv1a64:a2a6f57d31064ba6
 BENCH_FNV=fnv1a64:2133c039625f77df
 TEACHER="$ROOT/experiments/multimodal_v0350_01_trainable_forward_representation/model/best"
-RUNS="$ROOT/experiments/redeem_f2f_arms_20261109/runs"
+RUNS="$ROOT/experiments/${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}/runs"
+case "${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}" in redeem_f2f_arms_20261109|redeem_f2h_rt_harmonized_20261113) ;; *) echo "BLOCKED: unknown F2F_SCORE_EXPERIMENT"; exit 2;; esac
 : "${F2F_ARM:?}" "${F2F_RUN0:?}" "${F2F_RUN1:?}" "${F2F_RUN2:?}" "${F2F_EPOCHS:?}"
-case "$F2F_ARM" in ms2tok|rtlong) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok or rtlong"; exit 2;; esac
+case "$F2F_ARM" in ms2tok|rtlong|rtharm) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok, rtlong or rtharm"; exit 2;; esac
 R0="$RUNS/$F2F_RUN0/model"
 R1="$RUNS/$F2F_RUN1/model"
 R2="$RUNS/$F2F_RUN2/model"
@@ -45,7 +46,7 @@ done
 LAST=${F2F_EPOCHS##* }
 # Optional binary-equivalence control: one F2-E checkpoint, rows must equal the F2-E scores.
 [ -n "${F2F_CONTROL_CKPT:-}" ] && CKPTS+=("ctl_e0_ep30=$F2F_CONTROL_CKPT")
-OUT="$ROOT/experiments/redeem_f2f_arms_20261109/score/${F2F_ARM}_val_${SLURM_JOB_ID}"
+OUT="$ROOT/experiments/${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}/score/${F2F_ARM}_val_${SLURM_JOB_ID}"
 test ! -e "$OUT" || { echo "BLOCKED: output exists $OUT"; exit 2; }
 echo "$BIN_SHA  $BIN" | sha256sum -c - || { echo "BLOCKED: binary SHA mismatch"; exit 2; }
 echo "$SUMMARY_SHA  $SUMMARY" | sha256sum -c - || { echo "BLOCKED: summary SHA mismatch"; exit 2; }
