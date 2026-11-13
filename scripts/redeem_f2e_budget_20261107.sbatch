@@ -28,7 +28,7 @@ PREPARED_RUN="$ROOT/experiments/redeem_f2f_arms_20261109/prepared/run_v0260_root
 PREPARED_RUN_SHA256=${F2F_PREPARED_RUN_SHA256:-}
 [ -n "$PREPARED_RUN_SHA256" ] || { echo "ERROR: F2F_PREPARED_RUN_SHA256 is required" >&2; exit 2; }
 RUN_ROOT="$ROOT/experiments/${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}/runs"
-case "${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}" in redeem_f2e_budget_20261107|redeem_f2f_arms_20261109) ;; *) echo "ERROR: unknown F2F_EXPERIMENT" >&2; exit 2;; esac
+case "${F2F_EXPERIMENT:-redeem_f2e_budget_20261107}" in redeem_f2e_budget_20261107|redeem_f2f_arms_20261109|redeem_f2h_rt_harmonized_20261113) ;; *) echo "ERROR: unknown F2F_EXPERIMENT" >&2; exit 2;; esac
 EPOCHS=${F2E_EPOCHS:-30}
 case "$EPOCHS" in ''|*[!0-9]*) echo "ERROR: F2E_EPOCHS must be an integer" >&2; exit 2;; esac
 [ "$EPOCHS" -ge 10 ] && [ "$EPOCHS" -le 60 ] || { echo "ERROR: F2E_EPOCHS out of range 10..60" >&2; exit 2; }
@@ -57,7 +57,11 @@ RUN_EPOCHS=$((EPOCHS - RESUME_EPOCH))
 MS2_TOKENS=${F2F_MS2_TOKENS:-0}
 case "$MS2_TOKENS" in 0) MS2_TOKENS_JSON=false;; 1) MS2_TOKENS_JSON=true;; *) echo "ERROR: F2F_MS2_TOKENS must be 0 or 1" >&2; exit 2;; esac
 ARM_TAG=${F2F_ARM_TAG:-}
-case "$ARM_TAG" in ''|ms2tok|rtlong) ;; *) echo "ERROR: F2F_ARM_TAG must be empty, ms2tok or rtlong" >&2; exit 2;; esac
+case "$ARM_TAG" in ''|ms2tok|rtlong|rtharm) ;; *) echo "ERROR: F2F_ARM_TAG must be empty, ms2tok, rtlong or rtharm" >&2; exit 2;; esac
+# F2-H: opt-in RT target coordinate. Default = the trainer default (IntrinsicAndObserved), which is
+# what every earlier F2 run used; the field is then omitted from the JSON, so old renders are unchanged.
+RT_OBJECTIVE=${F2H_RT_OBJECTIVE:-}
+case "$RT_OBJECTIVE" in '') RT_OBJECTIVE_JSON='';; Harmonized) RT_OBJECTIVE_JSON='"rt_objective": "Harmonized",';; *) echo "ERROR: F2H_RT_OBJECTIVE must be empty or Harmonized" >&2; exit 2;; esac
 EXPECTED_COMMIT=${F2F_EXPECTED_COMMIT:-82f490de1178b71dbe98c7257b4a8687b0d1f898}
 if [ "$MS2_TOKENS" = 1 ] && [ "$EXPECTED_COMMIT" = 82f490de1178b71dbe98c7257b4a8687b0d1f898 ]; then
   echo "ERROR: F2F_MS2_TOKENS=1 needs F2F_EXPECTED_COMMIT pointing at a build with 7c964c6" >&2
@@ -156,6 +160,7 @@ cat > "$CFG" <<JSON
   "foundation": {
     "model": {
       "peptide_backbone": "residue_pair_task_tokens",
+      $RT_OBJECTIVE_JSON
       "specialists": {
         "enabled": true,
         "rt": true,
@@ -231,7 +236,7 @@ fi
 
 # Fail before loading millions of TRAIN records if nested Serde defaults silently
 # replaced deep-model dimensions or MS2 shape-loss controls.
-python3 - "$CFG" "$EPOCHS" "$MS2_TOKENS" "$RESUME_EPOCH" <<'PY_CONFIG_CHECK'
+python3 - "$CFG" "$EPOCHS" "$MS2_TOKENS" "$RESUME_EPOCH" "$RT_OBJECTIVE" <<'PY_CONFIG_CHECK'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     cfg = json.load(stream)["foundation"]
@@ -239,6 +244,7 @@ model = cfg["model"]
 peptide = model["peptide"]
 inverse = model["inverse"]
 assert model["peptide_backbone"] == "residue_pair_task_tokens"
+assert model.get("rt_objective") == (sys.argv[5] or None), model.get("rt_objective")
 assert model["specialists"] == {
     "enabled": True,
     "rt": True,
@@ -309,6 +315,7 @@ fi
   printf 'prepared_run_sha256\t%s\n' "$PREPARED_RUN_SHA256"
   printf 'ms2_fragment_tokens\t%s\n' "$MS2_TOKENS"
   printf 'arm_tag\t%s\n' "${ARM_TAG:-none}"
+  printf 'rt_objective\t%s\n' "${RT_OBJECTIVE:-default_IntrinsicAndObserved}"
   printf 'data_order_seed\t%s\n' "$F2B_SEED"
   printf 'cuda_init_seed\t%s\n' "$F2B_INIT_SEED"
   printf 'recipe_parent_job\t62709585\n'
@@ -461,6 +468,10 @@ if [ "$MS2_TOKENS" = 1 ] && ! grep -Eq '^\s*ms2_fragment_tokens:\s*true\s*$' "$M
   exit 2
 fi
 printf 'research_property_sampling_exposure=PASS\n'
+if [ -n "$RT_OBJECTIVE" ] && ! grep -Eq "^\s*rt_objective:\s*$RT_OBJECTIVE\s*$" "$MODEL/metadata.yaml"; then
+  echo "ERROR: rt_objective=$RT_OBJECTIVE requested but not recorded in model metadata" >&2
+  exit 2
+fi
 
 # Preserve the deterministic Validation prefix (2048 records); explicitly
 # check RT/CCS/MS2 support before interpreting best-forward checkpointing.
