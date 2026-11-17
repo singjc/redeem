@@ -28,7 +28,7 @@ TEACHER="$ROOT/experiments/multimodal_v0350_01_trainable_forward_representation/
 RUNS="$ROOT/experiments/${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}/runs"
 case "${F2F_SCORE_EXPERIMENT:-redeem_f2f_arms_20261109}" in redeem_f2f_arms_20261109|redeem_f2h_rt_harmonized_20261113|redeem_f2i_ccs_ms2_20261113) ;; *) echo "BLOCKED: unknown F2F_SCORE_EXPERIMENT"; exit 2;; esac
 : "${F2F_ARM:?}" "${F2F_RUN0:?}" "${F2F_RUN1:?}" "${F2F_RUN2:?}" "${F2F_EPOCHS:?}"
-case "$F2F_ARM" in ms2tok|rtlong|rtharm|ccsx) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok, rtlong, rtharm or ccsx"; exit 2;; esac
+case "$F2F_ARM" in ms2tok|rtlong|rtharm|ccsx|ccslm) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok, rtlong, rtharm, ccsx or ccslm"; exit 2;; esac
 R0="$RUNS/$F2F_RUN0/model"
 R1="$RUNS/$F2F_RUN1/model"
 R2="$RUNS/$F2F_RUN2/model"

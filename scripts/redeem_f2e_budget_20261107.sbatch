@@ -57,7 +57,7 @@ RUN_EPOCHS=$((EPOCHS - RESUME_EPOCH))
 MS2_TOKENS=${F2F_MS2_TOKENS:-0}
 case "$MS2_TOKENS" in 0) MS2_TOKENS_JSON=false;; 1) MS2_TOKENS_JSON=true;; *) echo "ERROR: F2F_MS2_TOKENS must be 0 or 1" >&2; exit 2;; esac
 ARM_TAG=${F2F_ARM_TAG:-}
-case "$ARM_TAG" in ''|ms2tok|rtlong|rtharm|ccsx) ;; *) echo "ERROR: F2F_ARM_TAG must be empty, ms2tok, rtlong, rtharm or ccsx" >&2; exit 2;; esac
+case "$ARM_TAG" in ''|ms2tok|rtlong|rtharm|ccsx|ccslm) ;; *) echo "ERROR: F2F_ARM_TAG must be empty, ms2tok, rtlong, rtharm, ccsx or ccslm" >&2; exit 2;; esac
 # F2-H: opt-in RT target coordinate. Default = the trainer default (IntrinsicAndObserved), which is
 # what every earlier F2 run used; the field is then omitted from the JSON, so old renders are unchanged.
 RT_OBJECTIVE=${F2H_RT_OBJECTIVE:-}

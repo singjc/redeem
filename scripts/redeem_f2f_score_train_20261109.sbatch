@@ -27,7 +27,7 @@ BENCH_FNV=fnv1a64:2133c039625f77df
 TEACHER="$ROOT/experiments/multimodal_v0350_01_trainable_forward_representation/model/best"
 RUNS="$OUT_EXP/runs"
 : "${F2F_ARM:?}" "${F2F_RUN0:?}" "${F2F_RUN1:?}" "${F2F_RUN2:?}" "${F2F_LAST_EPOCH:?}"
-case "$F2F_ARM" in ms2tok|rtlong|rtharm|ccsx) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok, rtlong, rtharm or ccsx"; exit 2;; esac
+case "$F2F_ARM" in ms2tok|rtlong|rtharm|ccsx|ccslm) ;; *) echo "BLOCKED: F2F_ARM must be ms2tok, rtlong, rtharm, ccsx or ccslm"; exit 2;; esac
 E0="$RUNS/$F2F_RUN0/model"
 E1="$RUNS/$F2F_RUN1/model"
 E2="$RUNS/$F2F_RUN2/model"
