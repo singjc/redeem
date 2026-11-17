@@ -56,7 +56,10 @@ def length_bias(rows, length):
 
 
 def evaluate(x_val, c_val, x_train, c_train, bench, out=print):
-    X = [f'ccsx{s}_ep60' for s in range(3)]
+    arm = os.environ.get('F2I_ARM', 'ccsx')  # ccsx (F2-I) or ccslm (F2-I2, C2 only)
+    if arm not in ('ccsx', 'ccslm'):
+        raise SystemExit('F2I_ARM must be ccsx or ccslm')
+    X = [f'{arm}{s}_ep60' for s in range(3)]
     C = [f'rtharm{s}_ep60' for s in range(3)]
     x, c = source_means(x_val, set(X)), source_means(c_val, set(C))
     gains = {}
@@ -64,7 +67,7 @@ def evaluate(x_val, c_val, x_train, c_train, bench, out=print):
         g = [gain(t, c[(C[s], t)], x[(X[s], t)]) for s in range(3)]
         gains[t] = g
         out(f'task\t{t}\tctrl_rtharm_ep60={statistics.fmean(c[(k, t)] for k in C):.4f}\t'
-            f'ccsx_ep60={statistics.fmean(x[(k, t)] for k in X):.4f}\tgain={statistics.fmean(g):+.4f}\t'
+            f'{arm}_ep60={statistics.fmean(x[(k, t)] for k in X):.4f}\tgain={statistics.fmean(g):+.4f}\t'
             f'pairs={",".join(f"{v:+.4f}" for v in g)}\tMDE={MDE[t]}')
     ok = guard(statistics.fmean(gains['rt']), statistics.fmean(gains['ms2']))
     out(f'rule\tprimary={ccs_label(gains["ccs"])}\tGUARD={"PASS" if ok else "HARM"}')
@@ -79,7 +82,7 @@ def evaluate(x_val, c_val, x_train, c_train, bench, out=print):
     for lo, hi, n, bias, mae in length_bias(xt, length):
         c_n, c_bias, c_mae = cb[(lo, hi)][2:] if (lo, hi) in cb else (0, float('nan'), float('nan'))
         out(f'mechanism_train_ccs_length\t{lo}-{hi}\tn={n}\trtharm_bias={c_bias:+.2f}\trtharm_MAE={c_mae:.2f}\t'
-            f'ccsx_bias={bias:+.2f}\tccsx_MAE={mae:.2f}')
+            f'{arm}_bias={bias:+.2f}\t{arm}_MAE={mae:.2f}')
     out('F2I_EVAL=COMPLETE')
 
 
