@@ -10,8 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 redeem-properties = { path = "../redeem-properties" }
-pyo3 = { version = "0.22", features = ["extension-module"] }
-numpy = "0.22"
+pyo3 = { version = "0.27", features = ["extension-module"] }
+numpy = "0.27"
 anyhow = "1.0"
 
 [dependencies.candle-core]

@@ -356,15 +356,12 @@ impl FoundationCollator {
         let mut ms2_mask = vec![0.0f32; b * (l - 1) * channels];
 
         for (batch_index, record) in records.iter().enumerate() {
-            let rt = match self.config.retention_time_objective {
-                RetentionTimeObjective::Normalized => record.retention_time.normalized,
-                RetentionTimeObjective::Harmonized => record.retention_time.harmonized,
-                RetentionTimeObjective::Observed => record.retention_time.observed_seconds,
-                // The current foundation RT head is intrinsic.  In combined
-                // mode we therefore train it only on normalized RT and retain
-                // observed RT in the record for a future LC-context head.
-                RetentionTimeObjective::IntrinsicAndObserved => record.retention_time.normalized,
-            };
+            // IntrinsicAndObserved trains the intrinsic head on normalized RT and keeps
+            // observed RT in the record for a future LC-context head.
+            let rt = self
+                .config
+                .retention_time_objective
+                .target(&record.retention_time);
             if let Some(rt) = rt.filter(|value| value.is_finite()) {
                 rt_values[batch_index] = rt;
                 rt_mask[batch_index] = 1.0;

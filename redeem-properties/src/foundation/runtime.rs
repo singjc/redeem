@@ -65,6 +65,19 @@ pub struct FoundationSpecialistConfig {
     /// correction. Missing on old serialized checkpoints => replacement mode.
     #[serde(default)]
     pub ms2_residual_blend: bool,
+    /// Opt-in v0.51-style fragment tokens: one token per (cleavage, channel) with a
+    /// learned channel embedding (ion series and fragment charge are fixed per channel)
+    /// plus a precursor-charge embedding, then one transformer block over all tokens and
+    /// 1-output heads. `false` (default and all older checkpoints) keeps one token per
+    /// cleavage with 8-output heads.
+    #[serde(default)]
+    pub ms2_fragment_tokens: bool,
+    /// Opt-in CCS length/mass prior: a zero-initialized linear path from explicit peptide
+    /// length, neutral mass, sqrt(mass), length x charge and their presence flags into the
+    /// mobility specialist hidden layer. `false` (default and all older checkpoints) keeps
+    /// the historical specialist with no new variables.
+    #[serde(default)]
+    pub mobility_length_mass: bool,
 }
 
 impl Default for FoundationSpecialistConfig {
@@ -75,6 +88,8 @@ impl Default for FoundationSpecialistConfig {
             ms2: true,
             mobility_ccs: true,
             ms2_residual_blend: true,
+            ms2_fragment_tokens: false,
+            mobility_length_mass: false,
         }
     }
 }
@@ -86,6 +101,8 @@ fn legacy_foundation_specialists() -> FoundationSpecialistConfig {
         ms2: false,
         mobility_ccs: false,
         ms2_residual_blend: false,
+        ms2_fragment_tokens: false,
+        mobility_length_mass: false,
     }
 }
 
@@ -108,6 +125,10 @@ pub struct FoundationModelConfig {
     pub auxiliary_supervision_heads: bool,
     /// Spectrum encoder plus autoregressive peptide decoder.
     pub inverse: FoundationDiffusionConfig,
+    /// Intrinsic RT label the RT head predicts. Older checkpoints omit this field and
+    /// keep the source-native `IntrinsicAndObserved` target.
+    #[serde(default)]
+    pub rt_objective: RetentionTimeObjective,
 }
 
 impl Default for FoundationModelConfig {
@@ -144,6 +165,7 @@ impl Default for FoundationModelConfig {
             specialists: FoundationSpecialistConfig::default(),
             auxiliary_supervision_heads: true,
             inverse,
+            rt_objective: RetentionTimeObjective::IntrinsicAndObserved,
         }
     }
 }
@@ -348,7 +370,7 @@ impl FoundationModel {
         let peptide_collator = FoundationCollator::new(
             config.peptide.clone(),
             FoundationCollatorConfig {
-                retention_time_objective: RetentionTimeObjective::IntrinsicAndObserved,
+                retention_time_objective: config.rt_objective,
                 corruption: no_corruption(),
             },
         )?;
@@ -919,6 +941,54 @@ mod tests {
             ));
         let legacy: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
         assert!(!legacy.auxiliary_supervision_heads);
+    }
+
+    #[test]
+    fn missing_rt_objective_keeps_source_native_target_and_harmonized_is_opt_in() {
+        let mut value = serde_yaml::to_value(FoundationModelConfig::default()).unwrap();
+        value
+            .as_mapping_mut()
+            .unwrap()
+            .remove(&serde_yaml::Value::String("rt_objective".into()));
+        let legacy: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(
+            legacy.rt_objective,
+            RetentionTimeObjective::IntrinsicAndObserved
+        );
+        let labels = super::super::data::RetentionTimeLabels {
+            normalized: Some(40.0),
+            harmonized: Some(50.0),
+            observed_seconds: Some(1800.0),
+        };
+        assert_eq!(legacy.rt_objective.target(&labels), Some(40.0));
+        assert_eq!(
+            RetentionTimeObjective::Harmonized.target(&labels),
+            Some(50.0)
+        );
+        let harmonized: FoundationModelConfig =
+            serde_yaml::from_str("rt_objective: Harmonized").unwrap();
+        assert_eq!(harmonized.rt_objective, RetentionTimeObjective::Harmonized);
+    }
+
+    #[test]
+    fn rt_objective_override_requires_full_model_block() {
+        // A partial block falls back to legacy field defaults (different architecture).
+        let partial: FoundationModelConfig =
+            serde_yaml::from_str("rt_objective: Harmonized").unwrap();
+        assert_ne!(
+            partial.peptide_backbone,
+            FoundationModelConfig::default().peptide_backbone
+        );
+        // The full default block with only rt_objective changed keeps the architecture.
+        let mut value = serde_yaml::to_value(FoundationModelConfig::default()).unwrap();
+        value.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("rt_objective".into()),
+            serde_yaml::Value::String("Harmonized".into()),
+        );
+        let full: FoundationModelConfig = serde_yaml::from_value(value).unwrap();
+        let mut expected = FoundationModelConfig::default();
+        expected.rt_objective = RetentionTimeObjective::Harmonized;
+        assert_eq!(full, expected);
     }
 
     #[test]

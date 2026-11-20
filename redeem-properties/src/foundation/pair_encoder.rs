@@ -683,12 +683,134 @@ struct NativeMs2Specialist {
     // Optional source-proven v0.51-style gate. Old MS2-only specialist
     // checkpoints do not instantiate this parameter.
     blend_gate: Option<Linear>,
+    // Opt-in (`ms2_fragment_tokens`) v0.51-style per-(cleavage, channel) tokens.
+    fragment_tokens: Option<Ms2FragmentTokenHead>,
     model_dim: usize,
     channels: usize,
 }
 
-impl NativeMs2Specialist {
+/// Opt-in per-fragment token head (v0.51 idea, rebuilt on production tensors).
+///
+/// Each cleavage token is expanded into `channels` tokens. A learned channel
+/// embedding encodes ion series and fragment charge, because both are fixed per
+/// channel (channels 0-3: b1+, b2+, y1+, y2+; 4-7: neutral-loss series). A precursor
+/// charge embedding is added, so the decoder can learn charge-state rules such as
+/// "no 2+ fragments from a 1+ precursor". One transformer block then mixes all
+/// fragment tokens of a peptide, and 1-output heads give presence and intensity.
+#[derive(Clone)]
+struct Ms2FragmentTokenHead {
+    channel_embedding: Embedding,
+    precursor_charge_embedding: Embedding,
+    norm: FoundationLayerNorm,
+    block: PeptideTransformerBlock,
+    presence_head: Linear,
+    intensity_head: Linear,
+    blend_gate: Option<Linear>,
+}
+
+/// Precursor-charge classes for the fragment-token head: 0 = unknown, 1..=6, 7 = 7+.
+const MS2_TOKEN_PRECURSOR_CHARGE_CLASSES: usize = 8;
+
+impl Ms2FragmentTokenHead {
     fn new(config: &FoundationConfig, residual_blend: bool, vb: VarBuilder<'_>) -> Result<Self> {
+        let d = config.model_dim;
+        Ok(Self {
+            channel_embedding: nn::embedding(
+                config.ms2_fragment_channels,
+                d,
+                vb.pp("channel_embedding"),
+            )?,
+            precursor_charge_embedding: nn::embedding(
+                MS2_TOKEN_PRECURSOR_CHARGE_CLASSES,
+                d,
+                vb.pp("precursor_charge_embedding"),
+            )?,
+            norm: FoundationLayerNorm::new(d, 1e-5, vb.pp("norm"))?,
+            block: PeptideTransformerBlock::new(
+                d,
+                config.num_attention_heads,
+                config.transformer_ff_dim,
+                config.dropout,
+                vb.pp("transformer"),
+            )?,
+            presence_head: nn::linear(d, 1, vb.pp("presence"))?,
+            intensity_head: nn::linear(d, 1, vb.pp("intensity"))?,
+            blend_gate: residual_blend
+                .then(|| zero_initialized_ms2_blend_gate(d, 1, vb.pp("blend_gate")))
+                .transpose()?,
+        })
+    }
+
+    /// `tokens` [B, C, D] (one per cleavage) -> (factorized [B, C, K], hidden [B, C*K, D]).
+    fn forward_t(
+        &self,
+        tokens: &Tensor,
+        cleavage_mask: &Tensor,
+        context: &PrecursorContextBatch,
+        activation: super::config::FoundationMs2OutputActivation,
+        channels: usize,
+        train: bool,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (batch, cleavages, d) = tokens.dims3()?;
+        let device = tokens.device();
+        let channel_ids = Tensor::arange(0u32, channels as u32, device)?;
+        let channel = self
+            .channel_embedding
+            .forward(&channel_ids)?
+            .reshape((1, 1, channels, d))?;
+        // Charge is a float tensor (0 = unknown); round and clamp to the class range.
+        let charge_ids = context
+            .charge
+            .round()?
+            .clamp(0.0, (MS2_TOKEN_PRECURSOR_CHARGE_CLASSES - 1) as f64)?
+            .to_dtype(candle_core::DType::U32)?;
+        let charge = self
+            .precursor_charge_embedding
+            .forward(&charge_ids)?
+            .reshape((batch, 1, 1, d))?;
+        let expanded = tokens
+            .unsqueeze(2)?
+            .broadcast_as((batch, cleavages, channels, d))?
+            .broadcast_add(&channel)?
+            .broadcast_add(&charge)?;
+        let flat = self
+            .norm
+            .forward(&expanded.reshape((batch, cleavages * channels, d))?)?;
+        let token_mask = cleavage_mask
+            .unsqueeze(2)?
+            .broadcast_as((batch, cleavages, channels))?
+            .reshape((batch, cleavages * channels))?
+            .contiguous()?;
+        let hidden = self.block.forward_t(&flat, &token_mask, train)?;
+        let presence = ops::sigmoid(&self.presence_head.forward(&hidden)?)?;
+        let positive =
+            apply_ms2_output_activation(&self.intensity_head.forward(&hidden)?, activation)?;
+        let factorized = presence
+            .broadcast_mul(&positive)?
+            .reshape((batch, cleavages, channels))?;
+        Ok((factorized, hidden, token_mask))
+    }
+
+    /// Per-fragment signed blend with the base MS2 surface (zero gate = exact base).
+    fn blend(&self, base: &Tensor, factorized: &Tensor, hidden: &Tensor) -> Result<Tensor> {
+        let gate = self.blend_gate.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("MS2 baseline supplied without a blend gate".into())
+        })?;
+        let (batch, cleavages, channels) = factorized.dims3()?;
+        let g = ops::sigmoid(&gate.forward(hidden)?)?
+            .affine(2.0, -1.0)?
+            .reshape((batch, cleavages, channels))?;
+        (base + g.broadcast_mul(&(factorized - base)?)?)?.relu()
+    }
+}
+
+impl NativeMs2Specialist {
+    fn new(
+        config: &FoundationConfig,
+        residual_blend: bool,
+        fragment_tokens: bool,
+        vb: VarBuilder<'_>,
+    ) -> Result<Self> {
         let context_blocks = (0..3)
             .map(|index| {
                 PeptideTransformerBlock::new(
@@ -736,13 +858,18 @@ impl NativeMs2Specialist {
                 config.ms2_fragment_channels,
                 vb.pp("intensity"),
             )?,
-            blend_gate: residual_blend
+            blend_gate: (residual_blend && !fragment_tokens)
                 .then(|| {
                     zero_initialized_ms2_blend_gate(
                         config.model_dim,
                         config.ms2_fragment_channels,
                         vb.pp("blend_gate"),
                     )
+                })
+                .transpose()?,
+            fragment_tokens: fragment_tokens
+                .then(|| {
+                    Ms2FragmentTokenHead::new(config, residual_blend, vb.pp("fragment_tokens"))
                 })
                 .transpose()?,
             model_dim: config.model_dim,
@@ -805,6 +932,25 @@ impl NativeMs2Specialist {
             .broadcast_mul(&batch.residue_mask.narrow(1, 1, cleavages)?)?;
         for block in &self.fragment_blocks {
             tokens = block.forward_t(&tokens, &cleavage_mask, train)?;
+        }
+        if let Some(head) = &self.fragment_tokens {
+            let (factorized, hidden, _) = head.forward_t(
+                &tokens,
+                &cleavage_mask,
+                context,
+                activation,
+                self.channels,
+                train,
+            )?;
+            let prediction = match base_ms2 {
+                Some(base) => head.blend(base, &factorized, &hidden)?,
+                None => factorized,
+            };
+            return prediction.broadcast_mul(&cleavage_mask.unsqueeze(2)?.broadcast_as((
+                batch_size,
+                cleavages,
+                self.channels,
+            ))?);
         }
         let presence_logits = self.presence_head.forward(&tokens)?;
         let intensity_logits = self.intensity_head.forward(&tokens)?;
@@ -875,11 +1021,21 @@ struct PairAwareMobilitySpecialist {
     bottleneck: Linear,
     output: Linear,
     conformation_proxy: Option<Linear>,
+    /// Opt-in zero-initialized length/mass prior into the hidden layer (`mobility_length_mass`).
+    length_mass: Option<Linear>,
     model_dim: usize,
 }
 
+/// Number of explicit length/mass features for the opt-in CCS prior.
+const MOBILITY_LENGTH_MASS_FEATURES: usize = 6;
+
 impl PairAwareMobilitySpecialist {
-    fn new(config: &FoundationConfig, auxiliary_heads: bool, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(
+        config: &FoundationConfig,
+        auxiliary_heads: bool,
+        length_mass: bool,
+        vb: VarBuilder<'_>,
+    ) -> Result<Self> {
         let blocks = (0..2)
             .map(|index| {
                 PeptideTransformerBlock::new(
@@ -914,8 +1070,47 @@ impl PairAwareMobilitySpecialist {
             conformation_proxy: auxiliary_heads
                 .then(|| nn::linear(320, 14, vb.pp("conformation_proxy")))
                 .transpose()?,
+            length_mass: length_mass
+                .then(|| {
+                    // Exactly zero at initialization: the specialist starts as the historical one.
+                    let weight = vb.get_with_hints(
+                        (640, MOBILITY_LENGTH_MASS_FEATURES),
+                        "length_mass.weight",
+                        nn::Init::Const(0.0),
+                    )?;
+                    let bias = vb.get_with_hints(640, "length_mass.bias", nn::Init::Const(0.0))?;
+                    Ok::<_, candle_core::Error>(Linear::new(weight, Some(bias)))
+                })
+                .transpose()?,
             model_dim: config.model_dim,
         })
+    }
+
+    /// `[batch, 6]` length/mass features: length/30, neutral-mass proxy/3000, sqrt(mass)/60,
+    /// length x charge/120, and the charge and m/z presence flags. Mass uses the same
+    /// charge x precursor m/z proxy as the CCS physics prior; it is zero when either is absent.
+    fn length_mass_features(mask: &Tensor, context: &PrecursorContextBatch) -> Result<Tensor> {
+        let length = mask.sum(1)?;
+        let present = context
+            .charge_present
+            .broadcast_mul(&context.precursor_mz_present)?;
+        let mass = context
+            .precursor_mz
+            .broadcast_mul(&context.charge)?
+            .broadcast_mul(&present)?
+            .clamp(0.0, f64::INFINITY)?;
+        let charge = context.charge.broadcast_mul(&context.charge_present)?;
+        Tensor::stack(
+            &[
+                length.affine(1.0 / 30.0, 0.0)?,
+                mass.affine(1.0 / 3000.0, 0.0)?,
+                mass.sqrt()?.affine(1.0 / 60.0, 0.0)?,
+                length.broadcast_mul(&charge)?.affine(1.0 / 120.0, 0.0)?,
+                context.charge_present.clone(),
+                context.precursor_mz_present.clone(),
+            ],
+            1,
+        )
     }
 
     fn forward_with_proxy_t(
@@ -1009,7 +1204,11 @@ impl PairAwareMobilitySpecialist {
             ],
             1,
         )?;
-        let hidden = self.hidden.forward(&features)?.relu()?;
+        let mut hidden = self.hidden.forward(&features)?;
+        if let Some(prior) = &self.length_mass {
+            hidden = (hidden + prior.forward(&Self::length_mass_features(mask, context)?)?)?;
+        }
+        let hidden = hidden.relu()?;
         let hidden = self.bottleneck.forward(&hidden)?.relu()?;
         let ccs = self.output.forward(&hidden)?;
         let proxy = if need_auxiliary {
@@ -1132,6 +1331,7 @@ impl PairTaskPeptideModel {
                     NativeMs2Specialist::new(
                         &config,
                         specialist_config.ms2_residual_blend,
+                        specialist_config.ms2_fragment_tokens,
                         vb.pp("specialists.ms2"),
                     )
                 })
@@ -1141,6 +1341,7 @@ impl PairTaskPeptideModel {
                     PairAwareMobilitySpecialist::new(
                         &config,
                         auxiliary_heads,
+                        specialist_config.mobility_length_mass,
                         vb.pp("specialists.mobility_ccs"),
                     )
                 })
@@ -1511,6 +1712,148 @@ mod tests {
             "blended MS2 must start at the working pair head"
         );
         Ok(())
+    }
+
+    #[test]
+    fn fragment_token_specialist_matches_pair_ms2_head_at_initialization() -> Result<()> {
+        let device = Device::Cpu;
+        let mut config = smoke_config();
+        config.ms2_output_activation =
+            super::super::config::FoundationMs2OutputActivation::SoftplusV0138;
+        let featurizer = PeptideGraphFeaturizer::new(config.clone())?;
+        let batch = featurizer.featurize(
+            &[
+                PeptidoformInput::unmodified("PEPTIDEK"),
+                PeptidoformInput::unmodified("ACDK"),
+            ],
+            &device,
+        )?;
+        let context = PrecursorContextBatch::unknown(2, &device)?;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let tokens = PairTaskPeptideModel::new(
+            config.clone(),
+            FoundationSpecialistConfig {
+                ms2_fragment_tokens: true,
+                ..FoundationSpecialistConfig::default()
+            },
+            false,
+            vb.clone(),
+        )?;
+        let baseline = PairTaskPeptideModel::new(
+            config,
+            FoundationSpecialistConfig {
+                ms2: false,
+                ..FoundationSpecialistConfig::default()
+            },
+            false,
+            vb,
+        )?;
+        let out = tokens.forward_t(&batch, &context, false)?;
+        let base = baseline.forward_t(&batch, &context, false)?;
+        assert_eq!(out.ms2.dims(), base.ms2.dims(), "same fragment canvas");
+        let difference = (&out.ms2 - &base.ms2)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            difference <= 1.0e-6,
+            "fragment tokens must start at the pair head"
+        );
+
+        // The new parameters exist and receive gradient through the per-fragment gate.
+        let gradients = out.ms2.sum_all()?.backward()?;
+        let vars = varmap.data().lock().unwrap();
+        for name in [
+            "specialists.ms2.fragment_tokens.blend_gate.weight",
+            "specialists.ms2.fragment_tokens.channel_embedding.weight",
+        ] {
+            assert!(vars.contains_key(name), "missing {name}");
+        }
+        let gate = vars
+            .get("specialists.ms2.fragment_tokens.blend_gate.weight")
+            .unwrap();
+        let g = gradients.get(gate).expect("gate gradient");
+        assert!(g.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0);
+        // Default path is unchanged: the old 8-channel gate is NOT created with tokens on.
+        assert!(!vars.contains_key("specialists.ms2.blend_gate.weight"));
+        Ok(())
+    }
+
+    #[test]
+    fn mobility_length_mass_prior_starts_exact_and_learns() -> Result<()> {
+        let device = Device::Cpu;
+        let config = smoke_config();
+        let featurizer = PeptideGraphFeaturizer::new(config.clone())?;
+        let batch = featurizer.featurize(
+            &[
+                PeptidoformInput::unmodified("PEPTIDEK"),
+                PeptidoformInput::unmodified("ACDKLMNPQR"),
+            ],
+            &device,
+        )?;
+        let mut context = PrecursorContextBatch::unknown(2, &device)?;
+        context.charge = Tensor::new(&[2.0f32, 3.0], &device)?;
+        context.charge_present = Tensor::new(&[1.0f32, 1.0], &device)?;
+        context.precursor_mz = Tensor::new(&[450.0f32, 400.0], &device)?;
+        context.precursor_mz_present = Tensor::new(&[1.0f32, 1.0], &device)?;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let prior = PairTaskPeptideModel::new(
+            config.clone(),
+            FoundationSpecialistConfig {
+                mobility_length_mass: true,
+                ..FoundationSpecialistConfig::default()
+            },
+            false,
+            vb.clone(),
+        )?;
+        let base = PairTaskPeptideModel::new(config, FoundationSpecialistConfig::default(), false, vb)?;
+        let out = prior.forward_t(&batch, &context, false)?;
+        let reference = base.forward_t(&batch, &context, false)?;
+        let difference = (&out.ccs - &reference.ccs)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(difference <= 1.0e-6, "length/mass prior must start exactly at the old CCS");
+        let gradients = out.ccs.sum_all()?.backward()?;
+        let vars = varmap.data().lock().unwrap();
+        let weight = vars
+            .get("specialists.mobility_ccs.length_mass.weight")
+            .expect("prior weight exists when enabled");
+        let g = gradients.get(weight).expect("prior gradient");
+        assert!(g.sqr()?.sum_all()?.to_scalar::<f32>()? > 0.0, "prior must receive gradient");
+        Ok(())
+    }
+
+    #[test]
+    fn default_specialist_config_keeps_length_mass_prior_off() -> Result<()> {
+        assert!(!FoundationSpecialistConfig::default().mobility_length_mass);
+        let old: FoundationSpecialistConfig = serde_yaml::from_str(
+            "{enabled: true, rt: true, ms2: true, mobility_ccs: true, ms2_residual_blend: true}",
+        )
+        .unwrap();
+        assert!(!old.mobility_length_mass);
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        PairTaskPeptideModel::new(smoke_config(), FoundationSpecialistConfig::default(), false, vb)?;
+        let vars = varmap.data().lock().unwrap();
+        assert!(!vars.keys().any(|k| k.contains("length_mass")), "default creates no new variables");
+        Ok(())
+    }
+
+    #[test]
+    fn default_specialist_config_keeps_fragment_tokens_off() {
+        assert!(!FoundationSpecialistConfig::default().ms2_fragment_tokens);
+        let old: FoundationSpecialistConfig = serde_yaml::from_str(
+            "{enabled: true, rt: true, ms2: true, mobility_ccs: true, ms2_residual_blend: true}",
+        )
+        .unwrap();
+        assert!(
+            !old.ms2_fragment_tokens,
+            "older configs must deserialize with tokens off"
+        );
     }
 
     #[test]

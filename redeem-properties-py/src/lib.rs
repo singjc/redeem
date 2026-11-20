@@ -1,7 +1,7 @@
 use numpy::{PyArray1, PyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict};
 use redeem_properties::models::{
     ccs_model::CCSModelWrapper, model_interface::PredictionResult, ms2_model::MS2ModelWrapper,
     rt_model::RTModelWrapper,
@@ -109,7 +109,7 @@ fn locate_pretrained(name: &str) -> PyResult<String> {
 /// - `sidecar_path`: path to the sidecar or None
 /// - `sidecar_preview`: first 2048 characters of the sidecar (if present)
 #[pyfunction]
-fn validate_pretrained(py: Python, name: &str) -> PyResult<PyObject> {
+fn validate_pretrained(py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
     let pm = PretrainedModel::from_str(name).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let model_path =
         locate_pretrained_model(pm).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -155,7 +155,7 @@ fn validate_pretrained(py: Python, name: &str) -> PyResult<PyObject> {
         None => (false, None, None),
     };
 
-    let dict = PyDict::new_bound(py);
+    let dict = PyDict::new(py);
     dict.set_item("located_path", model_path.to_string_lossy().into_owned())?;
     dict.set_item("extension", ext)?;
     dict.set_item("file_type", file_type)?;
@@ -163,7 +163,7 @@ fn validate_pretrained(py: Python, name: &str) -> PyResult<PyObject> {
     dict.set_item("sidecar_path", sidecar_path)?;
     dict.set_item("sidecar_preview", sidecar_preview)?;
 
-    Ok(dict.into())
+    Ok(dict.unbind().into())
 }
 
 /// Download pretrained models from the GitHub release and extract them locally.
@@ -319,7 +319,7 @@ impl RTModel {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         match result {
-            PredictionResult::RTResult(values) => Ok(PyArray1::from_slice_bound(py, &values)),
+            PredictionResult::RTResult(values) => Ok(PyArray1::from_slice(py, &values)),
             _ => Err(PyRuntimeError::new_err("Unexpected prediction result type")),
         }
     }
@@ -486,7 +486,7 @@ impl CCSModel {
                 }
                 let mut out = Vec::with_capacity(values.len());
                 for (ccs, charge) in values.into_iter().zip(charges.into_iter()) {
-                    let d = PyDict::new_bound(py);
+                    let d = PyDict::new(py);
                     d.set_item("ccs", ccs)?;
                     d.set_item("charge", charge)?;
                     out.push(d);
@@ -706,8 +706,8 @@ impl MS2Model {
                     // y ordinals: n_pos, n_pos-1, ..., 1
                     let y_ords: Vec<i32> = (1..=(n_pos as i32)).rev().collect();
 
-                    let d = PyDict::new_bound(py);
-                    let intensities = PyArray2::from_vec2_bound(py, &matrix).map_err(|e| {
+                    let d = PyDict::new(py);
+                    let intensities = PyArray2::from_vec2(py, &matrix).map_err(|e| {
                         PyRuntimeError::new_err(format!(
                             "Failed to create intensities array: {}",
                             e
@@ -716,8 +716,8 @@ impl MS2Model {
                     d.set_item("intensities", intensities)?;
                     d.set_item("ion_types", ion_types.to_vec())?;
                     d.set_item("ion_charges", ion_charges.to_vec())?;
-                    d.set_item("b_ordinals", PyArray1::from_slice_bound(py, &b_ords))?;
-                    d.set_item("y_ordinals", PyArray1::from_slice_bound(py, &y_ords))?;
+                    d.set_item("b_ordinals", PyArray1::from_slice(py, &b_ords))?;
+                    d.set_item("y_ordinals", PyArray1::from_slice(py, &y_ords))?;
                     out.push(d);
                 }
                 Ok(out)
@@ -823,7 +823,7 @@ fn compute_fragment_mzs<'py>(
     let ordinals: Vec<usize> = product_ions.iter().map(|i| i.ordinal).collect();
     let mzs: Vec<f64> = product_ions.iter().map(|i| i.mz).collect();
 
-    let dict = PyDict::new_bound(py);
+    let dict = PyDict::new(py);
     dict.set_item("ion_types", ion_types)?;
     dict.set_item("charges", charges)?;
     dict.set_item("ordinals", ordinals)?;
@@ -870,7 +870,7 @@ fn compute_peptide_mz_info<'py>(
     let ordinals: Vec<usize> = info.product_ions.iter().map(|i| i.ordinal).collect();
     let mzs: Vec<f64> = info.product_ions.iter().map(|i| i.mz).collect();
 
-    let dict = PyDict::new_bound(py);
+    let dict = PyDict::new(py);
     dict.set_item("precursor_mz", info.precursor_mz)?;
     dict.set_item("ion_types", ion_types)?;
     dict.set_item("charges", charges)?;

@@ -121,3 +121,14 @@ pub enum RetentionTimeObjective {
     #[default]
     IntrinsicAndObserved,
 }
+
+impl RetentionTimeObjective {
+    /// The intrinsic RT label this objective supervises and scores.
+    pub fn target(self, labels: &RetentionTimeLabels) -> Option<f32> {
+        match self {
+            Self::Normalized | Self::IntrinsicAndObserved => labels.normalized,
+            Self::Harmonized => labels.harmonized,
+            Self::Observed => labels.observed_seconds,
+        }
+    }
+}

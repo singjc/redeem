@@ -427,6 +427,21 @@ pub fn apply_foundation_rt_harmonization(
     Ok(())
 }
 
+/// Cross-source RT consistency of one partition under caller-supplied transforms.
+///
+/// Identity transforms (`scale=1`, `offset=0`) measure the raw source-native coordinate.
+/// This is read-only: it never fits or changes a record.
+pub fn foundation_rt_partition_consistency(
+    records: &[FoundationTrainingRecord],
+    provenance: &[FoundationRecordProvenance],
+    benchmark: &FoundationBenchmarkManifest,
+    partition: FoundationPartition,
+    transforms: &BTreeMap<String, FoundationRtHarmonizationTransform>,
+) -> Result<FoundationRtCrossSourceConsistency> {
+    let data = aggregate_partition(records, provenance, benchmark, partition)?;
+    Ok(cross_source_consistency(&data, transforms))
+}
+
 type AggregatedRt = BTreeMap<String, BTreeMap<String, f64>>;
 
 fn aggregate_partition(
@@ -945,6 +960,47 @@ mod tests {
         assert!((harmonized - 50.0).abs() < 1.0e-6);
         let source = transform.source_native(harmonized).unwrap();
         assert!((source - 80.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn consistency_separates_native_and_harmonized_coordinates() {
+        // Source b reports 2 * a - 60 for each shared peptide; c is unfitted.
+        let mut data = AggregatedRt::new();
+        for (peptide, latent) in [("AAK", 20.0f64), ("CCK", 40.0), ("DDK", 60.0)] {
+            data.entry("a".into())
+                .or_default()
+                .insert(peptide.into(), latent);
+            data.entry("b".into())
+                .or_default()
+                .insert(peptide.into(), 2.0 * latent - 60.0);
+            data.entry("c".into())
+                .or_default()
+                .insert(peptide.into(), 999.0);
+        }
+        let transform = |scale: f64, offset: f64| FoundationRtHarmonizationTransform {
+            scale,
+            offset,
+            calibration_id: "test".into(),
+        };
+        let native = BTreeMap::from([
+            ("a".to_string(), transform(1.0, 0.0)),
+            ("b".to_string(), transform(1.0, 0.0)),
+        ]);
+        let harmonized = BTreeMap::from([
+            ("a".to_string(), transform(1.0, 0.0)),
+            ("b".to_string(), transform(0.5, 30.0)),
+        ]);
+        let native = cross_source_consistency(&data, &native);
+        let harmonized = cross_source_consistency(&data, &harmonized);
+        assert_eq!(native.shared_peptidoforms, 3);
+        assert_eq!(native.observations, 6);
+        // Native |a-b| = 40, 20, 0; each observation is |a-b|/2 from the median -> MAD 10.
+        assert!((native.mean_absolute_deviation.unwrap() - 10.0).abs() < 1.0e-9);
+        assert!(harmonized.mean_absolute_deviation.unwrap() < 1.0e-9);
+        assert_eq!(
+            cross_source_consistency(&data, &BTreeMap::new()).observations,
+            0
+        );
     }
 
     #[test]
