@@ -28,6 +28,13 @@ jobs:
     - name: Install system dependencies
       run: sudo apt-get install -y libgomp1 build-essential clang libstdc++-12-dev libxgboost-dev
 
+    # The workspace builds redeem-properties-py (PyO3 0.22), which supports Python <= 3.13.
+    # ubuntu-latest now ships 3.14, so pin the interpreter that the pyo3 build script finds.
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
     - name: Set up Rust
       uses: actions-rs/toolchain@v1
       with:
